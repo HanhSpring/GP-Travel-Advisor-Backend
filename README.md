@@ -1,343 +1,212 @@
 # 🌍 Travel Advisor Backend
 
-Hệ thống backend microservices cho ứng dụng đề xuất du lịch cá nhân hóa sử dụng AI.
+Backend microservices cho ứng dụng đề xuất du lịch sử dụng AI - bao gồm NestJS API Gateway, Python AI Service và PostgreSQL.
 
-## 📋 Tổng quan dự án
+---
 
-Travel Advisor Backend là một hệ thống microservices bao gồm:
+## 📦 Yêu cầu
 
-- **API Gateway (NestJS)**: RESTful API gateway xử lý authentication, authorization, và routing
-- **AI Service (Python/FastAPI)**: Service AI cung cấp các đề xuất du lịch cá nhân hóa sử dụng machine learning
-- **PostgreSQL Database**: Cơ sở dữ liệu quan hệ lưu trữ thông tin người dùng, địa điểm, và lịch sử tương tác
-
-## 🏗️ Kiến trúc hệ thống
-
-```
-travel-advisor-backend/
-├── api-service/           # NestJS API Gateway
-│   ├── src/
-│   │   ├── app.controller.ts
-│   │   ├── app.module.ts
-│   │   ├── app.service.ts
-│   │   └── main.ts
-│   ├── package.json
-│   └── tsconfig.json
-│
-├── ai-service/            # Python AI Service
-│   ├── venv/              # Virtual environment (not tracked in git)
-│   ├── main.py            # FastAPI application
-│   └── requirements.txt   # Python dependencies
-│
-├── docker-compose.yml     # Docker Compose configuration
-├── .env.example           # Environment variables template
-├── .gitignore
-└── README.md
-```
-
-## 🛠️ Công nghệ sử dụng
-
-### Backend Services
-- **NestJS** (v10.x): Progressive Node.js framework
-- **Python** (3.11+): AI/ML service
-- **FastAPI**: Modern Python web framework
-- **TypeORM/Prisma**: ORM for NestJS
-- **SQLAlchemy**: ORM for Python
-
-### Database
-- **PostgreSQL** (15): Primary database
-
-### DevOps
-- **Docker & Docker Compose**: Containerization
-- **Git**: Version control
-
-### AI/ML Libraries
-- **NumPy**: Numerical computing
-- **Pandas**: Data manipulation
-- **Scikit-learn**: Machine learning
-
-## 📦 Yêu cầu hệ thống
-
-Trước khi bắt đầu, đảm bảo bạn đã cài đặt:
-
-- **Node.js** (v18.x trở lên) và **npm**
-- **Python** (v3.11 trở lên) và **pip**
-- **Docker** và **Docker Compose**
+- **Node.js** >= 18.x và npm
+- **Python** >= 3.11 và pip  
+- **Docker** và Docker Compose
 - **Git**
 
-Kiểm tra phiên bản:
-
+Kiểm tra version:
 ```bash
-node --version   # v18.x+
-npm --version    # 9.x+
-python --version # 3.11+
+node --version && npm --version
+python --version
 docker --version
-docker-compose --version
 ```
 
-## 🚀 Hướng dẫn cài đặt
+---
+
+## ⚡ Cài đặt lần đầu
 
 ### 1. Clone repository
-
 ```bash
-git clone <your-repository-url>
+git clone <repo-url>
 cd travel-advisor-backend
 ```
 
 ### 2. Cấu hình môi trường
-
-Sao chép file `.env.example` thành `.env`:
-
 ```bash
-# Windows PowerShell
-Copy-Item .env.example .env
-
-# macOS/Linux
-cp .env.example .env
+Copy-Item .env.example .env    # Copy file môi trường
+# Mở .env và chỉnh sửa nếu cần (mặc định đã ok để dev)
 ```
 
-Chỉnh sửa file `.env` với các giá trị thực tế của bạn.
-
-### 3. Khởi động PostgreSQL Database
-
-Sử dụng Docker Compose để khởi động database:
-
+### 3. Chạy Database
 ```bash
-docker-compose up -d
+docker-compose up -d           # Start PostgreSQL
+docker-compose ps              # Kiểm tra đang chạy
 ```
-
-Kiểm tra database đã chạy:
-
-```bash
-docker-compose ps
-```
-
-Bạn có thể kết nối đến database qua:
-- **Host**: localhost
-- **Port**: 5432
-- **Database**: travel_db
-- **User**: admin
-- **Password**: password123
 
 ### 4. Setup API Service (NestJS)
-
 ```bash
-# Di chuyển vào thư mục api-service
 cd api-service
-
-# Cài đặt dependencies
-npm install
-
-# Chạy development server
-npm run start:dev
+npm install                    # Cài dependencies
+npm run start:dev              # Chạy dev server
 ```
+→ API chạy tại: **http://localhost:3000**
 
-API Gateway sẽ chạy tại: **http://localhost:3000**
-
-### 5. Setup AI Service (Python)
-
-Mở terminal mới:
-
+### 5. Setup AI Service (Python) 
+*Mở terminal mới*
 ```bash
-# Di chuyển vào thư mục ai-service
 cd ai-service
 
-# Kích hoạt virtual environment
-# Windows PowerShell:
-.\venv\Scripts\Activate.ps1
+# Tạo & kích hoạt virtual environment
+python -m venv venv
+.\venv\Scripts\Activate.ps1   # Windows PowerShell
 
-# macOS/Linux:
-source venv/bin/activate
-
-# Cài đặt dependencies
+# Cài dependencies
 pip install -r requirements.txt
 
-# Chạy Python service
+# Chạy service
 python main.py
 ```
+→ AI Service chạy tại: **http://localhost:8000**  
+→ API Docs: **http://localhost:8000/docs**
 
-AI Service sẽ chạy tại: **http://localhost:8000**
+---
 
-## 🎯 Chạy toàn bộ hệ thống
+## 🔄 Quy trình làm việc hằng ngày
 
-Để chạy tất cả các services, bạn cần 3 terminal:
-
-**Terminal 1 - PostgreSQL Database:**
 ```bash
-docker-compose up
-```
+# 1. Update code mới nhất
+git checkout develop
+git pull origin develop
 
-**Terminal 2 - NestJS API Gateway:**
-```bash
+# 2. Start database (nếu chưa chạy)
+docker-compose up -d
+
+# 3. Start NestJS (Terminal 1)
 cd api-service
 npm run start:dev
-```
 
-**Terminal 3 - Python AI Service:**
-```bash
+# 4. Start Python AI (Terminal 2)  
 cd ai-service
-# Kích hoạt venv trước
+.\venv\Scripts\Activate.ps1
 python main.py
 ```
 
-## 📡 API Endpoints
+### Làm việc với Git
 
-### API Gateway (NestJS) - Port 3000
-
-- `GET /` - Health check
-- `GET /api/v1/...` - API endpoints (thêm sau)
-
-### AI Service (FastAPI) - Port 8000
-
-- `GET /` - Service health check
-- `GET /health` - Detailed health check
-- `POST /api/v1/recommendations` - Lấy đề xuất du lịch
-- `GET /api/v1/status` - Service status
-- `GET /docs` - Swagger API documentation (tự động)
-
-### Swagger Documentation
-
-FastAPI tự động tạo interactive API docs:
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
-
-## 🧪 Testing
-
-### Test NestJS API
-
+#### Bắt đầu feature/task mới
 ```bash
-cd api-service
-
-# Unit tests
-npm run test
-
-# E2E tests
-npm run test:e2e
-
-# Test coverage
-npm run test:cov
+git checkout develop
+git pull origin develop
+git checkout -b feature/ten-feature    # hoặc fix/ten-bug
 ```
 
-### Test Python AI Service
-
+#### Commit thường xuyên
 ```bash
-cd ai-service
-# Kích hoạt venv
-pytest  # Cài pytest nếu cần
+git status                             # Xem file thay đổi
+git add .                              # Stage tất cả
+git commit -m "feat: mô tả ngắn gọn"  # Commit với message chuẩn
 ```
 
-## 🗄️ Database Management
-
-### Kết nối đến PostgreSQL
-
-```bash
-# Sử dụng docker exec
-docker exec -it travel-advisor-postgres psql -U admin -d travel_db
-```
-
-### Migrations (NestJS với TypeORM)
-
-```bash
-cd api-service
-
-# Tạo migration
-npm run migration:generate -- -n MigrationName
-
-# Chạy migrations
-npm run migration:run
-
-# Revert migration
-npm run migration:revert
-```
-
-### Dừng và xóa database
-
-```bash
-# Dừng containers
-docker-compose down
-
-# Dừng và xóa volumes (MẤT TOÀN BỘ DATA!)
-docker-compose down -v
-```
-
-## 🔧 Development Workflow
-
-### 1. Tạo branch mới cho feature
-
-```bash
-git checkout -b feature/your-feature-name
-```
-
-### 2. Thực hiện thay đổi và commit
-
-```bash
-git add .
-git commit -m "feat: add your feature description"
-```
-
-### 3. Push và tạo Pull Request
-
-```bash
-git push origin feature/your-feature-name
-```
-
-### Commit Message Convention
-
-Sử dụng [Conventional Commits](https://www.conventionalcommits.org/):
-
+**Convention commit messages:**
 - `feat:` - Tính năng mới
-- `fix:` - Sửa bug
-- `docs:` - Thay đổi documentation
-- `style:` - Format code, không thay đổi logic
+- `fix:` - Sửa bug  
+- `docs:` - Thay đổi docs
 - `refactor:` - Refactor code
 - `test:` - Thêm tests
-- `chore:` - Maintenance tasks
+- `chore:` - Update dependencies, config
 
-## 📚 Tài liệu bổ sung
-
-- [NestJS Documentation](https://docs.nestjs.com/)
-- [FastAPI Documentation](https://fastapi.tiangolo.com/)
-- [PostgreSQL Documentation](https://www.postgresql.org/docs/)
-- [Docker Documentation](https://docs.docker.com/)
-
-## 🤝 Contributing
-
-1. Fork repository
-2. Tạo branch cho feature (`git checkout -b feature/AmazingFeature`)
-3. Commit changes (`git commit -m 'feat: Add some AmazingFeature'`)
-4. Push to branch (`git push origin feature/AmazingFeature`)
-5. Tạo Pull Request
-
-## 📝 License
-
-[MIT License](LICENSE)
-
-## 👥 Team
-
-- **Developer**: [Your Name]
-- **Project**: Đồ án tốt nghiệp (DATN)
-- **Year**: 2026
-
-## 🐛 Troubleshooting
-
-### Database connection failed
-- Kiểm tra Docker container đang chạy: `docker-compose ps`
-- Kiểm tra port 5432 không bị chiếm: `netstat -an | findstr 5432` (Windows)
-
-### Port already in use
-- **3000 đã bị sử dụng**: Thay đổi `API_SERVICE_PORT` trong `.env`
-- **8000 đã bị sử dụng**: Thay đổi `AI_SERVICE_PORT` trong `.env`
-
-### Python venv activation failed
-- Windows: Chạy `Set-ExecutionPolicy -ExecutionPolicy RemoteSigned -Scope CurrentUser`
-- Hoặc sử dụng: `venv\Scripts\activate.bat` thay vì `.ps1`
-
-### NestJS dependencies error
+#### Push code lên remote
 ```bash
-cd api-service
-rm -rf node_modules package-lock.json
-npm install
+git push origin feature/ten-feature
+```
+
+#### Tạo Pull Request
+1. Vào GitHub/GitLab
+2. Tạo PR từ `feature/ten-feature` → `develop`
+3. Điền mô tả, tag reviewer
+4. Chờ review & merge
+
+#### Sau khi merge
+```bash
+git checkout develop
+git pull origin develop
+git branch -d feature/ten-feature      # Xóa branch local
+```
+
+---
+
+## 🛠️ Các lệnh hay dùng
+
+### Git
+```bash
+git status                    # Xem trạng thái
+git log --oneline            # Xem lịch sử commit
+git stash                    # Cất changes tạm thời
+git stash pop                # Lấy lại stashed changes
+git diff                     # Xem thay đổi chưa commit
+```
+
+### Database
+```bash
+# Kết nối vào PostgreSQL
+docker exec -it travel-advisor-postgres psql -U admin -d travel_db
+
+# Trong psql:
+\dt                          # List tables
+\d table_name                # Describe table
+\q                           # Quit
+```
+
+---
+
+## 🧪 Testing & Debugging
+
+### Test API endpoints
+- **NestJS API**: http://localhost:3000
+- **Python API Docs**: http://localhost:8000/docs (Swagger tự động)
+- Hoặc dùng Thunder Client extension trong VSCode
+
+### Debug NestJS với VSCode
+Tạo `.vscode/launch.json`:
+```json
+{
+ "type": "node",
+  "request": "launch",
+  "name": "Debug NestJS",
+  "runtimeExecutable": "npm",
+  "runtimeArgs": ["run", "start:debug"],
+  "cwd": "${workspaceFolder}/api-service"
+}
+```
+Script trong `package.json`: `"start:debug": "nest start --debug --watch"`
+
+### Xem logs
+```bash
+# NestJS logs - hiện ngay trên terminal đang chạy
+
+# Docker logs
+docker-compose logs -f postgres
+```
+
+---
+
+## 🔗 Thông tin Database
+
+**Local Development:**
+- Host: `localhost`
+- Port: `5432`
+- Database: `travel_db`
+- User: `admin`
+- Password: `password123`
+
+**Connection strings:**
+```bash
+# NestJS
+DATABASE_URL=postgresql://admin:password123@localhost:5432/travel_db
+
+# Python  
+PYTHON_DATABASE_URL=postgresql://admin:password123@localhost:5432/travel_db
 ```
 
 ---
 
 **Happy Coding! 🚀**
+
+*Last updated: February 2026*
