@@ -1,0 +1,33 @@
+openapi: 3.0.0
+info:
+  title: Travel Advisor API
+  version: 1.0.0
+
+paths:
+
+  /search:
+    get:
+      summary: Search places
+      parameters:
+        - in: query
+          name: q
+          schema:
+            type: string
+      responses:
+        200:
+          description: List places
+
+  /itinerary:
+    post:
+      summary: Create itinerary
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                creator_id:
+                  type: string
+                description:
+                  type: string
