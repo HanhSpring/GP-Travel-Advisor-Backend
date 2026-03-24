@@ -129,7 +129,7 @@ export class ExploreService {
         'id, creator_id, description, start_date, end_date, participant_count, status, destination, created_at, is_public',
       )
       .eq('creator_id', touristId)
-      .in('status',['ongoing', 'completed'])
+      .in('status', ['ongoing', 'completed'])
       .gte('start_date', today)
       .order('start_date', { ascending: true })
       .limit(1)
