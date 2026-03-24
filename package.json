@@ -1,0 +1,8 @@
+{
+  "dependencies": {
+    "@nestjs/config": "^4.0.3",
+    "@nestjs/swagger": "^11.2.6",
+    "@supabase/supabase-js": "^2.99.1",
+    "swagger-ui-express": "^5.0.1"
+  }
+}
