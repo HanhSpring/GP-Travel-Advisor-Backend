@@ -1,20 +1,123 @@
-import { Injectable } from '@nestjs/common'
+import { Injectable, InternalServerErrorException } from '@nestjs/common'
 import { supabase } from '../../config/supabase'
+import * as XLSX from 'xlsx'
 
 @Injectable()
 export class BusinessService {
 
-  async getVendorPlaces(vendorId:string){
-
+  async getVendorPlaces(vendorId: string) {
     const { data, error } = await supabase
       .schema('travel')
-      .from('places')
-      .select('*')
-      .eq('vendor_id', vendorId)
+      .rpc('get_places_by_vendor', { p_vendor_id: vendorId })
 
-    if(error) throw error
-
+    if (error) throw new InternalServerErrorException(error.message)
     return data
   }
 
+  async getPlaceDetail(placeId: string) {
+    const { data, error } = await supabase
+      .schema('travel')
+      .rpc('get_place_detail', { p_place_id: placeId })
+
+    if (error) throw new InternalServerErrorException(error.message)
+    return data
+  }
+
+  async getOrdersByPlace(placeId: string) {
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .rpc('get_orders_by_place', { p_place_id: placeId })
+
+    if (error) throw new InternalServerErrorException(error.message)
+    return data
+  }
+
+  async getOrderDetail(orderId: string) {
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .rpc('get_order_detail', { p_order_id: orderId })
+
+    if (error) throw new InternalServerErrorException(error.message)
+    return data
+  }
+
+  async getPlaceServices(placeId: string) {
+    const { data, error } = await supabase
+      .schema('travel')
+      .rpc('get_place_services_and_menu', { p_place_id: placeId })
+
+    if (error) throw new InternalServerErrorException(error.message)
+    return data
+  }
+
+  async getDashboard(vendorId: string) {
+    const { data, error } = await supabase
+      .schema('travel')
+      .rpc('get_business_dashboard', { p_vendor_id: vendorId })
+
+    if (error) throw new InternalServerErrorException(error.message)
+    return data
+  }
+
+  parseExcel(file: any) {
+
+    const workbook = XLSX.read(file.buffer, { type: 'buffer' })
+    const sheet = workbook.Sheets[workbook.SheetNames[0]]
+
+    const rows = XLSX.utils.sheet_to_json(sheet)
+
+    return rows.map((r: any) => ({
+      name: r['Tên món'],
+      price: Number(r['Giá bán']),
+      description: r['Mô tả']
+    }))
+  }
+
+  validateMenu(menu: any[]) {
+
+    for (const m of menu) {
+      if (!m.name) throw new Error('Thiếu tên món')
+
+      if (!m.price || m.price <= 0)
+        throw new Error(`Giá sai: ${m.name}`)
+    }
+  }
+
+  async createFullPlace(dto: any, file?: any) {
+
+    if (!dto || !dto.name) {
+      throw new Error('Thiếu dữ liệu đầu vào')
+    }
+
+    let menu: any[] = []
+
+    if (file) {
+      menu = this.parseExcel(file)
+      this.validateMenu(menu)
+    }
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .rpc('create_full_place', {
+        p_name: dto.name,
+        p_address: dto.address,
+        p_city: dto.city,
+        p_lat: dto.latitude,
+        p_lng: dto.longitude,
+        p_categories: Array.isArray(dto.categories)
+          ? dto.categories
+          : [], p_services: dto.services || [],
+        p_menu: menu.length > 0 ? menu : []
+      })
+
+    if (error) {
+      console.error(error)
+      throw error
+    }
+
+    return {
+      message: 'Tạo thành công',
+      placeId: data
+    }
+  }
 }

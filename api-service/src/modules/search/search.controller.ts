@@ -1,18 +1,39 @@
-import { Controller, Get, Query } from '@nestjs/common'
+import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger'
 import { SearchService } from './search.service'
-import { ApiTags, ApiOperation, ApiQuery } from '@nestjs/swagger'
+import { SearchQueryDto } from './dto/search.dto'
+import { AutocompleteItemDto, SearchResultDto } from './dto/search-response.dto'
+import { SearchFilterDto } from './dto/search-filter.dto'
+import {
+  Controller,
+  Get,
+  Query,
+  Post,
+  Body,
+  UploadedFile,
+  UseInterceptors
+} from '@nestjs/common'
+
+import { FileInterceptor } from '@nestjs/platform-express'
 
 @ApiTags('Search')
 @Controller('search')
 export class SearchController {
 
-  constructor(private readonly searchService: SearchService){}
+  constructor(private readonly service: SearchService) { }
 
-  @Get()
-  @ApiOperation({ summary: 'Search places by name' })
-  @ApiQuery({ name: 'q', required: false })
-  async search(@Query('q') q: string){
-    return this.searchService.searchPlaces(q)
+  @Get('autocomplete')
+  @ApiOperation({ summary: 'Search autocomplete (suggestions)' })
+  @ApiResponse({ type: [AutocompleteItemDto] })
+  autocomplete(@Query() query: SearchQueryDto) {
+    return this.service.autocomplete(query.q)
   }
 
+  @Get('filter')
+  @ApiOperation({ summary: 'Filter places by city and category' })
+  getPlacesByFilter(@Query() query: SearchFilterDto) {
+    return this.service.getPlacesByFilter(
+      query.city,
+      query.category
+    )
+  }
 }

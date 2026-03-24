@@ -4,30 +4,19 @@ import { supabase } from '../../config/supabase'
 @Injectable()
 export class ItineraryService {
 
-  async createItinerary(body:any){
+async getMyItineraries(userId: string) {
 
-    const { data, error } = await supabase
-      .schema('travel')
-      .from('itineraries')
-      .insert([body])
-      .select()
+  const { data, error } = await supabase
+    .schema('travel')
+    .rpc('get_my_itineraries', {
+      p_user_id: userId
+    })
 
-    if(error) throw error
-
-    return data
+  if (error) {
+    console.error("Supabase RPC error:", error)
+    throw error
   }
 
-  async getMyItinerary(userId:string){
-
-    const { data, error } = await supabase
-      .schema('travel')
-      .from('itineraries')
-      .select('*')
-      .eq('creator_id', userId)
-
-    if(error) throw error
-
-    return data
-  }
-
+  return data
+}
 }
