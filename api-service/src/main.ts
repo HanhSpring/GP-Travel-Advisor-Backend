@@ -1,10 +1,12 @@
-import 'dotenv/config'
-import { NestFactory } from '@nestjs/core'
-import { AppModule } from './app.module'
-import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger'
-import { ValidationPipe } from '@nestjs/common' 
+import 'dotenv/config';
+import { NestFactory } from '@nestjs/core';
+import { AppModule } from './app.module';
+import { SwaggerModule, DocumentBuilder } from '@nestjs/swagger';
+import { ValidationPipe } from '@nestjs/common';
+import { Logger } from '@nestjs/common';
 
 async function bootstrap() {
+  const logger = new Logger('Bootstrap');
   const app = await NestFactory.create(AppModule, {
     logger: ['error', 'warn'],
   });
@@ -38,6 +40,23 @@ async function bootstrap() {
 
   SwaggerModule.setup('api-docs', app, document);
 
-  await app.listen(3000);
+  const host = process.env.API_SERVICE_HOST || '0.0.0.0';
+  const preferredPort = Number(process.env.API_SERVICE_PORT || 3000);
+
+  try {
+    await app.listen(preferredPort, host);
+    logger.log(`API is running on http://localhost:${preferredPort}`);
+    return;
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') {
+      throw error;
+    }
+  }
+
+  const fallbackPort = preferredPort + 1;
+  await app.listen(fallbackPort, host);
+  logger.warn(
+    `Port ${preferredPort} is in use. API started on http://localhost:${fallbackPort}`,
+  );
 }
-bootstrap();
+void bootstrap();

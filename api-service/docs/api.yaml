@@ -31,3 +31,50 @@ paths:
                   type: string
                 description:
                   type: string
+
+  /explore:
+    get:
+      summary: Get explore screen data
+      responses:
+        200:
+          description: Explore data
+
+  /places:
+    get:
+      summary: Get places
+      responses:
+        200:
+          description: List of places
+
+  /places/{id}:
+    get:
+      summary: Get place detail
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        200:
+          description: Place detail
+
+  /reviews:
+    post:
+      summary: Create review
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                place_id:
+                  type: string
+                rating:
+                  type: integer
+                comment:
+                  type: string
+      responses:
+        201:
+          description: Review created

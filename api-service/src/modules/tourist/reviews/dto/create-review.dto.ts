@@ -1,0 +1,66 @@
+/* eslint-disable @typescript-eslint/no-unsafe-call */
+import { ApiProperty } from '@nestjs/swagger';
+import {
+  IsUUID,
+  IsNumber,
+  IsString,
+  IsOptional,
+  IsArray,
+  Min,
+  Max,
+} from 'class-validator';
+
+export class CreateReviewDto {
+  @ApiProperty({
+    example: '2c2caf9e-1fc9-4065-a280-45d8508458c7',
+    description: 'UUID of the tourist/user writing the review',
+  })
+  @IsUUID('4')
+  tourist_id: string;
+
+  @ApiProperty({
+    example: '16579947-051d-47ec-856c-a8f5159ab7ba',
+    description: 'UUID of the place being reviewed',
+  })
+  @IsUUID('4')
+  place_id: string;
+
+  @ApiProperty({
+    example: 5,
+    description: 'Rating between 1 and 5 stars',
+  })
+  @IsNumber()
+  @Min(1)
+  @Max(5)
+  rating: number;
+
+  @ApiProperty({
+    example: 'Great place! Clean and beautiful views.',
+    description: 'Written review content (optional)',
+    required: false,
+  })
+  @IsOptional()
+  @IsString()
+  content?: string | null;
+
+  @ApiProperty({
+    example: ['Sạch sẽ', 'Check-in đẹp', 'Phí hợp lý'],
+    description: 'Tags for the review (optional)',
+    required: false,
+  })
+  @IsOptional()
+  @IsArray()
+  tags?: string[] | null;
+
+  @ApiProperty({
+    example: [
+      'https://example.com/image1.jpg',
+      'https://example.com/image2.jpg',
+    ],
+    description: 'Image URLs for the review (optional)',
+    required: false,
+  })
+  @IsOptional()
+  @IsArray()
+  images?: string[] | null;
+}
