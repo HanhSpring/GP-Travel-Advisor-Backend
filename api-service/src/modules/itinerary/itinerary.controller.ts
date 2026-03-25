@@ -8,19 +8,30 @@ import {
   Param,
   Patch,
   Delete,
+  Query,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
 import { ItineraryService } from './itinerary.service';
+import { GetItinerariesDto } from './dto/get-itineraries.dto';
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
 import { ItinerarySummaryResponseDto } from './dto/itinerary-summary-response.dto';
 import { ItineraryDetailResponseDto } from './dto/itinerary-detail-response.dto';
+import { ItineraryResponseDto } from './dto/itinerary-response.dto';
 import { ToggleVisibilityDto } from './dto/toggle-visibility.dto';
 import { UpdateActivityNoteDto } from './dto/update-activity-note.dto';
 
 @ApiTags('Itinerary')
 @Controller('itinerary')
 export class ItineraryController {
+
   constructor(private readonly service: ItineraryService) {}
+
+  @Get('my-itineraries')
+  @ApiOperation({ summary: 'Get my itineraries' })
+  @ApiResponse({ type: ItineraryResponseDto })
+  getMyItineraries(@Query() query: GetItinerariesDto) {
+    return this.service.getMyItineraries(query.userId)
+  }
 
   @Post()
   @HttpCode(HttpStatus.CREATED)
