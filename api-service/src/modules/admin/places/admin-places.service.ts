@@ -22,6 +22,7 @@ interface PlaceCategoryJoinRow {
 
 interface PlaceListRow {
   id: string;
+  image_url: string | null;
   name: string;
   address: string | null;
   is_approved: boolean | null;
@@ -32,6 +33,7 @@ interface PlaceListRow {
 
 interface PlaceDetailRow {
   id: string;
+  image_url: string | null;
   name: string;
   description: string | null;
   address: string | null;
@@ -50,15 +52,7 @@ interface UserRow {
   full_name: string | null;
   email: string | null;
   phone_number: string | null;
-}
-
-interface UserFilterRow {
-  id: string;
-  full_name: string | null;
-}
-
-interface PlaceVendorRow {
-  vendor_id: string | null;
+  created_at: string | null;
 }
 
 interface CategoryFilterRow {
@@ -69,14 +63,24 @@ interface PlaceCategoryFilterRow {
   place_id: string;
 }
 
-interface VendorFilterByNameRow {
-  id: string;
-}
-
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
 
 @Injectable()
 export class AdminPlacesService {
+  private normalizeForSearch(value?: string | null): string {
+    if (!value) {
+      return '';
+    }
+
+    return value
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/đ/g, 'd')
+      .replace(/Đ/g, 'D')
+      .toLowerCase()
+      .trim();
+  }
+
   private extractCityName(cityData: CityRow | CityRow[] | null): string {
     if (!cityData) {
       return '';
@@ -139,7 +143,6 @@ export class AdminPlacesService {
     limit: number = 10,
     search?: string,
     categoryName?: string,
-    vendorName?: string,
   ) {
     const offset = (page - 1) * limit;
 
@@ -150,8 +153,6 @@ export class AdminPlacesService {
     }
 
     let placeIdsByCategoryName: string[] | null = null;
-    let vendorIdsByName: string[] | null = null;
-
     if (categoryName) {
       const { data: categories, error: categoriesError } = await supabase
         .schema('travel')
@@ -206,40 +207,11 @@ export class AdminPlacesService {
       }
     }
 
-    if (vendorName) {
-      const { data: vendorRows, error: vendorRowsError } = await supabase
-        .schema('public')
-        .from('users')
-        .select('id')
-        .ilike('full_name', `%${vendorName}%`);
-
-      if (vendorRowsError) {
-        throw new InternalServerErrorException(vendorRowsError.message);
-      }
-
-      vendorIdsByName = (vendorRows ?? [])
-        .map((item) => (item as VendorFilterByNameRow).id)
-        .filter(Boolean);
-
-      if (vendorIdsByName.length === 0) {
-        return {
-          data: [],
-          pagination: {
-            page,
-            limit,
-            total: 0,
-            pages: 0,
-          },
-        };
-      }
-    }
-
     let query = supabase
       .schema('travel')
       .from('places')
       .select(
-        'id, name, address, is_approved, vendor_id, registered_date, place_categories(category_id, categories(id, name))',
-        { count: 'exact' },
+        'id, image_url, name, address, is_approved, vendor_id, registered_date, place_categories(category_id, categories(id, name))',
       );
 
     if (status === 'pending') {
@@ -250,22 +222,16 @@ export class AdminPlacesService {
       query = query.eq('is_approved', false);
     }
 
-    if (search) {
-      query = query.ilike('name', `%${search}%`);
-    }
-
-    if (vendorIdsByName) {
-      query = query.in('vendor_id', vendorIdsByName);
-    }
-
     if (placeIdsByCategoryName) {
       query = query.in('id', placeIdsByCategoryName);
     }
 
-    const { data, error, count } = await query.range(
-      offset,
-      offset + limit - 1,
-    );
+    query = query.order('registered_date', {
+      ascending: false,
+      nullsFirst: false,
+    });
+
+    const { data, error } = await query;
 
     if (error) {
       throw new InternalServerErrorException(error.message);
@@ -295,12 +261,13 @@ export class AdminPlacesService {
       }
     }
 
-    const places = placeRows.map((place) => {
+    let places = placeRows.map((place) => {
       const vendor = vendors.find((v) => v.id === place.vendor_id);
       const categoryNames = this.extractCategoryNames(place.place_categories);
 
       return {
         id: place.id,
+        image_url: place.image_url,
         name: place.name,
         address: place.address ?? '',
         category: categoryNames.join(', '),
@@ -310,13 +277,30 @@ export class AdminPlacesService {
       };
     });
 
+    const normalizedSearch = this.normalizeForSearch(search);
+
+    if (normalizedSearch) {
+      places = places.filter((place) => {
+        const normalizedPlaceName = this.normalizeForSearch(place.name);
+        const normalizedVendorName = this.normalizeForSearch(place.vendor_name);
+
+        return (
+          normalizedPlaceName.includes(normalizedSearch) ||
+          normalizedVendorName.includes(normalizedSearch)
+        );
+      });
+    }
+
+    const total = places.length;
+    const pagedPlaces = places.slice(offset, offset + limit);
+
     return {
-      data: places,
+      data: pagedPlaces,
       pagination: {
         page,
         limit,
-        total: count || 0,
-        pages: Math.ceil((count || 0) / limit),
+        total,
+        pages: Math.ceil(total / limit),
       },
     };
   }
@@ -326,7 +310,7 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, description, address, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, place_categories(category_id, categories(id, name))',
+        'id, image_url, name, description, address, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, place_categories(category_id, categories(id, name))',
       )
       .eq('id', id)
       .maybeSingle<PlaceDetailRow>();
@@ -340,7 +324,7 @@ export class AdminPlacesService {
           await supabase
             .schema('public')
             .from('users')
-            .select('id, full_name, email, phone_number')
+            .select('id, full_name, email, phone_number, created_at')
             .eq('id', place.vendor_id)
             .maybeSingle<UserRow>()
         ).data
@@ -377,70 +361,29 @@ export class AdminPlacesService {
             email: vendor.email ?? '',
             phone: vendor.phone_number ?? '',
             total_places: vendorPlaceCount?.count ?? 0,
+            created_at: vendor.created_at,
           }
         : null,
-      images: [],
+      images: place.image_url ? [place.image_url] : [],
     };
   }
 
-  async getPlaceFilters() {
-    const [categoriesResult, placeVendorsResult] = await Promise.all([
-      supabase
-        .schema('travel')
-        .from('categories')
-        .select('id, name')
-        .order('name', { ascending: true }),
-      supabase.schema('travel').from('places').select('vendor_id'),
-    ]);
+  async getPlaceCategories() {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('categories')
+      .select('id, name')
+      .order('name', { ascending: true });
 
-    if (categoriesResult.error) {
-      throw new InternalServerErrorException(categoriesResult.error.message);
-    }
-
-    if (placeVendorsResult.error) {
-      throw new InternalServerErrorException(placeVendorsResult.error.message);
-    }
-
-    const vendorIds = Array.from(
-      new Set(
-        ((placeVendorsResult.data ?? []) as PlaceVendorRow[])
-          .map((item) => item.vendor_id)
-          .filter((id): id is string => Boolean(id)),
-      ),
-    );
-
-    const vendorsResult = vendorIds.length
-      ? await supabase
-          .schema('public')
-          .from('users')
-          .select('id, full_name')
-          .in('id', vendorIds)
-          .order('full_name', { ascending: true })
-      : { data: [], error: null };
-
-    if (vendorsResult.error) {
-      throw new InternalServerErrorException(vendorsResult.error.message);
+    if (error) {
+      throw new InternalServerErrorException(error.message);
     }
 
     return {
-      statuses: [
-        { value: 'all', label: 'Tất cả' },
-        { value: 'pending', label: 'Chờ duyệt' },
-        { value: 'approved', label: 'Đã duyệt' },
-        { value: 'rejected', label: 'Từ chối' },
-      ],
-      categories: ((categoriesResult.data ?? []) as CategoryRow[]).map(
-        (item) => ({
-          value: item.name,
-          label: item.name,
-        }),
-      ),
-      submitters: ((vendorsResult.data ?? []) as UserFilterRow[]).map(
-        (item) => ({
-          value: item.full_name ?? 'N/A',
-          label: item.full_name ?? 'N/A',
-        }),
-      ),
+      categories: ((data ?? []) as CategoryRow[]).map((item) => ({
+        value: item.name,
+        label: item.name,
+      })),
     };
   }
 

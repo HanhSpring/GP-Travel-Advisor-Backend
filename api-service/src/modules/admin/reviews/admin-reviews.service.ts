@@ -48,6 +48,20 @@ type ReviewDateSent =
 
 @Injectable()
 export class AdminReviewsService {
+  private normalizeForSearch(value?: string | null): string {
+    if (!value) {
+      return '';
+    }
+
+    return value
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/đ/g, 'd')
+      .replace(/Đ/g, 'D')
+      .toLowerCase()
+      .trim();
+  }
+
   private normalizeClassification(
     classification?: ReviewClassification,
   ): 'short-term' | 'long-term' | 'need-action' | 'unclassified' | null {
@@ -82,6 +96,7 @@ export class AdminReviewsService {
     sort: ReviewSort = 'newest',
     classification?: ReviewClassification,
     dateSent: ReviewDateSent = 'all',
+    dateExact?: string,
     rating?: number,
   ): Promise<AdminReviewListResponseDto> {
     if (page < 1) throw new BadRequestException('Page must be >= 1');
@@ -194,33 +209,19 @@ export class AdminReviewsService {
         }
       }
 
-      if (search) {
-        const { data: placeRows, error: placeSearchError } = await supabase
-          .schema('travel')
-          .from('places')
-          .select('id')
-          .ilike('name', `%${search}%`);
+      if (dateExact) {
+        const exactDate = new Date(`${dateExact}T00:00:00`);
 
-        if (placeSearchError) throw placeSearchError;
-
-        const placeIds = (placeRows || [])
-          .map((item) => (item as { id: string }).id)
-          .filter(Boolean);
-
-        if (placeIds.length === 0) {
-          return {
-            data: [],
-            pagination: {
-              total: 0,
-              page,
-              limit,
-              total_pages: 0,
-            },
-            summary,
-          };
+        if (Number.isNaN(exactDate.getTime())) {
+          throw new BadRequestException('date_exact must be in YYYY-MM-DD format');
         }
 
-        query = query.in('place_id', placeIds);
+        const nextDate = new Date(exactDate);
+        nextDate.setDate(nextDate.getDate() + 1);
+
+        query = query
+          .gte('created_at', exactDate.toISOString())
+          .lt('created_at', nextDate.toISOString());
       }
 
       const normalizedClassification =
@@ -297,7 +298,12 @@ export class AdminReviewsService {
           query = query.order('created_at', { ascending: false });
       }
 
-      query = query.range(offset, offset + limit - 1);
+      const normalizedSearch = this.normalizeForSearch(search);
+      const usesClientSearch = Boolean(normalizedSearch);
+
+      if (!usesClientSearch) {
+        query = query.range(offset, offset + limit - 1);
+      }
 
       const { data, error, count } = await query;
 
@@ -389,12 +395,31 @@ export class AdminReviewsService {
         }),
       );
 
-      const totalPages = Math.ceil((count || 0) / limit);
+      const filteredReviews = usesClientSearch
+        ? reviewsList.filter((review) => {
+            const searchableText = [
+              review.reviewer_name,
+              review.place_name,
+              review.review_content,
+            ]
+              .map((item) => this.normalizeForSearch(item))
+              .join(' ');
+
+            return searchableText.includes(normalizedSearch);
+          })
+        : reviewsList;
+
+      const total = usesClientSearch ? filteredReviews.length : (count ?? 0);
+      const pagedReviews = usesClientSearch
+        ? filteredReviews.slice(offset, offset + limit)
+        : filteredReviews;
+
+      const totalPages = Math.ceil(total / limit);
 
       return {
-        data: reviewsList,
+        data: pagedReviews,
         pagination: {
-          total: count || 0,
+          total,
           page,
           limit,
           total_pages: totalPages,
@@ -530,38 +555,4 @@ export class AdminReviewsService {
     }
   }
 
-  getFilterOptions(): Promise<{
-    statuses: Array<{ value: string; label: string }>;
-    classifications: Array<{ value: string; label: string }>;
-    date_sent_options: Array<{ value: string; label: string }>;
-    rating_options: Array<{ value: string; label: string }>;
-  }> {
-    return Promise.resolve({
-      statuses: [
-        { value: 'pending', label: 'Chờ duyệt' },
-        { value: 'approved', label: 'Đã duyệt' },
-        { value: 'violation', label: 'Vi phạm' },
-      ],
-      classifications: [
-        { value: 'long-term', label: 'Dài hạn' },
-        { value: 'short-term', label: 'Ngắn hạn' },
-        { value: 'need-action', label: 'Cần xử lý' },
-        { value: 'unclassified', label: 'Chưa phân loại' },
-      ],
-      date_sent_options: [
-        { value: 'all', label: 'Tất cả' },
-        { value: 'today', label: 'Hôm nay' },
-        { value: 'yesterday', label: 'Hôm qua' },
-        { value: 'last_7_days', label: '7 ngày qua' },
-        { value: 'last_30_days', label: '30 ngày qua' },
-      ],
-      rating_options: [
-        { value: '1', label: '1 sao' },
-        { value: '2', label: '2 sao' },
-        { value: '3', label: '3 sao' },
-        { value: '4', label: '4 sao' },
-        { value: '5', label: '5 sao' },
-      ],
-    });
-  }
 }

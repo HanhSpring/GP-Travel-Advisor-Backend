@@ -23,17 +23,12 @@ export class AdminPlacesController {
   @ApiQuery({
     name: 'search',
     required: false,
-    description: 'Search by place name',
+    description: 'Search by place name and submitter name (accent-insensitive)',
   })
   @ApiQuery({
     name: 'category_name',
     required: false,
     description: 'Filter by category name',
-  })
-  @ApiQuery({
-    name: 'vendor_name',
-    required: false,
-    description: 'Filter by submitter/vendor name',
   })
   @ApiQuery({
     name: 'page',
@@ -56,7 +51,6 @@ export class AdminPlacesController {
     @Query('limit') limit?: string,
     @Query('search') search?: string,
     @Query('category_name') categoryName?: string,
-    @Query('vendor_name') vendorName?: string,
   ) {
     const pageNum = page ? parseInt(page, 10) : 1;
     const limitNum = limit ? parseInt(limit, 10) : 10;
@@ -66,18 +60,16 @@ export class AdminPlacesController {
       limitNum,
       search,
       categoryName,
-      vendorName,
     );
   }
 
-  @Get('filters')
+  @Get('categories')
   @ApiOperation({
-    summary: 'Get filters for admin place management',
-    description:
-      'Return statuses, categories and submitters for filter dropdowns',
+    summary: 'Get place categories for admin filters',
+    description: 'Return available categories for the category filter dropdown',
   })
-  async getPlaceFilters() {
-    return this.service.getPlaceFilters();
+  async getPlaceCategories() {
+    return this.service.getPlaceCategories();
   }
 
   @Get(':id')

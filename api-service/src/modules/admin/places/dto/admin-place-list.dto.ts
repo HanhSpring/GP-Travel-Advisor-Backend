@@ -4,6 +4,13 @@ export class AdminPlaceListItemDto {
   @ApiProperty({ description: 'Place ID' })
   id: string;
 
+  @ApiProperty({
+    description: 'Place thumbnail image URL',
+    required: false,
+    nullable: true,
+  })
+  image_url?: string | null;
+
   @ApiProperty({ description: 'Place name' })
   name: string;
 
