@@ -71,7 +71,6 @@ import { BusinessReviewsModule } from './modules/business/reviews/business-revie
 
     BusinessPlacesModule,
     BusinessReviewsModule,
-    
   ],
 })
 export class AppModule {}

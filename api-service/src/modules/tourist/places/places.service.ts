@@ -9,7 +9,8 @@ interface PlaceRow {
   id: string;
   name: string;
   address: string | null;
-  city: string;
+  city_id: string | null;
+  cities: { name: string | null } | { name: string | null }[] | null;
   average_rating: number;
   review_count: number;
   description: string | null;
@@ -19,7 +20,10 @@ interface PlaceRow {
   is_approved: boolean;
   is_active: boolean;
   image_url: string | null;
-  tags: string[] | null;
+  place_tags: Array<{
+    tag_id: string;
+    tags: { name: string | null } | { name: string | null }[] | null;
+  }> | null;
 }
 
 interface PlaceCategoryRow {
@@ -45,7 +49,7 @@ interface RatingRow {
 interface UserRow {
   id: string;
   full_name: string | null;
-  phone?: string | null;
+  phone_number?: string | null;
 }
 
 interface ReviewContentRow {
@@ -67,11 +71,56 @@ export class PlacesService {
     content: string | null;
   }> = [];
 
+  private extractCityName(
+    cityData: { name: string | null } | { name: string | null }[] | null,
+  ): string | null {
+    if (!cityData) {
+      return null;
+    }
+
+    if (Array.isArray(cityData)) {
+      return cityData[0]?.name ?? null;
+    }
+
+    return cityData.name ?? null;
+  }
+
+  private extractTagNames(
+    placeTags: Array<{
+      tag_id: string;
+      tags: { name: string | null } | { name: string | null }[] | null;
+    }> | null,
+  ): string[] {
+    if (!placeTags || placeTags.length === 0) {
+      return [];
+    }
+
+    const names: string[] = [];
+
+    for (const item of placeTags) {
+      if (!item.tags) {
+        continue;
+      }
+
+      if (Array.isArray(item.tags)) {
+        for (const tag of item.tags) {
+          if (tag?.name) {
+            names.push(tag.name);
+          }
+        }
+      } else if (item.tags.name) {
+        names.push(item.tags.name);
+      }
+    }
+
+    return names;
+  }
+
   async getPlaceDetail(placeId: string, touristId?: string) {
     const { data: place, error: placeError } = await supabase
       .schema('travel')
       .from('places')
-      .select('*')
+      .select('*, cities(name), place_tags(tag_id, tags(name))')
       .eq('id', placeId)
       .eq('is_approved', true)
       .eq('is_active', true)
@@ -145,7 +194,7 @@ export class PlacesService {
 
     const usersPromise = userIds.length
       ? supabase
-          .schema('core')
+          .schema('public')
           .from('users')
           .select('id, full_name')
           .in('id', userIds)
@@ -205,9 +254,9 @@ export class PlacesService {
 
     const { data: vendor, error: vendorError } = place.vendor_id
       ? await supabase
-          .schema('core')
+          .schema('public')
           .from('users')
-          .select('phone')
+          .select('phone_number')
           .eq('id', place.vendor_id)
           .maybeSingle<UserRow>()
       : { data: null, error: null };
@@ -219,10 +268,12 @@ export class PlacesService {
     const { data: related, error: relatedError } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, name, city, average_rating, review_count, image_url, tags')
+      .select(
+        'id, name, city_id, cities(name), average_rating, review_count, image_url, place_tags(tag_id, tags(name))',
+      )
       .eq('is_approved', true)
       .eq('is_active', true)
-      .eq('city', place.city)
+      .eq('city_id', place.city_id)
       .neq('id', placeId)
       .order('average_rating', { ascending: false })
       .limit(12)
@@ -236,12 +287,15 @@ export class PlacesService {
     const relatedPlaces = typedRelated.slice(0, 6).map((item) => ({
       id: item.id,
       name: item.name,
-      city: item.city,
+      city: this.extractCityName(item.cities),
       rating: Number(item.average_rating) || 0,
       review_count: item.review_count || 0,
       image: this.resolvePlaceImage(item.image_url),
-      tags: item.tags ?? [],
+      tags: this.extractTagNames(item.place_tags),
     }));
+
+    const cityName = this.extractCityName(place.cities);
+    const tags = this.extractTagNames(place.place_tags);
 
     const isFavorite = touristId
       ? await this.checkFavorite(touristId, placeId)
@@ -251,14 +305,14 @@ export class PlacesService {
       id: place.id,
       name: place.name,
       address: place.address,
-      city: place.city,
+      city: cityName ?? '',
       district: this.extractDistrict(place.address ?? null),
       rating: Number(place.average_rating) || 0,
       review_count: place.review_count || 0,
       is_favorite: isFavorite,
       image_url: this.resolvePlaceImage(place.image_url),
       categories: categoryList,
-      tags: place.tags ?? [],
+      tags,
       images: this.buildGallery(place.image_url),
       description: place.description,
       open_time: place.open_time,
@@ -267,7 +321,7 @@ export class PlacesService {
         place.open_time ?? null,
         place.close_time ?? null,
       ),
-      phone: vendor?.phone ?? null,
+      phone: vendor?.phone_number ?? null,
       reviews: {
         average: Number(place.average_rating) || 0,
         total: place.review_count || 0,

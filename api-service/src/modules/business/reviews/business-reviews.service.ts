@@ -32,10 +32,51 @@ interface UserRow {
   full_name: string | null;
 }
 
+interface BusinessRow {
+  id: string;
+}
+
 type ReviewSort = 'newest' | 'oldest' | 'highest_rating' | 'lowest_rating';
 
 @Injectable()
 export class BusinessReviewsService {
+  private async resolveVendorId(vendorId: string): Promise<string> {
+    const normalizedVendorId = vendorId?.trim();
+
+    if (!normalizedVendorId) {
+      throw new BadRequestException('vendor_id is required');
+    }
+
+    const { data: existingPlaceRows, error: existingPlaceError } =
+      await supabase
+        .schema('travel')
+        .from('places')
+        .select('id')
+        .eq('vendor_id', normalizedVendorId)
+        .limit(1);
+
+    if (existingPlaceError) {
+      throw new InternalServerErrorException(existingPlaceError.message);
+    }
+
+    if ((existingPlaceRows ?? []).length > 0) {
+      return normalizedVendorId;
+    }
+
+    const { data: businessRow, error: businessError } = await supabase
+      .schema('public')
+      .from('businesses')
+      .select('id')
+      .eq('id', normalizedVendorId)
+      .maybeSingle<BusinessRow>();
+
+    if (businessError) {
+      throw new InternalServerErrorException(businessError.message);
+    }
+
+    return businessRow?.id ?? normalizedVendorId;
+  }
+
   private mapPlaceStatus(
     isApproved: boolean | null,
   ): 'pending' | 'approved' | 'rejected' {
@@ -94,9 +135,7 @@ export class BusinessReviewsService {
     topic?: string,
     hasImages?: boolean,
   ) {
-    if (!vendorId) {
-      throw new BadRequestException('vendor_id is required');
-    }
+    const resolvedVendorId = await this.resolveVendorId(vendorId);
 
     if (
       !['newest', 'oldest', 'highest_rating', 'lowest_rating'].includes(sort)
@@ -111,7 +150,7 @@ export class BusinessReviewsService {
       .from('places')
       .select('id, name, is_approved, is_active, vendor_id')
       .eq('id', placeId)
-      .eq('vendor_id', vendorId)
+      .eq('vendor_id', resolvedVendorId)
       .maybeSingle<PlaceRow>();
 
     if (placeError) {
@@ -195,7 +234,7 @@ export class BusinessReviewsService {
         : Promise.resolve({ data: [], error: null }),
       userIds.length
         ? supabase
-            .schema('core')
+            .schema('public')
             .from('users')
             .select('id, full_name')
             .in('id', userIds)

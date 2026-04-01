@@ -10,7 +10,15 @@ interface PlaceRow {
   id: string;
   name: string;
   address: string | null;
-  city: string | null;
+  city_id: string | null;
+  cities:
+    | {
+        name: string | null;
+      }
+    | {
+        name: string | null;
+      }[]
+    | null;
   average_rating: number | null;
   review_count: number | null;
 }
@@ -27,6 +35,27 @@ type FoodCategory = 'all' | 'main' | 'drink';
 
 @Injectable()
 export class OrdersService {
+  private extractCityName(
+    cityData:
+      | {
+          name: string | null;
+        }
+      | {
+          name: string | null;
+        }[]
+      | null,
+  ): string | null {
+    if (!cityData) {
+      return null;
+    }
+
+    if (Array.isArray(cityData)) {
+      return cityData[0]?.name ?? null;
+    }
+
+    return cityData.name ?? null;
+  }
+
   private mapFoodCategory(name: string | null): 'main' | 'drink' {
     const value = (name ?? '').toLowerCase();
     const drinkKeywords = [
@@ -60,7 +89,9 @@ export class OrdersService {
     const { data: place, error } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, name, address, city, average_rating, review_count')
+      .select(
+        'id, name, address, city_id, cities(name), average_rating, review_count',
+      )
       .eq('id', placeId)
       .maybeSingle<PlaceRow>();
 
@@ -77,7 +108,7 @@ export class OrdersService {
         id: place.id,
         name: place.name,
         address: place.address,
-        city: place.city,
+        city: this.extractCityName(place.cities),
       },
       suggestion: {
         title: `Ban sap den ${place.name}`,

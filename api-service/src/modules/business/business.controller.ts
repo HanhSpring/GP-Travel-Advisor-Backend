@@ -29,7 +29,11 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { Role } from '../../common/enum/role.enum';
 import { GetToken } from 'src/common/decorators/get-token.decorator';
 import { VendorDto, PlaceDto, OrderDto } from './dto/business-query.dto';
-import { DashboardDto, PlaceItemDto, OrderItemDto } from './dto/business-response.dto';
+import {
+  DashboardDto,
+  PlaceItemDto,
+  OrderItemDto,
+} from './dto/business-response.dto';
 import { CreateFullPlaceDto } from './dto/create-full-place.dto';
 import { FileInterceptor } from '@nestjs/platform-express';
 
@@ -41,8 +45,8 @@ import { FileInterceptor } from '@nestjs/platform-express';
 export class BusinessController {
   constructor(private readonly businessService: BusinessService) {}
 
-  @Get('places')
-  @ApiOperation({ summary: 'Get places managed by vendor' })
+  @Get('vendor-places')
+  @ApiOperation({ summary: 'Get places managed by vendor (legacy)' })
   @ApiResponse({ type: [PlaceItemDto] })
   getVendorPlaces(@Query() query: VendorDto) {
     return this.businessService.getVendorPlaces(query.vendorId)
@@ -79,7 +83,7 @@ export class BusinessController {
   @ApiOperation({ summary: 'Tạo địa điểm + services + menu Excel' })
   @ApiConsumes('multipart/form-data')
   @ApiBody({
-    type: CreateFullPlaceDto
+    type: CreateFullPlaceDto,
   })
   @UseInterceptors(FileInterceptor('file'))
   createFull(

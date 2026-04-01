@@ -324,7 +324,7 @@ export class AdminReviewsService {
             // Get user info
             let userName = 'Unknown User';
             const { data: userData } = (await supabase
-              .schema('core')
+              .schema('public')
               .from('users')
               .select('full_name')
               .eq('id', review.tourist_id)
@@ -442,7 +442,7 @@ export class AdminReviewsService {
       // Get user info
       let userName = 'Unknown User';
       const { data: userData } = (await supabase
-        .schema('core')
+        .schema('public')
         .from('users')
         .select('full_name')
         .eq('id', review.tourist_id)

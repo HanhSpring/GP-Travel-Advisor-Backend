@@ -13,11 +13,17 @@ async function bootstrap() {
 
   app.useGlobalPipes(
     new ValidationPipe({
-      whitelist: true,      
-      transform: true,      
-      forbidNonWhitelisted: true 
-    })
-  )
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: true,
+    }),
+  );
+
+  const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:5173';
+  app.enableCors({
+    origin: corsOrigin.split(',').map((origin) => origin.trim()),
+    credentials: true,
+  });
 
   const config = new DocumentBuilder()
     .setTitle('Travel Advisor API')
@@ -42,21 +48,32 @@ async function bootstrap() {
 
   const host = process.env.API_SERVICE_HOST || '0.0.0.0';
   const preferredPort = Number(process.env.API_SERVICE_PORT || 3000);
+  const maxPortAttempts = Number(process.env.API_SERVICE_PORT_RETRIES || 20); // Added max port attempts
 
-  try {
-    await app.listen(preferredPort, host);
-    logger.log(`API is running on http://localhost:${preferredPort}`);
-    return;
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') {
-      throw error;
+  for (let attempt = 0; attempt <= maxPortAttempts; attempt += 1) {
+    const port = preferredPort + attempt;
+
+    try {
+      await app.listen(port, host);
+
+      if (attempt === 0) {
+        logger.log(`API is running on http://localhost:${port}`);
+      } else {
+        logger.warn(
+          `Port ${preferredPort} is in use. API started on http://localhost:${port}`,
+        );
+      }
+
+      return;
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== 'EADDRINUSE') {
+        throw error;
+      }
     }
   }
 
-  const fallbackPort = preferredPort + 1;
-  await app.listen(fallbackPort, host);
-  logger.warn(
-    `Port ${preferredPort} is in use. API started on http://localhost:${fallbackPort}`,
+  throw new Error(
+    `Could not find a free port in range ${preferredPort}-${preferredPort + maxPortAttempts}`,
   );
 }
 void bootstrap();

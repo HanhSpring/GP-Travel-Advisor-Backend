@@ -10,7 +10,8 @@ interface ItineraryRow {
   destination: string;
   start_date: string;
   end_date: string;
-  participant_count: number;
+  adult_count: number | null;
+  children_count: number | null;
   status: string;
   description?: string;
 }
@@ -18,7 +19,15 @@ interface ItineraryRow {
 interface PlaceRow {
   id: string;
   name: string;
-  city: string;
+  city_id: string | null;
+  cities:
+    | {
+        name: string | null;
+      }
+    | {
+        name: string | null;
+      }[]
+    | null;
   average_rating: number;
   review_count: number;
   image_url: string | null;
@@ -38,6 +47,33 @@ export class CollectionsService {
     process.env.DEFAULT_PLACE_IMAGE_URL ||
     'https://placehold.co/1080x720?text=No+Image';
 
+  private toParticipantCount(itinerary: ItineraryRow): number {
+    const adults = itinerary.adult_count ?? 0;
+    const children = itinerary.children_count ?? 0;
+    return adults + children;
+  }
+
+  private extractCityName(
+    cityData:
+      | {
+          name: string | null;
+        }
+      | {
+          name: string | null;
+        }[]
+      | null,
+  ): string {
+    if (!cityData) {
+      return '';
+    }
+
+    if (Array.isArray(cityData)) {
+      return cityData[0]?.name ?? '';
+    }
+
+    return cityData.name ?? '';
+  }
+
   async getCollectionsHome(touristId: string) {
     if (!touristId) {
       throw new BadRequestException('tourist_id is required');
@@ -52,7 +88,7 @@ export class CollectionsService {
           `
           itineraries:itinerary_id(
             id, destination, start_date, end_date, 
-            participant_count, status, description
+            adult_count, children_count, status, description
           )
           `,
         )
@@ -71,7 +107,7 @@ export class CollectionsService {
       .select(
         `
         places:place_id(
-          id, name, city, average_rating, review_count, image_url
+          id, name, city_id, cities(name), average_rating, review_count, image_url
         )
         `,
       )
@@ -100,7 +136,7 @@ export class CollectionsService {
           title: it.destination ?? 'Lịch trình',
           location: it.destination ?? '',
           days: days || 1,
-          participant_count: it.participant_count ?? 0,
+          participant_count: this.toParticipantCount(it),
           status: it.status,
         };
       })
@@ -113,7 +149,7 @@ export class CollectionsService {
         return {
           id: place.id,
           name: place.name,
-          city: place.city,
+          city: this.extractCityName(place.cities),
           image: this.resolveImage(place.image_url),
           rating: place.average_rating ?? 0,
           review_count: place.review_count ?? 0,
@@ -154,7 +190,7 @@ export class CollectionsService {
         `
         itineraries:itinerary_id(
           id, destination, start_date, end_date, 
-          participant_count, status, description
+          adult_count, children_count, status, description
         )
         `,
       )
@@ -194,7 +230,7 @@ export class CollectionsService {
           title: it.destination ?? 'Lịch trình',
           location: it.destination ?? '',
           days: days || 1,
-          participant_count: it.participant_count ?? 0,
+          participant_count: this.toParticipantCount(it),
           status: it.status,
         };
       });
@@ -234,7 +270,7 @@ export class CollectionsService {
       .select(
         `
         places:place_id(
-          id, name, city, average_rating, review_count, image_url
+          id, name, city_id, cities(name), average_rating, review_count, image_url
         )
         `,
       )
@@ -264,7 +300,7 @@ export class CollectionsService {
         return {
           id: place.id,
           name: place.name,
-          city: place.city,
+          city: this.extractCityName(place.cities),
           image: this.resolveImage(place.image_url),
           rating: place.average_rating ?? 0,
           review_count: place.review_count ?? 0,

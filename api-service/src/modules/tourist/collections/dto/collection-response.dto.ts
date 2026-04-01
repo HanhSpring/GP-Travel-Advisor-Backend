@@ -33,8 +33,8 @@ export class FavoriteItineraryCardDto {
 
   @ApiProperty({
     description: 'Itinerary status',
-    enum: ['planned', 'ongoing', 'completed'],
-    example: 'planned',
+    enum: ['pending', 'ongoing', 'uncompleted', 'completed'],
+    example: 'pending',
   })
   status: string;
 }

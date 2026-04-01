@@ -11,6 +11,10 @@ interface CategoryRow {
   name: string;
 }
 
+interface CityRow {
+  name: string | null;
+}
+
 interface PlaceCategoryJoinRow {
   category_id: string;
   categories: CategoryRow | CategoryRow[] | null;
@@ -31,7 +35,8 @@ interface PlaceDetailRow {
   name: string;
   description: string | null;
   address: string | null;
-  city: string | null;
+  city_id: string | null;
+  cities: CityRow | CityRow[] | null;
   latitude: number | null;
   longitude: number | null;
   is_approved: boolean | null;
@@ -44,7 +49,7 @@ interface UserRow {
   id: string;
   full_name: string | null;
   email: string | null;
-  phone: string | null;
+  phone_number: string | null;
 }
 
 interface UserFilterRow {
@@ -72,6 +77,18 @@ type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
 
 @Injectable()
 export class AdminPlacesService {
+  private extractCityName(cityData: CityRow | CityRow[] | null): string {
+    if (!cityData) {
+      return '';
+    }
+
+    if (Array.isArray(cityData)) {
+      return cityData[0]?.name ?? '';
+    }
+
+    return cityData.name ?? '';
+  }
+
   private extractCategoryNames(
     placeCategories: PlaceCategoryJoinRow[] | null,
   ): string[] {
@@ -191,7 +208,7 @@ export class AdminPlacesService {
 
     if (vendorName) {
       const { data: vendorRows, error: vendorRowsError } = await supabase
-        .schema('core')
+        .schema('public')
         .from('users')
         .select('id')
         .ilike('full_name', `%${vendorName}%`);
@@ -268,9 +285,9 @@ export class AdminPlacesService {
 
     if (vendorIds.length > 0) {
       const { data: vendorData, error: vendorError } = await supabase
-        .schema('core')
+        .schema('public')
         .from('users')
-        .select('id, full_name, email, phone')
+        .select('id, full_name, email, phone_number')
         .in('id', vendorIds);
 
       if (!vendorError) {
@@ -309,7 +326,7 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, description, address, city, latitude, longitude, is_approved, vendor_id, registered_date, place_categories(category_id, categories(id, name))',
+        'id, name, description, address, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, place_categories(category_id, categories(id, name))',
       )
       .eq('id', id)
       .maybeSingle<PlaceDetailRow>();
@@ -321,9 +338,9 @@ export class AdminPlacesService {
     const vendor = place.vendor_id
       ? (
           await supabase
-            .schema('core')
+            .schema('public')
             .from('users')
-            .select('id, full_name, email, phone')
+            .select('id, full_name, email, phone_number')
             .eq('id', place.vendor_id)
             .maybeSingle<UserRow>()
         ).data
@@ -338,26 +355,27 @@ export class AdminPlacesService {
       : null;
 
     const categoryNames = this.extractCategoryNames(place.place_categories);
+    const cityName = this.extractCityName(place.cities);
 
     return {
       id: place.id,
       name: place.name,
       description: place.description ?? '',
       address: place.address ?? '',
-      city: place.city ?? '',
+      city: cityName,
       latitude: place.latitude ?? 0,
       longitude: place.longitude ?? 0,
       category: categoryNames.join(', '),
       registered_date: place.registered_date ?? '',
       status: this.mapStatus(place.is_approved),
-      contact_phone: vendor?.phone ?? '',
+      contact_phone: vendor?.phone_number ?? '',
       contact_email: vendor?.email ?? '',
       vendor: vendor
         ? {
             id: vendor.id,
             name: vendor.full_name ?? '',
             email: vendor.email ?? '',
-            phone: vendor.phone ?? '',
+            phone: vendor.phone_number ?? '',
             total_places: vendorPlaceCount?.count ?? 0,
           }
         : null,
@@ -393,7 +411,7 @@ export class AdminPlacesService {
 
     const vendorsResult = vendorIds.length
       ? await supabase
-          .schema('core')
+          .schema('public')
           .from('users')
           .select('id, full_name')
           .in('id', vendorIds)
