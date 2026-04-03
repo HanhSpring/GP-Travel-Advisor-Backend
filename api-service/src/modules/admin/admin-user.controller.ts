@@ -8,27 +8,43 @@ import {
   Query,
   Param,
   Body,
+  Post,
+  UseGuards,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiParam,
+  ApiBody,
+  ApiBearerAuth,
+} from '@nestjs/swagger';
 import { GetUsersQueryDto } from './dto/get-users-query.dto';
 import { BulkDeleteUsersDto } from './dto/bulk-delete.dto';
-import { UpdateUserByAdminDto } from './dto/update-user-by-admin.dto';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { CreateAdminDto } from './dto/admin-register.dto';
+import { AdminService } from './admin.service';
+import { RolesGuard } from 'src/common/guards/roles.guard';
+import { Roles } from 'src/common/decorators/roles.decorator';
+import { Role } from 'src/common/enum/role.enum';
+import { UserActiveStatus } from './dto/get-users-query.dto';
+import { CreateUserByAdminDto } from './dto/create-user-by-admin.dto';
 
 @ApiTags('Admin - User Management')
 @Controller('admin/users')
+@ApiBearerAuth('access-token')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(Role.ADMIN)
 // @UseGuards(JwtAuthGuard, RolesGuard) -> Sau này nhớ bật guard để chặn người lạ gọi API này
 // @Roles(Role.Admin)
 export class AdminUserController {
+  constructor(private readonly adminService: AdminService) {}
   @Get('stats')
-  @ApiOperation({ summary: 'Lấy các con số thống kê tổng quan (Top Cards)' })
-  getStats() {
-    return {
-      totalUsers: 12450,
-      newThisMonth: 124,
-      totalAdmins: 8,
-    };
+  @ApiOperation({ summary: 'Lấy 3 con số thống kê tổng quan của người dùng' })
+  @ApiResponse({ status: 200, description: 'Trả về thống kê thành công' })
+  getUserStats() {
+    return this.adminService.getUserStats();
   }
-
   @Get()
   @ApiOperation({
     summary: 'Lấy danh sách người dùng (Hỗ trợ phân trang, tìm kiếm, lọc)',
@@ -37,43 +53,9 @@ export class AdminUserController {
     status: 200,
     description: 'Trả về mảng danh sách và thông tin phân trang',
   })
-  getUsers(@Query() query: GetUsersQueryDto) {
-    // Dùng @Query() thay vì @Body()
-    // Data mẫu trả về cho Frontend dựng bảng
-    return {
-      data: [
-        {
-          id: 'uuid-1',
-          fullName: 'Tran Thi B',
-          email: 'b.tran@hotel.com',
-          role: 'BUSINESS',
-          status: 'ACTIVE',
-          joinedDate: '2023-03-15',
-        },
-        // ... các user khác
-      ],
-      meta: {
-        totalItems: 120, // Tổng số dòng trong Database thỏa mãn điều kiện lọc
-        itemCount: 10, // Số dòng trả về ở trang hiện tại
-        itemsPerPage: query.limit,
-        totalPages: 12, // Tổng số trang (120 / 10 = 12)
-        currentPage: query.page,
-      },
-    };
+  async getUsers(@Query() query: GetUsersQueryDto) {
+    return this.adminService.getUsers(query);
   }
-
-  // API xử lý nút icon Thùng rác (Xóa 1 user)
-  @Delete(':id')
-  @ApiOperation({ summary: 'Xóa một người dùng (Soft Delete)' })
-  @ApiParam({ name: 'id', description: 'ID của người dùng cần xóa' })
-  @ApiResponse({ status: 200, description: 'Đã xóa người dùng thành công' })
-  deleteUser(@Param('id') id: string) {
-    return {
-      message: `Đã xóa thành công người dùng có ID: ${id}`,
-      success: true,
-    };
-  }
-
   // API xử lý khi chọn nhiều Checkbox (Xóa nhiều user)
   @Delete('bulk')
   @HttpCode(HttpStatus.OK)
@@ -83,28 +65,46 @@ export class AdminUserController {
     description: 'Đã xóa danh sách người dùng thành công',
   })
   bulkDeleteUsers(@Body() bulkDeleteDto: BulkDeleteUsersDto) {
-    return {
-      message: `Đã xóa thành công ${bulkDeleteDto.userIds.length} người dùng`,
-      success: true,
-    };
+    return this.adminService.bulkDeleteUsers(bulkDeleteDto.userIds);
+  }
+
+  // API xử lý nút icon Thùng rác (Xóa 1 user)
+  @Delete(':id')
+  @ApiOperation({ summary: 'Xóa một người dùng (Soft Delete)' })
+  @ApiParam({ name: 'id', description: 'ID của người dùng cần xóa' })
+  @ApiResponse({ status: 200, description: 'Đã xóa người dùng thành công' })
+  deleteUser(@Param('id') id: string) {
+    return this.adminService.deleteUser(id);
   }
 
   @Patch(':id/status')
   @ApiOperation({
-    summary: 'Khóa hoặc mở khóa tài khoản người dùng ở trang CT thông tin user',
+    summary: 'Khóa hoặc mở khóa tài khoản người dùng',
   })
   @ApiParam({
     name: 'id',
     description: 'ID của người dùng cần thay đổi trạng thái',
+    example: 'uuid-1234',
   })
-  toggleStatus(
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        status: {
+          type: 'string',
+          enum: ['ACTIVE', 'LOCKED'],
+          example: 'LOCKED',
+          description: 'Trạng thái muốn áp dụng cho tài khoản',
+        },
+      },
+      required: ['status'],
+    },
+  })
+  async updateUserStatus(
     @Param('id') id: string,
-    @Body('status') newStatus: 'ACTIVE' | 'LOCKED',
+    @Body('status') newStatus: UserActiveStatus, // Ép kiểu bằng Enum của bạn
   ) {
-    return {
-      message: `Đã thay đổi trạng thái của user ${id} thành ${newStatus}`,
-      success: true,
-    };
+    return this.adminService.updateUserStatus(id, newStatus);
   }
 
   @Get(':id')
@@ -118,35 +118,45 @@ export class AdminUserController {
     status: 200,
     description: 'Trả về dữ liệu chi tiết để hiển thị lên Form',
   })
-  getUserDetail(@Param('id') id: string) {
-    // Dữ liệu mẫu (Mock data) khớp với giao diện
-    return {
-      id: id,
-      fullName: 'Nguyen Admin',
-      email: 'admin@system.com',
-      phoneNumber: '0987654321',
-      dateOfBirth: '1990-01-01',
-      address: '123 Đường Nguyễn Huệ, Phường Bến Nghé, Quận 1, TP. HCM',
-      role: 'ADMIN',
-      status: 'ACTIVE', // Để FE biết đường hiển thị nút "Khóa" hay "Mở khóa"
-    };
+  async getUserDetail(@Param('id') id: string) {
+    return this.adminService.getUserDetail(id);
   }
 
-  @Patch(':id')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Admin cập nhật thông tin cá nhân và vai trò của người dùng',
+  @Post('admin')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({ summary: 'Tạo tài khoản Admin mới' })
+  @ApiBody({ type: CreateAdminDto })
+  @ApiResponse({
+    status: 201,
+    description: 'Tạo tài khoản thành công.',
+    schema: {
+      example: {
+        message: 'Tạo tài khoản Admin thành công',
+        data: {
+          id: 'd83b7008-608b-49ea-b184-25e227181057',
+          role: 'ADMIN',
+          email: 'admin.travelsystem@gmail.com',
+          full_name: 'Trần Quản Trị',
+        },
+      },
+    },
   })
-  @ApiParam({ name: 'id', description: 'ID của người dùng cần cập nhật' })
-  @ApiResponse({ status: 200, description: 'Cập nhật thành công' })
-  updateUserDetail(
-    @Param('id') id: string,
-    @Body() updateDto: UpdateUserByAdminDto,
-  ) {
-    // Logic BE sẽ cập nhật vào database dựa trên id
-    return {
-      message: 'Lưu thay đổi thành công',
-      updatedData: updateDto,
-    };
+  @ApiResponse({
+    status: 400,
+    description: 'Dữ liệu đầu vào không hợp lệ hoặc email đã tồn tại.',
+  })
+  async createAdmin(@Body() createAdminDto: CreateAdminDto) {
+    return this.adminService.createAdmin(createAdminDto);
+  }
+
+  @Post()
+  @ApiOperation({ summary: 'Admin tạo tài khoản người dùng mới' })
+  @ApiResponse({ status: 201, description: 'Tạo tài khoản thành công' })
+  @ApiResponse({
+    status: 400,
+    description: 'Lỗi validate dữ liệu hoặc email đã tồn tại',
+  })
+  createUser(@Body() createDto: CreateUserByAdminDto) {
+    return this.adminService.createUserByAdmin(createDto);
   }
 }

@@ -11,13 +11,19 @@ async function bootstrap() {
     logger: ['error', 'warn'],
   });
 
+  app.enableCors({
+    origin: true,
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+    credentials: true,
+  });
+
   app.useGlobalPipes(
     new ValidationPipe({
-      whitelist: true,      
-      transform: true,      
-      forbidNonWhitelisted: true 
-    })
-  )
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: true,
+    }),
+  );
 
   const config = new DocumentBuilder()
     .setTitle('Travel Advisor API')
