@@ -5,12 +5,12 @@ import {
   Body,
   HttpCode,
   HttpStatus,
+  BadRequestException,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
-import { ForgotPasswordDto } from './dto/forgot-password.dto';
-import { ResetPasswordDto } from './dto/reset-password.dto';
+import { UpdatePasswordDto } from './dto/reset-password.dto';
 import { RegisterBusinessDto } from './dto/register-business.dto';
 import { RegisterTouristDto } from './dto/register-tourist.dto';
 // @ApiTags giúp gom tất cả API trong file này vào một thẻ tên là "Auth" trên Swagger
@@ -21,7 +21,7 @@ export class AuthController {
 
   // Login
   @Post('login')
-  @HttpCode(HttpStatus.OK) // Mặc định NestJS trả về 201 cho POST, đổi thành 200 cho logic Login
+  @HttpCode(HttpStatus.OK) 
   @ApiOperation({ summary: 'Đăng nhập hệ thống (Dùng chung cho cả 3 Role)' })
   @ApiResponse({
     status: 200,
@@ -49,33 +49,23 @@ export class AuthController {
 
   @Post('forgot-password')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Yêu cầu khôi phục mật khẩu (Gửi mã OTP về email)' })
-  @ApiResponse({
-    status: 200,
-    description: 'Đã gửi mã xác nhận đến email nếu tài khoản tồn tại',
-  })
-  forgotPassword(@Body() body: ForgotPasswordDto) {
-    // Chỉ return giả định cho Frontend thấy response mẫu
-    return {
-      message: 'Nếu email tồn tại trong hệ thống, một mã OTP đã được gửi đi.',
-      success: true,
-    };
+  @ApiOperation({ summary: 'Yêu cầu khôi phục mật khẩu (Gửi link về email)' })
+  async forgotPassword(@Body('email') email: string) {
+    if (!email) {
+      throw new BadRequestException('Vui lòng cung cấp địa chỉ email');
+    }
+    return this.authService.forgotPassword(email);
   }
 
-  @Post('reset-password')
+  @Post('update-password')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Cập nhật mật khẩu mới bằng mã OTP' })
-  @ApiResponse({ status: 200, description: 'Đổi mật khẩu thành công' })
-  @ApiResponse({ status: 400, description: 'Mã OTP sai hoặc đã hết hạn' })
-  resetPassword(@Body() body: ResetPasswordDto) {
-    return {
-      message: 'Mật khẩu đã được cập nhật thành công.',
-      success: true,
-    };
+  @ApiOperation({ summary: 'Cập nhật mật khẩu mới (Sử dụng token từ email)' })
+  async updatePassword(@Body() updatePasswordDto: UpdatePasswordDto) {
+    return this.authService.updatePassword(updatePasswordDto);
   }
 
   @Post('register/tourist')
-  @HttpCode(HttpStatus.CREATED) // Status 201 cho việc tạo resource thành công
+  @HttpCode(HttpStatus.CREATED) 
   @ApiOperation({ summary: 'Đăng ký tài khoản dành cho Du khách' })
   @ApiResponse({
     status: 201,
@@ -106,7 +96,6 @@ export class AuthController {
     description: 'Email hoặc Số điện thoại đã tồn tại trong hệ thống',
   })
   async registerBusiness(@Body() registerDto: RegisterBusinessDto) {
-    // Gọi xuống Service để xử lý thực tế
     return await this.authService.registerBusiness(registerDto);
   }
 }

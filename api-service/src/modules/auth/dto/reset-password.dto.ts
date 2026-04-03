@@ -1,26 +1,15 @@
 import { ApiProperty } from '@nestjs/swagger';
-import { IsEmail, IsNotEmpty, MinLength } from 'class-validator';
+import { IsNotEmpty, IsString, MinLength } from 'class-validator';
 
-export class ResetPasswordDto {
-  @ApiProperty({
-    example: 'tourist@example.com',
-    description: 'Email của tài khoản',
-  })
-  @IsEmail()
-  @IsNotEmpty()
-  email: string;
+export class UpdatePasswordDto {
+  @ApiProperty({ description: 'Token lấy từ URL khi click vào link email' })
+  @IsNotEmpty({ message: 'Thiếu mã xác thực (Token)' })
+  @IsString()
+  accessToken: string;
 
-  @ApiProperty({
-    example: '123456',
-    description: 'Mã OTP 6 số nhận được từ Email',
-  })
-  @IsNotEmpty({ message: 'Vui lòng nhập mã xác nhận' })
-  otp: string;
-
-  @ApiProperty({
-    example: 'newPassword123!',
-    description: 'Mật khẩu mới (ít nhất 6 ký tự)',
-  })
-  @MinLength(6, { message: 'Mật khẩu phải có ít nhất 6 ký tự' })
+  @ApiProperty({ description: 'Mật khẩu mới người dùng nhập' })
+  @IsNotEmpty({ message: 'Mật khẩu mới không được để trống' })
+  @MinLength(6, { message: 'Mật khẩu mới phải có ít nhất 6 ký tự' })
+  @IsString()
   newPassword: string;
 }
