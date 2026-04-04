@@ -17,6 +17,7 @@ interface PlaceCategoryJoinRow {
 
 interface PlaceRow {
   id: string;
+  image_url: string | null;
   name: string;
   address: string | null;
   is_approved: boolean | null;
@@ -146,7 +147,7 @@ export class BusinessPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, address, is_approved, average_rating, review_count, registered_date, place_categories(category_id, categories(id, name))',
+        'id, name, address, image_url, is_approved, average_rating, review_count, registered_date, place_categories(category_id, categories(id, name))',
         { count: 'exact' },
       )
       .eq('vendor_id', resolvedVendorId);
@@ -184,6 +185,7 @@ export class BusinessPlacesService {
       id: item.id,
       name: item.name,
       address: item.address ?? '',
+      image_url: item.image_url ?? null,
       categories: this.extractCategoryNames(item.place_categories),
       rating: Number(item.average_rating) || 0,
       review_count: item.review_count || 0,

@@ -4,6 +4,12 @@ export class BusinessPlaceDto {
   @ApiProperty()
   id: string;
 
+  @ApiProperty({
+    required: false,
+    nullable: true,
+  })
+  image_url?: string | null;
+
   @ApiProperty()
   name: string;
 
