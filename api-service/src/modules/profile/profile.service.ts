@@ -31,7 +31,11 @@ export class ProfileService {
       user_id_param: userId,
     });
 
-    if (error || !data || data.length === 0) {
+    if (error) {
+      console.error('Chi tiết lỗi từ Supabase RPC:', error);
+    }
+
+    if (!data || data.length === 0) {
       throw new NotFoundException('Không tìm thấy thông tin hồ sơ');
     }
 
@@ -42,6 +46,7 @@ export class ProfileService {
       phoneNumber: profile.phone_number,
       email: profile.email,
       travelPreferences: profile.travel_preferences,
+      avatarUrl: profile.avatar_url,
     };
   }
 
