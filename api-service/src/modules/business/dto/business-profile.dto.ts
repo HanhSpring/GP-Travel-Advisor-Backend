@@ -19,6 +19,9 @@ export class BusinessProfileDto {
   })
   @IsOptional()
   @IsString()
+  @Matches(/^[0-9]{10}$/, {
+    message: 'Số điện thoại phải bao gồm đúng 10 chữ số',
+  })
   phone?: string;
 
   @ApiProperty({
@@ -37,7 +40,7 @@ export class BusinessProfileDto {
   })
   @IsOptional()
   @IsString()
-  @Matches(/^[0-9]{12}$/, { message: 'CCCD phải bao gồm đúng 12 chữ số' }) // Validate chặt chẽ
+  @Matches(/^[0-9]{12}$/, { message: 'CCCD phải bao gồm đúng 12 chữ số' })
   identityCard?: string;
 
   @ApiProperty({
