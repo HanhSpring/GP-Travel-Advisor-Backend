@@ -35,6 +35,12 @@ Business modules
 import { BusinessPlacesModule } from './modules/business/places/business-places.module';
 import { BusinessReviewsModule } from './modules/business/reviews/business-reviews.module';
 
+/*
+Upload module
+*/
+
+import { UploadModule } from './modules/upload/upload.module';
+
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
@@ -71,6 +77,12 @@ import { BusinessReviewsModule } from './modules/business/reviews/business-revie
 
     BusinessPlacesModule,
     BusinessReviewsModule,
+
+    /*
+    Upload
+    */
+
+    UploadModule,
   ],
 })
 export class AppModule {}

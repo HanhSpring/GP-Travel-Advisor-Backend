@@ -11,6 +11,13 @@ async function bootstrap() {
     logger: ['error', 'warn'],
   });
 
+  const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:5173';
+  app.enableCors({
+    origin: corsOrigin.split(',').map((origin) => origin.trim()),
+    methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
+    credentials: true,
+  });
+
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
@@ -18,12 +25,6 @@ async function bootstrap() {
       forbidNonWhitelisted: true,
     }),
   );
-
-  const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:5173';
-  app.enableCors({
-    origin: corsOrigin.split(',').map((origin) => origin.trim()),
-    credentials: true,
-  });
 
   const config = new DocumentBuilder()
     .setTitle('Travel Advisor API')

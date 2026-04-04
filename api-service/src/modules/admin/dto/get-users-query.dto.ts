@@ -8,9 +8,14 @@ export enum UserRole {
   TOURIST = 'TOURIST',
 }
 
-export enum UserStatus {
-  ACTIVE = 'ACTIVE', // Hoạt động
-  LOCKED = 'LOCKED', // Đã khóa
+export enum UserActiveStatus {
+  ACTIVE = 'ACTIVE',
+  LOCKED = 'LOCKED',
+}
+
+export enum UserDeleteStatus {
+  DELETED = 'DELETED',
+  UNDELETED = 'UNDELETED',
 }
 
 export class GetUsersQueryDto {
@@ -19,7 +24,7 @@ export class GetUsersQueryDto {
     description: 'Trang hiện tại (Mặc định: 1)',
   })
   @IsOptional()
-  @Type(() => Number) // Tự động ép kiểu chuỗi trên URL thành số
+  @Type(() => Number)
   @IsInt()
   @Min(1)
   page?: number = 1;
@@ -51,10 +56,18 @@ export class GetUsersQueryDto {
   role?: UserRole;
 
   @ApiPropertyOptional({
-    enum: UserStatus,
+    enum: UserActiveStatus,
     description: 'Lọc theo trạng thái tài khoản',
   })
   @IsOptional()
-  @IsEnum(UserStatus)
-  status?: UserStatus;
+  @IsEnum(UserActiveStatus)
+  activeStatus?: UserActiveStatus;
+
+  @ApiPropertyOptional({
+    enum: UserDeleteStatus,
+    description: 'Lọc theo trạng thái xóa',
+  })
+  @IsOptional()
+  @IsEnum(UserDeleteStatus)
+  deleteStatus?: UserDeleteStatus;
 }
