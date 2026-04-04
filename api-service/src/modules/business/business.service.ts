@@ -8,6 +8,7 @@ import { createClient } from '@supabase/supabase-js';
 import { BusinessProfileDto } from './dto/business-profile.dto';
 import { supabase } from '../../config/supabase';
 import * as XLSX from 'xlsx';
+import { GetOrdersDto } from './dto/get-orders.dto';
 
 @Injectable()
 export class BusinessService {
@@ -59,6 +60,103 @@ export class BusinessService {
     return data
   }
 
+  async getPlaceServicesByType(placeId: string) {
+    try {
+      console.log('📍 Fetching services for placeId:', placeId)
+      
+      // Step 1: Get all place_services for this place (free services)
+      const { data: placeServices, error: psError } = await supabase
+        .schema('travel')
+        .from('place_services')
+        .select('place_id, service_id')
+        .eq('place_id', placeId)
+
+      console.log('📊 Place services query - error:', psError)
+      console.log('📊 Place services query - data:', placeServices)
+
+      if (psError) {
+        console.error('❌ Error fetching place_services:', psError.message)
+        throw new InternalServerErrorException(`Lỗi database: ${psError.message}`)
+      }
+
+      // Step 2: Get food items for paid services
+      const { data: foodItems, error: foodError } = await supabase
+        .schema('order_sys')
+        .from('food_items')
+        .select('id, name, price, description')
+        .eq('place_id', placeId)
+
+      console.log('🍽️  Food items query - error:', foodError)
+      console.log('🍽️  Food items query - data:', foodItems)
+
+      // Try to get free and paid services
+      const freeServices: any[] = []
+      const paidServices: any[] = []
+
+      // Process free services from place_services
+      if (placeServices && Array.isArray(placeServices) && placeServices.length > 0) {
+        const serviceIds = placeServices.map((ps: any) => ps.service_id)
+        console.log('🔍 Fetching services with IDs:', serviceIds)
+
+        // Fetch the services with their prices
+        const { data: services, error: sError } = await supabase
+          .schema('travel')
+          .from('services')
+          .select('id, name, price')
+          .in('id', serviceIds)
+
+        console.log('📊 Services query - error:', sError)
+        console.log('📊 Services query - data:', services)
+
+        if (!sError && services && Array.isArray(services)) {
+          services.forEach((service: any) => {
+            const serviceData = {
+              id: service.id,
+              name: service.name,
+              description: service.description,
+              price: service.price
+            }
+
+            // Group by whether price is null (free) or has value (paid)
+            if (service.price === null || service.price === undefined) {
+              freeServices.push(serviceData)
+            } else {
+              paidServices.push({
+                ...serviceData,
+                price: typeof service.price === 'string' ? parseFloat(service.price) : service.price
+              })
+            }
+          })
+        }
+      }
+
+      // Process paid services from food_items
+      if (foodItems && Array.isArray(foodItems)) {
+        console.log('🍽️  Processing', foodItems.length, 'food items as paid services')
+        foodItems.forEach((item: any) => {
+          paidServices.push({
+            id: item.id,
+            name: item.name,
+            description: item.description,
+            price: typeof item.price === 'string' ? parseFloat(item.price) : item.price
+          })
+        })
+      }
+
+      const result = {
+        freeServices,
+        paidServices,
+        total: freeServices.length + paidServices.length
+      }
+
+      console.log('✅ Services fetched successfully:', result)
+      return result
+    } catch (error) {
+      console.error('❌ Error in getPlaceServicesByType:', error)
+      throw new InternalServerErrorException('Không thể lấy dữ liệu dịch vụ')
+    }
+  }
+
   async getDashboard(vendorId: string) {
     const { data, error } = await supabase
       .schema('travel')
@@ -85,23 +183,51 @@ export class BusinessService {
   validateMenu(menu: any[]) {
 
     for (const m of menu) {
-      if (!m.name) throw new Error('Thiếu tên món')
+      if (!m.name) throw new BadRequestException('Thiếu tên món')
 
       if (!m.price || m.price <= 0)
-        throw new Error(`Giá sai: ${m.name}`)
+        throw new BadRequestException(`Giá sai: ${m.name}`)
     }
   }
 
   async createFullPlace(dto: any, file?: any) {
 
     if (!dto || !dto.name) {
-      throw new Error('Thiếu dữ liệu đầu vào')
+      throw new BadRequestException('Thiếu dữ liệu đầu vào: Tên địa điểm')
+    }
+
+    if (!dto.address) {
+      throw new BadRequestException('Thiếu dữ liệu đầu vào: Địa chỉ')
+    }
+
+    if (!dto.city) {
+      throw new BadRequestException('Thiếu dữ liệu đầu vào: Tỉnh/Thành phố')
+    }
+
+    if (!dto.categories || dto.categories.length === 0) {
+      throw new BadRequestException('Thiếu dữ liệu đầu vào: Danh mục')
     }
 
     let menu: any[] = []
 
+    // From request body (form items)
+    if (dto.menu && Array.isArray(dto.menu) && dto.menu.length > 0) {
+      menu = [...dto.menu]
+    }
+
+    // From Excel file - MERGE with existing items
     if (file) {
-      menu = this.parseExcel(file)
+      try {
+        const fileMenuItems = this.parseExcel(file)
+        menu = [...menu, ...fileMenuItems]
+      } catch (error) {
+        console.error('Excel parsing error:', error)
+        // Don't fail if Excel parsing errors - continue with form items
+      }
+    }
+
+    // Validate all menu items
+    if (menu.length > 0) {
       this.validateMenu(menu)
     }
 
@@ -111,17 +237,18 @@ export class BusinessService {
         p_name: dto.name,
         p_address: dto.address,
         p_city: dto.city,
-        p_lat: dto.latitude,
-        p_lng: dto.longitude,
+        p_lat: Number(dto.latitude),
+        p_lng: Number(dto.longitude),
         p_categories: Array.isArray(dto.categories)
           ? dto.categories
-          : [], p_services: dto.services || [],
+          : [],
+        p_services: Array.isArray(dto.services) ? dto.services : [],
         p_menu: menu.length > 0 ? menu : []
       })
 
     if (error) {
-      console.error(error)
-      throw error
+      console.error('Supabase RPC Error:', error)
+      throw new BadRequestException(error.message || 'Lỗi khi tạo địa điểm')
     }
 
     return {
@@ -187,4 +314,29 @@ export class BusinessService {
 
     return { success: true, message: 'Cập nhật thông tin thành công' };
   }
+
+  async getFilteredOrders(dto: GetOrdersDto) {
+    const { placeId, status, restaurant, page, limit } = dto;
+
+    // Gọi stored procedure từ Supabase
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .rpc('get_orders', {
+        p_place_id: placeId,
+        p_status: status || 'all',
+        p_restaurant: restaurant || 'all',
+        p_page: page || 1,
+        p_limit: limit || 10,
+      });
+
+    if (error) throw new InternalServerErrorException(error.message);
+
+    return {
+      data: data || [],
+      total: data && data.length > 0 ? Number(data[0].total_count) : 0,
+      page: page || 1,
+      limit: limit || 10,
+    };
+  }
 }
+

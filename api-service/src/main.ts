@@ -10,12 +10,15 @@ async function bootstrap() {
   const app = await NestFactory.create(AppModule, {
     logger: ['error', 'warn'],
   });
-
+  app.enableCors({
+    origin: 'http://localhost:5173', // địa chỉ frontend Vite
+    credentials: true,
+  });
   app.useGlobalPipes(
     new ValidationPipe({
-      whitelist: true,      
-      transform: true,      
-      forbidNonWhitelisted: true 
+      whitelist: true,
+      transform: true,
+      forbidNonWhitelisted: true
     })
   )
 
