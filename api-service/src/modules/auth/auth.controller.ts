@@ -6,6 +6,8 @@ import {
   HttpCode,
   HttpStatus,
   BadRequestException,
+  Request,
+  UseGuards,
 } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
 import { AuthService } from './auth.service';
@@ -13,6 +15,8 @@ import { LoginDto } from './dto/login.dto';
 import { UpdatePasswordDto } from './dto/reset-password.dto';
 import { RegisterBusinessDto } from './dto/register-business.dto';
 import { RegisterTouristDto } from './dto/register-tourist.dto';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
+import { RolesGuard } from 'src/common/guards/roles.guard';
 // @ApiTags giúp gom tất cả API trong file này vào một thẻ tên là "Auth" trên Swagger
 @ApiTags('Auth')
 @Controller('auth')
@@ -21,7 +25,7 @@ export class AuthController {
 
   // Login
   @Post('login')
-  @HttpCode(HttpStatus.OK) 
+  @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Đăng nhập hệ thống (Dùng chung cho cả 3 Role)' })
   @ApiResponse({
     status: 200,
@@ -33,18 +37,46 @@ export class AuthController {
     return await this.authService.login(loginDto);
   }
 
-  // 2. API Đăng nhập bằng Google
-  @Get('google') // Thường dùng phương thức GET cho luồng OAuth
-  @ApiOperation({ summary: 'Chuyển hướng xác thực qua Google' })
-  async loginGoogle() {
-    return { message: 'Sẽ chuyển hướng sang màn hình đăng nhập Google' };
-  }
+  // Hàm hỗ trợ đăng nhập qua Google
+  @UseGuards(JwtAuthGuard)
+  @Post('sync-oauth')
+  @ApiOperation({
+    summary: 'Đồng bộ data cho user đăng nhập qua OAuth lần đầu',
+  })
+  async syncOAuthUser(
+    @Request() req,
+    @Body('requestedRole') requestedRole: string,
+  ) {
+    const user = req.user;
 
-  // 3. API Đăng nhập bằng Facebook
-  @Get('facebook')
-  @ApiOperation({ summary: 'Chuyển hướng xác thực qua Facebook' })
-  async loginFacebook() {
-    return { message: 'Sẽ chuyển hướng sang màn hình đăng nhập Facebook' };
+    // 1. CHỐT CHẶN BẢO MẬT: Không cho phép tự ứng cử làm ADMIN
+    let targetRole = requestedRole || 'TOURIST';
+    if (targetRole === 'ADMIN') {
+      targetRole = 'TOURIST';
+    }
+
+    // 2. KỊCH BẢN: USER MỚI (Chưa có role trong hệ thống)
+    if (!user.role) {
+      await this.authService.syncOAuthData(
+        user.userId,
+        user.email,
+        user.fullName || '',
+        targetRole,
+      );
+
+      return {
+        message: `Khởi tạo tài khoản với quyền ${targetRole} thành công`,
+        isNewUser: true,
+        role: targetRole,
+      };
+    }
+
+    // 3. KỊCH BẢN: USER CŨ (Đã có role: BUSINESS hoặc ADMIN
+    return {
+      message: 'User đã có đầy đủ thông tin',
+      isNewUser: false,
+      role: user.role,
+    };
   }
 
   @Post('forgot-password')
@@ -65,7 +97,7 @@ export class AuthController {
   }
 
   @Post('register/tourist')
-  @HttpCode(HttpStatus.CREATED) 
+  @HttpCode(HttpStatus.CREATED)
   @ApiOperation({ summary: 'Đăng ký tài khoản dành cho Du khách' })
   @ApiResponse({
     status: 201,

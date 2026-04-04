@@ -16,14 +16,25 @@ import axios from 'axios';
 @Injectable()
 export class AuthService {
   private supabase: SupabaseClient;
+  private supabaseAdmin: SupabaseClient;
 
   constructor() {
     const supabaseUrl = process.env.SUPABASE_URL;
     const supabaseKey = process.env.SUPABASE_KEY;
-    if (!supabaseUrl || !supabaseKey) {
+    const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
+    if (!supabaseUrl || !supabaseKey || !supabaseServiceKey) {
       throw new Error('Missing Supabase URL or Anon Key');
     }
+    // Client thường cho đăng ký/đăng nhập
     this.supabase = createClient(supabaseUrl, supabaseKey);
+
+    // Client Admin (Siêu quyền lực) để can thiệp sâu vào user
+    this.supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+      },
+    });
   }
 
   async updatePassword(updateDto: UpdatePasswordDto) {
@@ -190,6 +201,7 @@ export class AuthService {
       },
     };
   }
+
   async forgotPassword(email: string) {
     // Gọi hàm reset mật khẩu có sẵn của Supabase
     const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
@@ -205,5 +217,84 @@ export class AuthService {
     return {
       message: 'Vui lòng kiểm tra hộp thư email để nhận liên kết khôi phục.',
     };
+  }
+
+  async updateUserMetadata(userId: string, metadata: any) {
+    // DÙNG SUPABASE ADMIN Ở ĐÂY
+    const { data, error } = await this.supabaseAdmin.auth.admin.updateUserById(
+      userId,
+      { user_metadata: metadata },
+    );
+
+    if (error) {
+      throw new InternalServerErrorException(
+        `Không thể cập nhật metadata: ${error.message}`,
+      );
+    }
+    return data;
+  }
+
+  async syncOAuthData(
+    userId: string,
+    email: string,
+    fullName: string,
+    role: string,
+  ) {
+    await this.updateUserMetadata(userId, { role });
+    console.log('role', role);
+
+    // 2. Đồng bộ vào bảng public.users
+    const { data: existingUser } = await this.supabaseAdmin
+      .from('users')
+      .select('id, email')
+      .or(`id.eq.${userId},email.eq.${email}`)
+      .single();
+
+    if (!existingUser) {
+      const { error: userError } = await this.supabaseAdmin
+        .from('users')
+        .insert([
+          {
+            id: userId,
+            email: email,
+            full_name: fullName,
+            role: role,
+          },
+        ]);
+      if (userError && userError.code !== '23505') {
+        throw new InternalServerErrorException(
+          'Lỗi đồng bộ users: ' + userError.message,
+        );
+      }
+    }
+
+    // 3. LOGIC MỚI: Tự động khởi tạo hồ sơ nếu là BUSINESS
+    if (role === 'BUSINESS') {
+      const { data: existingBusiness } = await this.supabaseAdmin
+        .from('businesses')
+        .select('id')
+        .eq('id', userId)
+        .single();
+
+      if (!existingBusiness) {
+        const { error: businessError } = await this.supabaseAdmin
+          .from('businesses')
+          .insert([
+            {
+              id: userId,
+              is_approved: false,
+            },
+          ]);
+
+        if (businessError && businessError.code !== '23505') {
+          console.error('Lỗi tạo hồ sơ Business:', businessError);
+          throw new InternalServerErrorException(
+            'Lỗi tạo hồ sơ Business trong DB',
+          );
+        }
+      }
+    }
+
+    // Bạn có thể viết thêm cụm if (role === 'TOURIST') tương tự để insert vào bảng tourists
   }
 }
