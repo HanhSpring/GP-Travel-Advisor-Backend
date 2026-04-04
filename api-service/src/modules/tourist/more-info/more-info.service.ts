@@ -82,7 +82,7 @@ export class MoreInfoService {
     }
 
     const { data: user, error: userError } = await supabase
-      .schema('core')
+      .schema('public')
       .from('users')
       .select('id, full_name')
       .eq('id', touristId)

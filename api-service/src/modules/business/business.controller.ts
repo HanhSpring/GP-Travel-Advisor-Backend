@@ -47,8 +47,8 @@ import { GetOrdersDto } from './dto/get-orders.dto';
 export class BusinessController {
   constructor(private readonly businessService: BusinessService) {}
 
-  @Get('places')
-  @ApiOperation({ summary: 'Get places managed by vendor' })
+  @Get('vendor-places')
+  @ApiOperation({ summary: 'Get places managed by vendor (legacy)' })
   @ApiResponse({ type: [PlaceItemDto] })
   getVendorPlaces(@Query() query: VendorDto) {
     return this.businessService.getVendorPlaces(query.vendorId);

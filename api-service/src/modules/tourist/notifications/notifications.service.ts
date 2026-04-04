@@ -6,8 +6,11 @@ import {
 import { supabase } from '../../../config/supabase';
 
 interface UserNotificationRow {
+  id: string;
   notification_id: string;
   user_id: string;
+  is_read: boolean | null;
+  read_at: string | null;
   sent_at: string | null;
 }
 
@@ -15,8 +18,8 @@ interface NotificationRow {
   id: string;
   title: string | null;
   content: string | null;
-  notification_type: string | null;
-  status: string | null;
+  type: string | null;
+  is_global: boolean | null;
   created_at: string | null;
 }
 
@@ -74,10 +77,8 @@ export class NotificationsService {
     return date.toLocaleDateString('vi-VN');
   }
 
-  private isUnreadStatus(status: string | null): boolean {
-    const value = (status ?? '').toLowerCase();
-
-    return value === 'unread' || value === 'new' || value === 'pending';
+  private isUnreadStatus(isRead: boolean | null): boolean {
+    return isRead !== true;
   }
 
   async getNotifications(touristId: string) {
@@ -87,9 +88,9 @@ export class NotificationsService {
 
     const { data: userNotificationRows, error: userNotificationError } =
       await supabase
-        .schema('core')
-        .from('user_notifications')
-        .select('notification_id, user_id, sent_at')
+        .schema('public')
+        .from('users_notifications')
+        .select('id, notification_id, user_id, is_read, read_at, sent_at')
         .eq('user_id', touristId)
         .order('sent_at', { ascending: false });
 
@@ -111,9 +112,9 @@ export class NotificationsService {
     const notificationIds = links.map((item) => item.notification_id);
 
     const { data: notificationRows, error: notificationError } = await supabase
-      .schema('core')
+      .schema('public')
       .from('notifications')
-      .select('id, title, content, notification_type, status, created_at')
+      .select('id, title, content, type, is_global, created_at')
       .in('id', notificationIds);
 
     if (notificationError) {
@@ -140,12 +141,14 @@ export class NotificationsService {
           id: base.id,
           title: base.title ?? 'Thông báo',
           content: base.content ?? '',
-          notification_type: base.notification_type,
-          status: base.status,
+          notification_type: base.type,
+          status: link.is_read ? 'read' : 'unread',
+          is_global: base.is_global ?? false,
+          read_at: link.read_at,
           sent_at: sentAt,
           time_label: this.buildTimeLabel(sentAt),
-          icon_key: this.mapIconKey(base.notification_type),
-          is_unread: this.isUnreadStatus(base.status),
+          icon_key: this.mapIconKey(base.type),
+          is_unread: this.isUnreadStatus(link.is_read),
         };
       })
       .filter((item): item is NonNullable<typeof item> => Boolean(item));

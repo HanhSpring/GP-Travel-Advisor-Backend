@@ -48,6 +48,12 @@ export class AdminReviewsController {
     required: false,
     enum: ['all', 'today', 'yesterday', 'last_7_days', 'last_30_days'],
   })
+  @ApiQuery({
+    name: 'date_exact',
+    required: false,
+    type: String,
+    description: 'Exact sent date in YYYY-MM-DD format',
+  })
   @ApiQuery({ name: 'rating', required: false, enum: [1, 2, 3, 4, 5] })
   async getReviews(
     @Query('page') page?: string,
@@ -64,6 +70,7 @@ export class AdminReviewsController {
       | 'unclassified',
     @Query('date_sent')
     dateSent?: 'all' | 'today' | 'yesterday' | 'last_7_days' | 'last_30_days',
+    @Query('date_exact') dateExact?: string,
     @Query('rating') rating?: string,
   ): Promise<AdminReviewListResponseDto> {
     const pageNum = page ? parseInt(page) : 1;
@@ -89,18 +96,9 @@ export class AdminReviewsController {
       sort,
       classification,
       dateSent,
+      dateExact,
       ratingNum,
     );
-  }
-
-  @Get('filters')
-  @ApiOperation({ summary: 'Get filter options' })
-  @ApiResponse({
-    status: 200,
-    description: 'Filter options retrieved successfully',
-  })
-  async getFilterOptions() {
-    return this.service.getFilterOptions();
   }
 
   @Get(':id')

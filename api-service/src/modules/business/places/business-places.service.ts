@@ -17,6 +17,7 @@ interface PlaceCategoryJoinRow {
 
 interface PlaceRow {
   id: string;
+  image_url: string | null;
   name: string;
   address: string | null;
   is_approved: boolean | null;
@@ -26,11 +27,54 @@ interface PlaceRow {
   place_categories: PlaceCategoryJoinRow[] | null;
 }
 
+interface BusinessRow {
+  id: string;
+}
+
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
 type PlaceSort = 'default' | 'popular' | 'newest';
 
 @Injectable()
 export class BusinessPlacesService {
+  private async resolveVendorId(vendorId: string): Promise<string> {
+    const normalizedVendorId = vendorId?.trim();
+
+    if (!normalizedVendorId) {
+      throw new BadRequestException('vendor_id is required');
+    }
+
+    // If caller already sends business id used by travel.places.vendor_id, keep it.
+    const { data: existingPlaceRows, error: existingPlaceError } =
+      await supabase
+        .schema('travel')
+        .from('places')
+        .select('id')
+        .eq('vendor_id', normalizedVendorId)
+        .limit(1);
+
+    if (existingPlaceError) {
+      throw new InternalServerErrorException(existingPlaceError.message);
+    }
+
+    if ((existingPlaceRows ?? []).length > 0) {
+      return normalizedVendorId;
+    }
+
+    // Fallback: validate against public.businesses.id.
+    const { data: businessRow, error: businessError } = await supabase
+      .schema('public')
+      .from('businesses')
+      .select('id')
+      .eq('id', normalizedVendorId)
+      .maybeSingle<BusinessRow>();
+
+    if (businessError) {
+      throw new InternalServerErrorException(businessError.message);
+    }
+
+    return businessRow?.id ?? normalizedVendorId;
+  }
+
   private mapStatus(
     isApproved: boolean | null,
   ): 'pending' | 'approved' | 'rejected' {
@@ -83,9 +127,7 @@ export class BusinessPlacesService {
     search?: string,
     sort: PlaceSort = 'default',
   ) {
-    if (!vendorId) {
-      throw new BadRequestException('vendor_id is required');
-    }
+    const resolvedVendorId = await this.resolveVendorId(vendorId);
 
     if (!['all', 'pending', 'approved', 'rejected'].includes(status)) {
       throw new BadRequestException(
@@ -105,10 +147,10 @@ export class BusinessPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, address, is_approved, average_rating, review_count, registered_date, place_categories(category_id, categories(id, name))',
+        'id, name, address, image_url, is_approved, average_rating, review_count, registered_date, place_categories(category_id, categories(id, name))',
         { count: 'exact' },
       )
-      .eq('vendor_id', vendorId);
+      .eq('vendor_id', resolvedVendorId);
 
     if (status === 'pending') {
       query = query.is('is_approved', null);
@@ -143,6 +185,7 @@ export class BusinessPlacesService {
       id: item.id,
       name: item.name,
       address: item.address ?? '',
+      image_url: item.image_url ?? null,
       categories: this.extractCategoryNames(item.place_categories),
       rating: Number(item.average_rating) || 0,
       review_count: item.review_count || 0,

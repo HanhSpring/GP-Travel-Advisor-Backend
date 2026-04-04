@@ -12,7 +12,8 @@ interface ItineraryRow {
   description: string | null;
   start_date: string | null;
   end_date: string | null;
-  participant_count: number | null;
+  adult_count: number | null;
+  children_count: number | null;
   status: string | null;
   destination: string | null;
   created_at: string;
@@ -27,7 +28,15 @@ interface ItineraryTimeRow {
 interface PlaceRow {
   id: string;
   name: string;
-  city: string | null;
+  city_id: string | null;
+  cities:
+    | {
+        name: string | null;
+      }
+    | {
+        name: string | null;
+      }[]
+    | null;
   average_rating: number | null;
   review_count: number | null;
   image_url?: string | null;
@@ -54,6 +63,33 @@ export class ExploreService {
     }
 
     return this.defaultImageUrl;
+  }
+
+  private toParticipantCount(itinerary: ItineraryRow): number {
+    const adults = itinerary.adult_count ?? 0;
+    const children = itinerary.children_count ?? 0;
+    return adults + children;
+  }
+
+  private extractCityName(
+    cityData:
+      | {
+          name: string | null;
+        }
+      | {
+          name: string | null;
+        }[]
+      | null,
+  ): string | null {
+    if (!cityData) {
+      return null;
+    }
+
+    if (Array.isArray(cityData)) {
+      return cityData[0]?.name ?? null;
+    }
+
+    return cityData.name ?? null;
   }
 
   async getExploreHome(touristId: string) {
@@ -95,7 +131,7 @@ export class ExploreService {
       .schema('travel')
       .from('itineraries')
       .select(
-        'id, creator_id, description, start_date, end_date, participant_count, status, destination, created_at, is_public',
+        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public',
       )
       .eq('creator_id', touristId)
       .eq('status', 'ongoing')
@@ -115,7 +151,7 @@ export class ExploreService {
         title: ongoing.destination ?? 'Lịch trình của bạn',
         date_range: `${ongoing.start_date ?? ''} - ${ongoing.end_date ?? ''}`,
         time_range: await this.getTimeRange(ongoing.id),
-        participant_count: ongoing.participant_count ?? 0,
+        participant_count: this.toParticipantCount(ongoing),
         status: ongoing.status,
         can_start: false,
         start_target: null,
@@ -126,10 +162,10 @@ export class ExploreService {
       .schema('travel')
       .from('itineraries')
       .select(
-        'id, creator_id, description, start_date, end_date, participant_count, status, destination, created_at, is_public',
+        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public',
       )
       .eq('creator_id', touristId)
-      .in('status', ['ongoing', 'completed'])
+      .in('status', ['pending', 'ongoing', 'uncompleted', 'completed'])
       .gte('start_date', today)
       .order('start_date', { ascending: true })
       .limit(1)
@@ -145,7 +181,7 @@ export class ExploreService {
         title: upcoming.destination ?? 'Lịch trình của bạn',
         date_range: `${upcoming.start_date ?? ''} - ${upcoming.end_date ?? ''}`,
         time_range: await this.getTimeRange(upcoming.id),
-        participant_count: upcoming.participant_count ?? 0,
+        participant_count: this.toParticipantCount(upcoming),
         status: upcoming.status,
         can_start: true,
         start_target: `/explore/itineraries/${upcoming.id}/start?tourist_id=${touristId}`,
@@ -156,7 +192,7 @@ export class ExploreService {
       .schema('travel')
       .from('itineraries')
       .select(
-        'id, creator_id, description, start_date, end_date, participant_count, status, destination, created_at, is_public',
+        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public',
       )
       .eq('creator_id', touristId)
       .order('start_date', { ascending: false })
@@ -176,7 +212,7 @@ export class ExploreService {
       title: recent.destination ?? 'Lịch trình của bạn',
       date_range: `${recent.start_date ?? ''} - ${recent.end_date ?? ''}`,
       time_range: await this.getTimeRange(recent.id),
-      participant_count: recent.participant_count ?? 0,
+      participant_count: this.toParticipantCount(recent),
       status: recent.status,
       can_start: false,
       start_target: null,
@@ -237,7 +273,7 @@ export class ExploreService {
       .schema('travel')
       .from('itineraries')
       .select(
-        'id, creator_id, description, start_date, end_date, participant_count, status, destination, created_at, is_public',
+        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public',
         { count: 'exact' },
       )
       .eq('is_public', true)
@@ -257,7 +293,7 @@ export class ExploreService {
       start_date: item.start_date,
       end_date: item.end_date,
       days: this.getDays(item.start_date, item.end_date),
-      participant_count: item.participant_count,
+      participant_count: this.toParticipantCount(item),
       image: this.defaultImageUrl,
     }));
 
@@ -341,9 +377,12 @@ export class ExploreService {
     let placesQuery = supabase
       .schema('travel')
       .from('places')
-      .select('id, name, city, average_rating, review_count, image_url', {
-        count: 'exact',
-      })
+      .select(
+        'id, name, city_id, cities(name), average_rating, review_count, image_url',
+        {
+          count: 'exact',
+        },
+      )
       .eq('is_approved', true)
       .eq('is_active', true)
       .order('average_rating', { ascending: false })
@@ -369,7 +408,7 @@ export class ExploreService {
         image: this.resolveImage(item.image_url),
         rating: Number(item.average_rating) || 0,
         review_count: item.review_count || 0,
-        city: item.city,
+        city: this.extractCityName(item.cities),
         category: categoryName,
       })),
       pagination: {

@@ -16,6 +16,12 @@ export class TouristNotificationItemDto {
   @ApiProperty({ nullable: true })
   status: string | null;
 
+  @ApiProperty({ nullable: true })
+  is_global?: boolean | null;
+
+  @ApiProperty({ nullable: true })
+  read_at?: string | null;
+
   @ApiProperty()
   sent_at: string;
 
