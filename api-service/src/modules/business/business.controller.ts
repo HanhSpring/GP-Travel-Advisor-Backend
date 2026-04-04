@@ -36,6 +36,8 @@ import {
 } from './dto/business-response.dto';
 import { CreateFullPlaceDto } from './dto/create-full-place.dto';
 import { FileInterceptor } from '@nestjs/platform-express';
+import { GetOrdersDto } from './dto/get-orders.dto';
+
 
 @ApiTags('Business')
 @Controller('business')
@@ -73,6 +75,12 @@ export class BusinessController {
     return this.businessService.getPlaceServices(query.placeId);
   }
 
+  @Get('place-services-by-type')
+  @ApiOperation({ summary: 'Lấy dịch vụ của địa điểm theo loại (miễn phí/trả phí)' })
+  getPlaceServicesByType(@Query() query: PlaceDto) {
+    return this.businessService.getPlaceServicesByType(query.placeId)
+  }
+
   @Get('dashboard')
   @ApiResponse({ type: DashboardDto })
   getDashboard(@Query() query: VendorDto) {
@@ -86,15 +94,26 @@ export class BusinessController {
     type: CreateFullPlaceDto,
   })
   @UseInterceptors(FileInterceptor('file'))
-  createFull(@Body() body: any, @UploadedFile() file: Express.Multer.File) {
+  async createFull(
+    @Body() body: any,
+    @UploadedFile() file?: Express.Multer.File
+  ) {
+    // Support both old format (name, address, etc) and new format (p_name, p_address, etc)
+    const name = body.p_name || body.name;
+    const address = body.p_address || body.address;
+    const city = body.p_city || body.city;
+    const latitude = body.p_lat !== undefined ? body.p_lat : body.latitude;
+    const longitude = body.p_lng !== undefined ? body.p_lng : body.longitude;
+    
     const dto = {
-      name: body.name,
-      address: body.address,
-      city: body.city,
-      latitude: Number(body.latitude),
-      longitude: Number(body.longitude),
-      categories: this.parseFlexible(body.categories),
-      services: this.parseFlexible(body.services),
+      name,
+      address,
+      city,
+      latitude: Number(latitude),
+      longitude: Number(longitude),
+      categories: this.parseFlexible(body.p_categories || body.categories),
+      services: this.parseFlexible(body.p_services || body.services),
+      menu: this.parseFlexible(body.p_menu || body.menu),
     };
 
     return this.businessService.createFullPlace(dto, file);
@@ -136,5 +155,11 @@ export class BusinessController {
   ) {
     const userId = req.user.userId;
     return this.businessService.updateProfile(userId, token, updateDto);
+  }
+
+  @Get('orders/filter')
+  @ApiResponse({ type: [OrderItemDto] })
+  getFilteredOrders(@Query() query: GetOrdersDto) {
+    return this.businessService.getFilteredOrders(query);
   }
 }
