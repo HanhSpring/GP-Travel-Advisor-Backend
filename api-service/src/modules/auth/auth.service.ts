@@ -23,12 +23,16 @@ export class AuthService {
     const supabaseKey = process.env.SUPABASE_KEY;
     const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
     if (!supabaseUrl || !supabaseKey || !supabaseServiceKey) {
-      throw new Error('Missing Supabase URL or Anon Key');
+      throw new Error('Missing Supabase URL or Keys');
     }
-    // Client thường cho đăng ký/đăng nhập
-    this.supabase = createClient(supabaseUrl, supabaseKey);
 
-    // Client Admin (Siêu quyền lực) để can thiệp sâu vào user
+    this.supabase = createClient(supabaseUrl, supabaseKey, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+      },
+    });
+
     this.supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
       auth: {
         autoRefreshToken: false,
@@ -110,13 +114,14 @@ export class AuthService {
   async login(loginDto: LoginDto) {
     const { emailOrPhone, password } = loginDto;
 
-    // 1. Kiểm tra xem input là Email hay Số điện thoại bằng Regex cơ bản
+    // 1. Kiểm tra xem input là Email hay Số điện thoại bằng Regex
     const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailOrPhone);
     let finalEmail = emailOrPhone;
 
+    // 2. Nếu là Số điện thoại -> Truy vấn vào public.users để lấy Email tương ứng
     if (!isEmail) {
-      const { data: userData, error: dbError } = await this.supabase
-        .from('users') // Bảng public.users
+      const { data: userData, error: dbError } = await this.supabaseAdmin
+        .from('users')
         .select('email')
         .eq('phone_number', emailOrPhone)
         .single();
@@ -129,13 +134,16 @@ export class AuthService {
 
       finalEmail = userData.email;
     }
+    // 3. CHỈNH SỬA Ở ĐÂY:
+    // Dù user nhập SĐT hay Email ban đầu, cuối cùng ta vẫn dùng 'finalEmail' để xác thực với Supabase
+    const credentials = {
+      email: finalEmail,
+      password: password,
+    };
 
-    const credentials = isEmail
-      ? { email: emailOrPhone, password }
-      : { phone: emailOrPhone, password };
+    console.log('Xác thực với credentials:', credentials);
 
-    console.log(credentials);
-
+    // 4. Gửi lên Supabase
     const { data, error } =
       await this.supabase.auth.signInWithPassword(credentials);
 
@@ -156,7 +164,6 @@ export class AuthService {
       user: {
         id: data.user.id,
         email: data.user.email,
-
         role: data.user.user_metadata?.role || 'TOURIST',
         phone: data.user.phone || data.user.user_metadata?.phone_number || '',
         fullName: data.user.user_metadata?.full_name || '',
@@ -241,60 +248,55 @@ export class AuthService {
     role: string,
   ) {
     await this.updateUserMetadata(userId, { role });
-    console.log('role', role);
+    const finalFullName = fullName || 'Người dùng Google';
 
-    // 2. Đồng bộ vào bảng public.users
-    const { data: existingUser } = await this.supabaseAdmin
-      .from('users')
-      .select('id, email')
-      .or(`id.eq.${userId},email.eq.${email}`)
-      .single();
+    await this.updateUserMetadata(userId, {
+      role,
+      full_name: finalFullName,
+    });
 
-    if (!existingUser) {
-      const { error: userError } = await this.supabaseAdmin
-        .from('users')
-        .insert([
+    const { error: userError } = await this.supabaseAdmin.from('users').upsert(
+      {
+        id: userId,
+        email: email,
+        full_name: finalFullName,
+        role: role,
+      },
+      { onConflict: 'id' },
+    );
+
+    if (userError) {
+      throw new InternalServerErrorException(
+        'Lỗi đồng bộ users: ' + userError.message,
+      );
+    }
+
+    // 3. XỬ LÝ PHÂN LUỒNG & DỌN DẸP DỮ LIỆU THỪA DO TRIGGER
+    if (role === 'BUSINESS') {
+      await this.supabaseAdmin.from('tourists').delete().eq('id', userId);
+      const { error: businessError } = await this.supabaseAdmin
+        .from('businesses')
+        .upsert(
           {
             id: userId,
-            email: email,
-            full_name: fullName,
-            role: role,
+            is_approved: false,
           },
-        ]);
-      if (userError && userError.code !== '23505') {
+          { onConflict: 'id' },
+        );
+
+      if (businessError) {
+        console.error('Lỗi tạo hồ sơ Business:', businessError);
         throw new InternalServerErrorException(
-          'Lỗi đồng bộ users: ' + userError.message,
+          'Lỗi tạo hồ sơ Business trong DB',
         );
       }
+    } else if (role === 'TOURIST') {
+      await this.supabaseAdmin.from('businesses').delete().eq('id', userId);
+
+      // 3.4 Đảm bảo có record trong bảng tourists
+      await this.supabaseAdmin
+        .from('tourists')
+        .upsert({ id: userId }, { onConflict: 'id' });
     }
-
-    // 3. LOGIC MỚI: Tự động khởi tạo hồ sơ nếu là BUSINESS
-    if (role === 'BUSINESS') {
-      const { data: existingBusiness } = await this.supabaseAdmin
-        .from('businesses')
-        .select('id')
-        .eq('id', userId)
-        .single();
-
-      if (!existingBusiness) {
-        const { error: businessError } = await this.supabaseAdmin
-          .from('businesses')
-          .insert([
-            {
-              id: userId,
-              is_approved: false,
-            },
-          ]);
-
-        if (businessError && businessError.code !== '23505') {
-          console.error('Lỗi tạo hồ sơ Business:', businessError);
-          throw new InternalServerErrorException(
-            'Lỗi tạo hồ sơ Business trong DB',
-          );
-        }
-      }
-    }
-
-    // Bạn có thể viết thêm cụm if (role === 'TOURIST') tương tự để insert vào bảng tourists
   }
 }

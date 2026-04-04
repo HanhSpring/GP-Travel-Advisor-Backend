@@ -48,7 +48,8 @@ export class AuthController {
     @Body('requestedRole') requestedRole: string,
   ) {
     const user = req.user;
-
+    const fullNameFromMeta =
+      user.user_metadata?.full_name || user.fullName || 'Người dùng Google';
     // 1. CHỐT CHẶN BẢO MẬT: Không cho phép tự ứng cử làm ADMIN
     let targetRole = requestedRole || 'TOURIST';
     if (targetRole === 'ADMIN') {
@@ -60,7 +61,7 @@ export class AuthController {
       await this.authService.syncOAuthData(
         user.userId,
         user.email,
-        user.fullName || '',
+        fullNameFromMeta,
         targetRole,
       );
 
