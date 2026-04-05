@@ -22,7 +22,7 @@ interface PlaceCategoryJoinRow {
 
 interface PlaceListRow {
   id: string;
-  image_url: string | null;
+  image_url: string[] | string | null;
   name: string;
   address: string | null;
   is_approved: boolean | null;
@@ -33,7 +33,7 @@ interface PlaceListRow {
 
 interface PlaceDetailRow {
   id: string;
-  image_url: string | null;
+  image_url: string[] | string | null;
   name: string;
   description: string | null;
   address: string | null;
@@ -67,6 +67,23 @@ type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
 
 @Injectable()
 export class AdminPlacesService {
+  private normalizeImageUrls(
+    value: string[] | string | null | undefined,
+  ): string[] {
+    if (Array.isArray(value)) {
+      return value.filter(
+        (item): item is string =>
+          typeof item === 'string' && item.trim().length > 0,
+      );
+    }
+
+    if (typeof value === 'string' && value.trim().length > 0) {
+      return [value];
+    }
+
+    return [];
+  }
+
   private normalizeForSearch(value?: string | null): string {
     if (!value) {
       return '';
@@ -364,7 +381,7 @@ export class AdminPlacesService {
             created_at: vendor.created_at,
           }
         : null,
-      images: place.image_url ? [place.image_url] : [],
+      images: this.normalizeImageUrls(place.image_url),
     };
   }
 

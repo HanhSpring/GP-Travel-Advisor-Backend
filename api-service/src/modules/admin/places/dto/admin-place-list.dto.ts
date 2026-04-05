@@ -8,8 +8,9 @@ export class AdminPlaceListItemDto {
     description: 'Place thumbnail image URL',
     required: false,
     nullable: true,
+    type: [String],
   })
-  image_url?: string | null;
+  image_url?: string[] | null;
 
   @ApiProperty({ description: 'Place name' })
   name: string;
