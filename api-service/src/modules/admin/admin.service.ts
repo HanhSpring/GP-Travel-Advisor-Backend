@@ -74,7 +74,7 @@ export class AdminService {
 
     const supabaseAdmin = createClient(
       process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+      process.env.SUPABASE_KEY as string,
     );
 
     const { data, error } = await supabaseAdmin.rpc('get_users_list', {
@@ -125,7 +125,7 @@ export class AdminService {
   async getUserDetail(id: string) {
     const supabaseAdmin = createClient(
       process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+      process.env.SUPABASE_KEY as string,
     );
 
     const { data, error } = await supabaseAdmin.rpc(
@@ -170,7 +170,7 @@ export class AdminService {
   async updateUserStatus(id: string, newStatus: UserActiveStatus) {
     const supabaseAdmin = createClient(
       process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+      process.env.SUPABASE_KEY as string,
     );
     const bitStatus = newStatus === UserActiveStatus.ACTIVE ? '1' : '0';
 
@@ -199,7 +199,7 @@ export class AdminService {
 
     const supabaseAdmin = createClient(
       process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+      process.env.SUPABASE_KEY as string,
     );
 
     const { data: deletedCount, error } = await supabaseAdmin.rpc(
@@ -234,7 +234,7 @@ export class AdminService {
   async createUserByAdmin(createDto: CreateUserByAdminDto) {
     const supabaseAdmin = createClient(
       process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+      process.env.SUPABASE_KEY as string,
     );
 
     const { data, error } = await supabaseAdmin.auth.admin.createUser({
@@ -269,7 +269,7 @@ export class AdminService {
   async getUserStats() {
     const supabaseAdmin = createClient(
       process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_SERVICE_ROLE_KEY as string,
+      process.env.SUPABASE_KEY as string,
     );
 
     const { data, error } = await supabaseAdmin.rpc('get_user_statistics');

@@ -19,11 +19,18 @@ export class AuthService {
   private supabaseAdmin: SupabaseClient;
 
   constructor() {
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseKey = process.env.SUPABASE_KEY;
-    const supabaseServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY;
-    if (!supabaseUrl || !supabaseKey || !supabaseServiceKey) {
-      throw new Error('Missing Supabase URL or Keys');
+    const supabaseUrl = process.env.SUPABASE_URL?.trim();
+    const supabaseKey = process.env.SUPABASE_KEY?.trim();
+
+    if (!supabaseUrl || !supabaseKey) {
+      const missing: string[] = [];
+      if (!supabaseUrl) {
+        missing.push('SUPABASE_URL');
+      }
+      if (!supabaseKey) {
+        missing.push('SUPABASE_KEY');
+      }
+      throw new Error(`Missing Supabase env: ${missing.join(', ')}`);
     }
 
     this.supabase = createClient(supabaseUrl, supabaseKey, {
@@ -33,7 +40,7 @@ export class AuthService {
       },
     });
 
-    this.supabaseAdmin = createClient(supabaseUrl, supabaseServiceKey, {
+    this.supabaseAdmin = createClient(supabaseUrl, supabaseKey, {
       auth: {
         autoRefreshToken: false,
         persistSession: false,
@@ -44,8 +51,8 @@ export class AuthService {
   async updatePassword(updateDto: UpdatePasswordDto) {
     const { accessToken, newPassword } = updateDto;
 
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseAnonKey = process.env.SUPABASE_KEY; // Chỉ dùng chìa khóa khách bình thường
+    const supabaseUrl = process.env.SUPABASE_URL?.trim();
+    const supabaseAnonKey = process.env.SUPABASE_KEY?.trim(); // Chỉ dùng chìa khóa khách bình thường
 
     if (!supabaseUrl || !supabaseAnonKey) {
       throw new InternalServerErrorException(

@@ -296,7 +296,6 @@ export class BusinessService {
     const userClient = this.getSupabaseUserClient(accessToken);
     const supabaseUrl = process.env.SUPABASE_URL as string;
     const supabaseKey = process.env.SUPABASE_KEY as string;
-    const serviceRoleKey = process.env.SUPABASE_SERVICE_ROLE_KEY as string;
 
     const isChangingPassword = updateDto.oldPassword && updateDto.newPassword;
     const isMissingOnePassword =
@@ -335,12 +334,12 @@ export class BusinessService {
       }
 
       // 3. Mật khẩu cũ đúng -> Cập nhật mật khẩu mới bằng quyền Admin
-      if (!serviceRoleKey) {
+      if (!supabaseKey) {
         throw new InternalServerErrorException(
-          'Server thiếu cấu hình SUPABASE_SERVICE_ROLE_KEY',
+          'Server thiếu cấu hình SUPABASE_KEY',
         );
       }
-      const adminClient = createClient(supabaseUrl, serviceRoleKey, {
+      const adminClient = createClient(supabaseUrl, supabaseKey, {
         auth: { persistSession: false, autoRefreshToken: false },
       });
 

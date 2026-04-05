@@ -26,10 +26,16 @@ export class UploadService {
           '',
       },
     });
-    this.supabase = createClient(
-      this.configService.get<string>('SUPABASE_URL') || '',
-      this.configService.get<string>('SUPABASE_SERVICE_ROLE_KEY') || '',
-    );
+    const supabaseUrl = this.configService.get<string>('SUPABASE_URL')?.trim();
+    const supabaseKey = this.configService.get<string>('SUPABASE_KEY')?.trim();
+
+    if (!supabaseUrl || !supabaseKey) {
+      throw new Error(
+        'Missing Supabase env in UploadService: SUPABASE_URL and SUPABASE_KEY',
+      );
+    }
+
+    this.supabase = createClient(supabaseUrl, supabaseKey);
   }
 
   // --- HÀM 1: UPLOAD AVATAR (Cắt vuông, tập trung vào tâm) ---
