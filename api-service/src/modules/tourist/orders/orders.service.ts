@@ -4,7 +4,9 @@ import {
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { supabase } from '../../../config/supabase';
+import { CreateOrderDto } from './dto/create-order.dto';
 
 interface PlaceRow {
   id: string;
@@ -31,10 +33,63 @@ interface FoodItemRow {
   place_id: string;
 }
 
+interface CreateOrderFoodItemRow {
+  id: string;
+  place_id: string;
+  name: string | null;
+  price: number | null;
+  is_active?: boolean | null;
+}
+
+interface ItineraryOwnerRow {
+  id: string;
+  creator_id: string;
+}
+
+interface ItineraryDetailRow {
+  id: string;
+  place_id: string;
+  visit_date: string | null;
+  arrival_time: string | null;
+}
+
+interface PlaceCategoryRow {
+  place_id: string;
+  category_id: string;
+}
+
+interface CategoryRow {
+  id: string;
+  name: string;
+}
+
+interface OrderRow {
+  id: string;
+  total_amount: number | null;
+}
+
 type FoodCategory = 'all' | 'main' | 'drink';
 
 @Injectable()
 export class OrdersService {
+  private normalizeText(value: string): string {
+    return value
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .trim();
+  }
+
+  private isOrderEligibleCategory(category: string): boolean {
+    const normalized = this.normalizeText(category);
+    return (
+      normalized.includes('cafe') ||
+      normalized.includes('ca phe') ||
+      normalized.includes('restaurant') ||
+      normalized.includes('nha hang')
+    );
+  }
+
   private extractCityName(
     cityData:
       | {
@@ -111,9 +166,9 @@ export class OrdersService {
         city: this.extractCityName(place.cities),
       },
       suggestion: {
-        title: `Ban sap den ${place.name}`,
+        title: `Bạn sắp đến ${place.name}`,
         message:
-          'Ban co muon dat truoc mon an de khong phai cho doi khi den noi?',
+          'Bạn có muốn đặt trước món ăn để không phải chờ đợi khi đến nơi?',
       },
       actions: {
         primary: {
@@ -130,6 +185,347 @@ export class OrdersService {
         rating: Number(place.average_rating) || 0,
         review_count: place.review_count || 0,
       },
+    };
+  }
+
+  async getItineraryOrderPlaces(itineraryId: string, touristId: string) {
+    if (!itineraryId || !touristId) {
+      throw new BadRequestException('itinerary_id and tourist_id are required');
+    }
+
+    const { data: itinerary, error: itineraryError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, creator_id')
+      .eq('id', itineraryId)
+      .eq('creator_id', touristId)
+      .maybeSingle<ItineraryOwnerRow>();
+
+    if (itineraryError) {
+      throw new InternalServerErrorException(itineraryError.message);
+    }
+
+    if (!itinerary) {
+      throw new NotFoundException('Itinerary not found for this tourist');
+    }
+
+    const { data: details, error: detailsError } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select('id, place_id, visit_date, arrival_time')
+      .eq('itinerary_id', itineraryId)
+      .order('visit_date', { ascending: true })
+      .order('arrival_time', { ascending: true })
+      .returns<ItineraryDetailRow[]>();
+
+    if (detailsError) {
+      throw new InternalServerErrorException(detailsError.message);
+    }
+
+    const orderedDetails = (details ?? []).filter((item) => !!item.place_id);
+    if (orderedDetails.length === 0) {
+      return { itinerary_id: itineraryId, places: [] };
+    }
+
+    const orderedUniquePlaceIds: string[] = [];
+    const firstOccurrence = new Map<string, ItineraryDetailRow>();
+    for (const item of orderedDetails) {
+      if (firstOccurrence.has(item.place_id)) {
+        continue;
+      }
+      firstOccurrence.set(item.place_id, item);
+      orderedUniquePlaceIds.push(item.place_id);
+    }
+
+    const { data: placeRows, error: placeError } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, name')
+      .in('id', orderedUniquePlaceIds)
+      .returns<Array<{ id: string; name: string }>>();
+
+    if (placeError) {
+      throw new InternalServerErrorException(placeError.message);
+    }
+
+    const placeMap = new Map(
+      (placeRows ?? []).map((item) => [item.id, item.name]),
+    );
+
+    const { data: placeCategoryRows, error: placeCategoryError } =
+      await supabase
+        .schema('travel')
+        .from('place_categories')
+        .select('place_id, category_id')
+        .in('place_id', orderedUniquePlaceIds)
+        .returns<PlaceCategoryRow[]>();
+
+    if (placeCategoryError) {
+      throw new InternalServerErrorException(placeCategoryError.message);
+    }
+
+    const categoryIds = Array.from(
+      new Set((placeCategoryRows ?? []).map((item) => item.category_id)),
+    );
+
+    const categoryMap = new Map<string, string>();
+    if (categoryIds.length > 0) {
+      const { data: categories, error: categoryError } = await supabase
+        .schema('travel')
+        .from('categories')
+        .select('id, name')
+        .in('id', categoryIds)
+        .returns<CategoryRow[]>();
+
+      if (categoryError) {
+        throw new InternalServerErrorException(categoryError.message);
+      }
+
+      for (const item of categories ?? []) {
+        categoryMap.set(item.id, item.name);
+      }
+    }
+
+    const categoriesByPlace = new Map<string, string[]>();
+    for (const row of placeCategoryRows ?? []) {
+      const categoryName = categoryMap.get(row.category_id);
+      if (!categoryName) {
+        continue;
+      }
+      const list = categoriesByPlace.get(row.place_id) ?? [];
+      list.push(categoryName);
+      categoriesByPlace.set(row.place_id, list);
+    }
+
+    const filtered = orderedUniquePlaceIds
+      .map((placeId) => {
+        const categories = categoriesByPlace.get(placeId) ?? [];
+        const eligible = categories.some((name) =>
+          this.isOrderEligibleCategory(name),
+        );
+
+        if (!eligible) {
+          return null;
+        }
+
+        const occurrence = firstOccurrence.get(placeId);
+        return {
+          itinerary_detail_id: occurrence?.id ?? '',
+          place_id: placeId,
+          place_name: placeMap.get(placeId) ?? 'Địa điểm',
+          visit_date: occurrence?.visit_date ?? null,
+          arrival_time: occurrence?.arrival_time ?? null,
+          categories,
+        };
+      })
+      .filter((item): item is NonNullable<typeof item> => item != null)
+      .map((item, index) => ({
+        order: index + 1,
+        ...item,
+      }));
+
+    return {
+      itinerary_id: itineraryId,
+      places: filtered,
+    };
+  }
+
+  async createOrder(placeId: string, payload: CreateOrderDto) {
+    if (!placeId || !payload.tourist_id) {
+      throw new BadRequestException('place_id and tourist_id are required');
+    }
+
+    if (!payload.items || payload.items.length === 0) {
+      throw new BadRequestException('items must not be empty');
+    }
+
+    const { data: place, error: placeError } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, name')
+      .eq('id', placeId)
+      .maybeSingle<{ id: string; name: string }>();
+
+    if (placeError) {
+      throw new InternalServerErrorException(placeError.message);
+    }
+
+    if (!place) {
+      throw new NotFoundException('Place not found');
+    }
+
+    const requestedFoodItemIds = Array.from(
+      new Set(payload.items.map((item) => item.food_item_id)),
+    );
+
+    const { data: menuItems, error: menuError } = await supabase
+      .schema('order_sys')
+      .from('food_items')
+      .select('id, place_id, name, price, is_active')
+      .in('id', requestedFoodItemIds)
+      .returns<CreateOrderFoodItemRow[]>();
+
+    if (menuError) {
+      throw new InternalServerErrorException(menuError.message);
+    }
+
+    const menuMap = new Map((menuItems ?? []).map((item) => [item.id, item]));
+
+    const normalizedItems = payload.items.map((item) => {
+      const menu = menuMap.get(item.food_item_id);
+      if (!menu) {
+        throw new BadRequestException(
+          `food_item_id ${item.food_item_id} not found`,
+        );
+      }
+      if (menu.place_id !== placeId) {
+        throw new BadRequestException(
+          `food_item_id ${item.food_item_id} does not belong to this place`,
+        );
+      }
+      if (menu.is_active === false) {
+        throw new BadRequestException(
+          `food_item_id ${item.food_item_id} is inactive`,
+        );
+      }
+
+      const unitPrice = Number(menu.price) || 0;
+      const quantity = item.quantity;
+      const totalPrice = unitPrice * quantity;
+
+      return {
+        food_item_id: item.food_item_id,
+        quantity,
+        unit_price: unitPrice,
+        total_price: totalPrice,
+      };
+    });
+
+    const totalAmount = normalizedItems.reduce(
+      (sum, item) => sum + item.total_price,
+      0,
+    );
+
+    const orderedAt = new Date().toISOString();
+
+    const orderId = randomUUID();
+    const statusCandidates = ['pending', 'processing', 'confirmed', 'created'];
+
+    const orderInsertVariants = statusCandidates.flatMap((status) => [
+      {
+        id: orderId,
+        ordered_at: orderedAt,
+        total_amount: totalAmount,
+        status,
+        notes: payload.notes ?? null,
+        tourist_id: payload.tourist_id,
+        itinerary_detail_id: payload.itinerary_detail_id ?? null,
+      },
+      {
+        id: orderId,
+        ordered_at: orderedAt,
+        total_amount: totalAmount,
+        status,
+        tourist_id: payload.tourist_id,
+      },
+      {
+        id: orderId,
+        ordered_at: orderedAt,
+        status,
+        tourist_id: payload.tourist_id,
+      },
+    ]);
+
+    let orderInsertError: { code?: string; message?: string } | null = null;
+    for (const variant of orderInsertVariants) {
+      const { error } = await supabase
+        .schema('order_sys')
+        .from('orders')
+        .insert([variant]);
+
+      if (!error) {
+        orderInsertError = null;
+        break;
+      }
+
+      orderInsertError = error as { code?: string; message?: string };
+
+      const isUnknownColumn = error.code === '42703';
+      const isInvalidStatusEnum =
+        (error.message || '').includes('order_status_enum') &&
+        (error.message || '').includes('invalid input value for enum');
+
+      if (!isUnknownColumn && !isInvalidStatusEnum) {
+        break;
+      }
+    }
+
+    if (orderInsertError) {
+      throw new InternalServerErrorException(orderInsertError.message);
+    }
+
+    const orderItemRowVariants = [
+      normalizedItems.map((item) => ({
+        id: randomUUID(),
+        quantity: item.quantity,
+        unit_price: item.unit_price,
+        total_price: item.total_price,
+        order_id: orderId,
+        food_item_id: item.food_item_id,
+      })),
+      normalizedItems.map((item) => ({
+        id: randomUUID(),
+        quantity: item.quantity,
+        order_id: orderId,
+        food_item_id: item.food_item_id,
+      })),
+      normalizedItems.map((item) => ({
+        order_id: orderId,
+        food_item_id: item.food_item_id,
+      })),
+    ];
+
+    let insertedOrderItems = false;
+    let orderItemsError: { code?: string; message?: string } | null = null;
+    for (const rows of orderItemRowVariants) {
+      const { error } = await supabase
+        .schema('order_sys')
+        .from('order_items')
+        .insert(rows);
+
+      if (!error) {
+        insertedOrderItems = true;
+        orderItemsError = null;
+        break;
+      }
+
+      orderItemsError = error as { code?: string; message?: string };
+      if (error.code !== '42703') {
+        break;
+      }
+    }
+
+    if (!insertedOrderItems && orderItemsError) {
+      const { error: fallbackError } = await supabase
+        .schema('order_sys')
+        .from('order_item')
+        .insert(orderItemRowVariants[orderItemRowVariants.length - 1]);
+
+      if (fallbackError) {
+        throw new InternalServerErrorException(
+          fallbackError.message ||
+            orderItemsError.message ||
+            'Failed to create order items',
+        );
+      }
+    }
+
+    return {
+      success: true,
+      order_id: orderId,
+      total_amount: totalAmount,
+      items: normalizedItems,
+      message: 'Đặt món thành công',
     };
   }
 

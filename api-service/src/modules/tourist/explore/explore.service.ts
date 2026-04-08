@@ -25,21 +25,38 @@ interface ItineraryTimeRow {
   departure_time: string | null;
 }
 
+interface ItineraryDetailPlaceRow {
+  itinerary_id: string;
+  places:
+    | {
+        image_url?: unknown;
+      }
+    | {
+        image_url?: unknown;
+      }[]
+    | null;
+}
+
 interface PlaceRow {
   id: string;
   name: string;
   city_id: string | null;
   cities:
     | {
+        id?: string | null;
         name: string | null;
       }
     | {
+        id?: string | null;
         name: string | null;
       }[]
     | null;
+  address?: string | null;
+  open_time?: string | null;
+  close_time?: string | null;
   average_rating: number | null;
   review_count: number | null;
-  image_url?: string | null;
+  image_url?: unknown;
 }
 
 interface CategoryRow {
@@ -48,7 +65,30 @@ interface CategoryRow {
 }
 
 interface PlaceCategoryRow {
+  category_id?: string;
   place_id: string;
+}
+
+interface CityRow {
+  id: string;
+  name: string;
+}
+
+interface UserRow {
+  id: string;
+  full_name: string | null;
+}
+
+interface ItineraryDetailPlaceCityRow {
+  itinerary_id: string;
+  places:
+    | {
+        city_id?: string | null;
+      }
+    | {
+        city_id?: string | null;
+      }[]
+    | null;
 }
 
 @Injectable()
@@ -57,9 +97,29 @@ export class ExploreService {
     process.env.DEFAULT_PLACE_IMAGE_URL ||
     'https://placehold.co/1080x720?text=No+Image';
 
-  private resolveImage(imageUrl?: string | null): string {
-    if (imageUrl && imageUrl.trim().length > 0) {
-      return imageUrl;
+  private toImageList(imageUrl?: unknown): string[] {
+    if (Array.isArray(imageUrl)) {
+      return imageUrl
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0);
+    }
+
+    if (typeof imageUrl === 'string') {
+      const value = imageUrl.trim();
+      if (!value) {
+        return [];
+      }
+      return [value];
+    }
+
+    return [];
+  }
+
+  private resolveImage(imageUrl?: unknown): string {
+    const images = this.toImageList(imageUrl);
+    if (images.length > 0) {
+      return images[0];
     }
 
     return this.defaultImageUrl;
@@ -74,9 +134,11 @@ export class ExploreService {
   private extractCityName(
     cityData:
       | {
+          id?: string | null;
           name: string | null;
         }
       | {
+          id?: string | null;
           name: string | null;
         }[]
       | null,
@@ -92,18 +154,72 @@ export class ExploreService {
     return cityData.name ?? null;
   }
 
+  private extractCityId(
+    cityData:
+      | {
+          id?: string | null;
+          name: string | null;
+        }
+      | {
+          id?: string | null;
+          name: string | null;
+        }[]
+      | null,
+  ): string | null {
+    if (!cityData) {
+      return null;
+    }
+
+    if (Array.isArray(cityData)) {
+      return cityData[0]?.id ?? null;
+    }
+
+    return cityData.id ?? null;
+  }
+
+  private async getCreatorNameMap(
+    creatorIds: string[],
+  ): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+
+    const dedupedCreatorIds = Array.from(
+      new Set(creatorIds.filter((id) => id.trim().length > 0)),
+    );
+
+    if (dedupedCreatorIds.length === 0) {
+      return map;
+    }
+
+    const { data: users, error } = await supabase
+      .from('users')
+      .select('id, full_name')
+      .in('id', dedupedCreatorIds)
+      .returns<UserRow[]>();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    for (const user of users ?? []) {
+      const fullName = (user.full_name ?? '').trim();
+      if (!fullName) {
+        continue;
+      }
+
+      map.set(user.id, fullName);
+    }
+
+    return map;
+  }
+
   async getExploreHome(touristId: string) {
-    if (!touristId) {
+    if (!touristId || !touristId.trim()) {
       throw new BadRequestException('tourist_id is required');
     }
 
     const currentItinerary = await this.getCurrentItinerary(touristId);
     const publicItinerariesResult = await this.getPublicItineraries(1, 5);
-    const featuredPlacesResult = await this.getPlacesByCategory(
-      undefined,
-      1,
-      5,
-    );
+    const featuredPlacesResult = await this.getFeaturedCities(1, 5);
     const hotelsResult = await this.getPlacesByCategory('hotel', 1, 5);
 
     return {
@@ -118,7 +234,7 @@ export class ExploreService {
       hotels: hotelsResult.data,
       view_all_targets: {
         suggestion_itineraries: '/explore/itineraries/public?page=1&limit=50',
-        featured_places: '/explore/places?page=1&limit=50',
+        featured_places: '/explore/cities?page=1&limit=50',
         hotels: '/explore/places?category=hotel&page=1&limit=50',
       },
     };
@@ -148,7 +264,10 @@ export class ExploreService {
     if (ongoing) {
       return {
         id: ongoing.id,
-        title: ongoing.destination ?? 'Lịch trình của bạn',
+        title:
+          (ongoing.description && ongoing.description.trim()) ||
+          ongoing.destination ||
+          'Lịch trình của bạn',
         date_range: `${ongoing.start_date ?? ''} - ${ongoing.end_date ?? ''}`,
         time_range: await this.getTimeRange(ongoing.id),
         participant_count: this.toParticipantCount(ongoing),
@@ -178,7 +297,10 @@ export class ExploreService {
     if (upcoming) {
       return {
         id: upcoming.id,
-        title: upcoming.destination ?? 'Lịch trình của bạn',
+        title:
+          (upcoming.description && upcoming.description.trim()) ||
+          upcoming.destination ||
+          'Lịch trình của bạn',
         date_range: `${upcoming.start_date ?? ''} - ${upcoming.end_date ?? ''}`,
         time_range: await this.getTimeRange(upcoming.id),
         participant_count: this.toParticipantCount(upcoming),
@@ -209,7 +331,10 @@ export class ExploreService {
 
     return {
       id: recent.id,
-      title: recent.destination ?? 'Lịch trình của bạn',
+      title:
+        (recent.description && recent.description.trim()) ||
+        recent.destination ||
+        'Lịch trình của bạn',
       date_range: `${recent.start_date ?? ''} - ${recent.end_date ?? ''}`,
       time_range: await this.getTimeRange(recent.id),
       participant_count: this.toParticipantCount(recent),
@@ -285,17 +410,35 @@ export class ExploreService {
       throw new InternalServerErrorException(error.message);
     }
 
-    const mapped = (data ?? []).map((item) => ({
-      id: item.id,
-      title: item.destination ?? 'Lịch trình công khai',
-      location: item.destination ?? 'Không xác định',
-      description: item.description,
-      start_date: item.start_date,
-      end_date: item.end_date,
-      days: this.getDays(item.start_date, item.end_date),
-      participant_count: this.toParticipantCount(item),
-      image: this.defaultImageUrl,
-    }));
+    const itineraryIds = (data ?? []).map((item) => item.id);
+    const creatorNameMap = await this.getCreatorNameMap(
+      (data ?? []).map((item) => item.creator_id),
+    );
+    const itineraryImages = await this.getItineraryImageMap(itineraryIds);
+
+    const mapped = (data ?? []).map((item) => {
+      const gallery = itineraryImages.get(item.id) ?? [];
+      const imageGallery =
+        gallery.length > 0 ? gallery.slice(0, 3) : [this.defaultImageUrl];
+
+      return {
+        id: item.id,
+        title:
+          (item.description && item.description.trim()) ||
+          item.destination ||
+          'Lịch trình công khai',
+        location: item.destination ?? 'Không xác định',
+        description: item.description,
+        start_date: item.start_date,
+        end_date: item.end_date,
+        days: this.getDays(item.start_date, item.end_date),
+        participant_count: this.toParticipantCount(item),
+        creator_id: item.creator_id,
+        creator_name: creatorNameMap.get(item.creator_id) ?? 'Traveler',
+        image: imageGallery[0],
+        image_gallery: imageGallery,
+      };
+    });
 
     return {
       data: mapped,
@@ -305,6 +448,429 @@ export class ExploreService {
         total: count ?? 0,
         pages: Math.ceil((count ?? 0) / safeLimit),
       },
+    };
+  }
+
+  private buildCategoryKeywords(categoryName: string): string[] {
+    const normalized = categoryName.toLowerCase().trim();
+
+    if (this.isRestaurantCategory(normalized)) {
+      return ['restaurant', 'nhà hàng', 'nha hang', 'cafe', 'cà phê', 'ca phe'];
+    }
+
+    if (this.isHotelCategory(normalized)) {
+      return ['hotel', 'khách sạn', 'khach san'];
+    }
+
+    if (this.isActivityCategory(normalized)) {
+      return ['activity'];
+    }
+
+    return [normalized];
+  }
+
+  private isRestaurantCategory(name: string): boolean {
+    return (
+      name.includes('restaurant') ||
+      name.includes('nhà hàng') ||
+      name.includes('nha hang') ||
+      name.includes('cafe') ||
+      name.includes('cà phê') ||
+      name.includes('ca phe')
+    );
+  }
+
+  private isHotelCategory(name: string): boolean {
+    return (
+      name.includes('hotel') ||
+      name.includes('khách sạn') ||
+      name.includes('khach san')
+    );
+  }
+
+  private isActivityCategory(name: string): boolean {
+    return name.includes('activity');
+  }
+
+  private async getCategoryIdsByKeywords(
+    keywords: string[],
+  ): Promise<string[]> {
+    const ids = new Set<string>();
+
+    for (const keyword of keywords) {
+      const { data: categories, error } = await supabase
+        .schema('travel')
+        .from('categories')
+        .select('id, name')
+        .ilike('name', `%${keyword}%`)
+        .returns<CategoryRow[]>();
+
+      if (error) {
+        throw new InternalServerErrorException(error.message);
+      }
+
+      for (const item of categories ?? []) {
+        ids.add(item.id);
+      }
+    }
+
+    return Array.from(ids);
+  }
+
+  async getFeaturedCities(page = 1, limit = 5) {
+    const safePage = page > 0 ? page : 1;
+    const safeLimit = limit > 0 ? limit : 5;
+    const offset = (safePage - 1) * safeLimit;
+
+    const {
+      data: cities,
+      error: cityError,
+      count,
+    } = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name', { count: 'exact' })
+      .order('name', { ascending: true })
+      .range(offset, offset + safeLimit - 1)
+      .returns<CityRow[]>();
+
+    if (cityError) {
+      throw new InternalServerErrorException(cityError.message);
+    }
+
+    const cityIds = (cities ?? []).map((item) => item.id);
+    const cityImageMap = new Map<string, string>();
+
+    if (cityIds.length > 0) {
+      const activityCategoryIds = await this.getCategoryIdsByKeywords(
+        this.buildCategoryKeywords('activity'),
+      );
+
+      let activityPlaceIds: string[] = [];
+      if (activityCategoryIds.length > 0) {
+        const { data: placeCategoryRows, error: placeCategoryError } =
+          await supabase
+            .schema('travel')
+            .from('place_categories')
+            .select('place_id')
+            .in('category_id', activityCategoryIds)
+            .returns<PlaceCategoryRow[]>();
+
+        if (placeCategoryError) {
+          throw new InternalServerErrorException(placeCategoryError.message);
+        }
+
+        activityPlaceIds = Array.from(
+          new Set((placeCategoryRows ?? []).map((item) => item.place_id)),
+        );
+      }
+
+      if (activityPlaceIds.length === 0) {
+        const mapped = (cities ?? []).map((item) => ({
+          id: item.id,
+          name: item.name,
+          image: this.defaultImageUrl,
+          rating: 0,
+          review_count: 0,
+          city: item.name,
+          category: null,
+        }));
+
+        return {
+          category: null,
+          data: mapped,
+          pagination: {
+            page: safePage,
+            limit: safeLimit,
+            total: count ?? 0,
+            pages: Math.ceil((count ?? 0) / safeLimit),
+          },
+        };
+      }
+
+      const { data: places, error: placesError } = await supabase
+        .schema('travel')
+        .from('places')
+        .select('id, city_id, image_url, average_rating, review_count')
+        .eq('is_approved', true)
+        .eq('is_active', true)
+        .in('city_id', cityIds)
+        .in('id', activityPlaceIds)
+        .order('review_count', { ascending: false })
+        .returns<PlaceRow[]>();
+
+      if (placesError) {
+        throw new InternalServerErrorException(placesError.message);
+      }
+
+      for (const item of places ?? []) {
+        if (!item.city_id || cityImageMap.has(item.city_id)) {
+          continue;
+        }
+
+        const images = this.toImageList(item.image_url);
+        if (images.length === 0) {
+          continue;
+        }
+
+        cityImageMap.set(item.city_id, images[0]);
+      }
+    }
+
+    const mapped = (cities ?? []).map((item) => ({
+      id: item.id,
+      name: item.name,
+      image: cityImageMap.get(item.id) ?? this.defaultImageUrl,
+      rating: 0,
+      review_count: 0,
+      city: item.name,
+      category: null,
+    }));
+
+    return {
+      category: null,
+      data: mapped,
+      pagination: {
+        page: safePage,
+        limit: safeLimit,
+        total: count ?? 0,
+        pages: Math.ceil((count ?? 0) / safeLimit),
+      },
+    };
+  }
+
+  async getCityOverview(cityId: string) {
+    if (!cityId || !cityId.trim()) {
+      throw new BadRequestException('city_id is required');
+    }
+
+    const { data: city, error: cityError } = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name')
+      .eq('id', cityId)
+      .maybeSingle<CityRow>();
+
+    if (cityError) {
+      throw new InternalServerErrorException(cityError.message);
+    }
+
+    if (!city) {
+      throw new NotFoundException('City not found');
+    }
+
+    const { data: places, error: placesError } = await supabase
+      .schema('travel')
+      .from('places')
+      .select(
+        'id, name, address, city_id, cities(id, name), average_rating, review_count, image_url, open_time, close_time',
+      )
+      .eq('city_id', cityId)
+      .eq('is_approved', true)
+      .eq('is_active', true)
+      .order('review_count', { ascending: false })
+      .returns<PlaceRow[]>();
+
+    if (placesError) {
+      throw new InternalServerErrorException(placesError.message);
+    }
+
+    const placeIds = (places ?? []).map((item) => item.id);
+    let placeCategoryRows: PlaceCategoryRow[] = [];
+
+    if (placeIds.length > 0) {
+      const { data: placeCategories, error: placeCategoryError } =
+        await supabase
+          .schema('travel')
+          .from('place_categories')
+          .select('place_id, category_id')
+          .in('place_id', placeIds)
+          .returns<PlaceCategoryRow[]>();
+
+      if (placeCategoryError) {
+        throw new InternalServerErrorException(placeCategoryError.message);
+      }
+
+      placeCategoryRows = placeCategories ?? [];
+    }
+
+    const categoryIds = Array.from(
+      new Set(
+        placeCategoryRows
+          .map((row) => row.category_id)
+          .filter(
+            (id): id is string => typeof id === 'string' && id.length > 0,
+          ),
+      ),
+    );
+
+    const categoryMap = new Map<string, string>();
+    if (categoryIds.length > 0) {
+      const { data: categories, error: categoriesError } = await supabase
+        .schema('travel')
+        .from('categories')
+        .select('id, name')
+        .in('id', categoryIds)
+        .returns<CategoryRow[]>();
+
+      if (categoriesError) {
+        throw new InternalServerErrorException(categoriesError.message);
+      }
+
+      for (const item of categories ?? []) {
+        categoryMap.set(item.id, item.name.toLowerCase());
+      }
+    }
+
+    const placeCategoriesByPlace = new Map<string, string[]>();
+    for (const row of placeCategoryRows) {
+      if (!row.category_id) {
+        continue;
+      }
+
+      const name = categoryMap.get(row.category_id);
+      if (!name) {
+        continue;
+      }
+
+      const list = placeCategoriesByPlace.get(row.place_id) ?? [];
+      list.push(name);
+      placeCategoriesByPlace.set(row.place_id, list);
+    }
+
+    const { data: publicItineraries, error: itineraryError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select(
+        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public',
+      )
+      .eq('is_public', true)
+      .order('created_at', { ascending: false })
+      .returns<ItineraryRow[]>();
+
+    if (itineraryError) {
+      throw new InternalServerErrorException(itineraryError.message);
+    }
+
+    const publicItineraryIds = (publicItineraries ?? []).map((item) => item.id);
+
+    const { data: itineraryDetailRows, error: itineraryDetailError } =
+      await supabase
+        .schema('travel')
+        .from('itinerary_details')
+        .select('itinerary_id, places:place_id(city_id)')
+        .in('itinerary_id', publicItineraryIds)
+        .returns<ItineraryDetailPlaceCityRow[]>();
+
+    if (itineraryDetailError) {
+      throw new InternalServerErrorException(itineraryDetailError.message);
+    }
+
+    const itineraryIdsInCity = new Set<string>();
+    for (const row of itineraryDetailRows ?? []) {
+      const place = Array.isArray(row.places) ? row.places[0] : row.places;
+      if (place?.city_id === cityId) {
+        itineraryIdsInCity.add(row.itinerary_id);
+      }
+    }
+
+    const cityItineraries = (publicItineraries ?? [])
+      .filter((item) => itineraryIdsInCity.has(item.id))
+      .slice(0, 6);
+
+    const cityItineraryImages = await this.getItineraryImageMap(
+      cityItineraries.map((item) => item.id),
+    );
+    const cityCreatorNameMap = await this.getCreatorNameMap(
+      cityItineraries.map((item) => item.creator_id),
+    );
+
+    const itineraries = cityItineraries.map((item) => {
+      const gallery = cityItineraryImages.get(item.id) ?? [];
+      const imageGallery =
+        gallery.length > 0 ? gallery.slice(0, 3) : [this.defaultImageUrl];
+
+      return {
+        id: item.id,
+        title:
+          (item.description && item.description.trim()) ||
+          item.destination ||
+          'Lịch trình công khai',
+        authorName: cityCreatorNameMap.get(item.creator_id) ?? 'Traveler',
+        authorAvatar: `https://i.pravatar.cc/150?u=${item.creator_id}`,
+        imageUrl: imageGallery[0],
+        duration: `${this.getDays(item.start_date, item.end_date)} NGÀY`,
+        views: String(this.toParticipantCount(item)),
+        likes: String(this.toParticipantCount(item)),
+      };
+    });
+
+    const activities: Array<Record<string, unknown>> = [];
+    const restaurants: Array<Record<string, unknown>> = [];
+    const hotels: Array<Record<string, unknown>> = [];
+
+    for (const item of places ?? []) {
+      const categories = placeCategoriesByPlace.get(item.id) ?? [];
+      const isRestaurant = categories.some((name) =>
+        this.isRestaurantCategory(name),
+      );
+      const isHotel = categories.some((name) => this.isHotelCategory(name));
+
+      if (isHotel) {
+        hotels.push({
+          id: item.id,
+          name: item.name,
+          imageUrl: this.resolveImage(item.image_url),
+          rating: Number(item.average_rating) || 0,
+          reviewCount: item.review_count || 0,
+          price: 'Liên hệ',
+          starRating: 4,
+          priceValue: 0,
+          accommodationType: 'hotel',
+          amenities: [] as string[],
+        });
+        continue;
+      }
+
+      if (isRestaurant) {
+        restaurants.push({
+          id: item.id,
+          name: item.name,
+          imageUrl: this.resolveImage(item.image_url),
+          rating: Number(item.average_rating) || 0,
+          reviewCount: item.review_count || 0,
+          address: item.address ?? city.name,
+          status: 'Đang mở cửa',
+          cuisine: 'vietnamese',
+          priceLevel: 'mid_range',
+          amenities: [] as string[],
+        });
+        continue;
+      }
+
+      activities.push({
+        id: item.id,
+        title: item.name,
+        imageUrl: this.resolveImage(item.image_url),
+        rating: Number(item.average_rating) || 0,
+        reviewCount: item.review_count || 0,
+        address: item.address ?? city.name,
+        status: 'Đang mở cửa',
+        category: 'cultural_history',
+        priceType: 'free',
+        district: this.extractCityName(item.cities) ?? city.name,
+      });
+    }
+
+    return {
+      city: {
+        id: city.id,
+        name: city.name,
+      },
+      itineraries,
+      activities,
+      restaurants,
+      hotels,
     };
   }
 
@@ -319,18 +885,8 @@ export class ExploreService {
     if (category && category.trim().length > 0) {
       categoryName = category.trim().toLowerCase();
 
-      const { data: categories, error: categoryError } = await supabase
-        .schema('travel')
-        .from('categories')
-        .select('id, name')
-        .ilike('name', `%${categoryName}%`)
-        .returns<CategoryRow[]>();
-
-      if (categoryError) {
-        throw new InternalServerErrorException(categoryError.message);
-      }
-
-      const categoryIds = (categories ?? []).map((item) => item.id);
+      const keywords = this.buildCategoryKeywords(categoryName);
+      const categoryIds = await this.getCategoryIdsByKeywords(keywords);
       if (categoryIds.length === 0) {
         return {
           category: categoryName,
@@ -441,6 +997,45 @@ export class ExploreService {
     const last = data[data.length - 1];
 
     return `${first.arrival_time ?? '??'} - ${last.departure_time ?? '??'}`;
+  }
+
+  private async getItineraryImageMap(
+    itineraryIds: string[],
+  ): Promise<Map<string, string[]>> {
+    const imageMap = new Map<string, string[]>();
+    if (itineraryIds.length === 0) {
+      return imageMap;
+    }
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select('itinerary_id, places:place_id(image_url)')
+      .in('itinerary_id', itineraryIds)
+      .returns<ItineraryDetailPlaceRow[]>();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    for (const row of data ?? []) {
+      const place = Array.isArray(row.places) ? row.places[0] : row.places;
+      const images = this.toImageList(place?.image_url);
+      if (images.length === 0) {
+        continue;
+      }
+
+      const existing = imageMap.get(row.itinerary_id) ?? [];
+      existing.push(...images);
+      imageMap.set(row.itinerary_id, existing);
+    }
+
+    for (const [itineraryId, images] of imageMap.entries()) {
+      const deduped = Array.from(new Set(images));
+      imageMap.set(itineraryId, deduped.slice(0, 3));
+    }
+
+    return imageMap;
   }
 
   getDays(start?: string | null, end?: string | null): number {

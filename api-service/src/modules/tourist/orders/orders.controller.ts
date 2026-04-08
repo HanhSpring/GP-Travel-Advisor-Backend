@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
 import {
   ApiOkResponse,
   ApiOperation,
@@ -7,6 +7,8 @@ import {
 } from '@nestjs/swagger';
 import { OrderFoodItemsResponseDto } from './dto/order-food-items-response.dto';
 import { OrderPopupResponseDto } from './dto/order-popup-response.dto';
+import { CreateOrderDto } from './dto/create-order.dto';
+import { CreateOrderResponseDto } from './dto/create-order-response.dto';
 import { OrdersService } from './orders.service';
 
 @ApiTags('Tourist Orders')
@@ -51,5 +53,12 @@ export class OrdersController {
       page ? parseInt(page, 10) : 1,
       limit ? parseInt(limit, 10) : 20,
     );
+  }
+
+  @Post()
+  @ApiOperation({ summary: 'Create preorder for selected food items' })
+  @ApiOkResponse({ type: CreateOrderResponseDto })
+  createOrder(@Param('placeId') placeId: string, @Body() body: CreateOrderDto) {
+    return this.service.createOrder(placeId, body);
   }
 }

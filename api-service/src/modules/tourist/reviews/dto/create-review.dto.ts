@@ -26,6 +26,16 @@ export class CreateReviewDto {
   place_id: string;
 
   @ApiProperty({
+    example: '0f3d38ec-ef35-4f83-9e3a-d0cf6b1f3d1d',
+    description: 'UUID of the itinerary being reviewed',
+    required: false,
+    nullable: true,
+  })
+  @IsOptional()
+  @IsUUID('4')
+  itinerary_id?: string | null;
+
+  @ApiProperty({
     example: 5,
     description: 'Rating between 1 and 5 stars',
   })

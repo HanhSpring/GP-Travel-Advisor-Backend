@@ -71,4 +71,24 @@ export class ExploreController {
       limit ? parseInt(limit, 10) : 5,
     );
   }
+
+  @Get('cities')
+  @ApiOperation({ summary: 'Get featured cities for explore section' })
+  @ApiQuery({ name: 'page', required: false, type: Number })
+  @ApiQuery({ name: 'limit', required: false, type: Number })
+  getFeaturedCities(
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.service.getFeaturedCities(
+      page ? parseInt(page, 10) : 1,
+      limit ? parseInt(limit, 10) : 5,
+    );
+  }
+
+  @Get('cities/:cityId/overview')
+  @ApiOperation({ summary: 'Get city overview data for city detail screen' })
+  getCityOverview(@Param('cityId') cityId: string) {
+    return this.service.getCityOverview(cityId);
+  }
 }

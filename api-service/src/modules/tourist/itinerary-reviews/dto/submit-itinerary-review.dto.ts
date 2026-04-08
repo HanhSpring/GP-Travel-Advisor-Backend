@@ -30,6 +30,16 @@ export class SubmitItineraryPlaceReviewDto {
   @IsOptional()
   @IsString()
   content?: string | null;
+
+  @ApiProperty({
+    type: [String],
+    required: false,
+    description: 'Quick tags selected by the user',
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[] | null;
 }
 
 export class SubmitItineraryReviewDto {

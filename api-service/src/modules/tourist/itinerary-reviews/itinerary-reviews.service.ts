@@ -36,11 +36,6 @@ interface ItineraryReviewRow {
   id: string;
   itinerary_id: string;
   tourist_id: string;
-  overall_rating: number | null;
-  overall_content: string | null;
-  apply_all_places: boolean;
-  status: 'draft' | 'submitted';
-  popup_dismissed_at: string | null;
 }
 
 @Injectable()
@@ -128,9 +123,7 @@ export class ItineraryReviewsService {
     const { data, error } = await supabase
       .schema('review_ai')
       .from('itinerary_reviews')
-      .select(
-        'id, itinerary_id, tourist_id, overall_rating, overall_content, apply_all_places, status, popup_dismissed_at',
-      )
+      .select('id, itinerary_id, tourist_id')
       .eq('tourist_id', touristId)
       .eq('itinerary_id', itineraryId)
       .maybeSingle<ItineraryReviewRow>();
@@ -157,12 +150,9 @@ export class ItineraryReviewsService {
         {
           tourist_id: touristId,
           itinerary_id: itineraryId,
-          status: 'draft',
         },
       ])
-      .select(
-        'id, itinerary_id, tourist_id, overall_rating, overall_content, apply_all_places, status, popup_dismissed_at',
-      )
+      .select('id, itinerary_id, tourist_id')
       .single<ItineraryReviewRow>();
 
     this.handleTableError(error as { code?: string; message?: string } | null);
@@ -174,6 +164,239 @@ export class ItineraryReviewsService {
     }
 
     return data;
+  }
+
+  private async saveItinerarySummaryReview(
+    touristId: string,
+    itineraryId: string,
+    overallRating: number | null,
+    overallContent: string | null,
+    applyAllPlaces: boolean,
+  ): Promise<string | null> {
+    const isUnknownColumnError = (error: { code?: string; message?: string }) =>
+      error.code === '42703' ||
+      error.code === 'PGRST204' ||
+      error.code === 'PGRST205' ||
+      (error.message || '').includes('Could not find the') ||
+      ((error.message || '').includes('column') &&
+        (error.message || '').includes('does not exist'));
+
+    const hasSummary = overallRating !== null || Boolean(overallContent);
+    if (!hasSummary) {
+      return null;
+    }
+
+    const existing = await this.getReviewDraft(touristId, itineraryId);
+    let fallbackExistingId: string | null = null;
+
+    if (!existing) {
+      const { data: latestByItinerary } = await supabase
+        .schema('review_ai')
+        .from('itinerary_reviews')
+        .select('id')
+        .eq('itinerary_id', itineraryId)
+        .order('created_at', { ascending: false })
+        .limit(1)
+        .maybeSingle<{ id: string }>();
+
+      fallbackExistingId = latestByItinerary?.id ?? null;
+    }
+
+    const updateCandidates: Array<Record<string, unknown>> = [
+      {
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        overall_rating: overallRating,
+        overall_content: overallContent,
+        apply_all_places: applyAllPlaces,
+        is_approved: null,
+      },
+      {
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        rating: overallRating,
+        content: overallContent,
+        apply_all_places: applyAllPlaces,
+        is_approved: null,
+      },
+      {
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        rating: overallRating,
+        content: overallContent,
+        is_approved: null,
+      },
+      {
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        score: overallRating,
+        comment: overallContent,
+        is_approved: null,
+      },
+    ];
+
+    if (existing || fallbackExistingId != null) {
+      const targetId = existing?.id ?? (fallbackExistingId as string);
+      for (const candidate of updateCandidates) {
+        const { error } = await supabase
+          .schema('review_ai')
+          .from('itinerary_reviews')
+          .update(candidate)
+          .eq('id', targetId);
+
+        if (!error) {
+          return targetId;
+        }
+
+        const isUnknownColumn = isUnknownColumnError(error);
+        if (!isUnknownColumn) {
+          throw new InternalServerErrorException(error.message);
+        }
+      }
+
+      return targetId;
+    }
+
+    const baseCandidates: Array<Record<string, unknown>> = [
+      {
+        id: randomUUID(),
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        is_approved: null,
+      },
+      {
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        is_approved: null,
+      },
+      {
+        id: randomUUID(),
+        itinerary_id: itineraryId,
+        is_approved: null,
+      },
+      {
+        itinerary_id: itineraryId,
+        is_approved: null,
+      },
+    ];
+
+    for (const base of baseCandidates) {
+      for (const update of updateCandidates) {
+        const candidate = {
+          ...base,
+          ...update,
+        };
+
+        const { data, error } = await supabase
+          .schema('review_ai')
+          .from('itinerary_reviews')
+          .insert([candidate])
+          .select('id')
+          .maybeSingle<{ id: string }>();
+
+        if (!error) {
+          return data?.id ?? null;
+        }
+
+        const isUnknownColumn = isUnknownColumnError(error);
+        const isFkTouristError = (error.message || '').includes(
+          'itinerary_reviews_tourist_id_fkey',
+        );
+
+        if (!isUnknownColumn && !isFkTouristError) {
+          throw new InternalServerErrorException(error.message);
+        }
+      }
+    }
+
+    return null;
+  }
+
+  private async getItinerarySummaryReview(
+    touristId: string,
+    itineraryId: string,
+  ): Promise<{
+    overall_rating: number | null;
+    overall_content: string | null;
+    apply_all_places: boolean;
+  }> {
+    const selectVariants = [
+      'id, itinerary_id, tourist_id, overall_rating, overall_content, apply_all_places',
+      'id, itinerary_id, tourist_id, rating, content, apply_all_places',
+      'id, itinerary_id, tourist_id, rating, content',
+      'id, itinerary_id, tourist_id, score, comment',
+    ];
+
+    for (const fields of selectVariants) {
+      for (const byTourist of [true, false]) {
+        let query = supabase
+          .schema('review_ai')
+          .from('itinerary_reviews')
+          .select(fields)
+          .eq('itinerary_id', itineraryId)
+          .order('created_at', { ascending: false })
+          .limit(1);
+
+        if (byTourist) {
+          query = query.eq('tourist_id', touristId);
+        }
+
+        const { data: rows, error } =
+          await query.returns<Record<string, unknown>[]>();
+
+        if (error) {
+          const isUnknownColumn =
+            error.code === '42703' ||
+            error.code === 'PGRST204' ||
+            error.code === 'PGRST205' ||
+            (error.message || '').includes('Could not find the') ||
+            ((error.message || '').includes('column') &&
+              (error.message || '').includes('does not exist'));
+
+          if (isUnknownColumn) {
+            break;
+          }
+
+          throw new InternalServerErrorException(error.message);
+        }
+
+        const data = rows != null && rows.length > 0 ? rows[0] : null;
+
+        if (!data) {
+          continue;
+        }
+
+        const overallRatingRaw =
+          (data['overall_rating'] as number | null | undefined) ??
+          (data['rating'] as number | null | undefined) ??
+          (data['score'] as number | null | undefined) ??
+          null;
+
+        const overallContentRaw =
+          (data['overall_content'] as string | null | undefined) ??
+          (data['content'] as string | null | undefined) ??
+          (data['comment'] as string | null | undefined) ??
+          null;
+
+        const applyAllRaw =
+          (data['apply_all_places'] as boolean | null | undefined) ?? false;
+
+        return {
+          overall_rating:
+            overallRatingRaw !== null && overallRatingRaw !== undefined
+              ? Number(overallRatingRaw)
+              : null,
+          overall_content: overallContentRaw,
+          apply_all_places: Boolean(applyAllRaw),
+        };
+      }
+    }
+
+    return {
+      overall_rating: null,
+      overall_content: null,
+      apply_all_places: false,
+    };
   }
 
   private buildDayInfo(details: ItineraryDetailRow[]) {
@@ -211,6 +434,10 @@ export class ItineraryReviewsService {
 
     const itinerary = await this.getItineraryOrThrow(touristId, itineraryId);
     const details = await this.getItineraryDetails(itineraryId);
+    const summaryReview = await this.getItinerarySummaryReview(
+      touristId,
+      itineraryId,
+    );
     const placeIds = Array.from(new Set(details.map((item) => item.place_id)));
     const places = await this.getPlaces(placeIds);
     const coverImage = places[0]?.image_url ?? null;
@@ -230,9 +457,9 @@ export class ItineraryReviewsService {
         cover_image: coverImage,
       },
       draft: {
-        overall_rating: null,
-        overall_content: null,
-        apply_all_places: false,
+        overall_rating: summaryReview.overall_rating,
+        overall_content: summaryReview.overall_content,
+        apply_all_places: summaryReview.apply_all_places,
         status: 'draft' as const,
       },
       actions: {
@@ -243,19 +470,6 @@ export class ItineraryReviewsService {
     };
   }
 
-  async dismissPopup(touristId: string, itineraryId: string) {
-    if (!touristId || !itineraryId) {
-      throw new BadRequestException('tourist_id and itinerary_id are required');
-    }
-
-    await this.getItineraryOrThrow(touristId, itineraryId);
-
-    return {
-      success: true,
-      message: 'Popup dismissed successfully (not persisted)',
-    };
-  }
-
   async getDetail(touristId: string, itineraryId: string) {
     if (!touristId || !itineraryId) {
       throw new BadRequestException('tourist_id and itinerary_id are required');
@@ -263,6 +477,10 @@ export class ItineraryReviewsService {
 
     const itinerary = await this.getItineraryOrThrow(touristId, itineraryId);
     const details = await this.getItineraryDetails(itineraryId);
+    const summaryReview = await this.getItinerarySummaryReview(
+      touristId,
+      itineraryId,
+    );
     const placeIds = Array.from(new Set(details.map((item) => item.place_id)));
     const places = await this.getPlaces(placeIds);
     const placeMap = new Map(places.map((item) => [item.id, item]));
@@ -280,9 +498,9 @@ export class ItineraryReviewsService {
         total_places: details.length,
       },
       general_review: {
-        overall_rating: null,
-        overall_content: null,
-        apply_all_places: false,
+        overall_rating: summaryReview.overall_rating,
+        overall_content: summaryReview.overall_content,
+        apply_all_places: summaryReview.apply_all_places,
       },
       day_filters: dayFilters,
       places: details.map((item) => {
@@ -339,9 +557,12 @@ export class ItineraryReviewsService {
       throw new BadRequestException('Itinerary has no place details to review');
     }
 
-    const reviewDraft = await this.getOrCreateReviewDraft(
+    const itineraryReviewId = await this.saveItinerarySummaryReview(
       touristId,
       itineraryId,
+      hasOverallRating ? (payload.overall_rating as number) : null,
+      normalizedOverallContent,
+      payload.apply_all_places ?? false,
     );
 
     const detailById = new Map(details.map((item) => [item.id, item]));
@@ -385,43 +606,38 @@ export class ItineraryReviewsService {
 
     const finalPlaceRatings = Array.from(ratingByDetailId.values());
 
-    const { error: updateReviewError } = await supabase
-      .schema('review_ai')
-      .from('itinerary_reviews')
-      .update({
-        overall_rating: payload.overall_rating ?? null,
-        overall_content: normalizedOverallContent,
-        apply_all_places: payload.apply_all_places ?? false,
-        status: 'submitted',
-        submitted_at: new Date().toISOString(),
-        popup_dismissed_at: new Date().toISOString(),
-        updated_at: new Date().toISOString(),
-      })
-      .eq('id', reviewDraft.id);
-
-    this.handleTableError(
-      updateReviewError as { code?: string; message?: string } | null,
-    );
-
     if (finalPlaceRatings.length > 0) {
-      const newReviews = finalPlaceRatings.map((item) => ({
-        id: randomUUID(),
-        tourist_id: touristId,
-        place_id: item.place_id,
-        rating: item.rating,
-        review_type: item.content ? 'with_content' : 'without_content',
-      }));
+      const reviewsWithTags = finalPlaceRatings.map((item) => {
+        const matchingPlaceReview = payload.place_reviews?.find(
+          (placeReview) =>
+            placeReview.itinerary_detail_id === item.itinerary_detail_id,
+        ) as { tags?: string[] | null } | undefined;
+
+        const tags: string[] | null = Array.isArray(matchingPlaceReview?.tags)
+          ? [...matchingPlaceReview.tags]
+          : null;
+
+        return {
+          id: randomUUID(),
+          tourist_id: touristId,
+          itinerary_id: itineraryId,
+          place_id: item.place_id,
+          rating: item.rating,
+          review_type: item.content ? 'with_content' : 'without_content',
+          tags,
+        };
+      });
 
       const { error: insertReviewsError } = await supabase
         .schema('review_ai')
         .from('reviews')
-        .insert(newReviews);
+        .insert(reviewsWithTags);
 
       if (insertReviewsError) {
         throw new InternalServerErrorException(insertReviewsError.message);
       }
 
-      const reviewContents = newReviews
+      const reviewContents = reviewsWithTags
         .map((review, index) => ({
           id: randomUUID(),
           review_id: review.id,
@@ -446,7 +662,7 @@ export class ItineraryReviewsService {
 
     return {
       success: true,
-      itinerary_review_id: reviewDraft.id,
+      itinerary_review_id: itineraryReviewId ?? randomUUID(),
       saved_place_reviews: finalPlaceRatings.length,
       saved_media_count: 0,
       message: 'Itinerary review submitted successfully',

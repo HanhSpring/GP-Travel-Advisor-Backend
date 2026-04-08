@@ -10,6 +10,9 @@ export class ReviewResponseDto {
   @ApiProperty()
   place_id: string;
 
+  @ApiProperty({ required: false, nullable: true })
+  itinerary_id?: string | null;
+
   @ApiProperty()
   rating: number;
 
