@@ -9,8 +9,8 @@ import {
 
 // Định nghĩa các lựa chọn cố định bằng Enum để tránh lưu sai chính tả vào DB
 export enum Gender {
-  MALE = 'NAM',
-  FEMALE = 'NỮ',
+  MALE = 'MALE',
+  FEMALE = 'FEMALE',
 }
 
 export enum TravelPreference {

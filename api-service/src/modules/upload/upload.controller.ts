@@ -4,13 +4,22 @@ import {
   UseInterceptors,
   UploadedFile,
   Body,
+  Req,
+  UseGuards,
   ParseFilePipe,
   MaxFileSizeValidator,
   FileTypeValidator,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { UploadService } from './upload.service';
-import { ApiConsumes, ApiBody, ApiOperation, ApiTags } from '@nestjs/swagger';
+import {
+  ApiBearerAuth,
+  ApiConsumes,
+  ApiBody,
+  ApiOperation,
+  ApiTags,
+} from '@nestjs/swagger';
+import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 
 @ApiTags('Upload Resources')
 @Controller('upload')
@@ -20,6 +29,7 @@ export class UploadController {
   // 1. LUỒNG UPLOAD AVATAR
   @Post('avatar')
   @ApiOperation({ summary: 'Upload user avatar' })
+  @ApiBearerAuth('access-token')
   @ApiConsumes('multipart/form-data')
   @ApiBody({
     schema: {
@@ -29,12 +39,10 @@ export class UploadController {
           type: 'string',
           format: 'binary',
         },
-        userId: {
-          type: 'string',
-        },
       },
     },
   })
+  @UseGuards(JwtAuthGuard)
   @UseInterceptors(FileInterceptor('file'))
   async uploadAvatar(
     @UploadedFile(
@@ -46,8 +54,9 @@ export class UploadController {
       }),
     )
     file: Express.Multer.File,
-    @Body('userId') userId: string,
+    @Req() req: any,
   ) {
+    const userId = req.user.userId;
     return this.uploadService.uploadAvatar(file, userId);
   }
 
