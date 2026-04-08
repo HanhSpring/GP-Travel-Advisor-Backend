@@ -8,8 +8,16 @@ import {
   BadRequestException,
   Request,
   UseGuards,
+  Headers,
+  Put,
+  UnauthorizedException,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiBearerAuth,
+} from '@nestjs/swagger';
 import { AuthService } from './auth.service';
 import { LoginDto } from './dto/login.dto';
 import { UpdatePasswordDto } from './dto/reset-password.dto';
@@ -17,6 +25,7 @@ import { RegisterBusinessDto } from './dto/register-business.dto';
 import { RegisterTouristDto } from './dto/register-tourist.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from 'src/common/guards/roles.guard';
+import { ChangePasswordDto } from './dto/changePassword.dto';
 // @ApiTags giúp gom tất cả API trong file này vào một thẻ tên là "Auth" trên Swagger
 @ApiTags('Auth')
 @Controller('auth')
@@ -83,11 +92,14 @@ export class AuthController {
   @Post('forgot-password')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Yêu cầu khôi phục mật khẩu (Gửi link về email)' })
-  async forgotPassword(@Body('email') email: string) {
+  async forgotPassword(
+    @Body('email') email: string,
+    @Body('returnUrl') returnUrl?: string,
+  ) {
     if (!email) {
       throw new BadRequestException('Vui lòng cung cấp địa chỉ email');
     }
-    return this.authService.forgotPassword(email);
+    return this.authService.forgotPassword(email, returnUrl);
   }
 
   @Post('update-password')
@@ -130,5 +142,22 @@ export class AuthController {
   })
   async registerBusiness(@Body() registerDto: RegisterBusinessDto) {
     return await this.authService.registerBusiness(registerDto);
+  }
+
+  @Put('change-password') // Hoặc PATCH tùy chuẩn REST của bạn
+  @ApiOperation({ summary: 'Đổi mật khẩu trong App (Cần mật khẩu hiện tại)' })
+  @ApiBearerAuth() // Bắt buộc Mobile phải gửi token lên Header
+  async changePassword(
+    @Headers('Authorization') authHeader: string,
+    @Body() changePasswordDto: ChangePasswordDto,
+  ) {
+    if (!authHeader || !authHeader.startsWith('Bearer ')) {
+      throw new UnauthorizedException('Thiếu hoặc sai định dạng Access Token');
+    }
+
+    // Cắt bỏ chữ "Bearer " để lấy token thuần
+    const accessToken = authHeader.split(' ')[1];
+
+    return this.authService.changePassword(accessToken, changePasswordDto);
   }
 }

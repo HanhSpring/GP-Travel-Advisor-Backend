@@ -11,6 +11,7 @@ import { LoginDto } from './dto/login.dto';
 import { RegisterBusinessDto } from './dto/register-business.dto';
 import { supabase } from 'src/config/supabase';
 import { UpdatePasswordDto } from './dto/reset-password.dto';
+import { ChangePasswordDto } from './dto/changePassword.dto';
 import axios from 'axios';
 
 @Injectable()
@@ -216,10 +217,11 @@ export class AuthService {
     };
   }
 
-  async forgotPassword(email: string) {
+  async forgotPassword(email: string, returnUrl?: string) {
     // Gọi hàm reset mật khẩu có sẵn của Supabase
+    const redirectTo = returnUrl || 'http://localhost:5173/reset-password';
     const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
-      redirectTo: 'http://localhost:5173/reset-password',
+      redirectTo: redirectTo,
     });
 
     if (error) {
@@ -305,5 +307,55 @@ export class AuthService {
         .from('tourists')
         .upsert({ id: userId }, { onConflict: 'id' });
     }
+  }
+
+  async changePassword(
+    accessToken: string,
+    changePasswordDto: ChangePasswordDto,
+  ) {
+    const { currentPassword, newPassword } = changePasswordDto;
+
+    // 1. Xác thực Access Token và lấy thông tin User hiện tại
+    const {
+      data: { user },
+      error: userError,
+    } = await this.supabase.auth.getUser(accessToken);
+
+    if (userError || !user) {
+      throw new UnauthorizedException(
+        'Mã xác thực không hợp lệ hoặc đã hết hạn.',
+      );
+    }
+
+    if (!user.email) {
+      throw new BadRequestException('Tài khoản không có email để xác thực.');
+    }
+
+    // 2. Kiểm tra "Mật khẩu hiện tại" bằng cách thử đăng nhập ngầm
+    const { error: signInError } = await this.supabase.auth.signInWithPassword({
+      email: user.email,
+      password: currentPassword,
+    });
+
+    if (signInError) {
+      throw new BadRequestException('Mật khẩu hiện tại không chính xác.');
+    }
+
+    // 3. Nếu mật khẩu cũ đúng, tiến hành cập nhật mật khẩu mới bằng Admin API
+    const { error: updateError } =
+      await this.supabaseAdmin.auth.admin.updateUserById(user.id, {
+        password: newPassword,
+      });
+
+    if (updateError) {
+      throw new InternalServerErrorException(
+        `Lỗi hệ thống khi cập nhật mật khẩu: ${updateError.message}`,
+      );
+    }
+
+    return {
+      success: true,
+      message: 'Cập nhật mật khẩu thành công.',
+    };
   }
 }
