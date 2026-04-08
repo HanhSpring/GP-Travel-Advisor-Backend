@@ -12,8 +12,38 @@ async function bootstrap() {
   });
 
   const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:5173';
+  const allowedOrigins = corsOrigin
+    .split(',')
+    .map((origin) => origin.trim())
+    .filter((origin) => origin.length > 0);
+  const allowAnyOrigin = allowedOrigins.includes('*');
+
   app.enableCors({
-    origin: corsOrigin.split(',').map((origin) => origin.trim()),
+    origin: (origin, callback) => {
+      // Non-browser and same-origin requests may not send Origin header.
+      if (!origin) {
+        callback(null, true);
+        return;
+      }
+
+      // Explicit wildcard in env means allow all origins.
+      if (allowAnyOrigin) {
+        callback(null, true);
+        return;
+      }
+
+      // Always allow localhost/127.0.0.1 with any port for dev web builds.
+      const isLocalDevOrigin =
+        /^https?:\/\/localhost:\d+$/i.test(origin) ||
+        /^https?:\/\/127\.0\.0\.1:\d+$/i.test(origin);
+
+      if (isLocalDevOrigin || allowedOrigins.includes(origin)) {
+        callback(null, true);
+        return;
+      }
+
+      callback(new Error(`CORS blocked for origin: ${origin}`), false);
+    },
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
     credentials: true,
   });

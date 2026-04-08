@@ -9,6 +9,7 @@ import { supabase } from '../../../config/supabase';
 interface CreateReviewPayload {
   tourist_id: string;
   place_id: string;
+  itinerary_id?: string | null;
   rating: number;
   content?: string | null;
   tags?: string[] | null;
@@ -19,6 +20,7 @@ export interface ReviewResponse {
   id: string;
   tourist_id: string;
   place_id: string;
+  itinerary_id?: string | null;
   rating: number;
   created_at: string;
   content?: string | null;
@@ -53,8 +55,10 @@ export class ReviewsService {
           id: reviewId,
           tourist_id: payload.tourist_id,
           place_id: payload.place_id,
+          itinerary_id: payload.itinerary_id ?? null,
           rating: payload.rating,
           review_type: reviewType,
+          tags: payload.tags ?? null,
         },
       ]);
 
@@ -88,6 +92,7 @@ export class ReviewsService {
       id: reviewId,
       tourist_id: payload.tourist_id,
       place_id: payload.place_id,
+      itinerary_id: payload.itinerary_id ?? null,
       rating: payload.rating,
       created_at: createdAt,
       content: payload.content || null,

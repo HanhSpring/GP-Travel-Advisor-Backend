@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Post, Query } from '@nestjs/common';
+import { Controller, Get, Param, Post, Query, Body } from '@nestjs/common';
 import {
   ApiCreatedResponse,
   ApiOkResponse,
@@ -6,18 +6,12 @@ import {
   ApiQuery,
   ApiTags,
 } from '@nestjs/swagger';
-import { DismissItineraryReviewPopupDto } from './dto/dismiss-popup.dto';
 import {
   ItineraryReviewDetailResponseDto,
   ItineraryReviewPopupResponseDto,
 } from './dto/itinerary-review-response.dto';
 import { SubmitItineraryReviewDto } from './dto/submit-itinerary-review.dto';
 import { ItineraryReviewsService } from './itinerary-reviews.service';
-
-type DismissPopupResponse = {
-  success: boolean;
-  message: string;
-};
 
 type SubmitReviewResponse = {
   success: boolean;
@@ -44,22 +38,6 @@ export class ItineraryReviewsController {
     @Query('itinerary_id') itineraryId: string,
   ): Promise<ItineraryReviewPopupResponseDto> {
     return this.service.getPopup(touristId, itineraryId);
-  }
-
-  @Post('popup/dismiss')
-  @ApiOperation({ summary: 'Dismiss itinerary review popup (choose later)' })
-  @ApiCreatedResponse({
-    schema: {
-      example: {
-        success: true,
-        message: 'Popup dismissed successfully',
-      },
-    },
-  })
-  dismissPopup(
-    @Body() body: DismissItineraryReviewPopupDto,
-  ): Promise<DismissPopupResponse> {
-    return this.service.dismissPopup(body.tourist_id, body.itinerary_id);
   }
 
   @Get(':itineraryId/detail')

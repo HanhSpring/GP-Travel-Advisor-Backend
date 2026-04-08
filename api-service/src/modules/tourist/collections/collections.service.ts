@@ -30,7 +30,7 @@ interface PlaceRow {
     | null;
   average_rating: number;
   review_count: number;
-  image_url: string | null;
+  image_url: unknown;
 }
 
 interface FavoriteItineraryItem {
@@ -39,6 +39,18 @@ interface FavoriteItineraryItem {
 
 interface FavoritePlaceItem {
   places: PlaceRow;
+}
+
+interface ItineraryDetailPlaceRow {
+  itinerary_id: string;
+  places:
+    | {
+        image_url?: unknown;
+      }
+    | {
+        image_url?: unknown;
+      }[]
+    | null;
 }
 
 @Injectable()
@@ -119,25 +131,37 @@ export class CollectionsService {
       throw new InternalServerErrorException(placesError.message);
     }
 
-    const itinerariesData = (
+    const itineraryRows = (
       favoriteItineraries as unknown as FavoriteItineraryItem[]
     )
       .filter((item) => item.itineraries)
+      .map((item) => item.itineraries);
+
+    const itineraryImages = await this.getItineraryImageMap(
+      itineraryRows.map((item) => item.id),
+    );
+
+    const itinerariesData = itineraryRows
       .map((item) => {
-        const it = item.itineraries;
+        const it = item;
         const startDate = new Date(it.start_date);
         const endDate = new Date(it.end_date);
         const days = Math.ceil(
           (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24),
         );
+        const imageGallery = itineraryImages.get(it.id) ?? [
+          this.defaultImageUrl,
+        ];
 
         return {
           id: it.id,
-          title: it.destination ?? 'Lịch trình',
+          title: it.description ?? 'Lịch trình',
           location: it.destination ?? '',
           days: days || 1,
           participant_count: this.toParticipantCount(it),
           status: it.status,
+          image: imageGallery[0],
+          image_gallery: imageGallery,
         };
       })
       .slice(0, 5);
@@ -213,27 +237,36 @@ export class CollectionsService {
       throw new InternalServerErrorException(countError.message);
     }
 
-    const itinerariesData = (
+    const itineraryRows = (
       favoriteItineraries as unknown as FavoriteItineraryItem[]
     )
       .filter((item) => item.itineraries)
-      .map((item) => {
-        const it = item.itineraries;
-        const startDate = new Date(it.start_date);
-        const endDate = new Date(it.end_date);
-        const days = Math.ceil(
-          (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24),
-        );
+      .map((item) => item.itineraries);
 
-        return {
-          id: it.id,
-          title: it.destination ?? 'Lịch trình',
-          location: it.destination ?? '',
-          days: days || 1,
-          participant_count: this.toParticipantCount(it),
-          status: it.status,
-        };
-      });
+    const itineraryImages = await this.getItineraryImageMap(
+      itineraryRows.map((item) => item.id),
+    );
+
+    const itinerariesData = itineraryRows.map((item) => {
+      const it = item;
+      const startDate = new Date(it.start_date);
+      const endDate = new Date(it.end_date);
+      const days = Math.ceil(
+        (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24),
+      );
+      const imageGallery = itineraryImages.get(it.id) ?? [this.defaultImageUrl];
+
+      return {
+        id: it.id,
+        title: it.description ?? 'Lịch trình',
+        location: it.destination ?? '',
+        days: days || 1,
+        participant_count: this.toParticipantCount(it),
+        status: it.status,
+        image: imageGallery[0],
+        image_gallery: imageGallery,
+      };
+    });
 
     const totalPages = Math.ceil((count || 0) / limit);
 
@@ -320,10 +353,79 @@ export class CollectionsService {
     };
   }
 
-  private resolveImage(imageUrl: string | null): string {
-    if (imageUrl && imageUrl.trim()) {
-      return imageUrl;
+  private resolveImage(imageUrl: unknown): string {
+    if (Array.isArray(imageUrl)) {
+      const first = imageUrl.find(
+        (item): item is string =>
+          typeof item === 'string' && item.trim().length > 0,
+      );
+      if (first) {
+        return first.trim();
+      }
+      return this.defaultImageUrl;
+    }
+
+    if (typeof imageUrl === 'string' && imageUrl.trim().length > 0) {
+      return imageUrl.trim();
     }
     return this.defaultImageUrl;
+  }
+
+  private toImageList(imageUrl?: unknown): string[] {
+    if (Array.isArray(imageUrl)) {
+      return imageUrl
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0);
+    }
+
+    if (typeof imageUrl === 'string') {
+      const value = imageUrl.trim();
+      if (!value) {
+        return [];
+      }
+      return [value];
+    }
+
+    return [];
+  }
+
+  private async getItineraryImageMap(
+    itineraryIds: string[],
+  ): Promise<Map<string, string[]>> {
+    const imageMap = new Map<string, string[]>();
+    if (itineraryIds.length === 0) {
+      return imageMap;
+    }
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select('itinerary_id, places:place_id(image_url)')
+      .in('itinerary_id', itineraryIds)
+      .returns<ItineraryDetailPlaceRow[]>();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    for (const row of data ?? []) {
+      const place = Array.isArray(row.places) ? row.places[0] : row.places;
+      const images = this.toImageList(place?.image_url);
+      if (images.length === 0) {
+        continue;
+      }
+
+      const existing = imageMap.get(row.itinerary_id) ?? [];
+      existing.push(...images);
+      imageMap.set(row.itinerary_id, existing);
+    }
+
+    for (const [itineraryId, images] of imageMap.entries()) {
+      const deduped = Array.from(new Set(images));
+      imageMap.set(itineraryId, deduped.slice(0, 3));
+    }
+
+    return imageMap;
   }
 }

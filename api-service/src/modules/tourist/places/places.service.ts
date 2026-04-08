@@ -19,7 +19,7 @@ interface PlaceRow {
   vendor_id: string | null;
   is_approved: boolean;
   is_active: boolean;
-  image_url: string | null;
+  image_url: unknown;
   place_tags: Array<{
     tag_id: string;
     tags: { name: string | null } | { name: string | null }[] | null;
@@ -364,16 +364,41 @@ export class PlacesService {
     return null;
   }
 
-  private resolvePlaceImage(imageUrl?: string | null): string {
-    if (imageUrl && imageUrl.trim().length > 0) {
-      return imageUrl;
+  private toImageList(imageUrl?: unknown): string[] {
+    if (Array.isArray(imageUrl)) {
+      return imageUrl
+        .filter((item): item is string => typeof item === 'string')
+        .map((item) => item.trim())
+        .filter((item) => item.length > 0);
+    }
+
+    if (typeof imageUrl === 'string') {
+      const value = imageUrl.trim();
+      if (!value) {
+        return [];
+      }
+      return [value];
+    }
+
+    return [];
+  }
+
+  private resolvePlaceImage(imageUrl?: unknown): string {
+    const images = this.toImageList(imageUrl);
+    if (images.length > 0) {
+      return images[0];
     }
 
     return this.defaultPlaceImageUrl;
   }
 
-  private buildGallery(imageUrl?: string | null): string[] {
-    return [this.resolvePlaceImage(imageUrl)];
+  private buildGallery(imageUrl?: unknown): string[] {
+    const images = this.toImageList(imageUrl);
+    if (images.length > 0) {
+      return images;
+    }
+
+    return [this.defaultPlaceImageUrl];
   }
 
   private isOpenNow(
