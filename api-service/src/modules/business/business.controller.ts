@@ -2,6 +2,7 @@ import {
   Controller,
   Get,
   Post,
+  Put,
   Patch,
   Body,
   HttpCode,
@@ -29,6 +30,7 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { Role } from '../../common/enum/role.enum';
 import { GetToken } from 'src/common/decorators/get-token.decorator';
 import { VendorDto, PlaceDto, OrderDto } from './dto/business-query.dto';
+import { UpdateOrderStatusDto } from './dto/update-order-status.dto';
 import {
   DashboardDto,
   PlaceItemDto,
@@ -111,6 +113,7 @@ export class BusinessController {
       city,
       latitude: Number(latitude),
       longitude: Number(longitude),
+      vendorId: body.p_vendor_id || body.vendorId || '',
       categories: this.parseFlexible(body.p_categories || body.categories),
       services: this.parseFlexible(body.p_services || body.services),
       menu: this.parseFlexible(body.p_menu || body.menu),
@@ -155,6 +158,12 @@ export class BusinessController {
   ) {
     const userId = req.user.userId;
     return this.businessService.updateProfile(userId, token, updateDto);
+  }
+
+  @Put('update-order-status')
+  @ApiOperation({ summary: 'Cập nhật trạng thái đơn hàng' })
+  updateOrderStatus(@Body() dto: UpdateOrderStatusDto) {
+    return this.businessService.updateOrderStatus(dto.orderId, dto.status);
   }
 
   @Get('orders/filter')
