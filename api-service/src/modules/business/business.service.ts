@@ -385,6 +385,15 @@ export class BusinessService {
     return { success: true, message };
   }
 
+  async getFoodPerformance(vendorId: string) {
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .rpc('get_food_performance', { p_vendor_id: vendorId });
+
+    if (error) throw new InternalServerErrorException(error.message);
+    return data ?? [];
+  }
+
   async updateOrderStatus(orderId: string, status: string) {
     const { data, error } = await supabase
       .schema('order_sys')

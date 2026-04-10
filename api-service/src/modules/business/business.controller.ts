@@ -160,6 +160,12 @@ export class BusinessController {
     return this.businessService.updateProfile(userId, token, updateDto);
   }
 
+  @Get('food-performance')
+  @ApiOperation({ summary: 'Hiệu suất món ăn theo vendor' })
+  getFoodPerformance(@Query() query: VendorDto) {
+    return this.businessService.getFoodPerformance(query.vendorId);
+  }
+
   @Put('update-order-status')
   @ApiOperation({ summary: 'Cập nhật trạng thái đơn hàng' })
   updateOrderStatus(@Body() dto: UpdateOrderStatusDto) {
