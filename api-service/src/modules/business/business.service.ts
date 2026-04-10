@@ -37,7 +37,7 @@ export class BusinessService {
   async getOrdersByPlace(placeId: string) {
     const { data, error } = await supabase
       .schema('order_sys')
-      .rpc('get_orders_by_place', { p_place_id: placeId });
+      .rpc('get_orders_by_place', { p_vendor_id: placeId });
 
     if (error) throw new InternalServerErrorException(error.message);
     return data;
@@ -131,11 +131,12 @@ export class BusinessService {
         }
       }
 
-      // Process paid services from food_items
+      // Process food items separately (for restaurant menu section)
+      const menuItems: any[] = []
       if (foodItems && Array.isArray(foodItems)) {
-        console.log('🍽️  Processing', foodItems.length, 'food items as paid services')
+        console.log('🍽️  Processing', foodItems.length, 'food items as menu')
         foodItems.forEach((item: any) => {
-          paidServices.push({
+          menuItems.push({
             id: item.id,
             name: item.name,
             description: item.description,
@@ -147,7 +148,8 @@ export class BusinessService {
       const result = {
         freeServices,
         paidServices,
-        total: freeServices.length + paidServices.length
+        menuItems,
+        total: freeServices.length + paidServices.length + menuItems.length
       }
 
       console.log('✅ Services fetched successfully:', result)
@@ -206,6 +208,10 @@ export class BusinessService {
       throw new BadRequestException('Thiếu dữ liệu đầu vào: Danh mục');
     }
 
+    if (!dto.vendorId) {
+      throw new BadRequestException('Thiếu dữ liệu đầu vào: Vendor ID');
+    }
+
     let menu: any[] = [];
 
     // From request body (form items)
@@ -237,9 +243,8 @@ export class BusinessService {
         p_city: dto.city,
         p_lat: Number(dto.latitude),
         p_lng: Number(dto.longitude),
-        p_categories: Array.isArray(dto.categories)
-          ? dto.categories
-          : [],
+        p_vendor_id: dto.vendorId,
+        p_categories: Array.isArray(dto.categories) ? dto.categories : [],
         p_services: Array.isArray(dto.services) ? dto.services : [],
         p_menu: menu.length > 0 ? menu : [],
       });
@@ -378,6 +383,30 @@ export class BusinessService {
       : 'Cập nhật thông tin hồ sơ thành công.';
 
     return { success: true, message };
+  }
+
+  async getFoodPerformance(vendorId: string) {
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .rpc('get_food_performance', { p_vendor_id: vendorId });
+
+    if (error) throw new InternalServerErrorException(error.message);
+    return data ?? [];
+  }
+
+  async updateOrderStatus(orderId: string, status: string) {
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .from('orders')
+      .update({ status })
+      .eq('id', orderId)
+      .select('id, status')
+      .single();
+
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!data) throw new NotFoundException(`Không tìm thấy đơn hàng: ${orderId}`);
+
+    return { message: 'Cập nhật trạng thái thành công', order: data };
   }
 
   async getFilteredOrders(dto: GetOrdersDto) {
