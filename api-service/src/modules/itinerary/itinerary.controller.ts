@@ -10,7 +10,13 @@ import {
   Delete,
   Query,
 } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiParam } from '@nestjs/swagger';
+import {
+  ApiTags,
+  ApiOperation,
+  ApiResponse,
+  ApiParam,
+  ApiBody,
+} from '@nestjs/swagger';
 import { ItineraryService } from './itinerary.service';
 import { GetItinerariesDto } from './dto/get-itineraries.dto';
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
@@ -18,19 +24,27 @@ import { ItinerarySummaryResponseDto } from './dto/itinerary-summary-response.dt
 import { ItineraryDetailResponseDto } from './dto/itinerary-detail-response.dto';
 import { ItineraryResponseDto } from './dto/itinerary-response.dto';
 import { ToggleVisibilityDto } from './dto/toggle-visibility.dto';
-import { UpdateActivityNoteDto } from './dto/update-activity-note.dto';
+import { EditActivityDto } from './dto/edit-activity.dto';
+import { AddActivityDto } from './dto/add-activity.dto';
+import {
+  CustomizeActivityResponseDto,
+  SuggestionsResponseDto,
+} from './dto/customize-response.dto';
 
 @ApiTags('Itinerary')
 @Controller('itinerary')
 export class ItineraryController {
-
   constructor(private readonly service: ItineraryService) {}
 
+  // ════════════════════════════════════════════════════════════════
+  // CÁC ENDPOINT CŨ (GIỮ NGUYÊN)
+  // ════════════════════════════════════════════════════════════════
+
   @Get('my-itineraries')
-  @ApiOperation({ summary: 'Get my itineraries' })
+  @ApiOperation({ summary: 'Lấy danh sách lịch trình của user' })
   @ApiResponse({ type: ItineraryResponseDto })
   getMyItineraries(@Query() query: GetItinerariesDto) {
-    return this.service.getMyItineraries(query.userId)
+    return this.service.getMyItineraries(query.userId);
   }
 
   @Post()
@@ -39,10 +53,10 @@ export class ItineraryController {
   @ApiResponse({
     status: 201,
     description: 'Lịch trình đã được khởi tạo thành công',
-    type: ItinerarySummaryResponseDto, // Khai báo type trả về tại đây
+    type: ItinerarySummaryResponseDto,
   })
   create(@Body() body: CreateItineraryDto): ItinerarySummaryResponseDto {
-    // Return mock data khớp chuẩn 100% với giao diện UI
+    // TODO: Thay thế mock data bằng logic AI thực tế
     return {
       id: 'uuid-123',
       destinationName: 'Hà Nội',
@@ -55,36 +69,11 @@ export class ItineraryController {
         totalTransfers: 5,
       },
       dailySummaries: [
-        {
-          dayNumber: 1,
-          dateLabel: '15 Th10',
-          title: 'Đến nơi & Nhận phòng',
-          iconType: 'FLIGHT',
-        },
-        {
-          dayNumber: 2,
-          dateLabel: '16 Th10',
-          title: 'Khám phá Hồ Gươm & Lăng Bác',
-          iconType: 'CAMERA',
-        },
-        {
-          dayNumber: 3,
-          dateLabel: '17 Th10',
-          title: 'Tham quan Đền chùa & Văn hóa',
-          iconType: 'TEMPLE',
-        },
-        {
-          dayNumber: 4,
-          dateLabel: '18 Th10',
-          title: 'Mua sắm tại Aeon Mall Long Biên',
-          iconType: 'SHOPPING',
-        },
-        {
-          dayNumber: 5,
-          dateLabel: '19 Th10',
-          title: 'Nhà tù Hoả Lò & Chợ Đồng Xuân',
-          iconType: 'STAR',
-        },
+        { dayNumber: 1, dateLabel: '15 Th10', title: 'Đến nơi & Nhận phòng', iconType: 'FLIGHT' },
+        { dayNumber: 2, dateLabel: '16 Th10', title: 'Khám phá Hồ Gươm & Lăng Bác', iconType: 'CAMERA' },
+        { dayNumber: 3, dateLabel: '17 Th10', title: 'Tham quan Đền chùa & Văn hóa', iconType: 'TEMPLE' },
+        { dayNumber: 4, dateLabel: '18 Th10', title: 'Mua sắm tại Aeon Mall Long Biên', iconType: 'SHOPPING' },
+        { dayNumber: 5, dateLabel: '19 Th10', title: 'Nhà tù Hoả Lò & Chợ Đồng Xuân', iconType: 'STAR' },
       ],
       budget: {
         estimatedCost: 4500000,
@@ -101,23 +90,13 @@ export class ItineraryController {
 
   @Get(':id')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Lấy chi tiết toàn bộ lịch trình, từng ngày và từng điểm đến',
-  })
-  @ApiParam({
-    name: 'id',
-    description: 'ID của lịch trình',
-    example: 'uuid-sg-3days',
-  })
-  @ApiResponse({
-    status: 200,
-    description: 'Trả về toàn bộ cây dữ liệu lịch trình',
-    type: ItineraryDetailResponseDto,
-  })
+  @ApiOperation({ summary: 'Lấy chi tiết toàn bộ lịch trình theo từng ngày' })
+  @ApiParam({ name: 'id', description: 'ID của lịch trình', example: 'uuid-sg-3days' })
+  @ApiResponse({ status: 200, type: ItineraryDetailResponseDto })
   getItineraryDetail(@Param('id') id: string): ItineraryDetailResponseDto {
-    // Trả về dữ liệu mẫu (Mock data) khớp với hình UI
+    // TODO: Thay thế mock data bằng query DB thực tế
     return {
-      id: id,
+      id,
       title: 'Khám phá Sài Gòn 3 ngày',
       dateRangeLabel: '12 Th06 - 15 Th06, 2026',
       status: 'IN_PROGRESS',
@@ -145,40 +124,10 @@ export class ItineraryController {
               imageUrl: 'https://example.com/cho-hoa.jpg',
               priceLabel: 'MIỄN PHÍ',
               tags: [],
-              transitToNext: {
-                mode: 'BIKE',
-                durationStr: '15 phút di chuyển',
-              },
-            },
-            {
-              id: 'act-2',
-              startTime: '09:30',
-              endTime: '11:00',
-              placeName: 'Bảo tàng Mỹ thuật',
-              address: '97A Phó Đức Chính, Quận 1',
-              imageUrl: 'https://example.com/bao-tang.jpg',
-              priceLabel: '30K VNĐ',
-              tags: ['Vé vào cổng'],
-              transitToNext: {
-                mode: 'TAXI',
-                durationStr: '10 phút taxi',
-                estimatedCost: 45000,
-              },
-            },
-            {
-              id: 'act-3',
-              startTime: '11:30',
-              endTime: '12:30',
-              placeName: 'Cơm tấm Ba Ghiền',
-              address: '84 Đ. Đặng Văn Ngữ, Phường 10, Phú Nhuận',
-              imageUrl: 'https://example.com/com-tam.jpg',
-              priceLabel: '',
-              tags: [],
-              // Không có transitToNext vì đây có thể là điểm nghỉ trưa hoặc cuối ngày (tạm thời)
+              transitToNext: { mode: 'BIKE', durationStr: '15 phút di chuyển' },
             },
           ],
         },
-        // ... Dữ liệu ngày 2, ngày 3
       ],
     };
   }
@@ -199,42 +148,158 @@ export class ItineraryController {
     };
   }
 
+  // ════════════════════════════════════════════════════════════════
+  // CÁC ENDPOINT TÙY CHỈNH LỊCH TRÌNH (MỚI)
+  // ════════════════════════════════════════════════════════════════
+
+  /**
+   * CHỈNH SỬA giờ đến, thời gian tham quan hoặc ghi chú của một hoạt động.
+   *
+   * - PATCH /:itineraryId/activities/:activityId
+   * - Nếu truyền `arriveTime` → tự động ghim giờ (is_locked = true)
+   * - Sau khi lưu, gọi FastAPI optimizer → trả về lịch ngày đã sắp xếp lại
+   *
+   * Response: CustomizeActivityResponseDto
+   */
+  @Patch(':itineraryId/activities/:activityId')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Chỉnh sửa giờ đến / thời gian / ghi chú của một hoạt động',
+    description:
+      'Truyền `arriveTime` để ghim giờ. Truyền `isLocked: false` để bỏ ghim. ' +
+      'Sau khi lưu, FastAPI tự động sắp xếp lại các hoạt động còn lại trong ngày.',
+  })
+  @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
+  @ApiParam({ name: 'activityId', description: 'ID hoạt động (itinerary_details.id)' })
+  @ApiBody({ type: EditActivityDto })
+  @ApiResponse({ status: 200, type: CustomizeActivityResponseDto })
+  async editActivity(
+    @Param('itineraryId') itineraryId: string,
+    @Param('activityId') activityId: string,
+    @Body() dto: EditActivityDto,
+  ) {
+    return this.service.editActivity(itineraryId, activityId, dto);
+  }
+
+  /**
+   * THÊM địa điểm mới vào lịch trình.
+   *
+   * - POST /:itineraryId/activities
+   * - Hệ thống tự tìm khe thời gian trống phù hợp trong ngày
+   * - Nếu truyền `preferredTime` → ghim giờ ngay
+   * - FastAPI tối ưu và trả về toàn bộ ngày đã sắp xếp lại
+   *
+   * Response: CustomizeActivityResponseDto
+   */
+  @Post(':itineraryId/activities')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    summary: 'Thêm địa điểm mới vào lịch trình',
+    description:
+      'Cung cấp `placeId` và `dayNumber`. ' +
+      'Hệ thống tự tính giờ dựa trên khe trống. ' +
+      'Tùy chọn: `preferredTime` để ghim giờ ngay khi thêm.',
+  })
+  @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
+  @ApiBody({ type: AddActivityDto })
+  @ApiResponse({ status: 201, type: CustomizeActivityResponseDto })
+  async addActivity(
+    @Param('itineraryId') itineraryId: string,
+    @Body() dto: AddActivityDto,
+  ) {
+    return this.service.addActivity(itineraryId, dto);
+  }
+
+  /**
+   * XÓA một hoạt động khỏi lịch trình.
+   *
+   * - DELETE /:itineraryId/activities/:activityId
+   * - Xóa hoàn toàn khỏi DB (hard delete)
+   * - FastAPI tối ưu lại ngày sau khi xóa
+   *
+   * Response: CustomizeActivityResponseDto
+   */
   @Delete(':itineraryId/activities/:activityId')
-  @ApiOperation({ summary: 'Xóa một địa điểm/hoạt động khỏi lịch trình' })
-  @ApiParam({ name: 'itineraryId', description: 'ID của lịch trình tổng' })
-  @ApiParam({ name: 'activityId', description: 'ID của hoạt động cần xóa' })
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Xóa một hoạt động khỏi lịch trình',
+    description: 'Hard delete. Sau khi xóa, các hoạt động còn lại trong ngày được sắp xếp lại.',
+  })
+  @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
+  @ApiParam({ name: 'activityId', description: 'ID hoạt động cần xóa' })
+  @ApiResponse({ status: 200, type: CustomizeActivityResponseDto })
   async deleteActivity(
     @Param('itineraryId') itineraryId: string,
     @Param('activityId') activityId: string,
   ) {
-    await this.service.deleteActivity(itineraryId, activityId);
-    return {
-      message: 'Đã xóa địa điểm khỏi lịch trình và tính toán lại tuyến đường',
-      success: true,
-    };
+    return this.service.deleteActivity(itineraryId, activityId);
   }
 
-  // @Patch(':itineraryId/activities/:activityId/note')
-  // @HttpCode(HttpStatus.OK)
-  // @ApiOperation({
-  //   summary: 'Lưu tự động (Auto-save) ghi chú cá nhân của một địa điểm',
-  // })
-  // @ApiParam({ name: 'itineraryId', description: 'ID của lịch trình' })
-  // @ApiParam({ name: 'activityId', description: 'ID của hoạt động' })
-  // async updateActivityNote(
-  //   @Param('itineraryId') itineraryId: string,
-  //   @Param('activityId') activityId: string,
-  //   @Body() updateDto: UpdateActivityNoteDto,
-  // ) {
-  //   await this.service.updateActivityNote(
-  //     itineraryId,
-  //     activityId,
-  //     updateDto.personalNote,
-  //   );
+  /**
+   * THAY THẾ địa điểm bằng địa điểm khác.
+   *
+   * - PATCH /:itineraryId/activities/:activityId/replace
+   * - Giữ nguyên thứ tự và giờ ghim (nếu có)
+   * - FastAPI tối ưu lại để tính toán đường đi mới
+   *
+   * Response: CustomizeActivityResponseDto
+   */
+  @Patch(':itineraryId/activities/:activityId/replace')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Thay thế địa điểm bằng địa điểm khác',
+    description:
+      'Giữ nguyên thứ tự và giờ ghim. ' +
+      'FastAPI tính lại đường đi với địa điểm mới.',
+  })
+  @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
+  @ApiParam({ name: 'activityId', description: 'ID hoạt động cần thay thế' })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      required: ['newPlaceId'],
+      properties: {
+        newPlaceId: {
+          type: 'string',
+          example: 'place-uuid-789',
+          description: 'UUID của địa điểm mới từ travel.places',
+        },
+      },
+    },
+  })
+  @ApiResponse({ status: 200, type: CustomizeActivityResponseDto })
+  async replaceActivity(
+    @Param('itineraryId') itineraryId: string,
+    @Param('activityId') activityId: string,
+    @Body('newPlaceId') newPlaceId: string,
+  ) {
+    return this.service.replaceActivity(itineraryId, activityId, newPlaceId);
+  }
 
-  //   return {
-  //     message: 'Đã lưu ghi chú',
-  //     success: true,
-  //   };
-  // }
+  /**
+   * LẤY GỢI Ý địa điểm thay thế cho một hoạt động.
+   *
+   * - GET /:itineraryId/activities/:activityId/suggestions
+   * - Tìm địa điểm cùng danh mục, cùng thành phố, chưa có trong lịch trình
+   * - Sắp xếp theo khoảng cách từ địa điểm hiện tại
+   *
+   * Response: SuggestionsResponseDto
+   */
+  @Get(':itineraryId/activities/:activityId/suggestions')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Lấy danh sách gợi ý địa điểm thay thế',
+    description:
+      'Trả về tối đa 8 địa điểm cùng danh mục, cùng thành phố, ' +
+      'chưa có trong lịch trình, sắp xếp theo điểm đánh giá.',
+  })
+  @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
+  @ApiParam({ name: 'activityId', description: 'ID hoạt động cần tìm gợi ý thay thế' })
+  @ApiResponse({ status: 200, type: SuggestionsResponseDto })
+  async getSuggestions(
+    @Param('itineraryId') itineraryId: string,
+    @Param('activityId') activityId: string,
+  ) {
+    return this.service.getSuggestions(itineraryId, activityId);
+  }
 }
