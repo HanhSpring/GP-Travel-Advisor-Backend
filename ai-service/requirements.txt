@@ -21,3 +21,6 @@ scikit-learn==1.5.2
 
 # Utilities
 python-multipart==0.0.12
+
+# Tối ưu lịch trình (tùy chọn — dùng OR-Tools nếu muốn nâng cấp lên VRPTW đầy đủ)
+# ortools==9.10.4067

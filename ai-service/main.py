@@ -8,26 +8,43 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import os
+import logging
 from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
 
+# Cấu hình logging chuẩn cho toàn bộ service
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Travel Advisor AI Service",
-    description="AI-powered personalized travel recommendations",
-    version="1.0.0"
+    description=(
+        "AI-powered personalized travel recommendations\n\n"
+        "## Tính năng\n"
+        "- **Tối ưu lịch trình**: Greedy TSPTW — sắp xếp địa điểm theo thứ tự tối ưu nhất\n"
+        "- **Kiểm tra xung đột**: Validate giờ ghim trước khi lưu DB\n"
+    ),
+    version="1.0.0",
 )
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],  # Cấu hình chặt hơn cho production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── Import và đăng ký router v1 ─────────────────────────────────
+from app.api.v1.api_router import api_router
+app.include_router(api_router)
 
 
 # Pydantic models
@@ -71,7 +88,7 @@ async def health_check():
 
 
 @app.post("/api/v1/recommendations", response_model=RecommendationResponse)
-async def get_recommendations(request: RecommendationRequest):
+async def get_recommendations(_request: RecommendationRequest):
     """
     Get personalized travel recommendations based on user preferences
     
