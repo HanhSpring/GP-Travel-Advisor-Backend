@@ -4,7 +4,11 @@ import {
   InternalServerErrorException,
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
+import axios from 'axios';
 import { supabase } from '../../../config/supabase';
+
+// Địa chỉ FastAPI optimizer/moderator
+const AI_SERVICE_URL = process.env.AI_SERVICE_URL ?? 'http://localhost:8000';
 
 interface CreateReviewPayload {
   tourist_id: string;
@@ -41,6 +45,26 @@ export class ReviewsService {
       payload.rating > 5
     ) {
       throw new BadRequestException('rating must be a number between 1 and 5');
+    }
+
+    // ─── KIỂM DUYỆT NỘI DUNG TỰ ĐỘNG (OpenAI Moderation) ───────────
+    if (payload.content) {
+      try {
+        const aiResponse = await axios.post(`${AI_SERVICE_URL}/api/v1/moderation/check`, {
+          text: payload.content,
+        });
+
+        if (aiResponse.data.flagged) {
+          throw new BadRequestException(
+            'Bình luận của bạn vi phạm tiêu chuẩn cộng đồng (chứa ngôn từ không phù hợp). Vui lòng chỉnh sửa lại.',
+          );
+        }
+      } catch (error) {
+        // Nếu lỗi do flagged thì throw tiếp
+        if (error instanceof BadRequestException) throw error;
+        // Nếu lỗi kết nối AI Service → log lại nhưng vẫn cho phép lưu để tránh block user
+        console.error('[ReviewsService] Moderation error:', error.message);
+      }
     }
 
     const reviewId = randomUUID();
