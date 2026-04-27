@@ -63,10 +63,50 @@ interface PlaceCategoryFilterRow {
   place_id: string;
 }
 
+interface PlaceCategoryNameRow {
+  place_id: string;
+  categories: CategoryRow | CategoryRow[] | null;
+}
+
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
 
 @Injectable()
 export class AdminPlacesService {
+  private getCurrentMonthRange(): { start: string; end: string } {
+    const now = new Date();
+    const start = new Date(now.getFullYear(), now.getMonth(), 1);
+    const end = new Date(now.getFullYear(), now.getMonth() + 1, 1);
+
+    return {
+      start: start.toISOString(),
+      end: end.toISOString(),
+    };
+  }
+
+  private getSafeInFilterLimit(): number {
+    const parsed = Number(process.env.ADMIN_PLACES_MAX_IN_FILTER_IDS ?? '200');
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return 200;
+    }
+
+    return Math.floor(parsed);
+  }
+
+  private splitIntoChunks<T>(items: T[], chunkSize: number): T[][] {
+    if (items.length === 0) {
+      return [];
+    }
+
+    const size = chunkSize > 0 ? chunkSize : 200;
+    const chunks: T[][] = [];
+
+    for (let index = 0; index < items.length; index += size) {
+      chunks.push(items.slice(index, index + size));
+    }
+
+    return chunks;
+  }
+
   private normalizeImageUrls(
     value: string[] | string | null | undefined,
   ): string[] {
@@ -154,6 +194,63 @@ export class AdminPlacesService {
     return 'pending';
   }
 
+  private async countPlaces(
+    status: PlaceStatus = 'all',
+    registeredFrom?: string,
+    registeredTo?: string,
+  ): Promise<number> {
+    if (!['all', 'pending', 'approved', 'rejected'].includes(status)) {
+      throw new BadRequestException(
+        'status must be one of: all, pending, approved, rejected',
+      );
+    }
+
+    let query = supabase
+      .schema('travel')
+      .from('places')
+      .select('id', { count: 'exact', head: true });
+
+    if (status === 'pending') {
+      query = query.is('is_approved', null);
+    } else if (status === 'approved') {
+      query = query.eq('is_approved', true);
+    } else if (status === 'rejected') {
+      query = query.eq('is_approved', false);
+    }
+
+    if (registeredFrom) {
+      query = query.gte('registered_date', registeredFrom);
+    }
+
+    if (registeredTo) {
+      query = query.lt('registered_date', registeredTo);
+    }
+
+    const { count, error } = await query;
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return count ?? 0;
+  }
+
+  async getPlaceStats() {
+    const { start, end } = this.getCurrentMonthRange();
+
+    const [totalLocations, pendingApproval, newThisMonth] = await Promise.all([
+      this.countPlaces('all'),
+      this.countPlaces('pending'),
+      this.countPlaces('all', start, end),
+    ]);
+
+    return {
+      totalLocations,
+      pendingApproval,
+      newThisMonth,
+    };
+  }
+
   async getPlaces(
     status: PlaceStatus = 'all',
     page: number = 1,
@@ -161,7 +258,11 @@ export class AdminPlacesService {
     search?: string,
     categoryName?: string,
   ) {
-    const offset = (page - 1) * limit;
+    const safePage = Number.isFinite(page) && page > 0 ? Math.floor(page) : 1;
+    const requestedLimit =
+      Number.isFinite(limit) && limit > 0 ? Math.floor(limit) : 10;
+    const safeLimit = Math.min(requestedLimit, 200);
+    const offset = (safePage - 1) * safeLimit;
 
     if (!['all', 'pending', 'approved', 'rejected'].includes(status)) {
       throw new BadRequestException(
@@ -207,9 +308,13 @@ export class AdminPlacesService {
         throw new InternalServerErrorException(categoryError.message);
       }
 
-      placeIdsByCategoryName = (categoryLinks ?? [])
-        .map((item) => (item as PlaceCategoryFilterRow).place_id)
-        .filter(Boolean);
+      placeIdsByCategoryName = Array.from(
+        new Set(
+          (categoryLinks ?? [])
+            .map((item) => (item as PlaceCategoryFilterRow).place_id)
+            .filter(Boolean),
+        ),
+      );
 
       if (placeIdsByCategoryName.length === 0) {
         return {
@@ -228,7 +333,8 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, image_url, name, address, is_approved, vendor_id, registered_date, place_categories(category_id, categories(id, name))',
+        'id, image_url, name, address, is_approved, vendor_id, registered_date',
+        { count: 'exact' },
       );
 
     if (status === 'pending') {
@@ -240,7 +346,21 @@ export class AdminPlacesService {
     }
 
     if (placeIdsByCategoryName) {
+      const inFilterLimit = this.getSafeInFilterLimit();
+      if (placeIdsByCategoryName.length > inFilterLimit) {
+        placeIdsByCategoryName = placeIdsByCategoryName.slice(0, inFilterLimit);
+      }
+
       query = query.in('id', placeIdsByCategoryName);
+    }
+
+    const normalizedSearch = this.normalizeForSearch(search);
+
+    if (normalizedSearch) {
+      const simpleSearch = search?.trim() ?? '';
+      if (simpleSearch) {
+        query = query.ilike('name', `%${simpleSearch}%`);
+      }
     }
 
     query = query.order('registered_date', {
@@ -248,13 +368,54 @@ export class AdminPlacesService {
       nullsFirst: false,
     });
 
-    const { data, error } = await query;
+    const { data, error, count } = await query.range(
+      offset,
+      offset + safeLimit - 1,
+    );
 
     if (error) {
       throw new InternalServerErrorException(error.message);
     }
 
     const placeRows = (data ?? []) as PlaceListRow[];
+
+    const placeIds = placeRows.map((item) => item.id);
+    const categoryMapByPlace = new Map<string, string[]>();
+
+    if (placeIds.length > 0) {
+      const { data: placeCategories, error: placeCategoriesError } =
+        await supabase
+          .schema('travel')
+          .from('place_categories')
+          .select('place_id, categories(id, name)')
+          .in('place_id', placeIds)
+          .returns<PlaceCategoryNameRow[]>();
+
+      if (placeCategoriesError) {
+        throw new InternalServerErrorException(placeCategoriesError.message);
+      }
+
+      for (const row of placeCategories ?? []) {
+        const categories = row.categories;
+        const names: string[] = [];
+
+        if (Array.isArray(categories)) {
+          for (const category of categories) {
+            if (category?.name) {
+              names.push(category.name);
+            }
+          }
+        } else if (categories?.name) {
+          names.push(categories.name);
+        }
+
+        if (names.length > 0) {
+          const existing = categoryMapByPlace.get(row.place_id) ?? [];
+          existing.push(...names);
+          categoryMapByPlace.set(row.place_id, Array.from(new Set(existing)));
+        }
+      }
+    }
 
     const vendorIds = Array.from(
       new Set(
@@ -278,13 +439,14 @@ export class AdminPlacesService {
       }
     }
 
-    let places = placeRows.map((place) => {
+    const places = placeRows.map((place) => {
       const vendor = vendors.find((v) => v.id === place.vendor_id);
-      const categoryNames = this.extractCategoryNames(place.place_categories);
+      const categoryNames = categoryMapByPlace.get(place.id) ?? [];
+      const primaryImage = this.normalizeImageUrls(place.image_url)[0] ?? '';
 
       return {
         id: place.id,
-        image_url: place.image_url,
+        image_url: primaryImage,
         name: place.name,
         address: place.address ?? '',
         category: categoryNames.join(', '),
@@ -294,30 +456,15 @@ export class AdminPlacesService {
       };
     });
 
-    const normalizedSearch = this.normalizeForSearch(search);
-
-    if (normalizedSearch) {
-      places = places.filter((place) => {
-        const normalizedPlaceName = this.normalizeForSearch(place.name);
-        const normalizedVendorName = this.normalizeForSearch(place.vendor_name);
-
-        return (
-          normalizedPlaceName.includes(normalizedSearch) ||
-          normalizedVendorName.includes(normalizedSearch)
-        );
-      });
-    }
-
-    const total = places.length;
-    const pagedPlaces = places.slice(offset, offset + limit);
+    const total = count ?? 0;
 
     return {
-      data: pagedPlaces,
+      data: places,
       pagination: {
-        page,
-        limit,
+        page: safePage,
+        limit: safeLimit,
         total,
-        pages: Math.ceil(total / limit),
+        pages: Math.ceil(total / safeLimit),
       },
     };
   }
