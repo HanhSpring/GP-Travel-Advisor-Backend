@@ -97,6 +97,30 @@ export class ExploreService {
     process.env.DEFAULT_PLACE_IMAGE_URL ||
     'https://placehold.co/1080x720?text=No+Image';
 
+  private getSafeInFilterLimit(): number {
+    const parsed = Number(process.env.EXPLORE_MAX_IN_FILTER_IDS ?? '50');
+    if (!Number.isFinite(parsed) || parsed <= 0) {
+      return 50;
+    }
+
+    return Math.floor(parsed);
+  }
+
+  private splitIntoChunks<T>(items: T[], chunkSize: number): T[][] {
+    if (items.length === 0) {
+      return [];
+    }
+
+    const size = chunkSize > 0 ? chunkSize : 500;
+    const chunks: T[][] = [];
+
+    for (let index = 0; index < items.length; index += size) {
+      chunks.push(items.slice(index, index + size));
+    }
+
+    return chunks;
+  }
+
   private toImageList(imageUrl?: unknown): string[] {
     if (Array.isArray(imageUrl)) {
       return imageUrl
@@ -535,59 +559,17 @@ export class ExploreService {
       .returns<CityRow[]>();
 
     if (cityError) {
-      throw new InternalServerErrorException(cityError.message);
+      throw new InternalServerErrorException(
+        `getCityOverview.city_lookup: ${cityError.message}`,
+      );
     }
 
     const cityIds = (cities ?? []).map((item) => item.id);
     const cityImageMap = new Map<string, string>();
 
     if (cityIds.length > 0) {
-      const activityCategoryIds = await this.getCategoryIdsByKeywords(
-        this.buildCategoryKeywords('activity'),
-      );
-
-      let activityPlaceIds: string[] = [];
-      if (activityCategoryIds.length > 0) {
-        const { data: placeCategoryRows, error: placeCategoryError } =
-          await supabase
-            .schema('travel')
-            .from('place_categories')
-            .select('place_id')
-            .in('category_id', activityCategoryIds)
-            .returns<PlaceCategoryRow[]>();
-
-        if (placeCategoryError) {
-          throw new InternalServerErrorException(placeCategoryError.message);
-        }
-
-        activityPlaceIds = Array.from(
-          new Set((placeCategoryRows ?? []).map((item) => item.place_id)),
-        );
-      }
-
-      if (activityPlaceIds.length === 0) {
-        const mapped = (cities ?? []).map((item) => ({
-          id: item.id,
-          name: item.name,
-          image: this.defaultImageUrl,
-          rating: 0,
-          review_count: 0,
-          city: item.name,
-          category: null,
-        }));
-
-        return {
-          category: null,
-          data: mapped,
-          pagination: {
-            page: safePage,
-            limit: safeLimit,
-            total: count ?? 0,
-            pages: Math.ceil((count ?? 0) / safeLimit),
-          },
-        };
-      }
-
+      // Keep this query lightweight: pick representative images from approved
+      // active places inside requested cities, without expensive category joins.
       const { data: places, error: placesError } = await supabase
         .schema('travel')
         .from('places')
@@ -595,7 +577,6 @@ export class ExploreService {
         .eq('is_approved', true)
         .eq('is_active', true)
         .in('city_id', cityIds)
-        .in('id', activityPlaceIds)
         .order('review_count', { ascending: false })
         .returns<PlaceRow[]>();
 
@@ -672,26 +653,42 @@ export class ExploreService {
       .returns<PlaceRow[]>();
 
     if (placesError) {
-      throw new InternalServerErrorException(placesError.message);
+      throw new InternalServerErrorException(
+        `getCityOverview.city_places: ${placesError.message}`,
+      );
     }
 
     const placeIds = (places ?? []).map((item) => item.id);
     let placeCategoryRows: PlaceCategoryRow[] = [];
 
     if (placeIds.length > 0) {
-      const { data: placeCategories, error: placeCategoryError } =
-        await supabase
-          .schema('travel')
-          .from('place_categories')
-          .select('place_id, category_id')
-          .in('place_id', placeIds)
-          .returns<PlaceCategoryRow[]>();
+      const chunkSize = this.getSafeInFilterLimit();
+      const chunks = this.splitIntoChunks(placeIds, chunkSize);
 
-      if (placeCategoryError) {
-        throw new InternalServerErrorException(placeCategoryError.message);
+      for (const chunk of chunks) {
+        try {
+          const { data: placeCategories, error: placeCategoryError } =
+            await supabase
+              .schema('travel')
+              .from('place_categories')
+              .select('place_id, category_id')
+              .in('place_id', chunk)
+              .returns<PlaceCategoryRow[]>();
+
+          if (placeCategoryError) {
+            // Degrade gracefully for city overview: categories are optional data.
+            placeCategoryRows = [];
+            break;
+          }
+
+          if (placeCategories?.length) {
+            placeCategoryRows.push(...placeCategories);
+          }
+        } catch {
+          placeCategoryRows = [];
+          break;
+        }
       }
-
-      placeCategoryRows = placeCategories ?? [];
     }
 
     const categoryIds = Array.from(
@@ -706,19 +703,30 @@ export class ExploreService {
 
     const categoryMap = new Map<string, string>();
     if (categoryIds.length > 0) {
-      const { data: categories, error: categoriesError } = await supabase
-        .schema('travel')
-        .from('categories')
-        .select('id, name')
-        .in('id', categoryIds)
-        .returns<CategoryRow[]>();
+      const chunkSize = this.getSafeInFilterLimit();
+      const chunks = this.splitIntoChunks(categoryIds, chunkSize);
 
-      if (categoriesError) {
-        throw new InternalServerErrorException(categoriesError.message);
-      }
+      for (const chunk of chunks) {
+        try {
+          const { data: categories, error: categoriesError } = await supabase
+            .schema('travel')
+            .from('categories')
+            .select('id, name')
+            .in('id', chunk)
+            .returns<CategoryRow[]>();
 
-      for (const item of categories ?? []) {
-        categoryMap.set(item.id, item.name.toLowerCase());
+          if (categoriesError) {
+            categoryMap.clear();
+            break;
+          }
+
+          for (const item of categories ?? []) {
+            categoryMap.set(item.id, item.name.toLowerCase());
+          }
+        } catch {
+          categoryMap.clear();
+          break;
+        }
       }
     }
 
@@ -749,25 +757,33 @@ export class ExploreService {
       .returns<ItineraryRow[]>();
 
     if (itineraryError) {
-      throw new InternalServerErrorException(itineraryError.message);
+      throw new InternalServerErrorException(
+        `getCityOverview.public_itineraries: ${itineraryError.message}`,
+      );
     }
 
     const publicItineraryIds = (publicItineraries ?? []).map((item) => item.id);
 
-    const { data: itineraryDetailRows, error: itineraryDetailError } =
-      await supabase
+    let itineraryDetailRows: ItineraryDetailPlaceCityRow[] = [];
+    if (publicItineraryIds.length > 0) {
+      const { data: rows, error: itineraryDetailError } = await supabase
         .schema('travel')
         .from('itinerary_details')
         .select('itinerary_id, places:place_id(city_id)')
         .in('itinerary_id', publicItineraryIds)
         .returns<ItineraryDetailPlaceCityRow[]>();
 
-    if (itineraryDetailError) {
-      throw new InternalServerErrorException(itineraryDetailError.message);
+      if (itineraryDetailError) {
+        throw new InternalServerErrorException(
+          `getCityOverview.itinerary_details: ${itineraryDetailError.message}`,
+        );
+      }
+
+      itineraryDetailRows = rows ?? [];
     }
 
     const itineraryIdsInCity = new Set<string>();
-    for (const row of itineraryDetailRows ?? []) {
+    for (const row of itineraryDetailRows) {
       const place = Array.isArray(row.places) ? row.places[0] : row.places;
       if (place?.city_id === cityId) {
         itineraryIdsInCity.add(row.itinerary_id);
@@ -778,12 +794,34 @@ export class ExploreService {
       .filter((item) => itineraryIdsInCity.has(item.id))
       .slice(0, 6);
 
-    const cityItineraryImages = await this.getItineraryImageMap(
-      cityItineraries.map((item) => item.id),
-    );
-    const cityCreatorNameMap = await this.getCreatorNameMap(
-      cityItineraries.map((item) => item.creator_id),
-    );
+    let cityItineraryImages = new Map<string, string[]>();
+    let cityCreatorNameMap = new Map<string, string>();
+
+    try {
+      cityItineraryImages = await this.getItineraryImageMap(
+        cityItineraries.map((item) => item.id),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error
+          ? error.message
+          : 'unknown itinerary image error';
+      throw new InternalServerErrorException(
+        `getCityOverview.itinerary_images: ${message}`,
+      );
+    }
+
+    try {
+      cityCreatorNameMap = await this.getCreatorNameMap(
+        cityItineraries.map((item) => item.creator_id),
+      );
+    } catch (error) {
+      const message =
+        error instanceof Error ? error.message : 'unknown creator name error';
+      throw new InternalServerErrorException(
+        `getCityOverview.creator_names: ${message}`,
+      );
+    }
 
     const itineraries = cityItineraries.map((item) => {
       const gallery = cityItineraryImages.get(item.id) ?? [];
@@ -915,6 +953,17 @@ export class ExploreService {
       placeIdsByCategory = (placeCategoryRows ?? []).map(
         (item) => item.place_id,
       );
+
+      placeIdsByCategory = Array.from(
+        new Set(placeIdsByCategory.filter((id) => id && id.trim().length > 0)),
+      );
+
+      const inFilterLimit = this.getSafeInFilterLimit();
+      const pageStart = (safePage - 1) * inFilterLimit;
+      const pageEnd = pageStart + inFilterLimit;
+      if (placeIdsByCategory.length > inFilterLimit) {
+        placeIdsByCategory = placeIdsByCategory.slice(pageStart, pageEnd);
+      }
 
       if (placeIdsByCategory.length === 0) {
         return {
