@@ -72,6 +72,15 @@ export class AdminPlacesController {
     return this.service.getPlaceCategories();
   }
 
+  @Get('stats')
+  @ApiOperation({
+    summary: 'Get place statistics for admin dashboard',
+    description: 'Return total, pending, and current month place counts',
+  })
+  async getPlaceStats() {
+    return this.service.getPlaceStats();
+  }
+
   @Get(':id')
   @ApiOperation({
     summary: 'Get place detail for admin',
