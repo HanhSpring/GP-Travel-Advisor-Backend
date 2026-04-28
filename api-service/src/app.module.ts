@@ -27,6 +27,7 @@ Admin modules
 
 import { AdminPlacesModule } from './modules/admin/places/admin-places.module';
 import { AdminReviewsModule } from './modules/admin/reviews/admin-reviews.module';
+import { AdminItineraryReviewsModule } from './modules/admin/itinerary-reviews/admin-itinerary-reviews.module';
 
 /*
 Business modules
@@ -70,6 +71,7 @@ import { UploadModule } from './modules/upload/upload.module';
 
     AdminPlacesModule,
     AdminReviewsModule,
+    AdminItineraryReviewsModule,
 
     /*
     Business
