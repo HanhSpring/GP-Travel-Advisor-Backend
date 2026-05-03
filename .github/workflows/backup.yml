@@ -1,0 +1,80 @@
+name: Database Backup
+
+permissions:
+  contents: write
+
+on:
+  push:
+    branches: [ main ]
+    paths-ignore:
+      - '.github/workflows/backup.yml'
+  schedule:
+    - cron: '0 0 * * *'
+  workflow_dispatch:
+
+jobs:
+  backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      # Bước 1: Checkout NHÁNH BACKUP (Không phải main) để giữ nguyên lịch sử cũ
+      # Nếu nhánh chưa tồn tại (lần chạy đầu tiên), nó sẽ báo lỗi nhẹ nhưng bước sau sẽ tự tạo
+      - name: Checkout backup branch
+        uses: actions/checkout@v4
+        with:
+          ref: 'database-backups'
+          fetch-depth: 0
+        continue-on-error: true # Cho phép chạy tiếp nếu nhánh chưa có
+
+      # Bước 2: Cài đặt PostgreSQL Client 17
+      - name: Install PostgreSQL Client 17
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y wget gnupg2 lsb-release curl
+          curl -fsSL https://www.postgresql.org/media/keys/ACCC4CF8.asc | sudo gpg --dearmor -o /usr/share/keyrings/postgresql-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/postgresql-keyring.gpg] http://apt.postgresql.org/pub/repos/apt $(lsb_release -cs)-pgdg main" | sudo tee /etc/apt/sources.list.d/pgdg.list
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client-17
+
+      # Bước 3: Tạo và Nén bản sao lưu
+      - name: Create & Compress Backup
+        env:
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          mkdir -p backups
+          DATE=$(date +'%Y-%m-%d_%H-%M-%S')
+          FILENAME="backup_$DATE.sql.gz"
+          
+          echo "🔄 Creating backup..."
+          /usr/lib/postgresql/17/bin/pg_dump \
+            --no-owner --no-acl --clean "$DATABASE_URL" | gzip -9 > "backups/$FILENAME"
+          
+          # Giữ tối đa 10 file gần nhất để tránh phình to Repository
+          ls -t backups/*.gz | tail -n +11 | xargs -r rm --
+          
+          echo "BACKUP_FILE=$FILENAME" >> $GITHUB_ENV
+
+      # Bước 4: Tải lên Artifacts (Tùy chọn tải về nhanh trong 60 ngày)
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: database-backups
+          path: backups/*.gz
+          retention-days: 60
+
+      # Bước 5: Đẩy an toàn lên nhánh Backup
+      - name: Commit and Push
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          
+          # Nếu nhánh chưa tồn tại (chạy lần đầu), tạo mới nhưng không dựa vào main
+          git checkout -b database-backups || echo "Branch exists"
+          
+          git add backups/
+          
+          # [skip ci] để tránh bot tự trigger lại chính nó
+          git commit -m "chore(backup): Auto backup: ${{ env.BACKUP_FILE }} [skip ci]" || echo "No changes to commit"
+          
+          # Đẩy lên an toàn, không dùng force vì lịch sử đã nối tiếp
+          git push origin database-backups
