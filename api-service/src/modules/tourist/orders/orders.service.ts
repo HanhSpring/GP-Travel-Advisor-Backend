@@ -72,6 +72,8 @@ type FoodCategory = 'all' | 'main' | 'drink';
 
 @Injectable()
 export class OrdersService {
+  constructor() {}
+
   private normalizeText(value: string): string {
     return value
       .normalize('NFD')
