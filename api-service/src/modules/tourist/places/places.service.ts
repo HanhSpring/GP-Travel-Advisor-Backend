@@ -20,14 +20,23 @@ interface PlaceRow {
   is_approved: boolean;
   is_active: boolean;
   image_url: unknown;
-  place_tags: Array<{
-    tag_id: string;
-    tags: { name: string | null } | { name: string | null }[] | null;
-  }> | null;
+  vibes: string | string[] | null;
+  type_id: string | null;
+  types: {
+    id: string;
+    category_id: string | null;
+    categories: { id: string; name: string } | { id: string; name: string }[] | null;
+  } | {
+    id: string;
+    category_id: string | null;
+    categories: { id: string; name: string } | { id: string; name: string }[] | null;
+  }[] | null;
 }
 
-interface PlaceCategoryRow {
-  category_id: string;
+interface PlaceTypeRow {
+  id: string;
+  category_id: string | null;
+  categories: { id: string; name: string } | { id: string; name: string }[] | null;
 }
 
 interface CategoryRow {
@@ -85,42 +94,30 @@ export class PlacesService {
     return cityData.name ?? null;
   }
 
-  private extractTagNames(
-    placeTags: Array<{
-      tag_id: string;
-      tags: { name: string | null } | { name: string | null }[] | null;
-    }> | null,
-  ): string[] {
-    if (!placeTags || placeTags.length === 0) {
+  private extractVibes(vibes: string | string[] | null): string[] {
+    if (!vibes) {
       return [];
     }
 
-    const names: string[] = [];
-
-    for (const item of placeTags) {
-      if (!item.tags) {
-        continue;
-      }
-
-      if (Array.isArray(item.tags)) {
-        for (const tag of item.tags) {
-          if (tag?.name) {
-            names.push(tag.name);
-          }
-        }
-      } else if (item.tags.name) {
-        names.push(item.tags.name);
-      }
+    if (Array.isArray(vibes)) {
+      return vibes.filter((v) => typeof v === 'string' && v.trim().length > 0);
     }
 
-    return names;
+    if (typeof vibes === 'string') {
+      return vibes
+        .split(',')
+        .map((v) => v.trim())
+        .filter((v) => v.length > 0);
+    }
+
+    return [];
   }
 
   async getPlaceDetail(placeId: string, touristId?: string) {
     const { data: place, error: placeError } = await supabase
       .schema('travel')
       .from('places')
-      .select('*, cities(name), place_tags(tag_id, tags(name))')
+      .select('*, cities(name), type_id, types(id, category_id, categories(id, name))')
       .eq('id', placeId)
       .eq('is_approved', true)
       .eq('is_active', true)
@@ -134,35 +131,16 @@ export class PlacesService {
       throw new NotFoundException('Place not found');
     }
 
-    const { data: placeCategories, error: placeCategoryError } = await supabase
-      .schema('travel')
-      .from('place_categories')
-      .select('category_id')
-      .eq('place_id', placeId);
-
-    if (placeCategoryError) {
-      throw new InternalServerErrorException(placeCategoryError.message);
-    }
-
-    const categoryIds =
-      (placeCategories as PlaceCategoryRow[] | null)?.map(
-        (item) => item.category_id,
-      ) ?? [];
-
+    // Extract category from type relationship
     let categoryList: string[] = [];
-    if (categoryIds.length > 0) {
-      const { data: categories, error: categoryError } = await supabase
-        .schema('travel')
-        .from('categories')
-        .select('id, name')
-        .in('id', categoryIds);
-
-      if (categoryError) {
-        throw new InternalServerErrorException(categoryError.message);
+    const typeData = Array.isArray(place.types) ? place.types?.[0] : place.types;
+    if (typeData) {
+      const categoryData = Array.isArray(typeData.categories)
+        ? typeData.categories?.[0]
+        : typeData.categories;
+      if (categoryData?.name) {
+        categoryList = [categoryData.name];
       }
-
-      categoryList =
-        (categories as CategoryRow[] | null)?.map((item) => item.name) ?? [];
     }
 
     const { data: ratingRows, error: ratingRowsError } = await supabase
@@ -269,7 +247,7 @@ export class PlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, city_id, cities(name), average_rating, review_count, image_url, place_tags(tag_id, tags(name))',
+        'id, name, city_id, cities(name), average_rating, review_count, image_url, vibes, type_id, types(id, category_id, categories(id, name))',
       )
       .eq('is_approved', true)
       .eq('is_active', true)
@@ -291,11 +269,11 @@ export class PlacesService {
       rating: Number(item.average_rating) || 0,
       review_count: item.review_count || 0,
       image: this.resolvePlaceImage(item.image_url),
-      tags: this.extractTagNames(item.place_tags),
+      vibes: this.extractVibes(item.vibes),
     }));
 
     const cityName = this.extractCityName(place.cities);
-    const tags = this.extractTagNames(place.place_tags);
+    const vibes = this.extractVibes(place.vibes);
 
     const isFavorite = touristId
       ? await this.checkFavorite(touristId, placeId)
@@ -312,7 +290,7 @@ export class PlacesService {
       is_favorite: isFavorite,
       image_url: this.resolvePlaceImage(place.image_url),
       categories: categoryList,
-      tags,
+      vibes,
       images: this.buildGallery(place.image_url),
       description: place.description,
       open_time: place.open_time,
