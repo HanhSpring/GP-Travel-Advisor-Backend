@@ -64,9 +64,18 @@ interface CategoryRow {
   name: string;
 }
 
-interface PlaceCategoryRow {
-  category_id?: string;
-  place_id: string;
+interface PlaceTypeRow {
+  id: string;
+  category_id: string | null;
+  categories:
+    | { id: string; name: string }
+    | { id: string; name: string }[]
+    | null;
+}
+
+interface PlaceWithTypeRow extends PlaceRow {
+  type_id?: string | null;
+  types?: PlaceTypeRow | PlaceTypeRow[] | null;
 }
 
 interface CityRow {
@@ -96,6 +105,11 @@ export class ExploreService {
   private readonly defaultImageUrl =
     process.env.DEFAULT_PLACE_IMAGE_URL ||
     'https://placehold.co/1080x720?text=No+Image';
+
+  private readonly featuredPlaceCategoryPriority = [
+    'tham quan & khám phá',
+    'văn hoá & di sản',
+  ];
 
   private getSafeInFilterLimit(): number {
     const parsed = Number(process.env.EXPLORE_MAX_IN_FILTER_IDS ?? '50');
@@ -201,6 +215,90 @@ export class ExploreService {
     return cityData.id ?? null;
   }
 
+  private extractCategoryNames(
+    categories: PlaceTypeRow['categories'],
+  ): string[] {
+    if (!categories) {
+      return [];
+    }
+
+    const categoryList = Array.isArray(categories) ? categories : [categories];
+    return categoryList
+      .map((item) => item.name.toLowerCase().trim())
+      .filter((name) => name.length > 0);
+  }
+
+  private matchesAnyCategory(
+    categoryNames: string[],
+    targetCategories: string[],
+  ): boolean {
+    return categoryNames.some((name) =>
+      targetCategories.some((target) => name.includes(target)),
+    );
+  }
+
+  private hasAnyCategoryId(
+    categoryId: string | null | undefined,
+    categoryIds: Set<string>,
+  ): boolean {
+    if (!categoryId) {
+      return false;
+    }
+
+    return categoryIds.has(categoryId);
+  }
+
+  private getCategoryPriorityIndex(categoryNames: string[]): number | null {
+    let bestIndex: number | null = null;
+
+    for (const categoryName of categoryNames) {
+      for (
+        let index = 0;
+        index < this.featuredPlaceCategoryPriority.length;
+        index += 1
+      ) {
+        if (categoryName.includes(this.featuredPlaceCategoryPriority[index])) {
+          if (bestIndex === null || index < bestIndex) {
+            bestIndex = index;
+          }
+        }
+      }
+    }
+
+    return bestIndex;
+  }
+
+  private pickRandomItem<T>(items: T[]): T | null {
+    if (items.length === 0) {
+      return null;
+    }
+
+    const index = Math.floor(Math.random() * items.length);
+    return items[index] ?? null;
+  }
+
+  private mapActivityEntityCategory(categoryNames: string[]): string {
+    const joinedCategoryNames = categoryNames.join(' ');
+
+    if (joinedCategoryNames.includes('tham quan & khám phá')) {
+      return 'attractions';
+    }
+
+    if (joinedCategoryNames.includes('văn hoá & di sản')) {
+      return 'culturalHistory';
+    }
+
+    if (joinedCategoryNames.includes('giải trí & vui chơi')) {
+      return 'entertainment';
+    }
+
+    if (joinedCategoryNames.includes('thư giãn & thể thao')) {
+      return 'nature';
+    }
+
+    return 'attractions';
+  }
+
   private async getCreatorNameMap(
     creatorIds: string[],
   ): Promise<Map<string, string>> {
@@ -244,7 +342,7 @@ export class ExploreService {
     const currentItinerary = await this.getCurrentItinerary(touristId);
     const publicItinerariesResult = await this.getPublicItineraries(1, 5);
     const featuredPlacesResult = await this.getFeaturedCities(1, 5);
-    const hotelsResult = await this.getPlacesByCategory('hotel', 1, 5);
+    const hotelsResult = await this.getPlacesByCategory('lưu trú', 1, 5);
 
     return {
       actions: {
@@ -259,7 +357,7 @@ export class ExploreService {
       view_all_targets: {
         suggestion_itineraries: '/explore/itineraries/public?page=1&limit=50',
         featured_places: '/explore/cities?page=1&limit=50',
-        hotels: '/explore/places?category=hotel&page=1&limit=50',
+        hotels: '/explore/places?category=lưu trú&page=1&limit=50',
       },
     };
   }
@@ -479,41 +577,42 @@ export class ExploreService {
     const normalized = categoryName.toLowerCase().trim();
 
     if (this.isRestaurantCategory(normalized)) {
-      return ['restaurant', 'nhà hàng', 'nha hang', 'cafe', 'cà phê', 'ca phe'];
+      return ['ẩm thực'];
     }
 
     if (this.isHotelCategory(normalized)) {
-      return ['hotel', 'khách sạn', 'khach san'];
+      return ['lưu trú'];
     }
 
     if (this.isActivityCategory(normalized)) {
-      return ['activity'];
+      return [
+        'giải trí & vui chơi',
+        'tham quan & khám phá',
+        'thư giãn & thể thao',
+        'văn hoá & di sản',
+        'mua sắm & dịch vụ',
+      ];
     }
 
     return [normalized];
   }
 
   private isRestaurantCategory(name: string): boolean {
-    return (
-      name.includes('restaurant') ||
-      name.includes('nhà hàng') ||
-      name.includes('nha hang') ||
-      name.includes('cafe') ||
-      name.includes('cà phê') ||
-      name.includes('ca phe')
-    );
+    return name.includes('ẩm thực') || name.includes('nhà hàng');
   }
 
   private isHotelCategory(name: string): boolean {
-    return (
-      name.includes('hotel') ||
-      name.includes('khách sạn') ||
-      name.includes('khach san')
-    );
+    return name.includes('lưu trú') || name.includes('khách sạn');
   }
 
   private isActivityCategory(name: string): boolean {
-    return name.includes('activity');
+    return (
+      name.includes('tham quan & khám phá') ||
+      name.includes('văn hoá & di sản') ||
+      name.includes('giải trí & vui chơi') ||
+      name.includes('thư giãn & thể thao') ||
+      name.includes('mua sắm & dịch vụ')
+    );
   }
 
   private async getCategoryIdsByKeywords(
@@ -568,33 +667,76 @@ export class ExploreService {
     const cityImageMap = new Map<string, string>();
 
     if (cityIds.length > 0) {
-      // Keep this query lightweight: pick representative images from approved
-      // active places inside requested cities, without expensive category joins.
+      // Pick representative images from approved active places in priority categories.
       const { data: places, error: placesError } = await supabase
         .schema('travel')
         .from('places')
-        .select('id, city_id, image_url, average_rating, review_count')
+        .select(
+          'id, city_id, image_url, average_rating, review_count, type_id, types(id, category_id, categories(id, name))',
+        )
         .eq('is_approved', true)
         .eq('is_active', true)
         .in('city_id', cityIds)
         .order('review_count', { ascending: false })
-        .returns<PlaceRow[]>();
+        .returns<PlaceWithTypeRow[]>();
 
       if (placesError) {
         throw new InternalServerErrorException(placesError.message);
       }
 
+      const placesByCity = new Map<string, PlaceWithTypeRow[]>();
+
       for (const item of places ?? []) {
-        if (!item.city_id || cityImageMap.has(item.city_id)) {
+        if (!item.city_id) {
           continue;
         }
 
-        const images = this.toImageList(item.image_url);
-        if (images.length === 0) {
-          continue;
+        const existing = placesByCity.get(item.city_id) ?? [];
+        existing.push(item);
+        placesByCity.set(item.city_id, existing);
+      }
+
+      for (const cityId of cityIds) {
+        const candidates = placesByCity.get(cityId) ?? [];
+        const prioritizedGroups = new Map<number, PlaceWithTypeRow[]>();
+
+        for (const item of candidates) {
+          const typeData = Array.isArray(item.types)
+            ? item.types?.[0]
+            : item.types;
+          const categoryNames = this.extractCategoryNames(
+            typeData?.categories ?? null,
+          );
+          const priorityIndex = this.getCategoryPriorityIndex(categoryNames);
+
+          if (priorityIndex === null) {
+            continue;
+          }
+
+          const group = prioritizedGroups.get(priorityIndex) ?? [];
+          group.push(item);
+          prioritizedGroups.set(priorityIndex, group);
         }
 
-        cityImageMap.set(item.city_id, images[0]);
+        for (
+          let index = 0;
+          index < this.featuredPlaceCategoryPriority.length;
+          index += 1
+        ) {
+          const group = prioritizedGroups.get(index) ?? [];
+          if (group.length === 0) {
+            continue;
+          }
+
+          const picked = this.pickRandomItem(group);
+          const images = this.toImageList(picked?.image_url);
+          if (images.length === 0) {
+            continue;
+          }
+
+          cityImageMap.set(cityId, images[0]);
+          break;
+        }
       }
     }
 
@@ -640,17 +782,24 @@ export class ExploreService {
       throw new NotFoundException('City not found');
     }
 
+    const restaurantCategoryIds = new Set(
+      await this.getCategoryIdsByKeywords(['ẩm thực', 'nhà hàng']),
+    );
+    const hotelCategoryIds = new Set(
+      await this.getCategoryIdsByKeywords(['lưu trú', 'khách sạn']),
+    );
+
     const { data: places, error: placesError } = await supabase
       .schema('travel')
       .from('places')
       .select(
-        'id, name, address, city_id, cities(id, name), average_rating, review_count, image_url, open_time, close_time',
+        'id, name, address, city_id, cities(id, name), average_rating, review_count, image_url, open_time, close_time, type_id, types(id, category_id, categories(id, name))',
       )
       .eq('city_id', cityId)
       .eq('is_approved', true)
       .eq('is_active', true)
       .order('review_count', { ascending: false })
-      .returns<PlaceRow[]>();
+      .returns<PlaceWithTypeRow[]>();
 
     if (placesError) {
       throw new InternalServerErrorException(
@@ -658,92 +807,20 @@ export class ExploreService {
       );
     }
 
-    const placeIds = (places ?? []).map((item) => item.id);
-    let placeCategoryRows: PlaceCategoryRow[] = [];
-
-    if (placeIds.length > 0) {
-      const chunkSize = this.getSafeInFilterLimit();
-      const chunks = this.splitIntoChunks(placeIds, chunkSize);
-
-      for (const chunk of chunks) {
-        try {
-          const { data: placeCategories, error: placeCategoryError } =
-            await supabase
-              .schema('travel')
-              .from('place_categories')
-              .select('place_id, category_id')
-              .in('place_id', chunk)
-              .returns<PlaceCategoryRow[]>();
-
-          if (placeCategoryError) {
-            // Degrade gracefully for city overview: categories are optional data.
-            placeCategoryRows = [];
-            break;
-          }
-
-          if (placeCategories?.length) {
-            placeCategoryRows.push(...placeCategories);
-          }
-        } catch {
-          placeCategoryRows = [];
-          break;
-        }
-      }
-    }
-
-    const categoryIds = Array.from(
-      new Set(
-        placeCategoryRows
-          .map((row) => row.category_id)
-          .filter(
-            (id): id is string => typeof id === 'string' && id.length > 0,
-          ),
-      ),
-    );
-
-    const categoryMap = new Map<string, string>();
-    if (categoryIds.length > 0) {
-      const chunkSize = this.getSafeInFilterLimit();
-      const chunks = this.splitIntoChunks(categoryIds, chunkSize);
-
-      for (const chunk of chunks) {
-        try {
-          const { data: categories, error: categoriesError } = await supabase
-            .schema('travel')
-            .from('categories')
-            .select('id, name')
-            .in('id', chunk)
-            .returns<CategoryRow[]>();
-
-          if (categoriesError) {
-            categoryMap.clear();
-            break;
-          }
-
-          for (const item of categories ?? []) {
-            categoryMap.set(item.id, item.name.toLowerCase());
-          }
-        } catch {
-          categoryMap.clear();
-          break;
-        }
-      }
-    }
-
     const placeCategoriesByPlace = new Map<string, string[]>();
-    for (const row of placeCategoryRows) {
-      if (!row.category_id) {
+
+    for (const place of places ?? []) {
+      const typeData = Array.isArray(place.types)
+        ? place.types?.[0]
+        : place.types;
+      if (!typeData) {
         continue;
       }
 
-      const name = categoryMap.get(row.category_id);
-      if (!name) {
-        continue;
+      const categoryNames = this.extractCategoryNames(typeData.categories);
+      if (categoryNames.length > 0) {
+        placeCategoriesByPlace.set(place.id, categoryNames);
       }
-
-      const list = placeCategoriesByPlace.get(row.place_id) ?? [];
-      list.push(name);
-      placeCategoriesByPlace.set(row.place_id, list);
     }
 
     const { data: publicItineraries, error: itineraryError } = await supabase
@@ -846,13 +923,29 @@ export class ExploreService {
     const activities: Array<Record<string, unknown>> = [];
     const restaurants: Array<Record<string, unknown>> = [];
     const hotels: Array<Record<string, unknown>> = [];
+    const activityCategoryNames = [
+      'giải trí & vui chơi',
+      'tham quan & khám phá',
+      'thư giãn & thể thao',
+      'văn hoá & di sản',
+      'mua sắm & dịch vụ',
+    ];
 
     for (const item of places ?? []) {
       const categories = placeCategoriesByPlace.get(item.id) ?? [];
-      const isRestaurant = categories.some((name) =>
-        this.isRestaurantCategory(name),
+      const typeData = Array.isArray(item.types) ? item.types?.[0] : item.types;
+      const isRestaurant = this.hasAnyCategoryId(
+        typeData?.category_id,
+        restaurantCategoryIds,
       );
-      const isHotel = categories.some((name) => this.isHotelCategory(name));
+      const isHotel = this.hasAnyCategoryId(
+        typeData?.category_id,
+        hotelCategoryIds,
+      );
+      const isActivity = this.matchesAnyCategory(
+        categories,
+        activityCategoryNames,
+      );
 
       if (isHotel) {
         hotels.push({
@@ -861,7 +954,7 @@ export class ExploreService {
           imageUrl: this.resolveImage(item.image_url),
           rating: Number(item.average_rating) || 0,
           reviewCount: item.review_count || 0,
-          price: 'Liên hệ',
+          price: '0đ',
           starRating: 4,
           priceValue: 0,
           accommodationType: 'hotel',
@@ -886,6 +979,10 @@ export class ExploreService {
         continue;
       }
 
+      if (!isActivity) {
+        continue;
+      }
+
       activities.push({
         id: item.id,
         title: item.name,
@@ -894,7 +991,7 @@ export class ExploreService {
         reviewCount: item.review_count || 0,
         address: item.address ?? city.name,
         status: 'Đang mở cửa',
-        category: 'cultural_history',
+        category: this.mapActivityEntityCategory(categories),
         priceType: 'free',
         district: this.extractCityName(item.cities) ?? city.name,
       });
@@ -918,54 +1015,21 @@ export class ExploreService {
     const offset = (safePage - 1) * safeLimit;
 
     let categoryName: string | null = null;
-    let placeIdsByCategory: string[] | null = null;
+    let categoryFilter: string[] | null = null;
 
     if (category && category.trim().length > 0) {
       categoryName = category.trim().toLowerCase();
 
-      const keywords = this.buildCategoryKeywords(categoryName);
-      const categoryIds = await this.getCategoryIdsByKeywords(keywords);
-      if (categoryIds.length === 0) {
-        return {
-          category: categoryName,
-          data: [],
-          pagination: {
-            page: safePage,
-            limit: safeLimit,
-            total: 0,
-            pages: 0,
-          },
-        };
+      // Map category keyword to actual category names
+      if (this.isRestaurantCategory(categoryName)) {
+        categoryFilter = ['ẩm thực'];
+      } else if (this.isHotelCategory(categoryName)) {
+        categoryFilter = ['lưu trú'];
+      } else if (this.isActivityCategory(categoryName)) {
+        categoryFilter = ['tham quan & khám phá', 'giải trí & vui chơi'];
       }
 
-      const { data: placeCategoryRows, error: placeCategoryError } =
-        await supabase
-          .schema('travel')
-          .from('place_categories')
-          .select('place_id')
-          .in('category_id', categoryIds)
-          .returns<PlaceCategoryRow[]>();
-
-      if (placeCategoryError) {
-        throw new InternalServerErrorException(placeCategoryError.message);
-      }
-
-      placeIdsByCategory = (placeCategoryRows ?? []).map(
-        (item) => item.place_id,
-      );
-
-      placeIdsByCategory = Array.from(
-        new Set(placeIdsByCategory.filter((id) => id && id.trim().length > 0)),
-      );
-
-      const inFilterLimit = this.getSafeInFilterLimit();
-      const pageStart = (safePage - 1) * inFilterLimit;
-      const pageEnd = pageStart + inFilterLimit;
-      if (placeIdsByCategory.length > inFilterLimit) {
-        placeIdsByCategory = placeIdsByCategory.slice(pageStart, pageEnd);
-      }
-
-      if (placeIdsByCategory.length === 0) {
+      if (!categoryFilter || categoryFilter.length === 0) {
         return {
           category: categoryName,
           data: [],
@@ -979,35 +1043,74 @@ export class ExploreService {
       }
     }
 
-    let placesQuery = supabase
+    const resolvedCategoryIds = categoryFilter
+      ? new Set(await this.getCategoryIdsByKeywords(categoryFilter))
+      : new Set<string>();
+
+    if (categoryFilter && resolvedCategoryIds.size === 0) {
+      return {
+        category: categoryName,
+        data: [],
+        pagination: {
+          page: safePage,
+          limit: safeLimit,
+          total: 0,
+          pages: 0,
+        },
+      };
+    }
+
+    const placesQuery = supabase
       .schema('travel')
       .from('places')
       .select(
-        'id, name, city_id, cities(name), average_rating, review_count, image_url',
+        'id, name, city_id, cities(name), average_rating, review_count, image_url, type_id, types(id, category_id, categories(id, name))',
         {
           count: 'exact',
         },
       )
       .eq('is_approved', true)
-      .eq('is_active', true)
+      .eq('is_active', true);
+
+    const { data: unfilteredData, error } = await placesQuery
       .order('average_rating', { ascending: false })
-      .order('review_count', { ascending: false });
-
-    if (placeIdsByCategory) {
-      placesQuery = placesQuery.in('id', placeIdsByCategory);
-    }
-
-    const { data, error, count } = await placesQuery
-      .range(offset, offset + safeLimit - 1)
-      .returns<PlaceRow[]>();
+      .order('review_count', { ascending: false })
+      .returns<
+        Array<
+          PlaceRow & {
+            type_id?: string | null;
+            types?: PlaceTypeRow | PlaceTypeRow[] | null;
+          }
+        >
+      >();
 
     if (error) {
       throw new InternalServerErrorException(error.message);
     }
 
+    // Client-side filter to ensure category matches
+    const filteredData = (unfilteredData ?? []).filter((item) => {
+      if (!categoryFilter) return true;
+
+      const typeData = Array.isArray(item.types) ? item.types?.[0] : item.types;
+      if (!typeData) return false;
+
+      if (this.hasAnyCategoryId(typeData.category_id, resolvedCategoryIds)) {
+        return true;
+      }
+
+      const categoryNames = this.extractCategoryNames(typeData.categories);
+      if (categoryNames.length === 0) return false;
+
+      return this.matchesAnyCategory(categoryNames, categoryFilter);
+    });
+
+    // Apply pagination on filtered data
+    const paginatedData = filteredData.slice(offset, offset + safeLimit);
+
     return {
       category: categoryName,
-      data: (data ?? []).map((item) => ({
+      data: paginatedData.map((item) => ({
         id: item.id,
         name: item.name,
         image: this.resolveImage(item.image_url),
@@ -1019,8 +1122,8 @@ export class ExploreService {
       pagination: {
         page: safePage,
         limit: safeLimit,
-        total: count ?? 0,
-        pages: Math.ceil((count ?? 0) / safeLimit),
+        total: filteredData.length,
+        pages: Math.ceil(filteredData.length / safeLimit),
       },
     };
   }

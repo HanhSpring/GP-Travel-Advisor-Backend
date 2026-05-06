@@ -54,7 +54,8 @@ export class ExploreController {
 
   @Get('places')
   @ApiOperation({
-    summary: 'Get featured places or places by category (hotel, etc.)',
+    summary:
+      'Get featured places or places by category (lưu trú, ẩm thực, etc.)',
   })
   @ApiQuery({ name: 'category', required: false, type: String })
   @ApiQuery({ name: 'page', required: false, type: Number })
