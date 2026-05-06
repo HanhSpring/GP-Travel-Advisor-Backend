@@ -1,6 +1,8 @@
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
+import { EventEmitterModule } from '@nestjs/event-emitter';
 
+import { ActivityModule } from './modules/activity/activity.module';
 import { SearchModule } from './modules/search/search.module';
 import { ItineraryModule } from './modules/itinerary/itinerary.module';
 import { BusinessModule } from './modules/business/business.module';
@@ -45,6 +47,8 @@ import { UploadModule } from './modules/upload/upload.module';
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    EventEmitterModule.forRoot(),
+    ActivityModule,
     SearchModule,
     ItineraryModule,
     BusinessModule,

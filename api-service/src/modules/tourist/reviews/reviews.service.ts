@@ -3,8 +3,10 @@ import {
   Injectable,
   InternalServerErrorException,
 } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { randomUUID } from 'crypto';
 import { supabase } from '../../../config/supabase';
+import { ACTIVITY_LOG_EVENT } from '../../activity/activity.listener';
 
 interface CreateReviewPayload {
   tourist_id: string;
@@ -30,6 +32,8 @@ export interface ReviewResponse {
 
 @Injectable()
 export class ReviewsService {
+  constructor(private readonly eventEmitter: EventEmitter2) {}
+
   async createReview(payload: CreateReviewPayload): Promise<ReviewResponse> {
     if (!payload.tourist_id || !payload.place_id) {
       throw new BadRequestException('tourist_id and place_id are required');
@@ -87,6 +91,12 @@ export class ReviewsService {
         );
       }
     }
+
+    this.eventEmitter.emit(ACTIVITY_LOG_EVENT, {
+      tourist_id: payload.tourist_id,
+      action_type: 'write_review',
+      place_id: payload.place_id,
+    });
 
     return {
       id: reviewId,
