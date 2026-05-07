@@ -94,7 +94,7 @@ export class ReviewsService {
 
     this.eventEmitter.emit(ACTIVITY_LOG_EVENT, {
       tourist_id: payload.tourist_id,
-      action_type: 'write_review',
+      action_type: 'review',
       place_id: payload.place_id,
     });
 
