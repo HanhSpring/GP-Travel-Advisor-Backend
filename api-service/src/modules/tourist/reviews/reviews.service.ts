@@ -8,6 +8,14 @@ import { randomUUID } from 'crypto';
 import { supabase } from '../../../config/supabase';
 import { ACTIVITY_LOG_EVENT } from '../../activity/activity.listener';
 
+/** Trả về ISO-8601 string theo múi giờ Việt Nam (UTC+7) */
+function getNowVN(): string {
+  const now = new Date();
+  const VN_OFFSET_MS = 7 * 60 * 60 * 1000;
+  const vnTime = new Date(now.getTime() + VN_OFFSET_MS);
+  return vnTime.toISOString().replace('Z', '+07:00');
+}
+
 interface CreateReviewPayload {
   tourist_id: string;
   place_id: string;
@@ -48,7 +56,7 @@ export class ReviewsService {
     }
 
     const reviewId = randomUUID();
-    const createdAt = new Date().toISOString();
+    const createdAt = getNowVN();
     const reviewType = payload.content ? 'with_content' : 'without_content';
 
     const { error: reviewError } = await supabase

@@ -10,7 +10,7 @@ Bảng `activity_logs`:
 | `tourist_id` | uuid | ID tourist thực hiện hành động |
 | `action_type` | varchar | Loại hành động |
 | `place_id` | uuid | Địa điểm liên quan (nullable) |
-| `created_at` | timestamp | Thời điểm xảy ra |
+| `created_at` | timestamptz | Thời điểm xảy ra — **giờ Việt Nam UTC+7** (ví dụ: `2026-05-08T11:09:53.000+07:00`) |
 
 ---
 
@@ -22,7 +22,7 @@ Bảng `activity_logs`:
 | `view` | Ở lại trang chi tiết ≥ 2s | Frontend |
 | `save` | Lưu POI vào yêu thích | Frontend |
 | `unsave` | Bỏ POI khỏi yêu thích | Frontend |
-| `search` | Tìm kiếm và có kết quả trả về | Frontend |
+| `search` | Tìm kiếm và click vào kết quả đầu tiên (place) | Frontend |
 | `visited` | Check-in tại địa điểm thực tế | Frontend |
 | `review` | Gửi đánh giá có nội dung | Frontend + Backend event |
 | `rating` | Chấm điểm sao | Frontend (2 điểm gọi) |
@@ -107,8 +107,9 @@ lib/
     │   ├── screens/place_detail_screen.dart   ← view (dwell 2s), save, unsave, visited
     │   └── widgets/related_places_section.dart ← click (địa điểm liên quan)
     ├── search/presentation/
-    │   ├── cubit/search_cubit.dart            ← search (sau khi có kết quả)
-    │   └── widgets/search_result_widget.dart  ← click (chỉ khi location.type == 'place')
+    │   ├── cubit/search_cubit.dart            ← search (khi user click kết quả đầu tiên, kèm place_id)
+    │   ├── widgets/search_result_widget.dart  ← click (chỉ khi location.type == 'place')
+    │   └── widgets/search_suggestion_widget.dart ← click (tìm kiếm gần đây, chỉ khi location.type == 'place')
     └── review/presentation/
         └── screens/
             ├── place_review_screen.dart       ← review + rating (khi user nhấn "Gửi" trong màn hình chi tiết đánh giá)
@@ -142,7 +143,8 @@ Các điểm gọi:
 | `destination_card.dart` | Card địa điểm trang chủ |
 | `explore_screen.dart` | PageView nhà hàng + PageView khách sạn + See All cả hai |
 | `related_places_section.dart` | Card địa điểm liên quan trong PlaceDetailScreen |
-| `search_result_widget.dart` | Kết quả tìm kiếm (chỉ khi `location.type == 'place'`) |
+| `search_result_widget.dart` | Kết quả tìm kiếm mới (chỉ khi `location.type == 'place'`) |
+| `search_suggestion_widget.dart` | Tìm kiếm gần đây (chỉ khi `location.type == 'place'`) |
 
 ---
 
@@ -156,7 +158,7 @@ Timer? _dwellTimer;
 bool _viewTracked = false;
 
 void _startDwellTimer() {
-  if (_viewTracked) return;
+  if (_viewTracked) return;   // guard: chỉ log 1 lần duy nhất
   _dwellTimer?.cancel();
   _dwellTimer = Timer(const Duration(seconds: 2), () {
     if (!mounted) return;
@@ -168,12 +170,16 @@ void _startDwellTimer() {
 // BlocConsumer listener:
 listener: (context, state) {
   if (state is PlaceDetailLoaded) {
-    _startDwellTimer();
+    _startDwellTimer();   // gọi mỗi lần state load/reload, nhưng guard _viewTracked ngăn log lại
   }
 },
 ```
 
 Timer bị hủy trong `dispose()` — nếu user rời trước 2s thì không log.
+
+> **Lưu ý:** `_startDwellTimer()` không reset timer khi state reload — `_viewTracked = true` sau lần đầu
+> fire sẽ khiến mọi lần gọi tiếp theo bị skip ngay lập tức (`if (_viewTracked) return`).
+> Đây là hành vi đúng: mỗi phiên vào trang chỉ log `view` 1 lần.
 
 **Card trong danh sách cuộn** dùng `VisiblePlaceTracker`:
 
@@ -188,9 +194,9 @@ VisiblePlaceTracker(
 ```
 
 `VisiblePlaceTracker` dùng `VisibilityDetector`:
-- `visibleFraction >= 0.5` → bắt đầu timer 2s
-- `visibleFraction < 0.5` (user scroll qua) → hủy timer
-- Timer fire → `trackView(placeId)`, đặt flag `_tracked = true` (chỉ log 1 lần)
+- `visibleFraction >= 0.5` → khởi động timer 2s (dùng `??=` — không restart nếu timer đang chạy)
+- `visibleFraction < 0.5` (user scroll qua) → hủy timer và set `_timer = null`
+- Timer fire → `trackView(placeId)`, đặt flag `_tracked = true` (chỉ log 1 lần, mọi lần gọi sau bị skip)
 
 ---
 
@@ -215,16 +221,24 @@ onFavorite: () {
 
 ### `search` — Tìm kiếm
 
+Log `search` kèm `place_id` khi user click vào kết quả đầu tiên (chỉ khi `location.type == 'place'`).
+Flag `_searchTracked` trong `SearchCubit` đảm bảo chỉ log 1 lần mỗi phiên search (reset khi query thay đổi).
+
 ```dart
-// search_cubit.dart — trong onSearchQueryChanged, sau khi emit kết quả
-_debounce = Timer(const Duration(milliseconds: 300), () async {
-  final results = await _searchLocations(query);
-  emit(SearchState.searchResults(results));
-  _activityService.trackSearch(); // log sau khi có kết quả
-});
+// search_cubit.dart — trong onLocationSelected
+Future<void> onLocationSelected(SearchLocation location) async {
+  // Log search với place_id — chỉ lần click đầu tiên mỗi phiên search
+  if (!_searchTracked && location.type == 'place') {
+    _searchTracked = true;
+    _activityService.trackSearch(placeId: location.id);
+  }
+  await _saveRecentSearch(location);
+}
 ```
 
-Không log khi: query rỗng, search lỗi, hoặc load recent searches.
+`onLocationSelected` được gọi từ `search_result_widget.dart` và `search_suggestion_widget.dart` trong `onTap`.
+
+Không log khi: query rỗng, search throw exception, user click vào city (không phải place), hoặc đã click place trước đó trong cùng phiên search.
 
 ---
 
@@ -340,6 +354,7 @@ Bảng tổng hợp:
 Future<void> _track({
   required String actionType,
   String? placeId,
+  Map<String, dynamic>? metadata,   // khai báo nhưng hiện không gửi lên server
 }) async {
   try {
     final touristId = await AuthUtils.getCurrentUserId();
@@ -360,6 +375,7 @@ Future<void> _track({
         'tourist_id': touristId,
         'action_type': actionType,
         if (placeId != null) 'place_id': placeId,
+        // metadata không được gửi — body chỉ có 3 field trên
       },
     );
 
@@ -401,3 +417,4 @@ flutter run 2>&1 | grep "\[ActivityLog\]"
 - Backend cho phép mọi origin `localhost:*` qua CORS — không cần cấu hình thêm khi chạy Flutter web dev.
 - `LocationReviewEntity.placeId` (nullable) là `place_id` thực của POI, khác với `LocationReviewEntity.id` vốn là `itinerary_detail_id`. Cả hai field đều cần thiết: `id` dùng cho logic cập nhật state cubit, `placeId` dùng cho activity tracking.
 - Chế độ demo (`kDemoMode`): `placeId` là `null` nên activity tracking cho review/rating bị skip hoàn toàn — hành vi đúng vì demo không có POI thực.
+- `created_at` trong `activity_logs` được tạo bởi hàm `getNowVN()` tại backend — trả về ISO-8601 với offset `+07:00` thay vì UTC `Z`. Không phụ thuộc vào timezone của server hay Supabase.
