@@ -100,6 +100,49 @@ interface ItineraryDetailPlaceCityRow {
     | null;
 }
 
+export interface ExplorePagination {
+  page: number;
+  limit: number;
+  total: number;
+  pages: number;
+}
+
+export interface ExplorePublicItineraryItem {
+  id: string;
+  title: string;
+  location: string;
+  description: string | null;
+  start_date: string | null;
+  end_date: string | null;
+  days: number;
+  participant_count: number;
+  creator_id: string;
+  creator_name: string;
+  image: string;
+  image_gallery: string[];
+}
+
+export interface ExplorePublicItinerariesResponse {
+  data: ExplorePublicItineraryItem[];
+  pagination: ExplorePagination;
+}
+
+export interface ExplorePlaceItem {
+  id: string;
+  name: string;
+  image: string;
+  rating: number;
+  review_count: number;
+  city: string | null;
+  category: string | null;
+}
+
+export interface ExplorePlacesResponse {
+  category: string | null;
+  data: ExplorePlaceItem[];
+  pagination: ExplorePagination;
+}
+
 @Injectable()
 export class ExploreService {
   private readonly defaultImageUrl =
@@ -110,6 +153,35 @@ export class ExploreService {
     'tham quan & khám phá',
     'văn hoá & di sản',
   ];
+
+  // Simple in-memory cache to reduce repeated DB work for high-traffic explore queries
+  private readonly _cache = new Map<string, { ts: number; value: unknown }>();
+  // Cache for category keyword -> resolved category ids to avoid repeated
+  // `ilike` scans on the categories table.
+  private readonly _categoryIdCache = new Map<string, string[]>();
+  private getCacheTtlMs(): number {
+    const parsed = Number(process.env.EXPLORE_CACHE_TTL_MS ?? '30000');
+    if (!Number.isFinite(parsed) || parsed <= 0) return 30000;
+    return Math.floor(parsed);
+  }
+
+  private getFromCache<T>(key: string): T | null {
+    const entry = this._cache.get(key);
+    if (!entry) return null;
+    if (Date.now() - entry.ts > this.getCacheTtlMs()) {
+      this._cache.delete(key);
+      return null;
+    }
+    return entry.value as T;
+  }
+
+  private setCache(key: string, value: unknown) {
+    try {
+      this._cache.set(key, { ts: Date.now(), value });
+    } catch {
+      // ignore cache errors
+    }
+  }
 
   private getSafeInFilterLimit(): number {
     const parsed = Number(process.env.EXPLORE_MAX_IN_FILTER_IDS ?? '50');
@@ -339,10 +411,65 @@ export class ExploreService {
       throw new BadRequestException('tourist_id is required');
     }
 
-    const currentItinerary = await this.getCurrentItinerary(touristId);
-    const publicItinerariesResult = await this.getPublicItineraries(1, 5);
-    const featuredPlacesResult = await this.getFeaturedCities(1, 5);
-    const hotelsResult = await this.getPlacesByCategory('lưu trú', 1, 5);
+    const publicKey = `explore:public_itineraries:1:5`;
+    const featuredKey = `explore:featured_places:1:5`;
+    const restaurantsKey = `explore:places:ẩm thực:1:5`;
+    const hotelsKey = `explore:places:lưu trú:1:5`;
+
+    const [
+      publicItinerariesResult,
+      featuredPlacesResult,
+      restaurantsResult,
+      hotelsResult,
+    ] = await Promise.all([
+      this.getFromCache<ExplorePublicItinerariesResponse>(publicKey) ??
+        this.getPublicItineraries(1, 5),
+      this.getFromCache<ExplorePlacesResponse>(featuredKey) ??
+        this.getFeaturedCities(1, 5),
+      this.getFromCache<ExplorePlacesResponse>(restaurantsKey) ??
+        this.getPlacesByCategory('ẩm thực', 1, 5),
+      this.getFromCache<ExplorePlacesResponse>(hotelsKey) ??
+        this.getPlacesByCategory('lưu trú', 1, 5),
+    ]);
+
+    let restaurants = restaurantsResult.data;
+    let hotels = hotelsResult.data;
+
+    if (restaurants.length === 0 || hotels.length === 0) {
+      const fallbackCity = featuredPlacesResult.data[0];
+      if (fallbackCity) {
+        const cityOverview = await this.getCityOverview(fallbackCity.id);
+
+        if (restaurants.length === 0) {
+          const fallbackRestaurants = (cityOverview.restaurants ?? []).slice(
+            0,
+            5,
+          );
+          restaurants = fallbackRestaurants.map((item) => ({
+            id: (item as { id?: string }).id ?? '',
+            name: (item as { name?: string }).name ?? 'Nhà hàng',
+            image: this.resolveImage((item as { imageUrl?: string }).imageUrl),
+            rating: (item as { rating?: number }).rating ?? 0,
+            review_count: (item as { reviewCount?: number }).reviewCount ?? 0,
+            city: cityOverview.city.name,
+            category: 'ẩm thực',
+          }));
+        }
+
+        if (hotels.length === 0) {
+          const fallbackHotels = (cityOverview.hotels ?? []).slice(0, 5);
+          hotels = fallbackHotels.map((item) => ({
+            id: (item as { id?: string }).id ?? '',
+            name: (item as { name?: string }).name ?? 'Khách sạn',
+            image: this.resolveImage((item as { imageUrl?: string }).imageUrl),
+            rating: (item as { rating?: number }).rating ?? 0,
+            review_count: (item as { reviewCount?: number }).reviewCount ?? 0,
+            city: cityOverview.city.name,
+            category: 'lưu trú',
+          }));
+        }
+      }
+    }
 
     return {
       actions: {
@@ -350,13 +477,16 @@ export class ExploreService {
         notifications_target: `/notifications?tourist_id=${touristId}`,
       },
       current_location: 'Vị trí của bạn (Hồ Chí Minh)',
-      current_itinerary: currentItinerary,
+      current_itinerary: null,
+      current_itinerary_target: `/explore/current?tourist_id=${touristId}`,
       suggestion_itineraries: publicItinerariesResult.data,
       featured_places: featuredPlacesResult.data,
-      hotels: hotelsResult.data,
+      restaurants,
+      hotels,
       view_all_targets: {
         suggestion_itineraries: '/explore/itineraries/public?page=1&limit=50',
         featured_places: '/explore/cities?page=1&limit=50',
+        restaurants: '/explore/places?category=ẩm thực&page=1&limit=50',
         hotels: '/explore/places?category=lưu trú&page=1&limit=50',
       },
     };
@@ -511,7 +641,14 @@ export class ExploreService {
     };
   }
 
-  async getPublicItineraries(page = 1, limit = 5) {
+  async getPublicItineraries(
+    page = 1,
+    limit = 5,
+  ): Promise<ExplorePublicItinerariesResponse> {
+    const cacheKey = `explore:public_itineraries:${page}:${limit}`;
+    const cached =
+      this.getFromCache<ExplorePublicItinerariesResponse>(cacheKey);
+    if (cached) return cached;
     const safePage = page > 0 ? page : 1;
     const safeLimit = limit > 0 ? limit : 5;
     const offset = (safePage - 1) * safeLimit;
@@ -562,7 +699,7 @@ export class ExploreService {
       };
     });
 
-    return {
+    const result = {
       data: mapped,
       pagination: {
         page: safePage,
@@ -571,17 +708,20 @@ export class ExploreService {
         pages: Math.ceil((count ?? 0) / safeLimit),
       },
     };
+
+    this.setCache(cacheKey, result);
+    return result;
   }
 
   private buildCategoryKeywords(categoryName: string): string[] {
     const normalized = categoryName.toLowerCase().trim();
 
     if (this.isRestaurantCategory(normalized)) {
-      return ['ẩm thực'];
+      return ['ẩm thực', 'nhà hàng', 'ăn uống'];
     }
 
     if (this.isHotelCategory(normalized)) {
-      return ['lưu trú'];
+      return ['lưu trú', 'khách sạn', 'nghỉ dưỡng'];
     }
 
     if (this.isActivityCategory(normalized)) {
@@ -618,6 +758,11 @@ export class ExploreService {
   private async getCategoryIdsByKeywords(
     keywords: string[],
   ): Promise<string[]> {
+    const cacheKey = keywords.join('|');
+    const cached = this._categoryIdCache.get(cacheKey);
+    if (cached && cached.length > 0) {
+      return cached;
+    }
     const ids = new Set<string>();
 
     for (const keyword of keywords) {
@@ -637,10 +782,22 @@ export class ExploreService {
       }
     }
 
-    return Array.from(ids);
+    const resolved = Array.from(ids);
+    try {
+      if (resolved.length > 0) {
+        this._categoryIdCache.set(cacheKey, resolved);
+      }
+    } catch {
+      // ignore cache errors
+    }
+
+    return resolved;
   }
 
-  async getFeaturedCities(page = 1, limit = 5) {
+  async getFeaturedCities(page = 1, limit = 5): Promise<ExplorePlacesResponse> {
+    const cacheKey = `explore:featured_places:${page}:${limit}`;
+    const cached = this.getFromCache<ExplorePlacesResponse>(cacheKey);
+    if (cached) return cached;
     const safePage = page > 0 ? page : 1;
     const safeLimit = limit > 0 ? limit : 5;
     const offset = (safePage - 1) * safeLimit;
@@ -737,6 +894,22 @@ export class ExploreService {
           cityImageMap.set(cityId, images[0]);
           break;
         }
+        // If no prioritized-category image was found, fall back to any place
+        // in the city that has an image. This reduces cases where cities show
+        // the default "No Image" despite having places with images.
+        if (!cityImageMap.has(cityId)) {
+          const anyWithImage = candidates.find((p) => {
+            const imgs = this.toImageList((p as any)?.image_url);
+            return imgs.length > 0;
+          });
+
+          if (anyWithImage) {
+            const imgs = this.toImageList((anyWithImage as any).image_url);
+            if (imgs.length > 0) {
+              cityImageMap.set(cityId, imgs[0]);
+            }
+          }
+        }
       }
     }
 
@@ -750,7 +923,7 @@ export class ExploreService {
       category: null,
     }));
 
-    return {
+    const result = {
       category: null,
       data: mapped,
       pagination: {
@@ -760,6 +933,9 @@ export class ExploreService {
         pages: Math.ceil((count ?? 0) / safeLimit),
       },
     };
+
+    this.setCache(cacheKey, result);
+    return result;
   }
 
   async getCityOverview(cityId: string) {
@@ -1009,7 +1185,11 @@ export class ExploreService {
     };
   }
 
-  async getPlacesByCategory(category?: string, page = 1, limit = 5) {
+  async getPlacesByCategory(
+    category?: string,
+    page = 1,
+    limit = 5,
+  ): Promise<ExplorePlacesResponse> {
     const safePage = page > 0 ? page : 1;
     const safeLimit = limit > 0 ? limit : 5;
     const offset = (safePage - 1) * safeLimit;
@@ -1019,15 +1199,7 @@ export class ExploreService {
 
     if (category && category.trim().length > 0) {
       categoryName = category.trim().toLowerCase();
-
-      // Map category keyword to actual category names
-      if (this.isRestaurantCategory(categoryName)) {
-        categoryFilter = ['ẩm thực'];
-      } else if (this.isHotelCategory(categoryName)) {
-        categoryFilter = ['lưu trú'];
-      } else if (this.isActivityCategory(categoryName)) {
-        categoryFilter = ['tham quan & khám phá', 'giải trí & vui chơi'];
-      }
+      categoryFilter = this.buildCategoryKeywords(categoryName);
 
       if (!categoryFilter || categoryFilter.length === 0) {
         return {
@@ -1047,17 +1219,85 @@ export class ExploreService {
       ? new Set(await this.getCategoryIdsByKeywords(categoryFilter))
       : new Set<string>();
 
-    if (categoryFilter && resolvedCategoryIds.size === 0) {
-      return {
+    const cacheKey = `explore:places:${categoryName}:${safePage}:${safeLimit}:${Array.from(
+      resolvedCategoryIds,
+    ).join(',')}`;
+    const cached = this.getFromCache<ExplorePlacesResponse>(cacheKey);
+    if (cached) return cached;
+
+    if (categoryFilter) {
+      // Fetch a larger candidate set and match by category names on the
+      // joined type/category data so mismatched IDs do not hide sections.
+      const fallbackMultiplier = Number(
+        process.env.EXPLORE_FALLBACK_FETCH_MULTIPLIER ?? '3',
+      );
+      const multiplier =
+        Number.isFinite(fallbackMultiplier) && fallbackMultiplier > 0
+          ? Math.floor(fallbackMultiplier)
+          : 10;
+      const candidateEnd = offset + safeLimit * multiplier - 1;
+
+      const { data: candidateData, error: candidateError } = await supabase
+        .schema('travel')
+        .from('places')
+        .select(
+          'id, name, city_id, cities(name), average_rating, review_count, image_url, type_id, types(id, category_id, categories(id, name))',
+          { count: 'exact' },
+        )
+        .eq('is_approved', true)
+        .eq('is_active', true)
+        .order('average_rating', { ascending: false })
+        .order('review_count', { ascending: false })
+        .range(0, candidateEnd)
+        .returns<
+          Array<
+            PlaceRow & {
+              type_id?: string | null;
+              types?: PlaceTypeRow | PlaceTypeRow[] | null;
+            }
+          >
+        >();
+
+      if (candidateError) {
+        throw new InternalServerErrorException(candidateError.message);
+      }
+
+      const filtered = (candidateData ?? []).filter((item) => {
+        const typeData = Array.isArray(item.types)
+          ? item.types?.[0]
+          : item.types;
+        if (!typeData) return false;
+        if (this.hasAnyCategoryId(typeData.category_id, resolvedCategoryIds)) {
+          return true;
+        }
+        const categoryNames = this.extractCategoryNames(typeData.categories);
+        if (categoryNames.length === 0) return false;
+        return this.matchesAnyCategory(categoryNames, categoryFilter);
+      });
+
+      const paginated = filtered.slice(offset, offset + safeLimit);
+
+      const result = {
         category: categoryName,
-        data: [],
+        data: paginated.map((item) => ({
+          id: item.id,
+          name: item.name,
+          image: this.resolveImage(item.image_url),
+          rating: Number(item.average_rating) || 0,
+          review_count: item.review_count || 0,
+          city: this.extractCityName(item.cities),
+          category: categoryName,
+        })),
         pagination: {
           page: safePage,
           limit: safeLimit,
-          total: 0,
-          pages: 0,
+          total: filtered.length,
+          pages: Math.ceil(filtered.length / safeLimit),
         },
       };
+
+      this.setCache(cacheKey, result);
+      return result;
     }
 
     const placesQuery = supabase
@@ -1072,9 +1312,10 @@ export class ExploreService {
       .eq('is_approved', true)
       .eq('is_active', true);
 
-    const { data: unfilteredData, error } = await placesQuery
+    const { data, error, count } = await placesQuery
       .order('average_rating', { ascending: false })
       .order('review_count', { ascending: false })
+      .range(offset, offset + safeLimit - 1)
       .returns<
         Array<
           PlaceRow & {
@@ -1088,44 +1329,29 @@ export class ExploreService {
       throw new InternalServerErrorException(error.message);
     }
 
-    // Client-side filter to ensure category matches
-    const filteredData = (unfilteredData ?? []).filter((item) => {
-      if (!categoryFilter) return true;
-
-      const typeData = Array.isArray(item.types) ? item.types?.[0] : item.types;
-      if (!typeData) return false;
-
-      if (this.hasAnyCategoryId(typeData.category_id, resolvedCategoryIds)) {
-        return true;
-      }
-
-      const categoryNames = this.extractCategoryNames(typeData.categories);
-      if (categoryNames.length === 0) return false;
-
-      return this.matchesAnyCategory(categoryNames, categoryFilter);
-    });
-
-    // Apply pagination on filtered data
-    const paginatedData = filteredData.slice(offset, offset + safeLimit);
-
-    return {
+    const mapped = (data ?? []).map((item) => ({
+      id: item.id,
+      name: item.name,
+      image: this.resolveImage(item.image_url),
+      rating: Number(item.average_rating) || 0,
+      review_count: item.review_count || 0,
+      city: this.extractCityName(item.cities),
       category: categoryName,
-      data: paginatedData.map((item) => ({
-        id: item.id,
-        name: item.name,
-        image: this.resolveImage(item.image_url),
-        rating: Number(item.average_rating) || 0,
-        review_count: item.review_count || 0,
-        city: this.extractCityName(item.cities),
-        category: categoryName,
-      })),
+    }));
+
+    const result: ExplorePlacesResponse = {
+      category: categoryName,
+      data: mapped,
       pagination: {
         page: safePage,
         limit: safeLimit,
-        total: filteredData.length,
-        pages: Math.ceil(filteredData.length / safeLimit),
+        total: count ?? mapped.length,
+        pages: Math.ceil((count ?? mapped.length) / safeLimit),
       },
     };
+
+    this.setCache(cacheKey, result);
+    return result;
   }
 
   async getTimeRange(itineraryId: string): Promise<string> {
