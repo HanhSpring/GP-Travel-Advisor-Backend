@@ -89,39 +89,44 @@ export class BusinessController {
     return this.businessService.getDashboard(query.vendorId);
   }
 
-  @Post('add-new-place')
-  @ApiOperation({ summary: 'Tạo địa điểm + services + menu Excel' })
-  @ApiConsumes('multipart/form-data')
-  @ApiBody({
-    type: CreateFullPlaceDto,
-  })
-  @UseInterceptors(FileInterceptor('file'))
-  async createFull(
-    @Body() body: any,
-    @UploadedFile() file?: Express.Multer.File
-  ) {
-    // Support both old format (name, address, etc) and new format (p_name, p_address, etc)
-    const name = body.p_name || body.name;
-    const address = body.p_address || body.address;
-    const city = body.p_city || body.city;
-    const latitude = body.p_lat !== undefined ? body.p_lat : body.latitude;
-    const longitude = body.p_lng !== undefined ? body.p_lng : body.longitude;
-    
-    const dto = {
-      name,
-      address,
-      city,
-      latitude: Number(latitude),
-      longitude: Number(longitude),
-      vendorId: body.p_vendor_id || body.vendorId || '',
-      categories: this.parseFlexible(body.p_categories || body.categories),
-      services: this.parseFlexible(body.p_services || body.services),
-      menu: this.parseFlexible(body.p_menu || body.menu),
-    };
+ @Post('add-new-place')
+@ApiOperation({ summary: 'Tạo địa điểm + services + menu Excel' })
+@ApiConsumes('multipart/form-data')
+@ApiBody({
+  type: CreateFullPlaceDto,
+})
+@UseInterceptors(FileInterceptor('file'))
+async createFull(
+  @Body() body: any,
+  @UploadedFile() file?: Express.Multer.File
+) {
+  // Support both old format (name, address, etc) and new format (p_name, p_address, etc)
+  const name = body.p_name || body.name;
+  const address = body.p_address || body.address;
+  const city = body.p_city || body.city;
+  const latitude = body.p_lat !== undefined ? body.p_lat : body.latitude;
+  const longitude = body.p_lng !== undefined ? body.p_lng : body.longitude;
+  
+  const dto = {
+    name,
+    address,
+    city,
+    latitude: Number(latitude),
+    longitude: Number(longitude),
+    vendorId: body.p_vendor_id || body.vendorId || '',
+    categories: this.parseFlexible(body.p_categories || body.categories),
+    services: this.parseFlexible(body.p_services || body.services),
+    menu: this.parseFlexible(body.p_menu || body.menu),
 
-    return this.businessService.createFullPlace(dto, file);
-  }
+    // 👉 BỔ SUNG CÁC DÒNG DƯỚI ĐÂY ĐỂ TRUYỀN DỮ LIỆU SANG SERVICE
+    p_open_time: body.p_open_time || body.openTime,
+    p_close_time: body.p_close_time || body.closeTime,
+    p_description: body.p_description || body.description,
+    p_images: this.parseFlexible(body.p_images || body.images),
+  };
 
+  return this.businessService.createFullPlace(dto, file);
+}
   private parseFlexible(value: any) {
     if (!value) return [];
 

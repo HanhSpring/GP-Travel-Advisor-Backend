@@ -26,11 +26,20 @@ export class BusinessService {
   }
 
   async getPlaceDetail(placeId: string) {
-    const { data, error } = await supabase
-      .schema('travel')
-      .rpc('get_place_detail', { p_place_id: placeId });
+    const [{ data, error }, { data: imagesData }] = await Promise.all([
+      supabase.schema('travel').rpc('get_place_detail', { p_place_id: placeId }),
+      supabase.schema('travel').from('place_images').select('image_url').eq('place_id', placeId).order('created_at', { ascending: true }),
+    ]);
 
     if (error) throw new InternalServerErrorException(error.message);
+
+    const images = (imagesData ?? []).map((r: any) => r.image_url);
+    if (Array.isArray(data) && data.length > 0) {
+      return { ...data[0], images };
+    }
+    if (data && typeof data === 'object') {
+      return { ...data, images };
+    }
     return data;
   }
 
@@ -64,7 +73,7 @@ export class BusinessService {
   async getPlaceServicesByType(placeId: string) {
     try {
       console.log('📍 Fetching services for placeId:', placeId)
-      
+
       // Step 1: Get all place_services for this place (free services)
       const { data: placeServices, error: psError } = await supabase
         .schema('travel')
@@ -192,61 +201,60 @@ export class BusinessService {
   }
 
   async createFullPlace(dto: any, file?: any) {
-    if (!dto || !dto.name) {
-      throw new BadRequestException('Thiếu dữ liệu đầu vào: Tên địa điểm');
-    }
+    // 1. Kiểm tra dữ liệu đầu vào (Sửa lại cách truy cập biến theo payload bạn đã gửi)
+    // Lưu ý: Vì payload bạn gửi có tiền tố p_, nên ta phải đọc đúng key đó
+    const name = dto.p_name || dto.name;
+    const address = dto.p_address || dto.address;
+    const city = dto.p_city || dto.city;
+    const categories = dto.p_categories || dto.categories;
+    const vendorId = dto.p_vendor_id || dto.vendorId;
 
-    if (!dto.address) {
-      throw new BadRequestException('Thiếu dữ liệu đầu vào: Địa chỉ');
-    }
-
-    if (!dto.city) {
-      throw new BadRequestException('Thiếu dữ liệu đầu vào: Tỉnh/Thành phố');
-    }
-
-    if (!dto.categories || dto.categories.length === 0) {
-      throw new BadRequestException('Thiếu dữ liệu đầu vào: Danh mục');
-    }
-
-    if (!dto.vendorId) {
-      throw new BadRequestException('Thiếu dữ liệu đầu vào: Vendor ID');
-    }
+    if (!name) throw new BadRequestException('Thiếu dữ liệu: Tên địa điểm');
+    if (!address) throw new BadRequestException('Thiếu dữ liệu: Địa chỉ');
+    if (!city) throw new BadRequestException('Thiếu dữ liệu: Tỉnh/Thành phố');
+    if (!categories || categories.length === 0) throw new BadRequestException('Thiếu dữ liệu: Danh mục');
+    if (!vendorId) throw new BadRequestException('Thiếu dữ liệu: Vendor ID');
 
     let menu: any[] = [];
-
-    // From request body (form items)
-    if (dto.menu && Array.isArray(dto.menu) && dto.menu.length > 0) {
-      menu = [...dto.menu]
+    // Lấy menu từ form (p_menu)
+    if (dto.p_menu && Array.isArray(dto.p_menu)) {
+      menu = [...dto.p_menu];
+    } else if (dto.menu && Array.isArray(dto.menu)) {
+      menu = [...dto.menu];
     }
 
-    // From Excel file - MERGE with existing items
+    // Merge với Excel nếu có
     if (file) {
       try {
         const fileMenuItems = this.parseExcel(file);
         menu = [...menu, ...fileMenuItems];
       } catch (error) {
         console.error('Excel parsing error:', error);
-        // Don't fail if Excel parsing errors - continue with form items
       }
     }
 
-    // Validate all menu items
     if (menu.length > 0) {
       this.validateMenu(menu);
     }
 
+    // 2. GỌI RPC VỚI ĐẦY ĐỦ 13 THAM SỐ
     const { data, error } = await supabase
       .schema('travel')
-      .rpc('create_full_place', {
-        p_name: dto.name,
-        p_address: dto.address,
-        p_city: dto.city,
-        p_lat: Number(dto.latitude),
-        p_lng: Number(dto.longitude),
-        p_vendor_id: dto.vendorId,
-        p_categories: Array.isArray(dto.categories) ? dto.categories : [],
-        p_services: Array.isArray(dto.services) ? dto.services : [],
-        p_menu: menu.length > 0 ? menu : [],
+      .rpc('create_full_place_v2', {
+        p_name: name,
+        p_address: address,
+        p_city: city,
+        p_lat: Number(dto.p_lat || dto.latitude),
+        p_lng: Number(dto.p_lng || dto.longitude),
+        p_vendor_id: vendorId,
+        p_categories: Array.isArray(categories) ? categories : [],
+        p_services: Array.isArray(dto.p_services || dto.services) ? (dto.p_services || dto.services) : [],
+        p_menu: menu,
+        // BỔ SUNG CÁC THAM SỐ CÒN THIẾU Ở ĐÂY:
+        p_images: Array.isArray(dto.p_images || dto.images) ? (dto.p_images || dto.images) : [],
+        p_open_time: dto.p_open_time || '08:00',
+        p_close_time: dto.p_close_time || '22:00',
+        p_description: dto.p_description || ''
       });
 
     if (error) {
