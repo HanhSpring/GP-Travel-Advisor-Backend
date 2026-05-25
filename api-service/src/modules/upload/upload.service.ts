@@ -106,6 +106,12 @@ export class UploadService {
       const fileName = `places/place-${placeId}-${Date.now()}.webp`;
       const url = await this.pushToR2(optimizedBuffer, fileName);
 
+      // Lưu URL vào bảng travel.place_images
+      await this.supabase
+        .schema('travel')
+        .from('place_images')
+        .insert({ place_id: placeId, image_url: url });
+
       return { url };
     } catch (error) {
       throw new InternalServerErrorException('Lỗi upload ảnh địa điểm');

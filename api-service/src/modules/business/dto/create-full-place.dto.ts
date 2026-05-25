@@ -57,6 +57,17 @@ export class CreateFullPlaceDto {
 
   @ApiProperty({ required: false })
   p_services?: Array<{ name: string; description?: string }>
+  @ApiProperty({ example: '10:00', required: false })
+  p_open_time?: string;
+
+  @ApiProperty({ example: '22:00', required: false })
+  p_close_time?: string;
+
+  @ApiProperty({ example: 'Mô tả địa điểm...', required: false })
+  p_description?: string;
+
+  @ApiProperty({ required: false })
+  p_images?: string[];
 
   @ApiProperty({ required: false })
   p_menu?: Array<{ name: string; description?: string; price: number }>
