@@ -66,11 +66,17 @@ interface CategoryRow {
 
 interface PlaceTypeRow {
   id: string;
+  name: string | null;
   category_id: string | null;
   categories:
     | { id: string; name: string }
     | { id: string; name: string }[]
     | null;
+}
+
+interface TypeRow {
+  id: string;
+  category_id: string | null;
 }
 
 interface PlaceWithTypeRow extends PlaceRow {
@@ -81,6 +87,10 @@ interface PlaceWithTypeRow extends PlaceRow {
 interface CityRow {
   id: string;
   name: string;
+}
+
+interface FavoritePlaceRow {
+  place_id: string;
 }
 
 interface UserRow {
@@ -149,9 +159,18 @@ export class ExploreService {
     process.env.DEFAULT_PLACE_IMAGE_URL ||
     'https://placehold.co/1080x720?text=No+Image';
 
-  private readonly featuredPlaceCategoryPriority = [
-    'tham quan & khám phá',
-    'văn hoá & di sản',
+  private readonly featuredPlaceTypePriority = [
+    'bãi biển/vịnh',
+    'thiên nhiên',
+    'khách sạn & resort',
+    'công viên/quảng trường',
+    'làng nghề',
+    'công trình tôn giáo',
+    'homestay & villa',
+    'bảo tàng & không gian trưng bày',
+    'bảo tàng nghệ thuật/3d',
+    'nông trại',
+    'công viên giải trí',
   ];
 
   // Simple in-memory cache to reduce repeated DB work for high-traffic explore queries
@@ -226,6 +245,17 @@ export class ExploreService {
     return [];
   }
 
+  private normalizeText(value: string): string {
+    return value
+      .toLowerCase()
+      .normalize('NFD')
+      .replace(/\p{Diacritic}/gu, '')
+      .replace(/[&/]+/g, ' ')
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim();
+  }
+
   private resolveImage(imageUrl?: unknown): string {
     const images = this.toImageList(imageUrl);
     if (images.length > 0) {
@@ -296,7 +326,20 @@ export class ExploreService {
 
     const categoryList = Array.isArray(categories) ? categories : [categories];
     return categoryList
-      .map((item) => item.name.toLowerCase().trim())
+      .map((item) => this.normalizeText(item.name))
+      .filter((name) => name.length > 0);
+  }
+
+  private extractTypeNames(
+    typeData: PlaceTypeRow | PlaceTypeRow[] | null | undefined,
+  ): string[] {
+    if (!typeData) {
+      return [];
+    }
+
+    const typeList = Array.isArray(typeData) ? typeData : [typeData];
+    return typeList
+      .map((item) => this.normalizeText(item.name ?? ''))
       .filter((name) => name.length > 0);
   }
 
@@ -320,16 +363,20 @@ export class ExploreService {
     return categoryIds.has(categoryId);
   }
 
-  private getCategoryPriorityIndex(categoryNames: string[]): number | null {
+  private getTypePriorityIndex(typeNames: string[]): number | null {
     let bestIndex: number | null = null;
 
-    for (const categoryName of categoryNames) {
+    for (const typeName of typeNames) {
       for (
         let index = 0;
-        index < this.featuredPlaceCategoryPriority.length;
+        index < this.featuredPlaceTypePriority.length;
         index += 1
       ) {
-        if (categoryName.includes(this.featuredPlaceCategoryPriority[index])) {
+        if (
+          typeName.includes(
+            this.normalizeText(this.featuredPlaceTypePriority[index]),
+          )
+        ) {
           if (bestIndex === null || index < bestIndex) {
             bestIndex = index;
           }
@@ -810,8 +857,6 @@ export class ExploreService {
       .schema('travel')
       .from('cities')
       .select('id, name', { count: 'exact' })
-      .order('name', { ascending: true })
-      .range(offset, offset + safeLimit - 1)
       .returns<CityRow[]>();
 
     if (cityError) {
@@ -820,100 +865,122 @@ export class ExploreService {
       );
     }
 
-    const cityIds = (cities ?? []).map((item) => item.id);
-    const cityImageMap = new Map<string, string>();
+    const { data: places, error: placesError } = await supabase
+      .schema('travel')
+      .from('places')
+      .select(
+        'id, city_id, image_url, average_rating, review_count, type_id, types(id, name, category_id, categories(id, name))',
+      )
+      .eq('is_approved', true)
+      .eq('is_active', true)
+      .returns<PlaceWithTypeRow[]>();
 
-    if (cityIds.length > 0) {
-      // Pick representative images from approved active places in priority categories.
-      const { data: places, error: placesError } = await supabase
-        .schema('travel')
-        .from('places')
-        .select(
-          'id, city_id, image_url, average_rating, review_count, type_id, types(id, category_id, categories(id, name))',
-        )
-        .eq('is_approved', true)
-        .eq('is_active', true)
-        .in('city_id', cityIds)
-        .order('review_count', { ascending: false })
-        .returns<PlaceWithTypeRow[]>();
+    if (placesError) {
+      throw new InternalServerErrorException(placesError.message);
+    }
 
-      if (placesError) {
-        throw new InternalServerErrorException(placesError.message);
+    const { data: favoritePlaces, error: favoritePlacesError } = await supabase
+      .schema('travel')
+      .from('favorite_places')
+      .select('place_id')
+      .returns<FavoritePlaceRow[]>();
+
+    if (favoritePlacesError) {
+      throw new InternalServerErrorException(favoritePlacesError.message);
+    }
+
+    const favoriteCountByPlace = new Map<string, number>();
+    for (const item of favoritePlaces ?? []) {
+      if (!item.place_id) {
+        continue;
       }
 
-      const placesByCity = new Map<string, PlaceWithTypeRow[]>();
+      favoriteCountByPlace.set(
+        item.place_id,
+        (favoriteCountByPlace.get(item.place_id) ?? 0) + 1,
+      );
+    }
 
-      for (const item of places ?? []) {
-        if (!item.city_id) {
+    const favoriteCountByCity = new Map<string, number>();
+    const placesByCity = new Map<string, PlaceWithTypeRow[]>();
+
+    for (const item of places ?? []) {
+      if (!item.city_id) {
+        continue;
+      }
+
+      const existing = placesByCity.get(item.city_id) ?? [];
+      existing.push(item);
+      placesByCity.set(item.city_id, existing);
+
+      const placeFavoriteCount = favoriteCountByPlace.get(item.id) ?? 0;
+      favoriteCountByCity.set(
+        item.city_id,
+        (favoriteCountByCity.get(item.city_id) ?? 0) + placeFavoriteCount,
+      );
+    }
+
+    const sortedCities = (cities ?? []).slice().sort((left, right) => {
+      const favoriteDiff =
+        (favoriteCountByCity.get(right.id) ?? 0) -
+        (favoriteCountByCity.get(left.id) ?? 0);
+
+      if (favoriteDiff !== 0) {
+        return favoriteDiff;
+      }
+
+      return left.name.localeCompare(right.name, 'vi', { sensitivity: 'base' });
+    });
+
+    const pagedCities = sortedCities.slice(offset, offset + safeLimit);
+    const cityImageMap = new Map<string, string>();
+
+    for (const city of pagedCities) {
+      const candidates = placesByCity.get(city.id) ?? [];
+      const prioritizedGroups = new Map<number, PlaceWithTypeRow[]>();
+
+      for (const item of candidates) {
+        const typeData = Array.isArray(item.types)
+          ? item.types?.[0]
+          : item.types;
+        const typeNames = this.extractTypeNames(typeData);
+        const priorityIndex = this.getTypePriorityIndex(typeNames);
+
+        if (priorityIndex === null) {
           continue;
         }
 
-        const existing = placesByCity.get(item.city_id) ?? [];
-        existing.push(item);
-        placesByCity.set(item.city_id, existing);
+        const group = prioritizedGroups.get(priorityIndex) ?? [];
+        group.push(item);
+        prioritizedGroups.set(priorityIndex, group);
       }
 
-      for (const cityId of cityIds) {
-        const candidates = placesByCity.get(cityId) ?? [];
-        const prioritizedGroups = new Map<number, PlaceWithTypeRow[]>();
-
-        for (const item of candidates) {
-          const typeData = Array.isArray(item.types)
-            ? item.types?.[0]
-            : item.types;
-          const categoryNames = this.extractCategoryNames(
-            typeData?.categories ?? null,
-          );
-          const priorityIndex = this.getCategoryPriorityIndex(categoryNames);
-
-          if (priorityIndex === null) {
-            continue;
-          }
-
-          const group = prioritizedGroups.get(priorityIndex) ?? [];
-          group.push(item);
-          prioritizedGroups.set(priorityIndex, group);
+      for (
+        let index = 0;
+        index < this.featuredPlaceTypePriority.length;
+        index += 1
+      ) {
+        const group = prioritizedGroups.get(index) ?? [];
+        if (group.length === 0) {
+          continue;
         }
 
-        for (
-          let index = 0;
-          index < this.featuredPlaceCategoryPriority.length;
-          index += 1
-        ) {
-          const group = prioritizedGroups.get(index) ?? [];
-          if (group.length === 0) {
-            continue;
-          }
+        const imageReadyGroup = group.filter((place) => {
+          return this.toImageList(place.image_url).length > 0;
+        });
 
-          const picked = this.pickRandomItem(group);
-          const images = this.toImageList(picked?.image_url);
-          if (images.length === 0) {
-            continue;
-          }
-
-          cityImageMap.set(cityId, images[0]);
-          break;
+        if (imageReadyGroup.length === 0) {
+          continue;
         }
-        // If no prioritized-category image was found, fall back to any place
-        // in the city that has an image. This reduces cases where cities show
-        // the default "No Image" despite having places with images.
-        if (!cityImageMap.has(cityId)) {
-          const anyWithImage = candidates.find((p) => {
-            const imgs = this.toImageList((p as any)?.image_url);
-            return imgs.length > 0;
-          });
 
-          if (anyWithImage) {
-            const imgs = this.toImageList((anyWithImage as any).image_url);
-            if (imgs.length > 0) {
-              cityImageMap.set(cityId, imgs[0]);
-            }
-          }
-        }
+        const picked = this.pickRandomItem(imageReadyGroup);
+        const images = this.toImageList(picked?.image_url);
+        cityImageMap.set(city.id, images[0]);
+        break;
       }
     }
 
-    const mapped = (cities ?? []).map((item) => ({
+    const mapped = pagedCities.map((item) => ({
       id: item.id,
       name: item.name,
       image: cityImageMap.get(item.id) ?? this.defaultImageUrl,
@@ -1131,6 +1198,7 @@ export class ExploreService {
           rating: Number(item.average_rating) || 0,
           reviewCount: item.review_count || 0,
           price: '0đ',
+          address: item.address ?? city.name,
           starRating: 4,
           priceValue: 0,
           accommodationType: 'hotel',
@@ -1226,6 +1294,83 @@ export class ExploreService {
     if (cached) return cached;
 
     if (categoryFilter) {
+      const resolvedCategoryIdList = Array.from(resolvedCategoryIds);
+      const safeInFilterLimit = this.getSafeInFilterLimit();
+
+      // Primary path: resolve category -> type_ids and paginate places by type_id.
+      // This returns the complete dataset for a category instead of only a
+      // limited candidate window.
+      if (resolvedCategoryIdList.length > 0) {
+        const { data: typeRows, error: typeError } = await supabase
+          .schema('travel')
+          .from('types')
+          .select('id, category_id')
+          .in('category_id', resolvedCategoryIdList)
+          .returns<TypeRow[]>();
+
+        if (typeError) {
+          throw new InternalServerErrorException(typeError.message);
+        }
+
+        const typeIds = Array.from(
+          new Set(
+            (typeRows ?? [])
+              .map((item) => item.id)
+              .filter((id) => id.trim().length > 0),
+          ),
+        );
+
+        if (typeIds.length > 0 && typeIds.length <= safeInFilterLimit) {
+          const { data, error, count } = await supabase
+            .schema('travel')
+            .from('places')
+            .select(
+              'id, name, city_id, cities(name), average_rating, review_count, image_url, type_id, types(id, category_id, categories(id, name))',
+              { count: 'exact' },
+            )
+            .eq('is_approved', true)
+            .eq('is_active', true)
+            .in('type_id', typeIds)
+            .order('average_rating', { ascending: false })
+            .order('review_count', { ascending: false })
+            .range(offset, offset + safeLimit - 1)
+            .returns<
+              Array<
+                PlaceRow & {
+                  type_id?: string | null;
+                  types?: PlaceTypeRow | PlaceTypeRow[] | null;
+                }
+              >
+            >();
+
+          if (error) {
+            throw new InternalServerErrorException(error.message);
+          }
+
+          const result: ExplorePlacesResponse = {
+            category: categoryName,
+            data: (data ?? []).map((item) => ({
+              id: item.id,
+              name: item.name,
+              image: this.resolveImage(item.image_url),
+              rating: Number(item.average_rating) || 0,
+              review_count: item.review_count || 0,
+              city: this.extractCityName(item.cities),
+              category: categoryName,
+            })),
+            pagination: {
+              page: safePage,
+              limit: safeLimit,
+              total: count ?? 0,
+              pages: Math.ceil((count ?? 0) / safeLimit),
+            },
+          };
+
+          this.setCache(cacheKey, result);
+          return result;
+        }
+      }
+
       // Fetch a larger candidate set and match by category names on the
       // joined type/category data so mismatched IDs do not hide sections.
       const fallbackMultiplier = Number(
