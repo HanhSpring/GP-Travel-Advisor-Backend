@@ -92,4 +92,14 @@ export class ExploreController {
   getCityOverview(@Param('cityId') cityId: string) {
     return this.service.getCityOverview(cityId);
   }
+
+  @Get('current')
+  @ApiOperation({
+    summary: 'Get current itinerary for tourist (fast endpoint)',
+  })
+  @ApiQuery({ name: 'tourist_id', required: true, type: String })
+  @ApiOkResponse({ type: Object })
+  getCurrent(@Query('tourist_id') touristId: string) {
+    return this.service.getCurrentItinerary(touristId);
+  }
 }

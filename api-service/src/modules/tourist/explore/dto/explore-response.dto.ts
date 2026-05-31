@@ -144,6 +144,9 @@ export class ExploreViewAllTargetsDto {
   featured_places: string;
 
   @ApiProperty()
+  restaurants: string;
+
+  @ApiProperty()
   hotels: string;
 }
 
@@ -162,6 +165,9 @@ export class ExploreResponseDto {
 
   @ApiProperty({ type: [ExplorePlaceDto] })
   featured_places: ExplorePlaceDto[];
+
+  @ApiProperty({ type: [ExplorePlaceDto] })
+  restaurants: ExplorePlaceDto[];
 
   @ApiProperty({ type: [ExplorePlaceDto] })
   hotels: ExploreHotelDto[];
