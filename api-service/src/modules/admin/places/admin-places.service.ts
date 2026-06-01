@@ -15,8 +15,9 @@ interface CityRow {
   name: string | null;
 }
 
-interface PlaceCategoryJoinRow {
-  category_id: string;
+interface TypeRow {
+  id: string;
+  name: string;
   categories: CategoryRow | CategoryRow[] | null;
 }
 
@@ -28,7 +29,7 @@ interface PlaceListRow {
   is_approved: boolean | null;
   vendor_id: string | null;
   registered_date: string | null;
-  place_categories: PlaceCategoryJoinRow[] | null;
+  types: TypeRow | TypeRow[] | null;
 }
 
 interface PlaceDetailRow {
@@ -44,7 +45,7 @@ interface PlaceDetailRow {
   is_approved: boolean | null;
   vendor_id: string | null;
   registered_date: string | null;
-  place_categories: PlaceCategoryJoinRow[] | null;
+  types: TypeRow | TypeRow[] | null;
 }
 
 interface UserRow {
@@ -59,13 +60,8 @@ interface CategoryFilterRow {
   id: string;
 }
 
-interface PlaceCategoryFilterRow {
-  place_id: string;
-}
-
-interface PlaceCategoryNameRow {
-  place_id: string;
-  categories: CategoryRow | CategoryRow[] | null;
+interface TypeFilterRow {
+  id: string;
 }
 
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
@@ -90,21 +86,6 @@ export class AdminPlacesService {
     }
 
     return Math.floor(parsed);
-  }
-
-  private splitIntoChunks<T>(items: T[], chunkSize: number): T[][] {
-    if (items.length === 0) {
-      return [];
-    }
-
-    const size = chunkSize > 0 ? chunkSize : 200;
-    const chunks: T[][] = [];
-
-    for (let index = 0; index < items.length; index += size) {
-      chunks.push(items.slice(index, index + size));
-    }
-
-    return chunks;
   }
 
   private normalizeImageUrls(
@@ -150,34 +131,21 @@ export class AdminPlacesService {
     return cityData.name ?? '';
   }
 
-  private extractCategoryNames(
-    placeCategories: PlaceCategoryJoinRow[] | null,
-  ): string[] {
-    if (!placeCategories || placeCategories.length === 0) {
-      return [];
+  private extractCategoryFromType(
+    typeData: TypeRow | TypeRow[] | null,
+  ): string {
+    if (!typeData) {
+      return '';
     }
 
-    const names: string[] = [];
-
-    for (const item of placeCategories) {
-      const categoryData = item.categories;
-
-      if (!categoryData) {
-        continue;
-      }
-
-      if (Array.isArray(categoryData)) {
-        for (const category of categoryData) {
-          if (category?.name) {
-            names.push(category.name);
-          }
-        }
-      } else if (categoryData.name) {
-        names.push(categoryData.name);
-      }
+    const type = Array.isArray(typeData) ? typeData[0] : typeData;
+    if (!type?.categories) {
+      return '';
     }
 
-    return names;
+    const catData = type.categories;
+    const cat = Array.isArray(catData) ? catData[0] : catData;
+    return cat?.name ?? '';
   }
 
   private mapStatus(
@@ -270,7 +238,7 @@ export class AdminPlacesService {
       );
     }
 
-    let placeIdsByCategoryName: string[] | null = null;
+    let typeIdsByCategoryName: string[] | null = null;
     if (categoryName) {
       const { data: categories, error: categoriesError } = await supabase
         .schema('travel')
@@ -298,25 +266,25 @@ export class AdminPlacesService {
         };
       }
 
-      const { data: categoryLinks, error: categoryError } = await supabase
+      const { data: types, error: typesError } = await supabase
         .schema('travel')
-        .from('place_categories')
-        .select('place_id')
+        .from('types')
+        .select('id')
         .in('category_id', categoryIds);
 
-      if (categoryError) {
-        throw new InternalServerErrorException(categoryError.message);
+      if (typesError) {
+        throw new InternalServerErrorException(typesError.message);
       }
 
-      placeIdsByCategoryName = Array.from(
+      typeIdsByCategoryName = Array.from(
         new Set(
-          (categoryLinks ?? [])
-            .map((item) => (item as PlaceCategoryFilterRow).place_id)
+          (types ?? [])
+            .map((item) => (item as TypeFilterRow).id)
             .filter(Boolean),
         ),
       );
 
-      if (placeIdsByCategoryName.length === 0) {
+      if (typeIdsByCategoryName.length === 0) {
         return {
           data: [],
           pagination: {
@@ -333,7 +301,7 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, image_url, name, address, is_approved, vendor_id, registered_date',
+        'id, image_url, name, address, is_approved, vendor_id, registered_date, types(id, name, categories(id, name))',
         { count: 'exact' },
       );
 
@@ -345,13 +313,13 @@ export class AdminPlacesService {
       query = query.eq('is_approved', false);
     }
 
-    if (placeIdsByCategoryName) {
+    if (typeIdsByCategoryName) {
       const inFilterLimit = this.getSafeInFilterLimit();
-      if (placeIdsByCategoryName.length > inFilterLimit) {
-        placeIdsByCategoryName = placeIdsByCategoryName.slice(0, inFilterLimit);
+      if (typeIdsByCategoryName.length > inFilterLimit) {
+        typeIdsByCategoryName = typeIdsByCategoryName.slice(0, inFilterLimit);
       }
 
-      query = query.in('id', placeIdsByCategoryName);
+      query = query.in('type_id', typeIdsByCategoryName);
     }
 
     const normalizedSearch = this.normalizeForSearch(search);
@@ -379,44 +347,6 @@ export class AdminPlacesService {
 
     const placeRows = (data ?? []) as PlaceListRow[];
 
-    const placeIds = placeRows.map((item) => item.id);
-    const categoryMapByPlace = new Map<string, string[]>();
-
-    if (placeIds.length > 0) {
-      const { data: placeCategories, error: placeCategoriesError } =
-        await supabase
-          .schema('travel')
-          .from('place_categories')
-          .select('place_id, categories(id, name)')
-          .in('place_id', placeIds)
-          .returns<PlaceCategoryNameRow[]>();
-
-      if (placeCategoriesError) {
-        throw new InternalServerErrorException(placeCategoriesError.message);
-      }
-
-      for (const row of placeCategories ?? []) {
-        const categories = row.categories;
-        const names: string[] = [];
-
-        if (Array.isArray(categories)) {
-          for (const category of categories) {
-            if (category?.name) {
-              names.push(category.name);
-            }
-          }
-        } else if (categories?.name) {
-          names.push(categories.name);
-        }
-
-        if (names.length > 0) {
-          const existing = categoryMapByPlace.get(row.place_id) ?? [];
-          existing.push(...names);
-          categoryMapByPlace.set(row.place_id, Array.from(new Set(existing)));
-        }
-      }
-    }
-
     const vendorIds = Array.from(
       new Set(
         placeRows
@@ -441,7 +371,7 @@ export class AdminPlacesService {
 
     const places = placeRows.map((place) => {
       const vendor = vendors.find((v) => v.id === place.vendor_id);
-      const categoryNames = categoryMapByPlace.get(place.id) ?? [];
+      const category = this.extractCategoryFromType(place.types);
       const primaryImage = this.normalizeImageUrls(place.image_url)[0] ?? '';
 
       return {
@@ -449,7 +379,7 @@ export class AdminPlacesService {
         image_url: primaryImage,
         name: place.name,
         address: place.address ?? '',
-        category: categoryNames.join(', '),
+        category,
         vendor_name: vendor?.full_name ?? 'N/A',
         status: this.mapStatus(place.is_approved),
         registered_date: place.registered_date ?? '',
@@ -474,7 +404,7 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, image_url, name, description, address, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, place_categories(category_id, categories(id, name))',
+        'id, image_url, name, description, address, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, types(id, name, categories(id, name))',
       )
       .eq('id', id)
       .maybeSingle<PlaceDetailRow>();
@@ -502,7 +432,7 @@ export class AdminPlacesService {
           .eq('vendor_id', place.vendor_id)
       : null;
 
-    const categoryNames = this.extractCategoryNames(place.place_categories);
+    const category = this.extractCategoryFromType(place.types);
     const cityName = this.extractCityName(place.cities);
 
     return {
@@ -513,7 +443,7 @@ export class AdminPlacesService {
       city: cityName,
       latitude: place.latitude ?? 0,
       longitude: place.longitude ?? 0,
-      category: categoryNames.join(', '),
+      category,
       registered_date: place.registered_date ?? '',
       status: this.mapStatus(place.is_approved),
       contact_phone: vendor?.phone_number ?? '',

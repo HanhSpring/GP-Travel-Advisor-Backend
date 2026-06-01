@@ -1,0 +1,12 @@
+version: "3.9"
+services:
+  ai-service:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./weights:/app/weights
+      - ./.cache:/app/.cache
+    env_file:
+      - .env
+    restart: unless-stopped
