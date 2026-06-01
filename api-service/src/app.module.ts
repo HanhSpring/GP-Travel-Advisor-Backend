@@ -30,6 +30,7 @@ Admin modules
 import { AdminPlacesModule } from './modules/admin/places/admin-places.module';
 import { AdminReviewsModule } from './modules/admin/reviews/admin-reviews.module';
 import { AdminItineraryReviewsModule } from './modules/admin/itinerary-reviews/admin-itinerary-reviews.module';
+import { AdminDashboardModule } from './modules/admin/dashboard/admin-dashboard.module';
 
 /*
 Business modules
@@ -43,6 +44,7 @@ Upload module
 */
 
 import { UploadModule } from './modules/upload/upload.module';
+import { AiTestModule } from './modules/ai-test/ai-test.module';
 
 @Module({
   imports: [
@@ -76,6 +78,7 @@ import { UploadModule } from './modules/upload/upload.module';
     AdminPlacesModule,
     AdminReviewsModule,
     AdminItineraryReviewsModule,
+    AdminDashboardModule,
 
     /*
     Business
@@ -89,6 +92,7 @@ import { UploadModule } from './modules/upload/upload.module';
     */
 
     UploadModule,
+    AiTestModule,
   ],
 })
 export class AppModule {}
