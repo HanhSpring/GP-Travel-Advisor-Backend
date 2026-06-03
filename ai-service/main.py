@@ -11,6 +11,8 @@ import os
 import logging
 from dotenv import load_dotenv
 
+from app.services.routing import optimize_route
+
 # Load environment variables
 load_dotenv()
 
@@ -65,6 +67,11 @@ class RecommendationResponse(BaseModel):
     recommendations: List[dict]
     confidence_score: float
 
+class RouteRequest(BaseModel):
+    locations: List[dict]
+
+class RouteResponse(BaseModel):
+    optimized_locations: List[dict]
 
 # Routes
 @app.get("/", response_model=HealthResponse)
@@ -117,6 +124,20 @@ async def get_recommendations(_request: RecommendationRequest):
         "recommendations": mock_recommendations,
         "confidence_score": 0.85
     }
+
+@app.post("/api/v1/optimize-route", response_model=RouteResponse)
+async def api_optimize_route(request: RouteRequest):
+    """
+    Optimize the itinerary route using OR-Tools (TSP).
+    """
+    if not request.locations or len(request.locations) == 0:
+        return {"optimized_locations": []}
+    
+    try:
+        ordered = optimize_route(request.locations)
+        return {"optimized_locations": ordered}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @app.get("/api/v1/status")

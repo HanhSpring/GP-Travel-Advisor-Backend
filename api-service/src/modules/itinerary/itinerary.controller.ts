@@ -56,7 +56,6 @@ export class ItineraryController {
     type: ItinerarySummaryResponseDto,
   })
   create(@Body() body: CreateItineraryDto): ItinerarySummaryResponseDto {
-    // TODO: Thay thế mock data bằng logic AI thực tế
     return {
       id: 'uuid-123',
       destinationName: 'Hà Nội',
@@ -90,46 +89,16 @@ export class ItineraryController {
 
   @Get(':id')
   @HttpCode(HttpStatus.OK)
-  @ApiOperation({ summary: 'Lấy chi tiết toàn bộ lịch trình theo từng ngày' })
-  @ApiParam({ name: 'id', description: 'ID của lịch trình', example: 'uuid-sg-3days' })
-  @ApiResponse({ status: 200, type: ItineraryDetailResponseDto })
-  getItineraryDetail(@Param('id') id: string): ItineraryDetailResponseDto {
-    // TODO: Thay thế mock data bằng query DB thực tế
-    return {
-      id,
-      title: 'Khám phá Sài Gòn 3 ngày',
-      dateRangeLabel: '12 Th06 - 15 Th06, 2026',
-      status: 'IN_PROGRESS',
-      isPublic: true,
-      totalBudget: 5000000,
-      totalDays: 3,
-      totalPlaces: 12,
-      days: [
-        {
-          dateLabel: '12/06',
-          dayNumber: 1,
-          weatherTemp: 32,
-          activeTimeStr: '6 tiếng 30 phút',
-          dayBudget: 1200000,
-          progressPercent: 35,
-          totalDistanceStr: '12.5km',
-          totalTransitTimeStr: '~45 phút',
-          activities: [
-            {
-              id: 'act-1',
-              startTime: '08:00',
-              endTime: '09:00',
-              placeName: 'Chợ Hoa Hồ Thị Kỷ',
-              address: 'Hẻm 52 Hồ Thị Kỷ, Phường 1...',
-              imageUrl: 'https://example.com/cho-hoa.jpg',
-              priceLabel: 'MIỄN PHÍ',
-              tags: [],
-              transitToNext: { mode: 'BIKE', durationStr: '15 phút di chuyển' },
-            },
-          ],
-        },
-      ],
-    };
+  @ApiOperation({
+    summary: 'Lấy chi tiết toàn bộ lịch trình, từng ngày và từng điểm đến',
+  })
+  @ApiParam({
+    name: 'id',
+    description: 'ID của lịch trình',
+    example: 'uuid-sg-3days',
+  })
+  async getItineraryDetail(@Param('id') id: string): Promise<any> {
+    return this.service.getItineraryDetail(id);
   }
 
   @Patch(':id/visibility')
@@ -301,5 +270,29 @@ export class ItineraryController {
     @Param('activityId') activityId: string,
   ) {
     return this.service.getSuggestions(itineraryId, activityId);
+  }
+
+  @Patch(':id/activities')
+  @ApiOperation({ summary: 'Cập nhật danh sách hoạt động/thời gian của lịch trình' })
+  @ApiParam({ name: 'id', description: 'ID của lịch trình' })
+  async updateActivities(
+    @Param('id') id: string,
+    @Body() body: { days: any[] },
+  ) {
+    await this.service.updateActivities(id, body.days);
+    return {
+      message: 'Đã cập nhật lịch trình thành công',
+      success: true,
+    };
+  }
+
+  @Post('optimize-day')
+  @ApiOperation({ summary: 'Tối ưu hoá các hoạt động trong một ngày bằng AI Service (OR-Tools)' })
+  async optimizeDay(@Body() body: { activities: any[] }) {
+    if (!body.activities || body.activities.length === 0) {
+      return { optimized: [] };
+    }
+    const optimized = await this.service.optimizeDayRoute(body.activities);
+    return { optimized };
   }
 }

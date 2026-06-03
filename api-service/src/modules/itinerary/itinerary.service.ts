@@ -658,4 +658,291 @@ export class ItineraryService {
   private _toRad(deg: number): number {
     return deg * (Math.PI / 180);
   }
+
+  async updateActivities(id: string, days: any[]) {
+    // Gom tất cả activities từ mọi ngày thành một mảng phẳng
+    const allActivities: Array<{ id: string; startTime: string; endTime: string }> = [];
+    for (const day of days) {
+      if (day.activities && Array.isArray(day.activities)) {
+        for (const act of day.activities) {
+          allActivities.push(act);
+        }
+      }
+    }
+
+    // Chạy tất cả lệnh UPDATE song song thay vì tuần tự
+    // Trước: 24 activities × ~150ms = ~3.6s
+    // Sau:   Promise.all → ~150ms (chỉ 1 vòng chờ duy nhất)
+    await Promise.all(
+      allActivities.map(async (act) => {
+        const { error } = await supabase
+          .schema('travel')
+          .from('itinerary_details')
+          .update({
+            arrival_time: act.startTime,
+            departure_time: act.endTime,
+          })
+          .eq('id', act.id);
+
+        if (error) {
+          console.warn(`[Supabase] Không thể cập nhật activity ${act.id}: ${error.message}`);
+        }
+      }),
+    );
+
+    return true;
+  }
+
+
+  async getItineraryDetail(id: string) {
+    const { data: itinerary, error: itinError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (itinError || !itinerary) {
+      throw new Error('Itinerary not found');
+    }
+
+    const { data: details, error: detailError } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select(`
+        id,
+        itinerary_id,
+        place_id,
+        visit_date,
+        arrival_time,
+        departure_time,
+        notes,
+        estimated_cost,
+        transport_cost,
+        actual_cost,
+        duration_minutes,
+        sequence_order,
+        user_notes,
+        locked_arrive_time,
+        place:place_id (
+          id,
+          name,
+          address,
+          image_url,
+          latitude,
+          longitude,
+          average_rating,
+          review_count,
+          open_hour_compressed,
+          types(categories(name))
+        )
+      `)
+      .eq('itinerary_id', id)
+      .order('visit_date', { ascending: true })
+      .order('arrival_time', { ascending: true, nullsFirst: true });
+
+    if (detailError) {
+      throw detailError;
+    }
+
+    const daysMap = new Map<string, any[]>();
+    for (const detail of details || []) {
+      const dateStr = detail.visit_date;
+      const list = daysMap.get(dateStr) || [];
+      list.push(detail);
+      daysMap.set(dateStr, list);
+    }
+
+    const sortedDates = Array.from(daysMap.keys()).sort();
+
+    const days = sortedDates.map((dateStr, index) => {
+      const dayNumber = index + 1;
+      const activitiesRaw = daysMap.get(dateStr) || [];
+      
+      const activities = activitiesRaw.map((act, actIndex) => {
+        const place = act.place;
+        const images = place?.image_url;
+        const imageUrl = Array.isArray(images) && images.length > 0 ? images[0] : (typeof images === 'string' ? images : 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80');
+
+        // Tính thời gian di chuyển đến địa điểm kế tiếp
+        const nextAct = activitiesRaw[actIndex + 1];
+        let transitInfo: string | null = null;
+        if (nextAct) {
+          const departureStr: string = act.departure_time || '';
+          const nextArrivalStr: string = nextAct.arrival_time || '';
+          transitInfo = this._calcTransitLabel(departureStr, nextArrivalStr);
+        }
+
+        const typeData = Array.isArray(place?.types) ? place.types[0] : place?.types;
+        const catData = Array.isArray(typeData?.categories) ? typeData.categories[0] : typeData?.categories;
+        const category: string | null = catData?.name ?? null;
+
+        return {
+          id: act.id,
+          startTime: act.arrival_time || '08:00',
+          endTime: act.departure_time || '09:00',
+          placeName: place?.name || 'Điểm tham quan',
+          address: place?.address || '',
+          imageUrl: imageUrl,
+          priceLabel: act.estimated_cost ? `${act.estimated_cost}đ` : 'MIỄN PHÍ',
+          tags: [],
+          transitToNext: transitInfo ? { durationStr: transitInfo } : null,
+          transport_info: transitInfo,
+          title: place?.name || 'Điểm tham quan',
+          locationName: place?.name || 'Điểm tham quan',
+          price: act.estimated_cost || 0,
+          currency: 'VNĐ',
+          isFree: !act.estimated_cost,
+          category,
+          open_hour_compressed: place?.open_hour_compressed ?? null,
+          latitude: place?.latitude,
+          longitude: place?.longitude,
+          rating: place?.average_rating || 4.5,
+          reviewCount: place?.review_count || 100,
+          status: 'chuaDi',
+        };
+      });
+
+      let totalDuration = '0 tiếng';
+      if (activities.length > 0) {
+        totalDuration = `${activities.length * 2} tiếng`;
+      }
+
+      let dateLabel = dateStr;
+      try {
+        const parts = dateStr.split('-');
+        if (parts.length === 3) {
+          dateLabel = `${parts[2]}/${parts[1]}`;
+        }
+      } catch (_) {}
+
+      return {
+        dateLabel: dateLabel,
+        dayNumber: dayNumber,
+        date: dateStr,
+        weatherTemp: 30,
+        activeTimeStr: totalDuration,
+        dayBudget: activities.reduce((sum, a) => sum + a.price, 0),
+        progressPercent: 0,
+        totalDistanceStr: '0km',
+        totalTransitTimeStr: '0 phút',
+        activities: activities,
+        day_number: dayNumber,
+        locations_count: activities.length,
+        day_budget: activities.reduce((sum, a) => sum + a.price, 0),
+        total_duration: totalDuration,
+      };
+    });
+
+    const startStr = itinerary.start_date || '';
+    const endStr = itinerary.end_date || '';
+
+    let diffDays = 1;
+    try {
+      const diffTime = Math.abs(new Date(endStr).getTime() - new Date(startStr).getTime());
+      diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
+    } catch (_) {}
+
+    return {
+      id: itinerary.id,
+      title: itinerary.description || 'Chi tiết lịch trình',
+      dateRangeLabel: `${startStr} - ${endStr}`,
+      status: (itinerary.status || 'pending').toUpperCase(),
+      isPublic: itinerary.is_public || false,
+      totalBudget: itinerary.estimated_cost || 0,
+      totalDays: diffDays || days.length || 1,
+      totalPlaces: details?.length || 0,
+      days: days,
+      destination: itinerary.destination || '',
+      start_date: startStr,
+      end_date: endStr,
+      durationDays: diffDays || days.length || 1,
+      activitiesCount: details?.length || 0,
+      estimatedBudget: itinerary.estimated_cost || 0,
+      spentBudget: itinerary.actual_cost || 0,
+      centerCoordinate: [10.7769, 106.7009],
+      notes: [
+        'Chuẩn bị quần áo thoải mái và phù hợp.',
+        'Đem theo các giấy tờ tùy thân đầy đủ.'
+      ],
+      visitedRestaurants: []
+    };
+  }
+
+  /**
+   * Tính thời gian di chuyển giữa 2 địa điểm dựa trên gap thời gian.
+   * @param departureStr - Giờ rời khỏi địa điểm hiện tại "HH:mm" hoặc "HH:mm:ss"
+   * @param nextArrivalStr - Giờ đến địa điểm kế tiếp "HH:mm" hoặc "HH:mm:ss"
+   * @returns Chuỗi mô tả như "15 phút di chuyển", "1 giờ 10 phút di chuyển", hoặc null nếu dữ liệu không hợp lệ
+   */
+  private _calcTransitLabel(departureStr: string, nextArrivalStr: string): string | null {
+    if (!departureStr || !nextArrivalStr) return null;
+    try {
+      const toMinutes = (t: string): number => {
+        const parts = t.split(':').map(Number);
+        return parts[0] * 60 + parts[1];
+      };
+      const gapMins = toMinutes(nextArrivalStr) - toMinutes(departureStr);
+      if (gapMins <= 0) return null;
+      if (gapMins < 60) return `${gapMins} phút di chuyển`;
+      const h = Math.floor(gapMins / 60);
+      const m = gapMins % 60;
+      return m === 0 ? `${h} giờ di chuyển` : `${h} giờ ${m} phút di chuyển`;
+    } catch (_) {
+      return null;
+    }
+  }
+  async optimizeDayRoute(activities: any[]) {
+    if (activities.length <= 2) return activities;
+
+    try {
+      const response = await fetch('http://127.0.0.1:8000/api/v1/optimize-route', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ locations: activities }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`AI Service returned ${response.status}`);
+      }
+
+      const data = await response.json() as any;
+      const optimized = data.optimized_locations;
+      
+      // We need to re-adjust start and end times based on the new order.
+      // Assuming first activity start time is fixed.
+      if (optimized && optimized.length > 0) {
+        let currentMinutes = this.toMinutes(activities[0].startTime || '08:00');
+        for (let i = 0; i < optimized.length; i++) {
+          const act = optimized[i];
+          const actOld = activities.find(a => a.id === act.id);
+          const oldStart = actOld ? this.toMinutes(actOld.startTime) : 0;
+          const oldEnd = actOld ? this.toMinutes(actOld.endTime) : 60;
+          const duration = oldEnd - oldStart > 0 ? oldEnd - oldStart : 60;
+          
+          act.startTime = this.toTimeString(currentMinutes);
+          act.endTime = this.toTimeString(currentMinutes + duration);
+          currentMinutes += duration + 30; // 30 mins travel buffer
+        }
+        return optimized;
+      }
+
+      return activities;
+    } catch (e) {
+      console.error('optimizeDayRoute failed:', e);
+      return activities;
+    }
+  }
+
+  private toMinutes(t: string): number {
+    if (!t) return 0;
+    const parts = t.split(':').map(Number);
+    return parts[0] * 60 + parts[1];
+  }
+
+  private toTimeString(m: number): string {
+    const h = Math.floor(m / 60) % 24;
+    const min = m % 60;
+    return `${h.toString().padStart(2, '0')}:${min.toString().padStart(2, '0')}`;
+  }
 }
