@@ -16,11 +16,12 @@ import {
   ApiResponse,
   ApiParam,
   ApiBody,
+  ApiQuery,
 } from '@nestjs/swagger';
 import { ItineraryService } from './itinerary.service';
+import { RecommendationService } from '../recommendation/recommendation.service';
 import { GetItinerariesDto } from './dto/get-itineraries.dto';
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
-import { ItinerarySummaryResponseDto } from './dto/itinerary-summary-response.dto';
 import { ItineraryDetailResponseDto } from './dto/itinerary-detail-response.dto';
 import { ItineraryResponseDto } from './dto/itinerary-response.dto';
 import { ToggleVisibilityDto } from './dto/toggle-visibility.dto';
@@ -30,15 +31,17 @@ import {
   CustomizeActivityResponseDto,
   SuggestionsResponseDto,
 } from './dto/customize-response.dto';
+import {
+  TwoTowerRetrievalResponseDto,
+} from './dto/retrieval-response.dto';
 
 @ApiTags('Itinerary')
 @Controller('itinerary')
 export class ItineraryController {
-  constructor(private readonly service: ItineraryService) {}
-
-  // ════════════════════════════════════════════════════════════════
-  // CÁC ENDPOINT CŨ (GIỮ NGUYÊN)
-  // ════════════════════════════════════════════════════════════════
+  constructor(
+    private readonly service: ItineraryService,
+    private readonly recommendationService: RecommendationService,
+  ) {}
 
   @Get('my-itineraries')
   @ApiOperation({ summary: 'Lấy danh sách lịch trình của user' })
@@ -47,50 +50,42 @@ export class ItineraryController {
     return this.service.getMyItineraries(query.userId);
   }
 
+  /**
+   * Two-Tower retrieval: nhận tham số chuyến đi → trả top-K địa điểm
+   * (cosine_score, predict_ranking = null chờ ranking model).
+   */
   @Post()
   @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Tạo lịch trình du lịch mới bằng AI' })
+  @ApiOperation({
+    summary: 'Two-Tower retrieval — trả top-K địa điểm phù hợp',
+    description:
+      'Gọi FastAPI encode-query → pgvector search → trả danh sách candidates. ' +
+      'predict_ranking sẽ được điền bởi ranking model (thành viên khác).',
+  })
+  @ApiQuery({
+    name: 'top_k',
+    required: false,
+    type: Number,
+    example: 100,
+    description: 'Số lượng candidates tối đa (mặc định 100)',
+  })
   @ApiResponse({
     status: 201,
-    description: 'Lịch trình đã được khởi tạo thành công',
-    type: ItinerarySummaryResponseDto,
+    description: 'Top-K địa điểm theo cosine similarity',
+    type: TwoTowerRetrievalResponseDto,
   })
-  create(@Body() body: CreateItineraryDto): ItinerarySummaryResponseDto {
-    return {
-      id: 'uuid-123',
-      destinationName: 'Hà Nội',
-      dateRangeLabel: '15 Th10 - 20 Th10, 2023',
-      mainTransportMode: 'AIRPLANE',
-      statistics: {
-        totalDays: 6,
-        totalActivities: 12,
-        totalHotels: 2,
-        totalTransfers: 5,
-      },
-      dailySummaries: [
-        { dayNumber: 1, dateLabel: '15 Th10', title: 'Đến nơi & Nhận phòng', iconType: 'FLIGHT' },
-        { dayNumber: 2, dateLabel: '16 Th10', title: 'Khám phá Hồ Gươm & Lăng Bác', iconType: 'CAMERA' },
-        { dayNumber: 3, dateLabel: '17 Th10', title: 'Tham quan Đền chùa & Văn hóa', iconType: 'TEMPLE' },
-        { dayNumber: 4, dateLabel: '18 Th10', title: 'Mua sắm tại Aeon Mall Long Biên', iconType: 'SHOPPING' },
-        { dayNumber: 5, dateLabel: '19 Th10', title: 'Nhà tù Hoả Lò & Chợ Đồng Xuân', iconType: 'STAR' },
-      ],
-      budget: {
-        estimatedCost: 4500000,
-        totalBudget: 7500000,
-        statusTag: 'Trong tầm kiểm soát',
-      },
-      importantNotes: [
-        'Mang theo hộ chiếu/ CCCD và bảo hiểm du lịch.',
-        'Chuẩn bị quần áo phù hợp với thời tiết.',
-        'Pin dự phòng cho điện thoại.',
-      ],
-    };
+  async create(
+    @Body() body: CreateItineraryDto,
+    @Query('top_k') topK?: string,
+  ): Promise<TwoTowerRetrievalResponseDto> {
+    const k = topK ? Math.min(parseInt(topK, 10) || 100, 200) : 100;
+    return this.recommendationService.retrieveCandidates(body, k);
   }
 
   @Get(':id')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
-    summary: 'Lấy chi tiết toàn bộ lịch trình, từng ngày và từng điểm đến',
+    summary: '[Mock] Lấy chi tiết lịch trình — sẽ được thành viên khác implement',
   })
   @ApiParam({
     name: 'id',

@@ -24,13 +24,23 @@ export enum TransportMode {
   WATERWAY = 'WATERWAY', // Đường thủy
 }
 
-// Định nghĩa Enum mới cho Chủ đề chuyến đi
+// tripTheme enum giữ lại để không break import cũ (nếu có)
 export enum TripTheme {
-  EXPLORE = 'EXPLORE', // Khám phá & Trải nghiệm
-  RELAX = 'RELAX', // Nghỉ dưỡng & Thư giãn
-  FAMILY = 'FAMILY', // Gia đình & Trẻ nhỏ
-  CULTURE = 'CULTURE', // Văn hóa & Lịch sử
+  EXPLORE = 'EXPLORE',
+  RELAX = 'RELAX',
+  FAMILY = 'FAMILY',
+  CULTURE = 'CULTURE',
 }
+
+// Các giá trị hợp lệ cho tripIntent — phải khớp vocab model AI
+export const TRIP_INTENT_OPTIONS = [
+  'Khám phá tổng hợp',
+  'Ẩm thực & Bản địa',
+  'Đô thị & Vui chơi',
+  'Khám phá & Sinh thái',
+  'Nghỉ dưỡng & Biển',
+  'Văn hóa & Lịch sử',
+] as const;
 
 // Định nghĩa Enum cho Ẩm thực (Khớp với các nút màu xanh/trắng)
 export enum FoodPreference {
@@ -42,6 +52,11 @@ export enum FoodPreference {
 }
 
 export class CreateItineraryDto {
+  @ApiProperty({ example: 'user-uuid', description: 'Supabase user ID' })
+  @IsNotEmpty({ message: 'Vui lòng cung cấp userId' })
+  @IsString()
+  userId!: string;
+
   // --- DỮ LIỆU TỪ BƯỚC 1 ---
 
   @ApiProperty({
@@ -51,7 +66,7 @@ export class CreateItineraryDto {
   })
   @IsNotEmpty({ message: 'Vui lòng chọn loại chuyến đi' })
   @IsEnum(TripType)
-  tripType: TripType;
+  tripType!: TripType;
 
   @ApiProperty({
     example: 'SGN',
@@ -59,7 +74,7 @@ export class CreateItineraryDto {
   })
   @IsNotEmpty({ message: 'Vui lòng chọn điểm khởi hành' })
   @IsString()
-  departureLocationId: string;
+  departureLocationId!: string;
 
   @ApiProperty({
     example: 'HAN',
@@ -67,7 +82,7 @@ export class CreateItineraryDto {
   })
   @IsNotEmpty({ message: 'Vui lòng chọn điểm đến' })
   @IsString()
-  destinationLocationId: string;
+  destinationLocationId!: string;
 
   @ApiProperty({
     enum: TransportMode,
@@ -76,7 +91,7 @@ export class CreateItineraryDto {
   })
   @IsNotEmpty({ message: 'Vui lòng chọn phương tiện di chuyển' })
   @IsEnum(TransportMode)
-  transportMode: TransportMode;
+  transportMode!: TransportMode;
 
   // ==========================================
   // --- DỮ LIỆU TỪ BƯỚC 2 (Bổ sung mới) ---
@@ -89,7 +104,7 @@ export class CreateItineraryDto {
   })
   @IsNotEmpty({ message: 'Vui lòng chọn ngày bắt đầu' })
   @IsDateString({}, { message: 'Định dạng ngày bắt đầu không hợp lệ' })
-  startDate: string;
+  startDate!: string;
 
   @ApiProperty({
     example: '2024-06-20',
@@ -97,7 +112,7 @@ export class CreateItineraryDto {
   })
   @IsNotEmpty({ message: 'Vui lòng chọn ngày kết thúc' })
   @IsDateString({}, { message: 'Định dạng ngày kết thúc không hợp lệ' })
-  endDate: string;
+  endDate!: string;
 
   // 2. THỜI GIAN HOẠT ĐỘNG TRONG NGÀY
   // Lưu ý: FE đang hiển thị 07:00 AM, nhưng khi gửi xuống BE nên chuẩn hóa thành hệ 24h (07:00 và 23:00) để AI dễ tính toán.
@@ -109,7 +124,7 @@ export class CreateItineraryDto {
   @Matches(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, {
     message: 'Giờ bắt đầu phải theo định dạng HH:mm',
   })
-  dailyStartTime: string;
+  dailyStartTime!: string;
 
   @ApiProperty({
     example: '23:00',
@@ -119,30 +134,30 @@ export class CreateItineraryDto {
   @Matches(/^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$/, {
     message: 'Giờ kết thúc phải theo định dạng HH:mm',
   })
-  dailyEndTime: string;
+  dailyEndTime!: string;
 
-  // 3. CHỦ ĐỀ CHUYẾN ĐI
+  // 3. MỤC ĐÍCH CHUYẾN ĐI (khớp vocab model AI)
   @ApiProperty({
-    enum: TripTheme,
-    example: TripTheme.EXPLORE,
-    description: 'Chủ đề của chuyến đi',
+    example: 'Khám phá tổng hợp',
+    description: 'Mục đích chuyến đi — phải khớp vocab model AI',
+    enum: TRIP_INTENT_OPTIONS,
   })
-  @IsNotEmpty({ message: 'Vui lòng chọn chủ đề chuyến đi' })
-  @IsEnum(TripTheme, { message: 'Chủ đề không hợp lệ' })
-  tripTheme: TripTheme;
+  @IsNotEmpty({ message: 'Vui lòng chọn mục đích chuyến đi' })
+  @IsString()
+  tripIntent!: string;
 
   // 4. SỐ LƯỢNG THÀNH VIÊN
   @ApiProperty({ example: 2, description: 'Số lượng người lớn (Tối thiểu 1)' })
   @IsNotEmpty()
   @IsInt()
   @Min(1, { message: 'Chuyến đi phải có ít nhất 1 người lớn' })
-  adultCount: number;
+  adultCount!: number;
 
   @ApiProperty({ example: 1, description: 'Số lượng trẻ em (Có thể bằng 0)' })
   @IsOptional() // Dùng IsOptional vì có chuyến đi không có trẻ em
   @IsInt()
   @Min(0, { message: 'Số lượng trẻ em không được âm' })
-  childCount: number;
+  childCount!: number;
 
   // ==========================================
   // --- BƯỚC 3: SỞ THÍCH & NGÂN SÁCH (MỚI) ---
@@ -156,7 +171,7 @@ export class CreateItineraryDto {
   @IsNotEmpty({ message: 'Vui lòng xác định mức ngân sách' })
   @IsNumber({}, { message: 'Ngân sách phải là một số' })
   @Min(0, { message: 'Ngân sách không hợp lệ' })
-  budget: number;
+  budget!: number;
 
   // 2. SỞ THÍCH ẨM THỰC (Cố định)
   @ApiProperty({

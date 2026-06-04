@@ -10,3 +10,4 @@ weights/*.bin
 .cache/
 *.egg-info/
 dist/
+weights/

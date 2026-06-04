@@ -25,17 +25,25 @@ def _load_bge_m3():
 
 def _load_two_tower():
     import os
-    path = "weights/two_tower.pt"
-    if os.path.exists(path):
-        import torch
-        from app.models.two_tower import TwoTowerModel
-        model = TwoTowerModel()
-        model.load_state_dict(torch.load(path, map_location="cpu"))
-        model.eval()
-        _models["two_tower"] = model
-        logger.info("Loaded: Two Tower")
-    else:
-        logger.warning("Two Tower weights not found — skipping")
+    from app.core.config import settings
+
+    vocab_path   = settings.two_tower_vocab_path
+    weights_path = settings.two_tower_weights_path
+
+    if not os.path.exists(vocab_path):
+        logger.warning(f"Two Tower vocab not found at {vocab_path!r} — skipping")
+        return
+    if not os.path.exists(weights_path):
+        logger.warning(f"Two Tower weights not found at {weights_path!r} — skipping")
+        return
+
+    try:
+        from app.models.two_tower import build_inference_model
+        query_tower = build_inference_model(vocab_path, weights_path)
+        _models["two_tower"] = query_tower
+        logger.info("Loaded: Two Tower (QueryTower ready for inference)")
+    except Exception as e:
+        logger.error(f"Two Tower load failed: {e}")
 
 
 def _load_content_based():

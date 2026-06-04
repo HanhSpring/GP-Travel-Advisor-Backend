@@ -46,6 +46,10 @@ Upload module
 import { UploadModule } from './modules/upload/upload.module';
 import { AiTestModule } from './modules/ai-test/ai-test.module';
 
+// City module
+import { CitiesModule } from './modules/city/city.module';
+import { RecommendationModule } from './modules/recommendation/recommendation.module';
+
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
@@ -53,6 +57,7 @@ import { AiTestModule } from './modules/ai-test/ai-test.module';
     ActivityModule,
     SearchModule,
     ItineraryModule,
+    RecommendationModule,
     BusinessModule,
     AuthModule,
     ProfileModule,
@@ -93,6 +98,9 @@ import { AiTestModule } from './modules/ai-test/ai-test.module';
 
     UploadModule,
     AiTestModule,
+
+    // City module
+    CitiesModule,
   ],
 })
 export class AppModule {}

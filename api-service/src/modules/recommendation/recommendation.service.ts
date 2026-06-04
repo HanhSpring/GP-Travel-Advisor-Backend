@@ -1,0 +1,153 @@
+import {
+  Injectable,
+  Logger,
+  NotFoundException,
+  ServiceUnavailableException,
+} from '@nestjs/common';
+import { supabase } from '../../config/supabase';
+import { MlClientService } from './ml-client.service';
+import { CreateItineraryDto } from '../itinerary/dto/create-itinerary.dto';
+import {
+  TwoTowerRetrievalResponseDto,
+  CandidatePlaceDto,
+} from '../itinerary/dto/retrieval-response.dto';
+import { diversifyTopK, getStratifiedFetchPlan, PlaceCandidate } from './utils/mmr-rerank';
+
+@Injectable()
+export class RecommendationService {
+  private readonly logger = new Logger(RecommendationService.name);
+
+  constructor(private readonly mlClient: MlClientService) {}
+
+  /**
+   * Two-Tower retrieval pipeline (khớp notebook retrieve_diverse_topk):
+   *   1. Encode query embedding
+   *   2. Tính số ngày → slot limits
+   *   3. Gọi recommend_places_by_slot riêng cho từng slot (song song)
+   *      - Slot filter TRƯỚC, ANN search TRONG pool đó
+   *   4. Gộp kết quả → diversifyTopK lấy top theo quota
+   */
+  async retrieveCandidates(
+    dto: CreateItineraryDto,
+    topK = 100,
+  ): Promise<TwoTowerRetrievalResponseDto> {
+    // ── 1. City name ──────────────────────────────────────────────────────────
+    const cityName = await this.getCityName(dto.destinationLocationId);
+
+    // ── 2. Encode query via FastAPI Two-Tower ─────────────────────────────────
+    let embedding: number[];
+    try {
+      embedding = await this.mlClient.encodeQuery({
+        user_id: dto.userId,
+        city: cityName,
+        trip_intent: dto.tripIntent,
+        intent_vibe: '',
+        history_types: [],
+        history_vibes: [],
+        history_biz: [],
+      });
+    } catch (err: any) {
+      const detail = err?.message ?? String(err);
+      throw new ServiceUnavailableException(`AI Service lỗi: ${detail}`);
+    }
+
+    // ── 3. Tính số ngày ───────────────────────────────────────────────────────
+    const numDays = this.calcNumDays(dto.startDate, dto.endDate);
+
+    // ── 4. Stratified slot fetch — mỗi slot 1 RPC call (song song) ───────────
+    //    Slot filter TRƯỚC, ANN trong pool đó → đảm bảo đa dạng như notebook
+    const fetchPlan = getStratifiedFetchPlan(dto.tripIntent, numDays);
+    const poolChunks = await Promise.all(
+      fetchPlan.map(({ slotType, limit, travelType }) =>
+        this.fetchBySlot(embedding, dto.destinationLocationId, slotType, limit, travelType),
+      ),
+    );
+
+    // ── 5. Gộp + deduplicate ──────────────────────────────────────────────────
+    const seenIds = new Set<string>();
+    const pool: PlaceCandidate[] = [];
+    for (const chunk of poolChunks) {
+      for (const c of chunk) {
+        if (!seenIds.has(c.place_id)) {
+          seenIds.add(c.place_id);
+          pool.push(c);
+        }
+      }
+    }
+
+    this.logger.debug(
+      `Pool: ${pool.length} places (${fetchPlan.map(p => `${p.slotType}:${p.limit / 2}`).join(', ')})`,
+    );
+
+    // ── 6. Diversity-aware top-K (phase 2 fill nếu 1 slot thiếu) ─────────────
+    const diversePool = diversifyTopK(pool, numDays, dto.tripIntent, topK);
+
+    // ── 7. Map → response DTO ─────────────────────────────────────────────────
+    const candidates: CandidatePlaceDto[] = diversePool.map((c) => ({
+      place_id: c.place_id,
+      place_name: c.place_name,
+      address: c.address,
+      image_url: c.image_url,
+      category: c.category,
+      cosine_score: c.score,
+      predict_ranking: null,
+    }));
+
+    return {
+      destination_name: cityName,
+      city_id: dto.destinationLocationId,
+      total_candidates: candidates.length,
+      candidates,
+    };
+  }
+
+  // ── Helpers ────────────────────────────────────────────────────────────────
+
+  private calcNumDays(startDate: string, endDate: string): number {
+    const start = new Date(startDate);
+    const end = new Date(endDate);
+    const days = Math.round((end.getTime() - start.getTime()) / 86_400_000);
+    return Math.max(1, days);
+  }
+
+  private async getCityName(cityId: string): Promise<string> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('name')
+      .eq('id', cityId)
+      .single();
+
+    if (error || !data) {
+      throw new NotFoundException(`Không tìm thấy thành phố với id: ${cityId}`);
+    }
+    return (data as any).name as string;
+  }
+
+  /**
+   * Gọi RPC recommend_places_by_slot — filter slot_type TRƯỚC, ANN search TRONG pool đó.
+   * travelType chỉ truyền cho attraction (filter theo trip_intent của user).
+   */
+  private async fetchBySlot(
+    embedding: number[],
+    cityId: string,
+    slotType: string,
+    limit: number,
+    travelType?: string,
+  ): Promise<PlaceCandidate[]> {
+    const { data, error } = await supabase.rpc('recommend_places_by_slot', {
+      query_embedding: `[${embedding.join(',')}]`,
+      target_city_id: cityId,
+      p_slot_type: slotType,
+      p_limit: limit,
+      p_travel_type: travelType ?? null,
+    });
+
+    if (error) {
+      this.logger.error(`fetchBySlot [${slotType}] error: ${error.message}`);
+      return [];
+    }
+
+    return (data ?? []) as PlaceCandidate[];
+  }
+}

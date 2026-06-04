@@ -75,8 +75,8 @@ class ItineraryDayDto {
   @ApiProperty({ example: 1, description: 'Ngày số mấy (Ngày 1, Ngày 2)' })
   dayNumber: number;
 
-  @ApiProperty({ example: 32, description: 'Nhiệt độ dự báo (°C)' })
-  weatherTemp: number;
+  @ApiProperty({ example: 32, description: 'Nhiệt độ dự báo (°C)', nullable: true })
+  weatherTemp: number | null;
 
   @ApiProperty({
     example: '6 tiếng 30 phút',
@@ -99,14 +99,16 @@ class ItineraryDayDto {
   @ApiProperty({
     example: '12.5km',
     description: 'Tổng quãng đường di chuyển trong ngày',
+    nullable: true,
   })
-  totalDistanceStr: string;
+  totalDistanceStr: string | null;
 
   @ApiProperty({
     example: '~45 phút',
     description: 'Tổng thời gian di chuyển trong ngày',
+    nullable: true,
   })
-  totalTransitTimeStr: string;
+  totalTransitTimeStr: string | null;
 
   @ApiProperty({
     type: [ItineraryActivityDto],
