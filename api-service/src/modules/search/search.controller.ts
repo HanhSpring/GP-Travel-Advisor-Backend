@@ -1,19 +1,9 @@
 import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger'
 import { SearchService } from './search.service'
 import { SearchQueryDto } from './dto/search.dto'
-import { AutocompleteItemDto, SearchResultDto } from './dto/search-response.dto'
+import { AutocompleteItemDto } from './dto/search-response.dto'
 import { SearchFilterDto } from './dto/search-filter.dto'
-import {
-  Controller,
-  Get,
-  Query,
-  Post,
-  Body,
-  UploadedFile,
-  UseInterceptors
-} from '@nestjs/common'
-
-import { FileInterceptor } from '@nestjs/platform-express'
+import { Controller, Get, Query } from '@nestjs/common'
 
 @ApiTags('Search')
 @Controller('search')
@@ -35,5 +25,26 @@ export class SearchController {
       query.city,
       query.category
     )
+  }
+
+  @Get('nearby')
+  @ApiOperation({ summary: 'Get nearby places based on lat, lng' })
+  getNearbyPlaces(
+    @Query('lat') lat: number,
+    @Query('lng') lng: number,
+    @Query('limit') limit?: number,
+    @Query('excludeIds') excludeIds?: string,
+    @Query('preferCategory') preferCategory?: string,
+    @Query('radius') radius?: number,
+  ) {
+    const ids = excludeIds ? excludeIds.split(',').filter(Boolean) : [];
+    return this.service.getNearbyPlaces(
+      Number(lat),
+      Number(lng),
+      limit ? Number(limit) : 20,
+      ids,
+      preferCategory ?? '',
+      radius ? Number(radius) : 10,
+    );
   }
 }

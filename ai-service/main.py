@@ -8,26 +8,46 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 import os
+import logging
 from dotenv import load_dotenv
+import uvicorn
+
+from app.services.routing import optimize_route
 
 # Load environment variables
 load_dotenv()
 
+# Cấu hình logging chuẩn cho toàn bộ service
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+
 # Initialize FastAPI app
 app = FastAPI(
     title="Travel Advisor AI Service",
-    description="AI-powered personalized travel recommendations",
-    version="1.0.0"
+    description=(
+        "AI-powered personalized travel recommendations\n\n"
+        "## Tính năng\n"
+        "- **Tối ưu lịch trình**: Greedy TSPTW — sắp xếp địa điểm theo thứ tự tối ưu nhất\n"
+        "- **Kiểm tra xung đột**: Validate giờ ghim trước khi lưu DB\n"
+    ),
+    version="1.0.0",
 )
 
 # Configure CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Configure appropriately for production
+    allow_origins=["*"],  # Cấu hình chặt hơn cho production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# ─── Import và đăng ký router v1 ─────────────────────────────────
+from app.api.v1.api_router import api_router
+app.include_router(api_router)
 
 
 # Pydantic models
@@ -48,6 +68,11 @@ class RecommendationResponse(BaseModel):
     recommendations: List[dict]
     confidence_score: float
 
+class RouteRequest(BaseModel):
+    locations: List[dict]
+
+class RouteResponse(BaseModel):
+    optimized_locations: List[dict]
 
 # Routes
 @app.get("/", response_model=HealthResponse)
@@ -71,7 +96,7 @@ async def health_check():
 
 
 @app.post("/api/v1/recommendations", response_model=RecommendationResponse)
-async def get_recommendations(request: RecommendationRequest):
+async def get_recommendations(_request: RecommendationRequest):
     """
     Get personalized travel recommendations based on user preferences
     
@@ -101,6 +126,20 @@ async def get_recommendations(request: RecommendationRequest):
         "confidence_score": 0.85
     }
 
+@app.post("/api/v1/optimize-route", response_model=RouteResponse)
+async def api_optimize_route(request: RouteRequest):
+    """
+    Optimize the itinerary route using OR-Tools (TSP).
+    """
+    if not request.locations or len(request.locations) == 0:
+        return {"optimized_locations": []}
+    
+    try:
+        ordered = optimize_route(request.locations)
+        return {"optimized_locations": ordered}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/api/v1/status")
 async def service_status():
@@ -115,8 +154,6 @@ async def service_status():
 
 # Run the application
 if __name__ == "__main__":
-    import uvicorn
-    
     port = int(os.getenv("AI_SERVICE_PORT", 8000))
     host = os.getenv("AI_SERVICE_HOST", "0.0.0.0")
     
