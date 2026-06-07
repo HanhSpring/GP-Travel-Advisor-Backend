@@ -27,6 +27,7 @@ import { ItineraryResponseDto } from './dto/itinerary-response.dto';
 import { ToggleVisibilityDto } from './dto/toggle-visibility.dto';
 import { EditActivityDto } from './dto/edit-activity.dto';
 import { AddActivityDto } from './dto/add-activity.dto';
+import { UpdateItineraryDto } from './dto/update-itinerary.dto';
 import {
   CustomizeActivityResponseDto,
   SuggestionsResponseDto,
@@ -34,6 +35,7 @@ import {
 import {
   TwoTowerRetrievalResponseDto,
 } from './dto/retrieval-response.dto';
+
 
 @ApiTags('Itinerary')
 @Controller('itinerary')
@@ -87,20 +89,60 @@ export class ItineraryController {
   @ApiOperation({
     summary: 'Create a full itinerary from Two-Tower candidates and GA planner',
     description:
-      'Runs candidate retrieval, fetches full place details, then calls FastAPI /itinerary/plan.',
+      'Runs candidate retrieval, fetches full place details, calls FastAPI /itinerary/plan, then persists to DB.',
   })
-  async plan(
-    @Body() body: CreateItineraryDto,
-    @Query('top_k') topK?: string,
-  ): Promise<unknown> {
+  @ApiQuery({
+    name: 'top_k',
+    required: false,
+    type: Number,
+    example: 60,
+    description: 'Số candidates tối đa (mặc định 60)',
+  })
+  @ApiBody({
+    type: CreateItineraryDto,
+    examples: {
+      createFromSwagger: {
+        summary: 'Create and persist itinerary',
+        description:
+          'Replace userId, departureLocationId and destinationLocationId with real UUIDs from Supabase before trying it in Swagger.',
+        value: {
+          userId: '00000000-0000-0000-0000-000000000000',
+          tripType: 'ROUND_TRIP',
+          departureLocationId: '11111111-1111-1111-1111-111111111111',
+          destinationLocationId: '22222222-2222-2222-2222-222222222222',
+          transportMode: 'ROAD',
+          startDate: '2026-06-10',
+          endDate: '2026-06-12',
+          dailyStartTime: '08:00',
+          dailyEndTime: '21:00',
+          tripIntent: 'KhÃ¡m phÃ¡ tá»•ng há»£p',
+          adultCount: 2,
+          childCount: 0,
+          budget: 5000000,
+          foodPreferences: ['LOCAL'],
+        },
+      },
+    },
+  })
+  async plan(@Body() body: CreateItineraryDto, @Query('top_k') topK?: string) {
     const k = topK ? Math.min(parseInt(topK, 10) || 60, 120) : 60;
-    return this.recommendationService.planItinerary(body, k);
+    const plan = await this.recommendationService.planItinerary(body, k);
+    const created = await this.service.createGeneratedItinerary(
+      body,
+      plan as any,
+    );
+    return {
+      id: created.id,
+      itineraryId: created.id,
+      status: created.status,
+      totalDetails: created.totalDetails,
+    };
   }
 
   @Get(':id')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
-    summary: '[Mock] Lấy chi tiết lịch trình — sẽ được thành viên khác implement',
+    summary: 'Lấy chi tiết lịch trình',
   })
   @ApiParam({
     name: 'id',
@@ -109,6 +151,26 @@ export class ItineraryController {
   })
   async getItineraryDetail(@Param('id') id: string): Promise<any> {
     return this.service.getItineraryDetail(id);
+  }
+
+  @Delete(':id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Xoá lịch trình' })
+  @ApiParam({ name: 'id', description: 'ID lịch trình cần xoá' })
+  async deleteItinerary(@Param('id') id: string): Promise<void> {
+    await this.service.deleteItinerary(id);
+  }
+
+  @Patch(':id')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Cập nhật tên / mô tả lịch trình' })
+  @ApiParam({ name: 'id', description: 'ID lịch trình' })
+  @ApiBody({ type: UpdateItineraryDto })
+  async updateItinerary(
+    @Param('id') id: string,
+    @Body() dto: UpdateItineraryDto,
+  ) {
+    return this.service.updateItinerary(id, dto);
   }
 
   @Patch(':id/visibility')

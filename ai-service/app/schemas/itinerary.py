@@ -37,6 +37,72 @@ class ItineraryPlanRequest(BaseModel):
     mutation_rate: float = Field(default=0.30, ge=0, le=1)
     seed: int | None = 42
 
+    model_config = {
+        "json_schema_extra": {
+            "example": {
+                "places": [
+                    {
+                        "id": "hotel-1",
+                        "name": "Demo Hotel",
+                        "longitude": 108.2208,
+                        "latitude": 16.0678,
+                        "place_type": "hotel",
+                        "slot_type": "accommodation",
+                        "category": "accommodation",
+                        "source": "swagger",
+                        "type_id": "hotel",
+                        "type_name": "Hotel",
+                        "open_hour_compressed": None,
+                        "visit_duration": 60,
+                        "average_rating": 4.5,
+                    },
+                    {
+                        "id": "attraction-1",
+                        "name": "Cau Rong",
+                        "longitude": 108.2274,
+                        "latitude": 16.0611,
+                        "place_type": "attraction",
+                        "slot_type": "attraction",
+                        "category": "attraction",
+                        "source": "swagger",
+                        "type_id": "attraction",
+                        "type_name": "Attraction",
+                        "open_hour_compressed": "08:00-22:00",
+                        "visit_duration": 90,
+                        "average_rating": 4.7,
+                    },
+                    {
+                        "id": "restaurant-1",
+                        "name": "Demo Restaurant",
+                        "longitude": 108.2244,
+                        "latitude": 16.0682,
+                        "place_type": "restaurant",
+                        "slot_type": "restaurant",
+                        "category": "restaurant",
+                        "source": "swagger",
+                        "type_id": "restaurant",
+                        "type_name": "Restaurant",
+                        "open_hour_compressed": "10:00-21:00",
+                        "visit_duration": 60,
+                        "average_rating": 4.3,
+                    },
+                ],
+                "num_days": 1,
+                "daily_start_time": "08:00",
+                "daily_end_time": "21:00",
+                "selected_hotel_id": "hotel-1",
+                "return_to_hotel": False,
+                "use_goong": False,
+                "goong_api_key": "",
+                "speed_kmh": 30,
+                "population_size": 20,
+                "generations": 40,
+                "mutation_rate": 0.3,
+                "seed": 42,
+            }
+        }
+    }
+
 
 class ScheduleEntryResponse(BaseModel):
     location_id: str
