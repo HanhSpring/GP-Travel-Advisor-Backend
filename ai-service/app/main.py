@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.api.deps import load_all_models
-from app.api.routes import recommend, embedding, review
+from app.api.routes import recommend, embedding, review, itinerary
 from app.core.config import settings
 from app.core.logger import get_logger
 
@@ -26,6 +26,7 @@ app = FastAPI(
 app.include_router(recommend.router, prefix="/recommend", tags=["Recommend"])
 app.include_router(embedding.router, prefix="/embedding", tags=["Embedding"])
 app.include_router(review.router,    prefix="/review",    tags=["Review"])
+app.include_router(itinerary.router, prefix="/itinerary", tags=["Itinerary"])
 
 
 @app.get("/health", tags=["System"])

@@ -13,6 +13,7 @@ AI Service là một FastAPI application cung cấp các API:
 | `POST /recommend/encode-query` | Tạo query vector bằng Two-Tower  |
 | `POST /recommend/`             | Gọi recommendation theo strategy |
 | `POST /review/classify`        | Phân loại review                 |
+| `POST /itinerary/plan`         | Lập lịch trình bằng thuật toán GA |
 | `GET /docs`                    | Swagger UI                       |
 
 Entry point chính xác của service là:
@@ -174,6 +175,34 @@ Review Classifier weights not found - skipping
 ```powershell
 python -m uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
+
+## 11. Cau hinh Goong cho GA Planner
+
+GA Planner co the dung Goong Distance Matrix de tinh thoi gian va khoang cach di chuyen that hon so voi Haversine.
+
+Them bien sau vao file `ai-service/.env`:
+
+```dotenv
+GOONG_API_KEY=your_goong_api_key_here
+```
+
+Khi API Service goi payload sang AI Service voi:
+
+```json
+{
+  "use_goong": true
+}
+```
+
+AI Service se doc `GOONG_API_KEY` tu `ai-service/.env` va goi Goong. Neu key khong co hoac Goong loi, planner se fallback ve Haversine.
+
+Trong output itinerary, kiem tra field:
+
+```json
+"travel_source": "goong"
+```
+
+Neu thay `"travel_source": "haversine"` thi nghia la request chua dung Goong hoac Goong da fallback.
 
 Hoặc
 

@@ -3,6 +3,13 @@ uvicorn[standard]==0.29.0
 pydantic==2.7.1
 pydantic-settings==2.2.1
 python-dotenv==1.0.1
+
+# TensorFlow — Two Tower inference (CPU-only, không cần CUDA)
+# tensorflow-recommenders KHÔNG cần cho serving, chỉ cần khi train
+#tensorflow-cpu==2.16.1
+h5py==3.11.0
+
+# PyTorch — Review Classifier & future models
 torch==2.3.0
 transformers==4.41.0
 #sentence-transformers==3.0.0

@@ -82,6 +82,21 @@ export class ItineraryController {
     return this.recommendationService.retrieveCandidates(body, k);
   }
 
+  @Post('plan')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    summary: 'Create a full itinerary from Two-Tower candidates and GA planner',
+    description:
+      'Runs candidate retrieval, fetches full place details, then calls FastAPI /itinerary/plan.',
+  })
+  async plan(
+    @Body() body: CreateItineraryDto,
+    @Query('top_k') topK?: string,
+  ): Promise<unknown> {
+    const k = topK ? Math.min(parseInt(topK, 10) || 60, 120) : 60;
+    return this.recommendationService.planItinerary(body, k);
+  }
+
   @Get(':id')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({

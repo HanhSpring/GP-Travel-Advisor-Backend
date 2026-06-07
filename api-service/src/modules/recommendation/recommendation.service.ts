@@ -5,7 +5,7 @@ import {
   ServiceUnavailableException,
 } from '@nestjs/common';
 import { supabase } from '../../config/supabase';
-import { MlClientService } from './ml-client.service';
+import { ItineraryPlanPayload, MlClientService } from './ml-client.service';
 import { CreateItineraryDto } from '../itinerary/dto/create-itinerary.dto';
 import {
   TwoTowerRetrievalResponseDto,
@@ -101,6 +101,33 @@ export class RecommendationService {
     };
   }
 
+  async planItinerary(dto: CreateItineraryDto, topK = 60): Promise<unknown> {
+    const retrieval = await this.retrieveCandidates(dto, topK);
+    const details = await this.fetchPlannerPlaceDetails(retrieval.candidates);
+    if (!details.length) {
+      throw new NotFoundException('No place details found for itinerary planning');
+    }
+
+    const payload: ItineraryPlanPayload = {
+      places: details,
+      num_days: this.calcNumDays(dto.startDate, dto.endDate),
+      daily_start_time: dto.dailyStartTime,
+      daily_end_time: dto.dailyEndTime,
+      use_goong: true,
+      population_size: 50,
+      generations: 120,
+      mutation_rate: 0.3,
+      seed: 42,
+    };
+
+    try {
+      return await this.mlClient.planItinerary(payload);
+    } catch (err: any) {
+      const detail = err?.message ?? String(err);
+      throw new ServiceUnavailableException(`AI Service error: ${detail}`);
+    }
+  }
+
   // ── Helpers ────────────────────────────────────────────────────────────────
 
   private calcNumDays(startDate: string, endDate: string): number {
@@ -149,5 +176,51 @@ export class RecommendationService {
     }
 
     return (data ?? []) as PlaceCandidate[];
+  }
+
+  private async fetchPlannerPlaceDetails(
+    candidates: CandidatePlaceDto[],
+  ): Promise<ItineraryPlanPayload['places']> {
+    const candidateById = new Map(
+      candidates.map((candidate) => [candidate.place_id, candidate]),
+    );
+    const ids = candidates.map((candidate) => candidate.place_id);
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('places')
+      .select(
+        'id,name,longitude,latitude,open_hour_compressed,source,type_id,visit_duration,average_rating',
+      )
+      .in('id', ids);
+
+    if (error) {
+      this.logger.error(`fetchPlannerPlaceDetails error: ${error.message}`);
+      return [];
+    }
+
+    return (data ?? [])
+      .filter((row: any) => row.longitude != null && row.latitude != null)
+      .map((row: any) => {
+        const candidate = candidateById.get(row.id);
+        return {
+          id: row.id,
+          name: row.name,
+          longitude: Number(row.longitude),
+          latitude: Number(row.latitude),
+          place_type:
+            candidate?.category === 'accommodation'
+              ? 'hotel'
+              : candidate?.category,
+          slot_type: candidate?.category,
+          category: candidate?.category,
+          source: row.source ?? '',
+          type_id: row.type_id ?? '',
+          open_hour: null,
+          open_hour_compressed: row.open_hour_compressed ?? null,
+          visit_duration: row.visit_duration ?? null,
+          average_rating:
+            row.average_rating != null ? Number(row.average_rating) : null,
+        };
+      });
   }
 }

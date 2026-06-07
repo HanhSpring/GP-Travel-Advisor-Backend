@@ -13,6 +13,35 @@ export interface EncodeQueryPayload {
   history_biz: string[];
 }
 
+export interface ItineraryPlanPayload {
+  places: Array<{
+    id: string;
+    name: string;
+    longitude: number;
+    latitude: number;
+    place_type?: string;
+    slot_type?: string;
+    category?: string;
+    source?: string;
+    type_id?: string;
+    type_name?: string;
+    open_hour?: string | null;
+    open_hour_compressed?: string | null;
+    visit_duration?: number | null;
+    average_rating?: number | null;
+  }>;
+  num_days: number;
+  daily_start_time: string;
+  daily_end_time: string;
+  selected_hotel_id?: string | null;
+  return_to_hotel?: boolean;
+  use_goong?: boolean;
+  population_size?: number;
+  generations?: number;
+  mutation_rate?: number;
+  seed?: number;
+}
+
 @Injectable()
 export class MlClientService {
   private readonly logger = new Logger(MlClientService.name);
@@ -31,14 +60,28 @@ export class MlClientService {
   async encodeQuery(payload: EncodeQueryPayload): Promise<number[]> {
     const url = `${this.aiServiceUrl}/recommend/encode-query`;
     try {
-      const { data } = await firstValueFrom(
+      const response: { data: { embedding: number[]; dim: number } } = await firstValueFrom(
         this.http.post<{ embedding: number[]; dim: number }>(url, payload),
       );
-      return data.embedding;
+      return response.data.embedding;
     } catch (error) {
       const msg = error?.response?.data?.detail ?? error?.message ?? 'unknown';
       this.logger.error(`encodeQuery failed: ${msg}`);
-      throw new Error(`AI Service không khả dụng: ${msg}`);
+      throw new Error(`AI Service is unavailable: ${msg}`);
+    }
+  }
+
+  async planItinerary(payload: ItineraryPlanPayload): Promise<unknown> {
+    const url = `${this.aiServiceUrl}/itinerary/plan`;
+    try {
+      const response: { data: unknown } = await firstValueFrom(
+        this.http.post<unknown>(url, payload),
+      );
+      return response.data;
+    } catch (error) {
+      const msg = error?.response?.data?.detail ?? error?.message ?? 'unknown';
+      this.logger.error(`planItinerary failed: ${msg}`);
+      throw new Error(`AI Service is unavailable: ${msg}`);
     }
   }
 }
