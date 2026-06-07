@@ -1,7 +1,12 @@
 import math
-from ortools.constraint_solver import routing_enums_pb2
-from ortools.constraint_solver import pywrapcp
 from typing import List, Dict, Any
+
+try:
+    from ortools.constraint_solver import routing_enums_pb2  # type: ignore[import]
+    from ortools.constraint_solver import pywrapcp           # type: ignore[import]
+    _ORTOOLS_AVAILABLE = True
+except ImportError:
+    _ORTOOLS_AVAILABLE = False
 
 def haversine_distance(lat1, lon1, lat2, lon2):
     """
@@ -38,43 +43,79 @@ def create_distance_matrix(locations: List[Dict[str, float]]):
         matrix.append(row)
     return matrix
 
-def optimize_route(locations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """
-    Solves the TSP for the given locations.
-    Assumes locations[0] is the depot (starting point).
-    """
-    if len(locations) <= 2:
+def _nearest_neighbor_route(locations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """Greedy nearest-neighbor fallback — dùng khi OR-Tools không có sẵn."""
+    if len(locations) <= 1:
         return locations
 
     coords = [
         {
-            'lat': float(loc.get('latitude') if loc.get('latitude') is not None else 0.0),
-            'lng': float(loc.get('longitude') if loc.get('longitude') is not None else 0.0)
-        } 
+            'lat': float(loc.get('latitude') or 0.0),
+            'lng': float(loc.get('longitude') or 0.0),
+        }
         for loc in locations
     ]
-    
-    data = {}
+
+    unvisited = list(range(1, len(coords)))
+    route = [0]
+
+    while unvisited:
+        current = route[-1]
+        nearest = min(
+            unvisited,
+            key=lambda i: haversine_distance(
+                coords[current]['lat'], coords[current]['lng'],
+                coords[i]['lat'],       coords[i]['lng'],
+            ),
+        )
+        route.append(nearest)
+        unvisited.remove(nearest)
+
+    return [locations[i] for i in route]
+
+
+def optimize_route(locations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    """
+    Solves the TSP for the given locations.
+    Assumes locations[0] is the depot (starting point).
+    Falls back to greedy nearest-neighbor if OR-Tools is not installed.
+    """
+    if len(locations) <= 2:
+        return locations
+
+    if not _ORTOOLS_AVAILABLE:
+        return _nearest_neighbor_route(locations)
+
+    coords = [
+        {
+            'lat': float(loc.get('latitude') if loc.get('latitude') is not None else 0.0),
+            'lng': float(loc.get('longitude') if loc.get('longitude') is not None else 0.0),
+        }
+        for loc in locations
+    ]
+
+    data: Dict[str, Any] = {}
     data['distance_matrix'] = create_distance_matrix(coords)
     data['num_vehicles'] = 1
     data['depot'] = 0
 
-    manager = pywrapcp.RoutingIndexManager(len(data['distance_matrix']),
-                                           data['num_vehicles'], data['depot'])
+    manager = pywrapcp.RoutingIndexManager(  # type: ignore[possibly-undefined]
+        len(data['distance_matrix']), data['num_vehicles'], data['depot']
+    )
+    routing = pywrapcp.RoutingModel(manager)  # type: ignore[possibly-undefined]
 
-    routing = pywrapcp.RoutingModel(manager)
-
-    def distance_callback(from_index, to_index):
+    def distance_callback(from_index: int, to_index: int) -> int:
         from_node = manager.IndexToNode(from_index)
-        to_node = manager.IndexToNode(to_index)
-        return data['distance_matrix'][from_node][to_node]
+        to_node   = manager.IndexToNode(to_index)
+        return data['distance_matrix'][from_node][to_node]  # type: ignore[no-any-return]
 
     transit_callback_index = routing.RegisterTransitCallback(distance_callback)
     routing.SetArcCostEvaluatorOfAllVehicles(transit_callback_index)
 
-    search_parameters = pywrapcp.DefaultRoutingSearchParameters()
+    search_parameters = pywrapcp.DefaultRoutingSearchParameters()  # type: ignore[possibly-undefined]
     search_parameters.first_solution_strategy = (
-        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC)
+        routing_enums_pb2.FirstSolutionStrategy.PATH_CHEAPEST_ARC  # type: ignore[possibly-undefined]
+    )
 
     solution = routing.SolveWithParameters(search_parameters)
 
@@ -86,5 +127,5 @@ def optimize_route(locations: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
             ordered_locations.append(locations[node_index])
             index = solution.Value(routing.NextVar(index))
         return ordered_locations
-    else:
-        return locations
+
+    return locations

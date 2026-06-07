@@ -896,41 +896,55 @@ export class ItineraryService {
     if (activities.length <= 2) return activities;
 
     try {
-      const response = await fetch('http://127.0.0.1:8000/api/v1/optimize-route', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ locations: activities }),
+      // ─── Chuẩn bị payload cho TSPTW optimizer (đầy đủ ràng buộc) ─
+      const payload = {
+        itinerary_id: 'client-optimize',   // placeholder — không cần lưu DB
+        visit_date: new Date().toISOString().split('T')[0],
+        day_start_time: '08:00',
+        day_end_time: '21:00',
+        activities: activities.map((a: any) => {
+          // Tính duration từ startTime/endTime nếu không có sẵn
+          const startMin = this.toMinutes(a.startTime || '08:00');
+          const endMin   = this.toMinutes(a.endTime   || '09:00');
+          const duration = endMin - startMin > 0 ? endMin - startMin : 60;
+
+          return {
+            id:                 a.id,
+            place_id:           a.id,                        // dùng id làm place_id
+            duration_minutes:   a.durationMinutes ?? duration,
+            is_locked:          a.isLocked ?? false,
+            locked_arrive_time: a.lockedArriveTime ?? null,
+            lat:                a.latitude  ?? null,
+            lng:                a.longitude ?? null,
+            open_time:          a.openTime  ?? '07:00',
+            close_time:         a.closeTime ?? '22:00',
+            estimated_cost:     a.price     ?? 0,
+          };
+        }),
+      };
+
+      const response = await axios.post(
+        `${AI_SERVICE_URL}/api/v1/itinerary/optimize`,
+        payload,
+        { timeout: 10000 },
+      );
+
+      const optimized: any[] = response.data?.optimized_activities ?? [];
+      if (optimized.length === 0) return activities;
+
+      // Map kết quả TSPTW về format Flutter mong đợi
+      return optimized.map((opt: any) => {
+        const original = activities.find((a: any) => a.id === opt.id) ?? {};
+        return {
+          ...original,
+          startTime:     opt.arrival_time,
+          endTime:       opt.departure_time,
+          transportInfo: opt.transport_to_next ?? original.transportInfo,
+        };
       });
-
-      if (!response.ok) {
-        throw new Error(`AI Service returned ${response.status}`);
-      }
-
-      const data = await response.json() as any;
-      const optimized = data.optimized_locations;
-      
-      // We need to re-adjust start and end times based on the new order.
-      // Assuming first activity start time is fixed.
-      if (optimized && optimized.length > 0) {
-        let currentMinutes = this.toMinutes(activities[0].startTime || '08:00');
-        for (let i = 0; i < optimized.length; i++) {
-          const act = optimized[i];
-          const actOld = activities.find(a => a.id === act.id);
-          const oldStart = actOld ? this.toMinutes(actOld.startTime) : 0;
-          const oldEnd = actOld ? this.toMinutes(actOld.endTime) : 60;
-          const duration = oldEnd - oldStart > 0 ? oldEnd - oldStart : 60;
-          
-          act.startTime = this.toTimeString(currentMinutes);
-          act.endTime = this.toTimeString(currentMinutes + duration);
-          currentMinutes += duration + 30; // 30 mins travel buffer
-        }
-        return optimized;
-      }
-
-      return activities;
     } catch (e) {
       console.error('optimizeDayRoute failed:', e);
-      return activities;
+      return activities; // Fallback: giữ nguyên thứ tự cũ
     }
   }
 

@@ -10,6 +10,7 @@ from typing import List, Optional
 import os
 import logging
 from dotenv import load_dotenv
+import uvicorn
 
 from app.services.routing import optimize_route
 
@@ -153,8 +154,6 @@ async def service_status():
 
 # Run the application
 if __name__ == "__main__":
-    import uvicorn
-    
     port = int(os.getenv("AI_SERVICE_PORT", 8000))
     host = os.getenv("AI_SERVICE_HOST", "0.0.0.0")
     

@@ -23,7 +23,7 @@ Phù hợp: n ≤ 20 địa điểm/ngày — đủ cho một ngày du lịch th
 import math
 import logging
 from typing import Optional
-from app.schemas.optimize import ActivityInput, OptimizedActivity, OptimizeResponse
+from app.schemas.optimize import ActivityInput, OptimizedActivity
 
 logger = logging.getLogger(__name__)
 
@@ -274,7 +274,6 @@ def optimize_day_schedule(
             best_idx: Optional[int] = None
             best_dist = float("inf")
             best_arrive: int = 0
-            best_transit: int = 0
 
             # Tìm địa điểm tự do gần nhất có thể nhét vào khoảng trống
             for idx, candidate in enumerate(free_remaining):
@@ -303,16 +302,14 @@ def optimize_day_schedule(
                     best_idx = idx
                     best_dist = dist
                     best_arrive = arrive
-                    best_transit = transit
 
             # Không tìm được điểm nào phù hợp → dừng lấp khoảng trống này
             if best_idx is None:
                 break
 
-            # Nhét điểm tốt nhất vào lịch
+            # Nhét điểm tốt nhất vào lịch (transit sẽ được tính tổng ở bước 6)
             chosen = free_remaining.pop(best_idx)
             scheduled_free.append((best_arrive, chosen))
-            total_transit_minutes += best_transit
 
             # Cập nhật vị trí và thời gian hiện tại
             current_time = best_arrive + chosen.duration_minutes
