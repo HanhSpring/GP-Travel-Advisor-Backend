@@ -105,4 +105,119 @@ export class SearchService {
 
     return Array.isArray(data) ? (data as SearchRow[]) : [];
   }
+
+  private deg2rad(deg: number): number {
+    return deg * (Math.PI / 180);
+  }
+
+  private getDistanceFromLatLonInKm(
+    lat1: number,
+    lon1: number,
+    lat2: number,
+    lon2: number,
+  ): number {
+    const R = 6371; // Bán kính Trái Đất (km)
+    const dLat = this.deg2rad(lat2 - lat1);
+    const dLon = this.deg2rad(lon2 - lon1);
+    const a =
+      Math.sin(dLat / 2) * Math.sin(dLat / 2) +
+      Math.cos(this.deg2rad(lat1)) *
+        Math.cos(this.deg2rad(lat2)) *
+        Math.sin(dLon / 2) *
+        Math.sin(dLon / 2);
+    const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+    return R * c;
+  }
+
+  async getNearbyPlaces(
+    lat: number,
+    lng: number,
+    limit: number = 20,
+    excludeIds: string[] = [],
+    preferCategory: string = '',
+    radius: number = 10,
+  ): Promise<any[]> {
+    // Pre-filter with bounding box to avoid fetching the entire table.
+    const latDelta = radius / 111.32;
+    const lngDelta = radius / (111.32 * Math.cos((lat * Math.PI) / 180));
+
+    let query = supabase
+      .schema('travel')
+      .from('places')
+      .select(
+        'id, name, address, average_rating, review_count, image_url, latitude, longitude, open_hour_compressed, types(id, category_id, categories(id, name))',
+      )
+      .eq('is_approved', true)
+      .eq('is_active', true)
+      .gte('latitude', lat - latDelta)
+      .lte('latitude', lat + latDelta)
+      .gte('longitude', lng - lngDelta)
+      .lte('longitude', lng + lngDelta);
+
+    if (excludeIds.length > 0) {
+      query = query.not('id', 'in', `(${excludeIds.join(',')})`);
+    }
+
+    const { data, error } = await query;
+
+    if (error) {
+      console.error('getNearbyPlaces error:', error);
+      throw new InternalServerErrorException(error.message);
+    }
+
+    const places = (data || []) as any[];
+    const normalizedPrefer = preferCategory.trim().toLowerCase();
+
+    const placesWithDistance = places.map((place) => {
+      const distance =
+        place.latitude && place.longitude
+          ? this.getDistanceFromLatLonInKm(lat, lng, place.latitude, place.longitude)
+          : Infinity;
+
+      let category = 'Tham quan';
+      const typeData = Array.isArray(place.types) ? place.types[0] : place.types;
+      if (typeData && typeData.categories) {
+        const catData = Array.isArray(typeData.categories) ? typeData.categories[0] : typeData.categories;
+        if (catData && catData.name) category = catData.name;
+      }
+
+      let parsedImageUrl = 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80';
+      if (Array.isArray(place.image_url) && place.image_url.length > 0) {
+        parsedImageUrl = place.image_url[0];
+      } else if (typeof place.image_url === 'string' && place.image_url.trim().length > 0) {
+        parsedImageUrl = place.image_url;
+      }
+
+      const isSameCategory =
+        normalizedPrefer.length > 0 &&
+        category.trim().toLowerCase() === normalizedPrefer;
+
+      return {
+        id: place.id,
+        name: place.name,
+        address: place.address || '',
+        category,
+        rating: place.average_rating || 0,
+        reviewCount: place.review_count || 0,
+        imageUrl: parsedImageUrl,
+        distanceKm: distance === Infinity ? null : Number(distance.toFixed(1)),
+        latitude: place.latitude,
+        longitude: place.longitude,
+        isSameCategory,
+        openHourCompressed: place.open_hour_compressed || null,
+      };
+    });
+
+    // Bounding box over-approximates — do a precise Haversine filter as the final step.
+    const inRadius = placesWithDistance
+      .filter((p) => p.distanceKm !== null && p.distanceKm <= radius)
+      .sort((a, b) => (a.distanceKm as number) - (b.distanceKm as number));
+
+    // Same-category places first (sorted by distance), then the rest.
+    const sameCategory = inRadius.filter((p) => p.isSameCategory);
+    const others = inRadius.filter((p) => !p.isSameCategory);
+
+    return [...sameCategory, ...others].slice(0, limit);
+  }
 }
+
