@@ -102,15 +102,23 @@ export class RecommendationService {
   }
 
   async planItinerary(dto: CreateItineraryDto, topK = 60): Promise<unknown> {
+    const numDays = this.calcNumDays(dto.startDate, dto.endDate);
     const retrieval = await this.retrieveCandidates(dto, topK);
-    const details = await this.fetchPlannerPlaceDetails(retrieval.candidates);
+    const plannerPlaceLimit = this.calcPlannerPlaceLimit(numDays);
+    const plannerCandidates = retrieval.candidates.slice(0, plannerPlaceLimit);
+    const details = await this.fetchPlannerPlaceDetails(plannerCandidates);
     if (!details.length) {
       throw new NotFoundException('No place details found for itinerary planning');
     }
 
+    this.logger.warn(
+      `Planning with ${details.length}/${retrieval.candidates.length} candidates ` +
+        `(days=${numDays}, retrievalTopK=${topK}, plannerCap=${plannerPlaceLimit})`,
+    );
+
     const payload: ItineraryPlanPayload = {
       places: details,
-      num_days: this.calcNumDays(dto.startDate, dto.endDate),
+      num_days: numDays,
       daily_start_time: dto.dailyStartTime,
       daily_end_time: dto.dailyEndTime,
       use_goong: true,
@@ -133,8 +141,13 @@ export class RecommendationService {
   private calcNumDays(startDate: string, endDate: string): number {
     const start = new Date(startDate);
     const end = new Date(endDate);
-    const days = Math.round((end.getTime() - start.getTime()) / 86_400_000);
+    const days =
+      Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
     return Math.max(1, days);
+  }
+
+  private calcPlannerPlaceLimit(numDays: number): number {
+    return Math.min(90, Math.max(30, numDays * 10));
   }
 
   private async getCityName(cityId: string): Promise<string> {

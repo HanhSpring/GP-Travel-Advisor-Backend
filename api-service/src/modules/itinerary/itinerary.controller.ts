@@ -9,6 +9,7 @@ import {
   Patch,
   Delete,
   Query,
+  Logger,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -40,6 +41,8 @@ import {
 @ApiTags('Itinerary')
 @Controller('itinerary')
 export class ItineraryController {
+  private readonly logger = new Logger(ItineraryController.name);
+
   constructor(
     private readonly service: ItineraryService,
     private readonly recommendationService: RecommendationService,
@@ -96,7 +99,7 @@ export class ItineraryController {
     required: false,
     type: Number,
     example: 60,
-    description: 'Số candidates tối đa (mặc định 60)',
+    description: 'Số candidates Two-Tower tối đa. Nếu không truyền, backend tự scale theo số ngày: min(200, max(60, days * 20)). Số điểm đưa vào GA/Goong được cap riêng.',
   })
   @ApiBody({
     type: CreateItineraryDto,
@@ -125,17 +128,50 @@ export class ItineraryController {
     },
   })
   async plan(@Body() body: CreateItineraryDto, @Query('top_k') topK?: string) {
-    const k = topK ? Math.min(parseInt(topK, 10) || 60, 120) : 60;
+    const startedAt = Date.now();
+    const requestedDays = this.calcRequestedDays(body.startDate, body.endDate);
+    const k = topK
+      ? Math.min(parseInt(topK, 10) || 60, 200)
+      : this.calcRetrievalTopK(requestedDays);
+
+    const planStartedAt = Date.now();
     const plan = await this.recommendationService.planItinerary(body, k);
+    const planTimeMs = Date.now() - planStartedAt;
+
+    const persistStartedAt = Date.now();
     const created = await this.service.createGeneratedItinerary(
       body,
       plan as any,
     );
+    const persistTimeMs = Date.now() - persistStartedAt;
+    const executionTimeMs = Date.now() - startedAt;
+    const sparseResult = created.totalDetails < requestedDays * 2;
+
+    this.logger.warn(
+      `POST /itinerary/plan completed in ${executionTimeMs}ms ` +
+        `(planner=${planTimeMs}ms, persist=${persistTimeMs}ms, ` +
+        `details=${created.totalDetails}, days=${requestedDays}, topK=${k})`,
+    );
+
     return {
       id: created.id,
       itineraryId: created.id,
       status: created.status,
       totalDetails: created.totalDetails,
+      executionTimeMs,
+      executionTimeSeconds: Number((executionTimeMs / 1000).toFixed(2)),
+      metrics: {
+        topK: k,
+        requestedDays,
+        plannerMs: planTimeMs,
+        persistMs: persistTimeMs,
+        totalMs: executionTimeMs,
+        totalDetails: created.totalDetails,
+        sparseResult,
+      },
+      warning: sparseResult
+        ? 'Khu vực này hiện có ít địa điểm phù hợp, lịch trình có thể ngắn hơn số ngày yêu cầu.'
+        : null,
     };
   }
 
@@ -366,5 +402,16 @@ export class ItineraryController {
     }
     const optimized = await this.service.optimizeDayRoute(body.activities);
     return { optimized };
+  }
+
+  private calcRequestedDays(startDate: string, endDate: string): number {
+    const start = new Date(`${startDate}T00:00:00.000Z`);
+    const end = new Date(`${endDate}T00:00:00.000Z`);
+    const diff = Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
+    return Math.max(1, diff);
+  }
+
+  private calcRetrievalTopK(numDays: number): number {
+    return Math.min(200, Math.max(60, numDays * 20));
   }
 }

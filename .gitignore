@@ -162,6 +162,7 @@ pids
 tmp/
 temp/
 .tmp/
+Note/
 
 # Secrets & Certificates
 *.pem
