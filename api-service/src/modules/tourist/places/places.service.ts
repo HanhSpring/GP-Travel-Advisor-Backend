@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { supabase } from '../../../config/supabase';
+import { RecommendationsService } from './recommendations.service';
 
 interface PlaceRow {
   id: string;
@@ -79,6 +80,8 @@ export class PlacesService {
     review_id: string;
     content: string | null;
   }> = [];
+
+  constructor(private readonly recommendations: RecommendationsService) {}
 
   private extractCityName(
     cityData: { name: string | null } | { name: string | null }[] | null,
@@ -243,34 +246,11 @@ export class PlacesService {
       throw new InternalServerErrorException(vendorError.message);
     }
 
-    const { data: related, error: relatedError } = await supabase
-      .schema('travel')
-      .from('places')
-      .select(
-        'id, name, city_id, cities(name), average_rating, review_count, image_url, vibes, type_id, types(id, category_id, categories(id, name))',
-      )
-      .eq('is_approved', true)
-      .eq('is_active', true)
-      .eq('city_id', place.city_id)
-      .neq('id', placeId)
-      .order('average_rating', { ascending: false })
-      .limit(12)
-      .returns<PlaceRow[]>();
-
-    if (relatedError) {
-      throw new InternalServerErrorException(relatedError.message);
-    }
-
-    const typedRelated = (related as PlaceRow[] | null) ?? [];
-    const relatedPlaces = typedRelated.slice(0, 6).map((item) => ({
-      id: item.id,
-      name: item.name,
-      city: this.extractCityName(item.cities),
-      rating: Number(item.average_rating) || 0,
-      review_count: item.review_count || 0,
-      image: this.resolvePlaceImage(item.image_url),
-      vibes: this.extractVibes(item.vibes),
-    }));
+    const relatedPlaces = await this.buildRelatedPlaces(
+      placeId,
+      place.city_id,
+      touristId,
+    );
 
     const cityName = this.extractCityName(place.cities);
     const vibes = this.extractVibes(place.vibes);
@@ -308,6 +288,98 @@ export class PlacesService {
       },
       related_places: relatedPlaces,
     };
+  }
+
+  private mapRelatedRow(item: PlaceRow) {
+    return {
+      id: item.id,
+      name: item.name,
+      city: this.extractCityName(item.cities),
+      rating: Number(item.average_rating) || 0,
+      review_count: item.review_count || 0,
+      image: this.resolvePlaceImage(item.image_url),
+      vibes: this.extractVibes(item.vibes),
+    };
+  }
+
+  /**
+   * Mục "Có thể bạn sẽ thích": ưu tiên gợi ý từ AI Service (Hybrid CB + CF + khoảng cách).
+   * AI Service chỉ trả place id đã xếp hạng → ở đây enrich lại bằng Supabase để có
+   * ảnh/rating đúng với app. Nếu AI Service không sẵn sàng/không có gợi ý → fallback
+   * danh sách cùng thành phố xếp theo rating (hành vi cũ).
+   */
+  private async buildRelatedPlaces(
+    placeId: string,
+    cityId: string | null,
+    touristId?: string,
+  ) {
+    const numericUserId =
+      touristId && /^\d+$/.test(touristId) ? Number(touristId) : null;
+
+    const recommended = await this.recommendations.getRecommendedPlaceIds(
+      placeId,
+      { userId: numericUserId, k: 10 },
+    );
+
+    const recommendedIds = recommended.map((item) => item.id);
+    if (recommendedIds.length > 0) {
+      const { data, error } = await supabase
+        .schema('travel')
+        .from('places')
+        .select(
+          'id, name, city_id, cities(name), average_rating, review_count, image_url, vibes, type_id, types(id, category_id, categories(id, name))',
+        )
+        .eq('is_approved', true)
+        .eq('is_active', true)
+        .in('id', recommendedIds)
+        .returns<PlaceRow[]>();
+
+      if (error) {
+        throw new InternalServerErrorException(error.message);
+      }
+
+      const byId = new Map<string, PlaceRow>(
+        ((data as PlaceRow[] | null) ?? []).map((row) => [row.id, row]),
+      );
+
+      // Giữ đúng thứ tự xếp hạng của model, bỏ id không còn approved/active.
+      const ordered = recommendedIds
+        .map((id) => byId.get(id))
+        .filter((row): row is PlaceRow => Boolean(row))
+        .slice(0, 10)
+        .map((row) => this.mapRelatedRow(row));
+
+      if (ordered.length > 0) {
+        return ordered;
+      }
+    }
+
+    return this.fetchSameCityPlaces(placeId, cityId);
+  }
+
+  /** Fallback: địa điểm cùng thành phố, xếp theo rating. */
+  private async fetchSameCityPlaces(placeId: string, cityId: string | null) {
+    const { data: related, error: relatedError } = await supabase
+      .schema('travel')
+      .from('places')
+      .select(
+        'id, name, city_id, cities(name), average_rating, review_count, image_url, vibes, type_id, types(id, category_id, categories(id, name))',
+      )
+      .eq('is_approved', true)
+      .eq('is_active', true)
+      .eq('city_id', cityId)
+      .neq('id', placeId)
+      .order('average_rating', { ascending: false })
+      .limit(12)
+      .returns<PlaceRow[]>();
+
+    if (relatedError) {
+      throw new InternalServerErrorException(relatedError.message);
+    }
+
+    return ((related as PlaceRow[] | null) ?? [])
+      .slice(0, 10)
+      .map((item) => this.mapRelatedRow(item));
   }
 
   private async checkFavorite(

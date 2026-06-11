@@ -3,69 +3,68 @@ import { supabase } from 'src/config/supabase';
 
 type SearchRow = Record<string, unknown>;
 
+export interface AutocompleteItem {
+  id: string;
+  name: string;
+  type: 'place' | 'city';
+  image: string;
+  city: string;
+  rating: number;
+  score: number;
+}
+
 @Injectable()
 export class SearchService {
+  private readonly defaultPlaceImageUrl =
+    process.env.DEFAULT_PLACE_IMAGE_URL ||
+    'https://placehold.co/1080x720?text=No+Image';
+
   private asString(value: unknown): string {
     return typeof value === 'string' ? value : '';
   }
 
-  async autocomplete(query: string): Promise<SearchRow[]> {
+  /**
+   * Autocomplete: gọi RPC travel.search_autocomplete (đã nâng cấp ở migration
+   * sql/2026_search_optimization.sql) — trả id, name, type, image, city, rating, score.
+   * Map phòng thủ để vẫn chạy được kể cả khi DB còn function bản cũ (chưa có image/city/rating).
+   */
+  async autocomplete(query: string): Promise<AutocompleteItem[]> {
+    const q = (query ?? '').trim();
+    if (q.length === 0) {
+      return [];
+    }
+
+    // Chỉ truyền p_query để tương thích cả function cũ (1 tham số) lẫn mới (p_limit có default).
     const { data, error } = await supabase
       .schema('travel')
-      .rpc('search_autocomplete', {
-        p_query: query,
-      })
+      .rpc('search_autocomplete', { p_query: q })
       .returns<SearchRow[]>();
 
     if (error) {
+      // Không ném 500: lỗi tạm thời (vd timeout) → trả rỗng để FE hiện "không có kết quả"
+      // thay vì banner đỏ "failed to search locations".
       console.error('Autocomplete error:', error);
-      throw new InternalServerErrorException(error.message);
+      return [];
     }
 
     const rows = Array.isArray(data) ? data : [];
-    if (rows.length === 0) {
-      return rows;
-    }
+    return rows.map((row) => {
+      const type =
+        this.asString(row['type']).trim().toLowerCase() === 'city'
+          ? 'city'
+          : 'place';
+      const image = this.asString(row['image']).trim();
 
-    const placeIds = Array.from(
-      new Set(
-        rows
-          .filter(
-            (item) =>
-              this.asString(item['type']).trim().toLowerCase() === 'place',
-          )
-          .map((item) => this.asString(item['id']).trim())
-          .filter((id) => id.length > 0),
-      ),
-    );
-
-    if (placeIds.length === 0) {
-      return rows;
-    }
-
-    const { data: validPlaces, error: validPlacesError } = await supabase
-      .schema('travel')
-      .from('places')
-      .select('id')
-      .in('id', placeIds)
-      .eq('is_approved', true)
-      .eq('is_active', true)
-      .returns<Array<{ id: string }>>();
-
-    if (validPlacesError) {
-      throw new InternalServerErrorException(validPlacesError.message);
-    }
-
-    const validPlaceIds = new Set((validPlaces ?? []).map((item) => item.id));
-
-    return rows.filter((item) => {
-      const type = this.asString(item['type']).trim().toLowerCase();
-      if (type !== 'place') {
-        return true;
-      }
-
-      const id = this.asString(item['id']).trim();
-      return id.length > 0 && validPlaceIds.has(id);
+      return {
+        id: this.asString(row['id']),
+        name: this.asString(row['name']),
+        type,
+        // Place không có ảnh → dùng ảnh mặc định; city để rỗng (FE hiện icon).
+        image: type === 'place' ? image || this.defaultPlaceImageUrl : image,
+        city: this.asString(row['city']),
+        rating: Number(row['rating']) || 0,
+        score: Number(row['score']) || 0,
+      };
     });
   }
 

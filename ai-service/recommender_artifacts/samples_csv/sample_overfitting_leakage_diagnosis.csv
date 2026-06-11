@@ -1,0 +1,7 @@
+﻿Check,Value,Interpretation
+CF train RMSE,0.5505,Baseline fit trên train
+CF validation RMSE,0.648,Sai số trên validation
+CF test RMSE,0.6477,Sai số trên test
+CF train-test gap,0.0972,Ổn: chưa thấy dấu hiệu overfitting mạnh qua RMSE train/validation/test.
+CF val-test gap,0.0003,Validation và test khá gần nhau; khả năng tổng quát hóa ổn định hơn.
+CB val-test gap,0.0043,Validation và test khá gần nhau; khả năng tổng quát hóa ổn định hơn.

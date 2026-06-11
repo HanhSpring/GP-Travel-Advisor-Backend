@@ -11,7 +11,23 @@ def load_all_models():
     _load_content_based()
     _load_collaborative()
     _load_review_classifier()
+    _load_hybrid_recommender()
     logger.info("✅ All models loaded successfully")
+
+
+def _load_hybrid_recommender():
+    try:
+        from app.core.config import settings
+        from app.models.hybrid_recommender import HybridRecommender
+
+        engine = HybridRecommender(settings.reco_artifact_dir, settings.reco_data_dir)
+        if engine.load():
+            _models["hybrid_recommender"] = engine
+            logger.info("Loaded: Hybrid Recommender")
+        else:
+            logger.warning("Hybrid Recommender artifacts not found — skipping")
+    except Exception as e:
+        logger.warning(f"Hybrid Recommender load failed: {e}")
 
 
 def _load_bge_m3():

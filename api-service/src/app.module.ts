@@ -5,6 +5,7 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ActivityModule } from './modules/activity/activity.module';
 import { SearchModule } from './modules/search/search.module';
 import { ItineraryModule } from './modules/itinerary/itinerary.module';
+import { ItineraryTrackingModule } from './modules/itinerary-tracking/itinerary-tracking.module';
 import { BusinessModule } from './modules/business/business.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { ProfileModule } from './modules/profile/profile.module';
@@ -53,6 +54,7 @@ import { AiTestModule } from './modules/ai-test/ai-test.module';
     ActivityModule,
     SearchModule,
     ItineraryModule,
+    ItineraryTrackingModule,
     BusinessModule,
     AuthModule,
     ProfileModule,
