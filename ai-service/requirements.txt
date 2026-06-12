@@ -26,7 +26,7 @@ pytest-asyncio==0.23.6
 # Utilities
 python-multipart==0.0.12
 
-# Tối ưu lịch trình (tùy chọn — dùng OR-Tools nếu muốn nâng cấp lên VRPTW đầy đủ)
+# Itinerary optimization (optional - use OR-Tools to upgrade to full VRPTW)
 # ortools==9.10.4067
 ortools>=9.7.2996
 geopy>=2.4.0
