@@ -16,6 +16,7 @@ import { diversifyTopK, getStratifiedFetchPlan, PlaceCandidate } from './utils/m
 @Injectable()
 export class RecommendationService {
   private readonly logger = new Logger(RecommendationService.name);
+  private readonly foodCategoryId = '97029cfb-069b-4dba-a152-dfb3d36634d3';
 
   constructor(private readonly mlClient: MlClientService) {}
 
@@ -104,16 +105,24 @@ export class RecommendationService {
   async planItinerary(dto: CreateItineraryDto, topK = 60): Promise<unknown> {
     const numDays = this.calcNumDays(dto.startDate, dto.endDate);
     const retrieval = await this.retrieveCandidates(dto, topK);
-    const plannerPlaceLimit = this.calcPlannerPlaceLimit(numDays);
-    const plannerCandidates = retrieval.candidates.slice(0, plannerPlaceLimit);
+    const plannerCandidates = retrieval.candidates;
     const details = await this.fetchPlannerPlaceDetails(plannerCandidates);
     if (!details.length) {
       throw new NotFoundException('No place details found for itinerary planning');
     }
+    if (!details.some((place) => place.place_type === 'hotel')) {
+      throw new NotFoundException(
+        'No real hotel/accommodation candidate found for itinerary planning',
+      );
+    }
 
     this.logger.warn(
       `Planning with ${details.length}/${retrieval.candidates.length} candidates ` +
-        `(days=${numDays}, retrievalTopK=${topK}, plannerCap=${plannerPlaceLimit})`,
+        `(days=${numDays}, retrievalTopK=${topK}, plannerCap=none)`,
+    );
+    this.logger.warn(
+      `Planner candidate mix: ${this.formatPlaceTypeCounts(details)} ` +
+        `(retrieval mix: ${this.formatCandidateCounts(retrieval.candidates)})`,
     );
 
     const payload: ItineraryPlanPayload = {
@@ -122,6 +131,7 @@ export class RecommendationService {
       daily_start_time: dto.dailyStartTime,
       daily_end_time: dto.dailyEndTime,
       use_goong: true,
+      travel_vehicle: this.resolveGoongVehicle(dto.transportMode),
       population_size: 50,
       generations: 120,
       mutation_rate: 0.3,
@@ -144,10 +154,6 @@ export class RecommendationService {
     const days =
       Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
     return Math.max(1, days);
-  }
-
-  private calcPlannerPlaceLimit(numDays: number): number {
-    return Math.min(90, Math.max(30, numDays * 10));
   }
 
   private async getCityName(cityId: string): Promise<string> {
@@ -202,7 +208,7 @@ export class RecommendationService {
       .schema('travel')
       .from('places')
       .select(
-        'id,name,longitude,latitude,open_hour_compressed,source,type_id,visit_duration,average_rating',
+        'id,name,longitude,latitude,open_hour_compressed,source,type_id,visit_duration,average_rating,types(name,categories(id,name))',
       )
       .in('id', ids);
 
@@ -215,19 +221,31 @@ export class RecommendationService {
       .filter((row: any) => row.longitude != null && row.latitude != null)
       .map((row: any) => {
         const candidate = candidateById.get(row.id);
+        const typeData = Array.isArray(row.types) ? row.types[0] : row.types;
+        const categoryData = Array.isArray(typeData?.categories)
+          ? typeData.categories[0]
+          : typeData?.categories;
+        const categoryId = categoryData?.id ?? null;
+        const categoryName = categoryData?.name ?? null;
+        const candidateCategory = candidate?.category ?? null;
+        const placeType = this.resolvePlannerPlaceType(
+          candidateCategory,
+          categoryId,
+          categoryName,
+        );
         return {
           id: row.id,
           name: row.name,
           longitude: Number(row.longitude),
           latitude: Number(row.latitude),
-          place_type:
-            candidate?.category === 'accommodation'
-              ? 'hotel'
-              : candidate?.category,
-          slot_type: candidate?.category,
-          category: candidate?.category,
+          place_type: placeType,
+          slot_type: candidateCategory ?? undefined,
+          category: candidateCategory ?? undefined,
           source: row.source ?? '',
           type_id: row.type_id ?? '',
+          type_name: typeData?.name ?? '',
+          category_id: categoryId,
+          category_name: categoryName,
           open_hour: null,
           open_hour_compressed: row.open_hour_compressed ?? null,
           visit_duration: row.visit_duration ?? null,
@@ -235,5 +253,61 @@ export class RecommendationService {
             row.average_rating != null ? Number(row.average_rating) : null,
         };
       });
+  }
+
+  private resolvePlannerPlaceType(
+    candidateCategory?: string | null,
+    categoryId?: string | null,
+    categoryName?: string | null,
+  ): 'hotel' | 'restaurant' | 'attraction' {
+    const category = (candidateCategory ?? '').toLowerCase();
+    const name = (categoryName ?? '').toLowerCase();
+    if (category === 'accommodation' || category === 'hotel') {
+      return 'hotel';
+    }
+    if (
+      category === 'restaurant' ||
+      category === 'cafe' ||
+      categoryId === this.foodCategoryId ||
+      name.includes('ẩm thực') ||
+      name.includes('am thuc')
+    ) {
+      return 'restaurant';
+    }
+    return 'attraction';
+  }
+
+  private resolveGoongVehicle(transportMode?: string): 'car' | 'bike' {
+    const mode = (transportMode ?? '').toUpperCase();
+    if (mode === 'MOTORBIKE') {
+      return 'bike';
+    }
+    return 'car';
+  }
+
+  private formatPlaceTypeCounts(
+    places: ItineraryPlanPayload['places'],
+  ): string {
+    const counts = places.reduce<Record<string, number>>((acc, place) => {
+      const key = place.place_type ?? 'unknown';
+      acc[key] = (acc[key] ?? 0) + 1;
+      return acc;
+    }, {});
+    return Object.entries(counts)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, value]) => `${key}=${value}`)
+      .join(', ');
+  }
+
+  private formatCandidateCounts(candidates: CandidatePlaceDto[]): string {
+    const counts = candidates.reduce<Record<string, number>>((acc, candidate) => {
+      const key = candidate.category ?? 'unknown';
+      acc[key] = (acc[key] ?? 0) + 1;
+      return acc;
+    }, {});
+    return Object.entries(counts)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, value]) => `${key}=${value}`)
+      .join(', ');
   }
 }

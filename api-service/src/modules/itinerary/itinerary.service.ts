@@ -96,18 +96,26 @@ export class ItineraryService {
 
     const detailRows = plan.days.flatMap((day) => {
       const schedule = Array.isArray(day.schedule) ? day.schedule : [];
-      return schedule
+      const visitDate = this.addDays(dto.startDate, day.day - 1);
+      const hotelRow = this.buildHotelDetailRow(
+        (itinerary as any).id,
+        plan,
+        visitDate,
+        dto.dailyStartTime,
+      );
+      const activityRows = schedule
         .filter((entry) => this.shouldPersistScheduleEntry(entry))
         .map((entry, index) => ({
           itinerary_id: (itinerary as any).id,
           place_id: entry.location_id,
-          visit_date: this.addDays(dto.startDate, day.day - 1),
+          visit_date: visitDate,
           arrival_time: entry.arrival_time,
           departure_time: entry.departure_time,
           duration_minutes: entry.active_duration_minutes,
           sequence_order: index + 1,
           is_locked: false,
         }));
+      return [hotelRow, ...activityRows];
     });
 
     if (detailRows.length === 0) {
@@ -701,18 +709,20 @@ export class ItineraryService {
       const optimizePayload = {
         itinerary_id: itineraryId,
         visit_date: visitDate,
-        activities: activities.map((a: any) => ({
-          id: a.id,
-          place_id: a.place_id,
-          duration_minutes: a.duration_minutes ?? 60,
-          is_locked: a.is_locked ?? false,
-          locked_arrive_time: a.locked_arrive_time ?? null,
-          lat: a.places?.latitude ?? null,
-          lng: a.places?.longitude ?? null,
-          open_time: a.places?.open_time ?? '07:00',
-          close_time: a.places?.close_time ?? '22:00',
-          estimated_cost: a.estimated_cost ?? 0,
-        })),
+        activities: activities
+          .filter((a: any) => !this.isStartPointDetail(a))
+          .map((a: any) => ({
+            id: a.id,
+            place_id: a.place_id,
+            duration_minutes: a.duration_minutes ?? 60,
+            is_locked: a.is_locked ?? false,
+            locked_arrive_time: a.locked_arrive_time ?? null,
+            lat: a.places?.latitude ?? null,
+            lng: a.places?.longitude ?? null,
+            open_time: a.places?.open_time ?? '07:00',
+            close_time: a.places?.close_time ?? '22:00',
+            estimated_cost: a.estimated_cost ?? 0,
+          })),
         // Mặc định ngày bắt đầu lúc 08:00, kết thúc lúc 21:00
         day_start_time: '08:00',
         day_end_time: '21:00',
@@ -1011,9 +1021,16 @@ export class ItineraryService {
           ? typeData.categories[0]
           : typeData?.categories;
         const category: string | null = catData?.name ?? null;
+        const durationMinutes = act.duration_minutes ?? 0;
+        const sequenceOrder = act.sequence_order ?? actIndex + 1;
+        const isAccommodation = this.isAccommodationCategory(category);
+        const isStartPoint =
+          isAccommodation && durationMinutes === 0 && sequenceOrder === 0;
 
         return {
           id: act.id,
+          placeId: act.place_id,
+          sequenceOrder,
           startTime: act.arrival_time || '08:00',
           endTime: act.departure_time || '09:00',
           placeName: place?.name || 'Điểm tham quan',
@@ -1031,6 +1048,9 @@ export class ItineraryService {
           currency: 'VNĐ',
           isFree: !act.estimated_cost,
           category,
+          durationMinutes,
+          isAccommodation,
+          isStartPoint,
           open_hour_compressed: place?.open_hour_compressed ?? null,
           latitude: place?.latitude,
           longitude: place?.longitude,
@@ -1040,10 +1060,14 @@ export class ItineraryService {
         };
       });
 
-      let totalDuration = '0 tiếng';
-      if (activities.length > 0) {
-        totalDuration = `${activities.length * 2} tiếng`;
-      }
+      const totalDurationMinutes = activities.reduce(
+        (sum, activity) => sum + (activity.durationMinutes ?? 0),
+        0,
+      );
+      const totalDuration = this.formatDuration(totalDurationMinutes);
+      const activityCount = activities.filter(
+        (activity) => !activity.isStartPoint,
+      ).length;
 
       let dateLabel = dateStr;
       try {
@@ -1065,7 +1089,7 @@ export class ItineraryService {
         totalTransitTimeStr: '0 phút',
         activities: activities,
         day_number: dayNumber,
-        locations_count: activities.length,
+        locations_count: activityCount,
         day_budget: activities.reduce((sum, a) => sum + a.price, 0),
         total_duration: totalDuration,
       };
@@ -1082,6 +1106,21 @@ export class ItineraryService {
       diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
     } catch (_) {}
 
+    const hotelDetailsCount = (details || []).filter((detail: any) => {
+      const place = detail.place;
+      const typeData = Array.isArray(place?.types)
+        ? place.types[0]
+        : place?.types;
+      const catData = Array.isArray(typeData?.categories)
+        ? typeData.categories[0]
+        : typeData?.categories;
+      return this.isAccommodationCategory(catData?.name);
+    }).length;
+    const nonHotelDetailsCount = Math.max(
+      0,
+      (details?.length || 0) - hotelDetailsCount,
+    );
+
     return {
       id: itinerary.id,
       title: itinerary.description || 'Chi tiết lịch trình',
@@ -1090,13 +1129,14 @@ export class ItineraryService {
       isPublic: itinerary.is_public || false,
       totalBudget: itinerary.estimated_cost || 0,
       totalDays: diffDays || days.length || 1,
-      totalPlaces: details?.length || 0,
+      totalPlaces: nonHotelDetailsCount,
+      hotelsCount: hotelDetailsCount,
       days: days,
       destination: itinerary.destination || '',
       start_date: startStr,
       end_date: endStr,
       durationDays: diffDays || days.length || 1,
-      activitiesCount: details?.length || 0,
+      activitiesCount: nonHotelDetailsCount,
       estimatedBudget: itinerary.estimated_cost || 0,
       spentBudget: itinerary.actual_cost || 0,
       centerCoordinate: [10.7769, 106.7009],
@@ -1214,7 +1254,12 @@ export class ItineraryService {
   private assertPlanIsUsable(plan: AIPlanResult): void {
     if (!plan || !Array.isArray(plan.days) || plan.days.length === 0) {
       throw new BadRequestException(
-        'AI planner trả về kế hoạch không hợp lệ hoặc rỗng',
+        'AI planner returned an empty or invalid itinerary plan',
+      );
+    }
+    if (!plan.hotel_id || plan.hotel_id === 'demo_hotel') {
+      throw new BadRequestException(
+        'AI planner did not return a real hotel for this itinerary',
       );
     }
   }
@@ -1236,6 +1281,53 @@ export class ItineraryService {
     return !entry.is_return_to_hotel && !!entry.location_id;
   }
 
+  private buildHotelDetailRow(
+    itineraryId: string,
+    plan: AIPlanResult,
+    visitDate: string,
+    dailyStartTime: string,
+  ) {
+    const startTime = this.trimTime(dailyStartTime) || '08:00';
+    return {
+      itinerary_id: itineraryId,
+      place_id: plan.hotel_id,
+      visit_date: visitDate,
+      arrival_time: startTime,
+      departure_time: startTime,
+      duration_minutes: 0,
+      sequence_order: 0,
+      is_locked: true,
+      notes: 'Hotel/start point selected by GA planner',
+    };
+  }
+
+  private formatDuration(totalMinutes: number): string {
+    if (!totalMinutes || totalMinutes <= 0) return '0 phút';
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours > 0 && minutes > 0) return `${hours} giờ ${minutes} phút`;
+    if (hours > 0) return `${hours} giờ`;
+    return `${minutes} phút`;
+  }
+  private isAccommodationCategory(category?: string | null): boolean {
+    const normalized = (category ?? '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+    return (
+      normalized.includes('luu tru') ||
+      normalized.includes('khach san') ||
+      normalized.includes('hotel') ||
+      normalized.includes('accommodation')
+    );
+  }
+
+  private isStartPointDetail(detail: any): boolean {
+    return (
+      (detail?.sequence_order ?? null) === 0 &&
+      (detail?.duration_minutes ?? 0) === 0
+    );
+  }
   /** Cộng thêm N ngày vào chuỗi ngày 'YYYY-MM-DD', trả về chuỗi mới */
   private addDays(dateStr: string, days: number): string {
     const d = new Date(dateStr);

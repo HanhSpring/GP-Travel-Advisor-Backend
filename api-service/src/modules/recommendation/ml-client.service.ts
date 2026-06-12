@@ -25,6 +25,8 @@ export interface ItineraryPlanPayload {
     source?: string;
     type_id?: string;
     type_name?: string;
+    category_id?: string | null;
+    category_name?: string | null;
     open_hour?: string | null;
     open_hour_compressed?: string | null;
     visit_duration?: number | null;
@@ -36,6 +38,7 @@ export interface ItineraryPlanPayload {
   selected_hotel_id?: string | null;
   return_to_hotel?: boolean;
   use_goong?: boolean;
+  travel_vehicle?: string;
   population_size?: number;
   generations?: number;
   mutation_rate?: number;

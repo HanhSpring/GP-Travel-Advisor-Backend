@@ -15,6 +15,8 @@ class ItineraryPlaceInput(BaseModel):
     source: str = ""
     type_id: str = ""
     type_name: str = ""
+    category_id: str | None = None
+    category_name: str | None = None
     open_hour: str | None = None
     open_hour_compressed: str | None = None
     visit_duration: int | None = None
@@ -30,6 +32,7 @@ class ItineraryPlanRequest(BaseModel):
     return_to_hotel: bool = False
     use_goong: bool = False
     goong_api_key: str = ""
+    travel_vehicle: str = Field(default="car", pattern=r"^(car|bike|taxi|truck)$")
     travel_cache_path: str | None = None
     speed_kmh: float = 30.0
     population_size: int = Field(default=50, ge=2)

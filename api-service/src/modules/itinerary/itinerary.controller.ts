@@ -137,6 +137,7 @@ export class ItineraryController {
     const planStartedAt = Date.now();
     const plan = await this.recommendationService.planItinerary(body, k);
     const planTimeMs = Date.now() - planStartedAt;
+    this.logPlanSummary(plan as any);
 
     const persistStartedAt = Date.now();
     const created = await this.service.createGeneratedItinerary(
@@ -413,5 +414,22 @@ export class ItineraryController {
 
   private calcRetrievalTopK(numDays: number): number {
     return Math.min(200, Math.max(60, numDays * 20));
+  }
+
+  private logPlanSummary(plan: any): void {
+    const days = Array.isArray(plan?.days) ? plan.days : [];
+    this.logger.warn(
+      `GA plan summary: hotel=${plan?.hotel_name ?? 'unknown'} ` +
+        `(${plan?.hotel_id ?? 'unknown'}), days=${days.length}, ` +
+        `visited=${plan?.total_visited ?? 0}`,
+    );
+    for (const day of days) {
+      this.logger.warn(
+        `GA day ${day.day}: fitness=${day.fitness}, ` +
+          `visited=${day.visited_count}, travel=${day.total_travel_minutes}m, ` +
+          `wait=${day.total_wait_minutes}m, visit=${day.total_visit_minutes}m, ` +
+          `restaurant=${day.restaurant_count}, stopped=${day.stopped_reason}`,
+      );
+    }
   }
 }

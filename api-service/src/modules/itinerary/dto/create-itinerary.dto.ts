@@ -22,6 +22,8 @@ export enum TransportMode {
   AIRPLANE = 'AIRPLANE', // Máy bay
   ROAD = 'ROAD', // Đường bộ
   WATERWAY = 'WATERWAY', // Đường thủy
+  CAR = 'CAR',
+  MOTORBIKE = 'MOTORBIKE',
 }
 
 // tripTheme enum giữ lại để không break import cũ (nếu có)
@@ -86,7 +88,7 @@ export class CreateItineraryDto {
 
   @ApiProperty({
     enum: TransportMode,
-    example: TransportMode.AIRPLANE,
+    example: TransportMode.CAR,
     description: 'Phương tiện di chuyển chính',
   })
   @IsNotEmpty({ message: 'Vui lòng chọn phương tiện di chuyển' })
