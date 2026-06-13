@@ -10,6 +10,7 @@ import {
   IsOptional,
   IsNumber,
   IsArray,
+  MaxLength,
 } from 'class-validator';
 
 // Định nghĩa các hằng số lựa chọn
@@ -199,4 +200,17 @@ export class CreateItineraryDto {
   @IsArray()
   @IsString({ each: true })
   customFoodPreferences?: string[];
+
+  // ════════════════════════════════════════════════════════════════
+  // [TRIP_NAME_INPUT] Tên chuyến đi do user nhập ở Bước 3
+  // Lưu vào cột `description` trong travel.itineraries
+  // ════════════════════════════════════════════════════════════════
+  @ApiPropertyOptional({
+    example: 'Khám phá Đà Nẵng • 10–13/06',
+    description: 'Tên chuyến đi (tùy chọn). Nếu không truyền, cột description sẽ là null.',
+  })
+  @IsOptional()
+  @IsString()
+  @MaxLength(255)
+  description?: string;
 }

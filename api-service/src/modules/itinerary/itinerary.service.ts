@@ -78,6 +78,8 @@ export class ItineraryService {
       .from('itineraries')
       .insert({
         creator_id: dto.userId,
+        // [TRIP_NAME_INPUT] Lưu tên chuyến đi user đặt vào cột description
+        description: dto.description ?? null,
         start_date: dto.startDate,
         end_date: dto.endDate,
         estimated_cost: dto.budget,
