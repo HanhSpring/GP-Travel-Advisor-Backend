@@ -25,6 +25,15 @@ class ItineraryItemDto {
 
   @ApiProperty()
   progress: number
+
+  @ApiProperty({ description: 'Tổng số địa điểm (trừ accommodation)' })
+  total_locations: number
+
+  @ApiProperty({ description: 'Số địa điểm đã ghé (geofence_visits.status = visited)' })
+  visited_locations: number
+
+  @ApiProperty({ type: [String], description: 'Ảnh địa điểm (tối đa 5, từ places.image_url[1])' })
+  place_images: string[]
 }
 
 class StatsDto {

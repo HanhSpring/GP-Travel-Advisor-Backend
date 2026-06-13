@@ -33,10 +33,7 @@ import {
   CustomizeActivityResponseDto,
   SuggestionsResponseDto,
 } from './dto/customize-response.dto';
-import {
-  TwoTowerRetrievalResponseDto,
-} from './dto/retrieval-response.dto';
-
+import { TwoTowerRetrievalResponseDto } from './dto/retrieval-response.dto';
 
 @ApiTags('Itinerary')
 @Controller('itinerary')
@@ -52,7 +49,7 @@ export class ItineraryController {
   @ApiOperation({ summary: 'Lấy danh sách lịch trình của user' })
   @ApiResponse({ type: ItineraryResponseDto })
   getMyItineraries(@Query() query: GetItinerariesDto) {
-    return this.service.getMyItineraries(query.userId);
+    return this.service.getMyItineraries(query.userId, query.q);
   }
 
   /**
@@ -99,7 +96,8 @@ export class ItineraryController {
     required: false,
     type: Number,
     example: 60,
-    description: 'Số candidates Two-Tower tối đa. Nếu không truyền, backend tự scale theo số ngày: min(200, max(60, days * 20)). Số điểm đưa vào GA/Goong được cap riêng.',
+    description:
+      'Số candidates Two-Tower tối đa. Nếu không truyền, backend tự scale theo số ngày: min(200, max(60, days * 20)). Số điểm đưa vào GA/Goong được cap riêng.',
   })
   @ApiBody({
     type: CreateItineraryDto,
@@ -296,7 +294,10 @@ export class ItineraryController {
       'Sau khi lưu, FastAPI tự động sắp xếp lại các hoạt động còn lại trong ngày.',
   })
   @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
-  @ApiParam({ name: 'activityId', description: 'ID hoạt động (itinerary_details.id)' })
+  @ApiParam({
+    name: 'activityId',
+    description: 'ID hoạt động (itinerary_details.id)',
+  })
   @ApiBody({ type: EditActivityDto })
   @ApiResponse({ status: 200, type: CustomizeActivityResponseDto })
   async editActivity(
@@ -349,7 +350,8 @@ export class ItineraryController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Xóa một hoạt động khỏi lịch trình',
-    description: 'Hard delete. Sau khi xóa, các hoạt động còn lại trong ngày được sắp xếp lại.',
+    description:
+      'Hard delete. Sau khi xóa, các hoạt động còn lại trong ngày được sắp xếp lại.',
   })
   @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
   @ApiParam({ name: 'activityId', description: 'ID hoạt động cần xóa' })
@@ -420,7 +422,10 @@ export class ItineraryController {
       'chưa có trong lịch trình, sắp xếp theo điểm đánh giá.',
   })
   @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
-  @ApiParam({ name: 'activityId', description: 'ID hoạt động cần tìm gợi ý thay thế' })
+  @ApiParam({
+    name: 'activityId',
+    description: 'ID hoạt động cần tìm gợi ý thay thế',
+  })
   @ApiResponse({ status: 200, type: SuggestionsResponseDto })
   async getSuggestions(
     @Param('itineraryId') itineraryId: string,
@@ -430,7 +435,9 @@ export class ItineraryController {
   }
 
   @Patch(':id/activities')
-  @ApiOperation({ summary: 'Cập nhật danh sách hoạt động/thời gian của lịch trình' })
+  @ApiOperation({
+    summary: 'Cập nhật danh sách hoạt động/thời gian của lịch trình',
+  })
   @ApiParam({ name: 'id', description: 'ID của lịch trình' })
   async updateActivities(
     @Param('id') id: string,
@@ -444,7 +451,10 @@ export class ItineraryController {
   }
 
   @Post('optimize-day')
-  @ApiOperation({ summary: 'Tối ưu hoá các hoạt động trong một ngày bằng AI Service (OR-Tools)' })
+  @ApiOperation({
+    summary:
+      'Tối ưu hoá các hoạt động trong một ngày bằng AI Service (OR-Tools)',
+  })
   async optimizeDay(@Body() body: { activities: any[] }) {
     if (!body.activities || body.activities.length === 0) {
       return { optimized: [] };

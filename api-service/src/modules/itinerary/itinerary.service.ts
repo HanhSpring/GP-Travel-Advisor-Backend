@@ -46,14 +46,24 @@ export class ItineraryService {
   private readonly logger = new Logger(ItineraryService.name);
 
   // ════════════════════════════════════════════════════════════════
-  // CÁC PHƯƠNG THỨC CŨ (GIỮ NGUYÊN)
+  // ITINERARY CRUD + LIST QUERIES
   // ════════════════════════════════════════════════════════════════
 
-  /** Lấy danh sách lịch trình của user (dùng Supabase RPC) */
-  async getMyItineraries(userId: string) {
+  /**
+   * Returns the current user's itinerary list through the Supabase RPC.
+   *
+   * `query` comes from GET /itinerary/my-itineraries?q=...
+   * The RPC currently searches the trip name stored in `itineraries.description`.
+   * Keep this in sync with travel.get_my_itineraries(p_user_id, p_query).
+   */
+  async getMyItineraries(userId: string, query?: string) {
+    const trimmedQuery = query?.trim() || null;
     const { data, error } = await supabase
       .schema('travel')
-      .rpc('get_my_itineraries', { p_user_id: userId, p_query: '' });
+      .rpc('get_my_itineraries', {
+        p_user_id: userId,
+        p_query: trimmedQuery,
+      });
 
     if (error) {
       console.error('[ItineraryService] getMyItineraries error:', error);
