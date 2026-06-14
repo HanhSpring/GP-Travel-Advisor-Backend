@@ -10,3 +10,8 @@ weights/*.bin
 .cache/
 *.egg-info/
 dist/
+
+# Artifact lưu trên Cloudflare R2 — không commit vào git
+data/
+recommender_artifacts/
+/tmp/ai_cache/

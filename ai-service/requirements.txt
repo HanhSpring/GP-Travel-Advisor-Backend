@@ -26,6 +26,9 @@ pytest-asyncio==0.23.6
 # Utilities
 python-multipart==0.0.12
 
+# Cloudflare R2 / S3-compatible storage
+boto3==1.34.131
+
 # Itinerary optimization (optional - use OR-Tools to upgrade to full VRPTW)
 # ortools==9.10.4067
 ortools>=9.7.2996

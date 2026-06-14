@@ -11,9 +11,10 @@ export const DEFAULT_GEOFENCE_RADIUS_M = 100;
 export const MIN_GEOFENCE_RADIUS_M = 80;
 export const MAX_GEOFENCE_RADIUS_M = 150;
 
-// Ngưỡng dwell time: max(2 phút, 30% thời lượng hoạt động dự kiến).
-export const MIN_DWELL_SECONDS = 120; // 2 phút
-export const DWELL_FRACTION = 0.3; // 30%
+// Ngưỡng dwell time: max(30 giây, 5% thời lượng hoạt động dự kiến).
+// 60-phút place → 180s (3 min); 30-phút → 90s; short → 30s.
+export const MIN_DWELL_SECONDS = 30;
+export const DWELL_FRACTION = 0.05;
 export const DEFAULT_EXPECTED_DURATION_MINUTES = 60;
 
 // Lịch tự động cho mobile (AlarmManager).
@@ -26,15 +27,15 @@ export const GEOFENCE_EVENTS = ['ENTER', 'DWELL', 'EXIT'] as const;
 export type GeofenceEventType = (typeof GEOFENCE_EVENTS)[number];
 
 // Trạng thái ghé — khớp enum tracking.visit_status_enum trong DB.
-// not_visited = Chưa ghé · visited = Đã ghé · skipped = Bỏ qua.
+// not_visited = Chưa đến · visited = Đã đến nơi · skipped = Bỏ qua.
 export const VISIT_STATUSES = ['not_visited', 'visited', 'skipped'] as const;
 export type VisitStatus = (typeof VISIT_STATUSES)[number];
 export const DEFAULT_VISIT_STATUS: VisitStatus = 'not_visited';
 
 // Nhãn tiếng Việt + màu/icon hiển thị trên bản đồ.
 export const STATUS_LABEL_VI: Record<VisitStatus, string> = {
-  not_visited: 'Chưa ghé',
-  visited: 'Đã ghé',
+  not_visited: 'Chưa đến',
+  visited: 'Đã đến nơi',
   skipped: 'Bỏ qua',
 };
 

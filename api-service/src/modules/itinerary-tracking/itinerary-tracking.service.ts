@@ -412,12 +412,12 @@ export class ItineraryTrackingService {
     const date = this.resolveDate(dto.date);
     const itinerary = await this.loadItinerary(dto.itineraryId, dto.touristId);
 
-    // Đánh dấu lịch trình đang diễn ra (trừ khi đã hoàn thành).
+    // Đánh dấu lịch trình đang diễn ra + bật cờ tracking_active.
     if ((itinerary.status ?? '').toLowerCase() !== 'completed') {
       const { error } = await supabase
         .schema('travel')
         .from('itineraries')
-        .update({ status: 'ongoing' })
+        .update({ status: 'ongoing', tracking_active: true })
         .eq('id', dto.itineraryId);
       if (error) this.dbError(error, 'start.updateStatus');
     }
@@ -856,16 +856,28 @@ export class ItineraryTrackingService {
     const nextDayDate = await this.findNextDay(dto.itineraryId, date);
 
     let itineraryStatus = (itinerary.status ?? 'ongoing').toLowerCase();
+    const isExplicitStop = dto.markPendingAsSkipped === false;
+
     if (!nextDayDate) {
-      // Hết ngày cuối -> hoàn thành lịch trình.
+      // Hết ngày cuối -> hoàn thành lịch trình, tắt tracking.
       const { error } = await supabase
         .schema('travel')
         .from('itineraries')
-        .update({ status: 'completed' })
+        .update({ status: 'completed', tracking_active: false })
         .eq('id', dto.itineraryId);
       if (error) this.dbError(error, 'endDay.complete');
       itineraryStatus = 'completed';
+    } else if (isExplicitStop) {
+      // User bấm Dừng → tắt tracking_active, giữ status = ongoing.
+      const { error } = await supabase
+        .schema('travel')
+        .from('itineraries')
+        .update({ tracking_active: false })
+        .eq('id', dto.itineraryId);
+      if (error) this.dbError(error, 'endDay.stopTracking');
+      itineraryStatus = 'ongoing';
     } else {
+      // Hết ngày (AlarmManager), sang ngày tiếp theo → tracking vẫn active.
       itineraryStatus = 'ongoing';
     }
 

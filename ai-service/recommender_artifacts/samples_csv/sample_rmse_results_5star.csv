@@ -1,6 +1,0 @@
-﻿Model,Split,RMSE
-Collaborative Filtering (Funk SVD),Train,0.5504811055727913
-Collaborative Filtering (Funk SVD),Validation,0.6480353373461835
-Collaborative Filtering (Funk SVD),Test,0.6477054665174821
-Content-Based kNN,Validation,0.6946473715103343
-Content-Based kNN,Test,0.6989962208995195
