@@ -236,19 +236,19 @@ export class AdminReviewsService {
         if (normalizedClassification === 'long-term') {
           contentsQuery = contentsQuery
             .eq('processing_status', 'processed')
-            .eq('time_label', 'long_term');
+            .eq('time_label', 'long-term');
         }
 
         if (normalizedClassification === 'short-term') {
           contentsQuery = contentsQuery
             .eq('processing_status', 'processed')
-            .eq('time_label', 'short_term');
+            .eq('time_label', 'short-term');
         }
 
         if (normalizedClassification === 'need-action') {
           contentsQuery = contentsQuery
             .eq('processing_status', 'processed')
-            .eq('time_label', 'unknown');
+            .eq('time_label', 'amb');
         }
 
         if (normalizedClassification === 'unclassified') {
@@ -350,12 +350,13 @@ export class AdminReviewsService {
             const { data: contentData } = (await supabase
               .schema('review_ai')
               .from('review_contents')
-              .select('main_topic, content')
+              .select('main_topic, content, time_label')
               .eq('review_id', review.id)
               .maybeSingle()) as { data: ReviewContentData | null };
 
             const mainTopic = contentData?.main_topic ?? null;
             const reviewContent = contentData?.content ?? null;
+            const timeLabel = contentData?.time_label ?? null;
 
             return {
               id: review.id,
@@ -369,6 +370,7 @@ export class AdminReviewsService {
               rating: review.rating,
               review_content: reviewContent,
               main_topic: mainTopic,
+              time_label: timeLabel,
               status: review.status,
               created_at: review.created_at,
               has_images: false,
@@ -387,6 +389,7 @@ export class AdminReviewsService {
               rating: review.rating,
               review_content: null,
               main_topic: null,
+              time_label: null,
               status: review.status,
               created_at: review.created_at,
               has_images: false,
@@ -487,12 +490,13 @@ export class AdminReviewsService {
       const { data: contentData } = (await supabase
         .schema('review_ai')
         .from('review_contents')
-        .select('content, main_topic')
+        .select('content, main_topic, time_label')
         .eq('review_id', reviewId)
         .maybeSingle()) as { data: ReviewContentData | null };
 
       const reviewContent = contentData?.content ?? null;
       const mainTopic = contentData?.main_topic ?? null;
+      const timeLabel = contentData?.time_label ?? null;
 
       return {
         id: review.id,
@@ -509,6 +513,7 @@ export class AdminReviewsService {
         },
         rating: review.rating,
         main_topic: mainTopic,
+        time_label: timeLabel,
         review_content: reviewContent,
         images: [],
         status: review.status,

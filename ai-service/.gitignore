@@ -1,17 +1,28 @@
 __pycache__/
 *.pyc
 *.pyo
+
 .env
+
 venv/
 .venv/
+
 weights/*.pt
 weights/*.pkl
 weights/*.bin
+
 .cache/
+
 *.egg-info/
 dist/
 
-# Artifact lưu trên Cloudflare R2 — không commit vào git
+# Recommender
 data/
 recommender_artifacts/
 /tmp/ai_cache/
+
+# Pipeline output
+output/
+
+# PhoBERT model
+app/models/phobert_timelabel/

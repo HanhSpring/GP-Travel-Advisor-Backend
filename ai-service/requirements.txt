@@ -1,8 +1,9 @@
-fastapi==0.111.0
-uvicorn[standard]==0.29.0
-pydantic==2.7.1
-pydantic-settings==2.2.1
-python-dotenv==1.0.1
+fastapi>=0.111.0
+uvicorn[standard]>=0.29.0
+pydantic>=2.10.0
+pydantic-settings>=2.6.0
+python-dotenv>=1.0.1
+
 # AI/ML libraries
 torch==2.3.0
 transformers==4.41.0
@@ -13,8 +14,7 @@ pandas==2.2.3
 scipy==1.13.0
 
 # Database
-psycopg2-binary==2.9.9
-sqlalchemy==2.0.35
+supabase>=2.0.0
 
 # HTTP client
 httpx==0.27.2
@@ -29,7 +29,6 @@ python-multipart==0.0.12
 # Cloudflare R2 / S3-compatible storage
 boto3==1.34.131
 
-# Itinerary optimization (optional - use OR-Tools to upgrade to full VRPTW)
-# ortools==9.10.4067
+# Itinerary optimization
 ortools>=9.7.2996
 geopy>=2.4.0

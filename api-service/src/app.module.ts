@@ -32,6 +32,7 @@ import { AdminPlacesModule } from './modules/admin/places/admin-places.module';
 import { AdminReviewsModule } from './modules/admin/reviews/admin-reviews.module';
 import { AdminItineraryReviewsModule } from './modules/admin/itinerary-reviews/admin-itinerary-reviews.module';
 import { AdminDashboardModule } from './modules/admin/dashboard/admin-dashboard.module';
+import { AdminAlgorithmPipelineModule } from './modules/admin/algorithm-pipeline/admin-algorithm-pipeline.module';
 
 /*
 Business modules
@@ -81,6 +82,7 @@ import { AiTestModule } from './modules/ai-test/ai-test.module';
     AdminReviewsModule,
     AdminItineraryReviewsModule,
     AdminDashboardModule,
+    AdminAlgorithmPipelineModule,
 
     /*
     Business
