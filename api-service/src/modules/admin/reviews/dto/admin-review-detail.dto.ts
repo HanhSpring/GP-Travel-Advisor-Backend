@@ -47,6 +47,9 @@ export class AdminReviewDetailDto {
   main_topic: string | null;
 
   @ApiProperty({ nullable: true, type: String })
+  time_label: string | null;
+
+  @ApiProperty({ nullable: true, type: String })
   review_content: string | null;
 
   @ApiProperty({ type: [AdminReviewImageDto] })
