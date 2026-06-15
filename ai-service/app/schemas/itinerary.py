@@ -8,7 +8,7 @@ class ItineraryPlaceInput(BaseModel):
     latitude: float
     place_type: str | None = Field(
         default=None,
-        description="hotel | restaurant | attraction. If omitted, slot_type/category/source is used.",
+        description="hotel | restaurant | cafe | entertainment | attraction. If omitted, slot_type/category/source is used.",
     )
     slot_type: str | None = None
     category: str | None = None
@@ -123,6 +123,7 @@ class ScheduleEntryResponse(BaseModel):
     departure_time: str
     wait_minutes: int
     active_duration_minutes: int
+    place_type: str = "attraction"
     is_restaurant: bool
     unknown_hours: bool
     is_return_to_hotel: bool
@@ -147,4 +148,7 @@ class ItineraryPlanResponse(BaseModel):
     num_days: int
     input_places: int
     total_visited: int
+    total_ms: int = 0
+    matrix_ms: int = 0
+    ga_ms: int = 0
     days: list[ItineraryDayResponse]

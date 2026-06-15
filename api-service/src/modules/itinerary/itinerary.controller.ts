@@ -176,6 +176,54 @@ export class ItineraryController {
     };
   }
 
+  @Post('plan/preview')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Preview itinerary from Two-Tower candidates and GA planner',
+    description:
+      'Runs candidate retrieval and GA planner, returns the full plan JSON, but does not persist anything to DB.',
+  })
+  @ApiQuery({
+    name: 'top_k',
+    required: false,
+    type: Number,
+    example: 120,
+    description: 'Số candidates Two-Tower tối đa dùng để chạy thử planner.',
+  })
+  @ApiBody({ type: CreateItineraryDto })
+  async previewPlan(
+    @Body() body: CreateItineraryDto,
+    @Query('top_k') topK?: string,
+  ) {
+    const startedAt = Date.now();
+    const requestedDays = this.calcRequestedDays(body.startDate, body.endDate);
+    const k = topK
+      ? Math.min(parseInt(topK, 10) || 60, 200)
+      : this.calcRetrievalTopK(requestedDays);
+
+    const plan = await this.recommendationService.planItinerary(body, k);
+    const executionTimeMs = Date.now() - startedAt;
+    this.logPlanSummary(plan as any);
+
+    this.logger.warn(
+      `POST /itinerary/plan/preview completed in ${executionTimeMs}ms ` +
+        `(persist=skipped, days=${requestedDays}, topK=${k})`,
+    );
+
+    return {
+      mode: 'preview',
+      persisted: false,
+      executionTimeMs,
+      executionTimeSeconds: Number((executionTimeMs / 1000).toFixed(2)),
+      metrics: {
+        topK: k,
+        requestedDays,
+        totalMs: executionTimeMs,
+      },
+      plan,
+    };
+  }
+
   @Get(':id')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({

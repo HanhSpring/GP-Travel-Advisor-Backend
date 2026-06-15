@@ -92,7 +92,39 @@ export function normalizeCategory(category: string, typeName?: string): string {
 
 /** Trả về daily quota theo tripIntent */
 export function getDailyQuota(tripIntent: string): Record<string, number> {
-  return INTENT_QUOTA[tripIntent] ?? DEFAULT_QUOTA;
+  const intents = parseTripIntents(tripIntent);
+  if (intents.length === 0) {
+    return DEFAULT_QUOTA;
+  }
+  if (intents.length === 1) {
+    return INTENT_QUOTA[intents[0]] ?? DEFAULT_QUOTA;
+  }
+
+  const merged: Record<string, number> = {};
+  const slots = new Set<string>();
+  for (const intent of intents) {
+    for (const slot of Object.keys(INTENT_QUOTA[intent] ?? {})) {
+      slots.add(slot);
+    }
+  }
+
+  for (const slot of slots) {
+    const total = intents.reduce(
+      (sum, intent) => sum + (INTENT_QUOTA[intent]?.[slot] ?? 0),
+      0,
+    );
+    merged[slot] = Math.ceil(total / intents.length);
+  }
+
+  return { ...DEFAULT_QUOTA, ...merged };
+}
+
+function parseTripIntents(tripIntent: string): string[] {
+  const known = new Set(Object.keys(INTENT_QUOTA));
+  return (tripIntent ?? '')
+    .split(',')
+    .map((intent) => intent.trim())
+    .filter((intent) => known.has(intent));
 }
 
 /**
@@ -116,13 +148,16 @@ export function getStratifiedFetchPlan(
   numDays: number,
 ): SlotFetchPlan[] {
   const quota = getDailyQuota(tripIntent);
+  const knownIntents = parseTripIntents(tripIntent);
   const plan: SlotFetchPlan[] = [];
 
   for (const [slot, dailyQ] of Object.entries(quota)) {
     if (dailyQ === 0) continue;
     const limit = dailyQ * numDays * 2;  // 2x buffer
     const entry: SlotFetchPlan = { slotType: slot, limit };
-    if (slot === 'attraction') entry.travelType = tripIntent;
+    if (slot === 'attraction' && knownIntents.length === 1) {
+      entry.travelType = knownIntents[0];
+    }
     plan.push(entry);
   }
 

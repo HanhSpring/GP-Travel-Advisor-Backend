@@ -4,6 +4,8 @@ import {
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { supabase } from '../../config/supabase';
 import { ItineraryPlanPayload, MlClientService } from './ml-client.service';
 import { CreateItineraryDto } from '../itinerary/dto/create-itinerary.dto';
@@ -104,9 +106,14 @@ export class RecommendationService {
 
   async planItinerary(dto: CreateItineraryDto, topK = 60): Promise<unknown> {
     const numDays = this.calcNumDays(dto.startDate, dto.endDate);
+    const runStartedAt = Date.now();
+    const retrievalStartedAt = Date.now();
     const retrieval = await this.retrieveCandidates(dto, topK);
+    const retrievalMs = Date.now() - retrievalStartedAt;
     const plannerCandidates = retrieval.candidates;
+    const detailsStartedAt = Date.now();
     const details = await this.fetchPlannerPlaceDetails(plannerCandidates);
+    const detailsMs = Date.now() - detailsStartedAt;
     if (!details.length) {
       throw new NotFoundException('No place details found for itinerary planning');
     }
@@ -139,7 +146,24 @@ export class RecommendationService {
     };
 
     try {
-      return await this.mlClient.planItinerary(payload);
+      const aiStartedAt = Date.now();
+      const plan = await this.mlClient.planItinerary(payload);
+      const aiPlannerMs = Date.now() - aiStartedAt;
+      this.logItineraryRunJson({
+        dto,
+        topK,
+        numDays,
+        retrieval,
+        details,
+        plan,
+        timings: {
+          twoTowerMs: retrievalMs,
+          detailsMs,
+          aiPlannerMs,
+          backendTotalMs: Date.now() - runStartedAt,
+        },
+      });
+      return plan;
     } catch (err: any) {
       const detail = err?.message ?? String(err);
       throw new ServiceUnavailableException(`AI Service error: ${detail}`);
@@ -232,6 +256,7 @@ export class RecommendationService {
           candidateCategory,
           categoryId,
           categoryName,
+          typeData?.name ?? '',
         );
         return {
           id: row.id,
@@ -259,15 +284,22 @@ export class RecommendationService {
     candidateCategory?: string | null,
     categoryId?: string | null,
     categoryName?: string | null,
-  ): 'hotel' | 'restaurant' | 'attraction' {
+    typeName?: string | null,
+  ): 'hotel' | 'restaurant' | 'cafe' | 'entertainment' | 'attraction' {
     const category = (candidateCategory ?? '').toLowerCase();
     const name = (categoryName ?? '').toLowerCase();
+    const type = (typeName ?? '').toLowerCase();
     if (category === 'accommodation' || category === 'hotel') {
       return 'hotel';
     }
+    if (category === 'cafe' || type.includes('cafe') || type.includes('coffee')) {
+      return 'cafe';
+    }
+    if (category === 'entertainment') {
+      return 'entertainment';
+    }
     if (
       category === 'restaurant' ||
-      category === 'cafe' ||
       categoryId === this.foodCategoryId ||
       name.includes('ẩm thực') ||
       name.includes('am thuc')
@@ -309,5 +341,156 @@ export class RecommendationService {
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([key, value]) => `${key}=${value}`)
       .join(', ');
+  }
+
+  private countCandidates(candidates: CandidatePlaceDto[]): Record<string, number> {
+    return candidates.reduce<Record<string, number>>((acc, candidate) => {
+      const key = candidate.category ?? 'unknown';
+      acc[key] = (acc[key] ?? 0) + 1;
+      return acc;
+    }, {});
+  }
+
+  private countPlannerPlaces(
+    places: ItineraryPlanPayload['places'],
+  ): Record<string, number> {
+    return places.reduce<Record<string, number>>((acc, place) => {
+      const key = place.place_type ?? 'unknown';
+      acc[key] = (acc[key] ?? 0) + 1;
+      return acc;
+    }, {});
+  }
+
+  private logItineraryRunJson(args: {
+    dto: CreateItineraryDto;
+    topK: number;
+    numDays: number;
+    retrieval: TwoTowerRetrievalResponseDto;
+    details: ItineraryPlanPayload['places'];
+    plan: unknown;
+    timings: {
+      twoTowerMs: number;
+      detailsMs: number;
+      aiPlannerMs: number;
+      backendTotalMs: number;
+    };
+  }) {
+    const plan = (args.plan ?? {}) as any;
+    const days = Array.isArray(plan.days) ? plan.days : [];
+    const report = {
+      event: 'itinerary_plan_debug',
+      generatedAt: new Date().toISOString(),
+      request: {
+        userId: args.dto.userId,
+        destinationLocationId: args.dto.destinationLocationId,
+        destinationName: args.retrieval.destination_name,
+        tripIntent: args.dto.tripIntent,
+        startDate: args.dto.startDate,
+        endDate: args.dto.endDate,
+        dailyStartTime: args.dto.dailyStartTime,
+        dailyEndTime: args.dto.dailyEndTime,
+        transportMode: args.dto.transportMode,
+        topK: args.topK,
+        numDays: args.numDays,
+      },
+      counts: {
+        twoTowerCandidates: args.retrieval.total_candidates,
+        twoTowerByCategory: this.countCandidates(args.retrieval.candidates),
+        plannerInputPlaces: args.details.length,
+        plannerByPlaceType: this.countPlannerPlaces(args.details),
+        aiInputPlaces: plan.input_places ?? null,
+        aiTotalVisited: plan.total_visited ?? null,
+      },
+      timingsMs: {
+        twoTower: args.timings.twoTowerMs,
+        fetchPlannerDetails: args.timings.detailsMs,
+        aiPlannerHttp: args.timings.aiPlannerMs,
+        aiTotal: plan.total_ms ?? null,
+        goongMatrix: plan.matrix_ms ?? null,
+        ga: plan.ga_ms ?? null,
+        backendTotal: args.timings.backendTotalMs,
+      },
+      hotel: {
+        id: plan.hotel_id ?? null,
+        name: plan.hotel_name ?? null,
+      },
+      days: days.map((day: any) => ({
+        day: day.day,
+        visitedCount: day.visited_count,
+        restaurantCount: day.restaurant_count,
+        fitness: day.fitness,
+        totalTravelMinutes: day.total_travel_minutes,
+        totalDistanceKm: day.total_distance_km,
+        totalVisitMinutes: day.total_visit_minutes,
+        totalWaitMinutes: day.total_wait_minutes,
+        stoppedReason: day.stopped_reason,
+        schedule: Array.isArray(day.schedule)
+          ? day.schedule.map((entry: any, index: number) => ({
+              sequence: index + 1,
+              locationId: entry.location_id,
+              locationName: entry.location_name,
+              fromId: entry.travel_from_id,
+              fromName: entry.travel_from_name,
+              type: entry.is_return_to_hotel
+                ? 'return_to_hotel'
+                : entry.is_restaurant
+                  ? 'restaurant'
+                  : entry.place_type ?? 'attraction',
+              arrivalTime: entry.arrival_time,
+              serviceStartTime: entry.service_start_time,
+              departureTime: entry.departure_time,
+              travelMinutes: entry.travel_minutes,
+              rawTravelMinutes: entry.raw_travel_minutes,
+              travelBufferMinutes: entry.travel_buffer_minutes,
+              travelBufferSource: entry.travel_buffer_source,
+              distanceKm: entry.distance_km,
+              travelSource: entry.travel_source,
+              waitMinutes: entry.wait_minutes,
+              activeDurationMinutes: entry.active_duration_minutes,
+              unknownHours: entry.unknown_hours,
+            }))
+          : [],
+      })),
+    };
+
+    this.logger.warn(
+      `ITINERARY_PLAN_DEBUG_JSON ${JSON.stringify(report, null, 2)}`,
+    );
+    this.writeItineraryRunJson(report);
+  }
+
+  private writeItineraryRunJson(report: Record<string, any>): void {
+    try {
+      const dir = join(process.cwd(), 'logs', 'itinerary-plan-debug');
+      mkdirSync(dir, { recursive: true });
+
+      const request = report.request ?? {};
+      const generatedAt = String(report.generatedAt ?? new Date().toISOString());
+      const timestamp = generatedAt.replace(/[:.]/g, '-');
+      const intent = this.slugifyFilePart(request.tripIntent ?? 'unknown');
+      const destination = this.slugifyFilePart(request.destinationName ?? 'unknown');
+      const days = request.numDays ?? 'x';
+      const topK = request.topK ?? 'x';
+      const filename = `${timestamp}_${destination}_${intent}_${days}days_top${topK}.json`;
+      const content = JSON.stringify(report, null, 2);
+
+      writeFileSync(join(dir, filename), content, 'utf8');
+      writeFileSync(join(dir, 'latest.json'), content, 'utf8');
+      this.logger.warn(`ITINERARY_PLAN_DEBUG_FILE ${join(dir, filename)}`);
+    } catch (err: any) {
+      this.logger.warn(
+        `Failed to write itinerary debug JSON: ${err?.message ?? String(err)}`,
+      );
+    }
+  }
+
+  private slugifyFilePart(value: unknown): string {
+    return String(value)
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .replace(/[^a-zA-Z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '')
+      .toLowerCase()
+      .slice(0, 48) || 'unknown';
   }
 }

@@ -3,6 +3,7 @@ import {
   InternalServerErrorException,
   NotFoundException,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import axios from 'axios';
 import { supabase } from '../../config/supabase';
@@ -42,6 +43,8 @@ export interface AIPlanResult {
 
 @Injectable()
 export class ItineraryService {
+  private readonly logger = new Logger(ItineraryService.name);
+
   // ════════════════════════════════════════════════════════════════
   // CÁC PHƯƠNG THỨC CŨ (GIỮ NGUYÊN)
   // ════════════════════════════════════════════════════════════════
@@ -50,7 +53,7 @@ export class ItineraryService {
   async getMyItineraries(userId: string) {
     const { data, error } = await supabase
       .schema('travel')
-      .rpc('get_my_itineraries', { p_user_id: userId });
+      .rpc('get_my_itineraries', { p_user_id: userId, p_query: '' });
 
     if (error) {
       console.error('[ItineraryService] getMyItineraries error:', error);
@@ -936,8 +939,17 @@ export class ItineraryService {
       .eq('id', id)
       .maybeSingle();
 
-    if (itinError || !itinerary) {
-      throw new Error('Itinerary not found');
+    if (itinError) {
+      this.logger.error(
+        `getItineraryDetail itinerary query failed id=${id}: ${itinError.message}`,
+      );
+      throw new InternalServerErrorException(
+        `Failed to load itinerary: ${itinError.message}`,
+      );
+    }
+
+    if (!itinerary) {
+      throw new NotFoundException(`Itinerary not found: ${id}`);
     }
 
     const { data: details, error: detailError } = await supabase
@@ -958,8 +970,37 @@ export class ItineraryService {
         duration_minutes,
         sequence_order,
         user_notes,
-        locked_arrive_time,
-        place:place_id (
+        locked_arrive_time
+      `,
+      )
+      .eq('itinerary_id', id)
+      .order('visit_date', { ascending: true })
+      .order('arrival_time', { ascending: true, nullsFirst: true });
+
+    if (detailError) {
+      this.logger.error(
+        `getItineraryDetail details query failed id=${id}: ${detailError.message}`,
+      );
+      throw new InternalServerErrorException(
+        `Failed to load itinerary details: ${detailError.message}`,
+      );
+    }
+
+    const placeIds = Array.from(
+      new Set(
+        (details || [])
+          .map((detail: any) => detail.place_id)
+          .filter((placeId: unknown): placeId is string => typeof placeId === 'string' && placeId.length > 0),
+      ),
+    );
+
+    const placesById = new Map<string, any>();
+    if (placeIds.length > 0) {
+      const { data: places, error: placesError } = await supabase
+        .schema('travel')
+        .from('places')
+        .select(
+          `
           id,
           name,
           address,
@@ -970,22 +1011,38 @@ export class ItineraryService {
           review_count,
           open_hour_compressed,
           types(categories(name))
+        `,
         )
-      `,
-      )
-      .eq('itinerary_id', id)
-      .order('visit_date', { ascending: true })
-      .order('arrival_time', { ascending: true, nullsFirst: true });
+        .in('id', placeIds);
 
-    if (detailError) {
-      throw detailError;
+      if (placesError) {
+        this.logger.error(
+          `getItineraryDetail places query failed id=${id}: ${placesError.message}`,
+        );
+        throw new InternalServerErrorException(
+          `Failed to load itinerary places: ${placesError.message}`,
+        );
+      }
+
+      for (const place of places || []) {
+        placesById.set((place as any).id, place);
+      }
     }
 
     const daysMap = new Map<string, any[]>();
     for (const detail of details || []) {
       const dateStr = detail.visit_date;
+      if (!dateStr) {
+        this.logger.warn(
+          `Skipping itinerary_detail without visit_date id=${detail.id} itinerary=${id}`,
+        );
+        continue;
+      }
       const list = daysMap.get(dateStr) || [];
-      list.push(detail);
+      list.push({
+        ...detail,
+        place: placesById.get(detail.place_id) ?? null,
+      });
       daysMap.set(dateStr, list);
     }
 

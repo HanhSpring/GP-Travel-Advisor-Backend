@@ -97,13 +97,21 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
             ga.generations_run,
         )
     planner.print_multi_day_schedule(result)
-    return _serialize_result(result, input_places=len(req.places))
+    return _serialize_result(
+        result,
+        input_places=len(req.places),
+        total_ms=total_ms,
+        matrix_ms=matrix_ms,
+        ga_ms=ga_ms,
+    )
 
 
 def _to_planner_place(raw: dict[str, Any]) -> planner.Place:
     place_type = _normalize_place_type(raw)
     open_time, close_time, unknown_hours = _extract_time_window(raw)
     default_duration = 60 if place_type == "restaurant" else 90
+    if place_type == "cafe":
+        default_duration = 45
     if place_type == "hotel":
         default_duration = 0
 
@@ -121,6 +129,8 @@ def _to_planner_place(raw: dict[str, Any]) -> planner.Place:
         visit_duration=int(raw.get("visit_duration") or default_duration),
         rating=float(raw.get("average_rating") or 0),
         unknown_hours=unknown_hours,
+        open_hour=str(raw.get("open_hour") or ""),
+        open_hour_compressed=str(raw.get("open_hour_compressed") or ""),
     )
 
 
@@ -134,8 +144,14 @@ def _normalize_place_type(raw: dict[str, Any]) -> str:
     value = explicit or slot
     if value in {"hotel", "accommodation"}:
         return "hotel"
-    if value in {"restaurant", "cafe"}:
+    if value == "cafe":
+        return "cafe"
+    if value == "entertainment":
+        return "entertainment"
+    if value == "restaurant":
         return "restaurant"
+    if any(keyword in type_name for keyword in ("cafe", "coffee", "tra sua", "milk tea", "do uong")):
+        return "cafe"
     if category_id == FOOD_CATEGORY_ID:
         return "restaurant"
     if any(keyword in category_name for keyword in planner.MEAL_TYPE_NAME_KEYWORDS):
@@ -159,7 +175,13 @@ def _extract_time_window(raw: dict[str, Any]) -> tuple[int, int, bool]:
     return time_window[0], time_window[1], False
 
 
-def _serialize_result(result: planner.MultiDayResult, input_places: int) -> ItineraryPlanResponse:
+def _serialize_result(
+    result: planner.MultiDayResult,
+    input_places: int,
+    total_ms: int = 0,
+    matrix_ms: int = 0,
+    ga_ms: int = 0,
+) -> ItineraryPlanResponse:
     days = [_serialize_day(day) for day in result.days]
     return ItineraryPlanResponse(
         hotel_id=result.hotel.id,
@@ -167,6 +189,9 @@ def _serialize_result(result: planner.MultiDayResult, input_places: int) -> Itin
         num_days=result.num_days,
         input_places=input_places,
         total_visited=sum(day.visited_count for day in days),
+        total_ms=total_ms,
+        matrix_ms=matrix_ms,
+        ga_ms=ga_ms,
         days=days,
     )
 
@@ -204,6 +229,7 @@ def _serialize_entry(entry: planner.ScheduleEntry) -> ScheduleEntryResponse:
         departure_time=entry.departure_str,
         wait_minutes=entry.wait_time,
         active_duration_minutes=entry.active_duration,
+        place_type=entry.place_type,
         is_restaurant=entry.is_restaurant,
         unknown_hours=entry.unknown_hours,
         is_return_to_hotel=entry.is_return_to_hotel,
