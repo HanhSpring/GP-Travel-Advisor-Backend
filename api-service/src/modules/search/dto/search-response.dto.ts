@@ -8,8 +8,17 @@ export class AutocompleteItemDto {
   @ApiProperty()
   name: string
 
-  @ApiProperty()
+  @ApiProperty({ description: "'place' | 'city'" })
   type: string
+
+  @ApiProperty({ description: 'Ảnh đại diện (rỗng với city)' })
+  image: string
+
+  @ApiProperty({ description: 'Tên thành phố của địa điểm' })
+  city: string
+
+  @ApiProperty()
+  rating: number
 
   @ApiProperty()
   score: number

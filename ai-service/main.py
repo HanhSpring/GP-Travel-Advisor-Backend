@@ -13,6 +13,7 @@ from dotenv import load_dotenv
 import uvicorn
 
 from app.services.routing import optimize_route
+from app.api.routes.recommend import router as recommend_router
 
 # Load environment variables
 load_dotenv()
@@ -48,6 +49,9 @@ app.add_middleware(
 # ─── Import và đăng ký router v1 ─────────────────────────────────
 from app.api.v1.api_router import api_router
 app.include_router(api_router)
+
+# Mount recommend router tại /recommend/ để NestJS gọi trực tiếp mà không cần prefix /api/v1
+app.include_router(recommend_router, prefix="/recommend", tags=["recommend"])
 
 
 # Pydantic models
