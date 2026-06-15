@@ -34,6 +34,9 @@ export class AdminReviewListItemDto {
   @ApiProperty({ nullable: true, type: String })
   main_topic: string | null;
 
+  @ApiProperty({ nullable: true, type: String })
+  time_label: string | null;
+
   @ApiProperty({ enum: ['pending', 'approved', 'violation'] })
   status: 'pending' | 'approved' | 'violation';
 
