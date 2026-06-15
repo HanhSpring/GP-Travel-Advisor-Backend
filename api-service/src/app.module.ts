@@ -5,6 +5,7 @@ import { EventEmitterModule } from '@nestjs/event-emitter';
 import { ActivityModule } from './modules/activity/activity.module';
 import { SearchModule } from './modules/search/search.module';
 import { ItineraryModule } from './modules/itinerary/itinerary.module';
+import { ItineraryTrackingModule } from './modules/itinerary-tracking/itinerary-tracking.module';
 import { BusinessModule } from './modules/business/business.module';
 import { AuthModule } from './modules/auth/auth.module';
 import { ProfileModule } from './modules/profile/profile.module';
@@ -31,6 +32,7 @@ import { AdminPlacesModule } from './modules/admin/places/admin-places.module';
 import { AdminReviewsModule } from './modules/admin/reviews/admin-reviews.module';
 import { AdminItineraryReviewsModule } from './modules/admin/itinerary-reviews/admin-itinerary-reviews.module';
 import { AdminDashboardModule } from './modules/admin/dashboard/admin-dashboard.module';
+import { AdminAlgorithmPipelineModule } from './modules/admin/algorithm-pipeline/admin-algorithm-pipeline.module';
 
 /*
 Business modules
@@ -57,6 +59,7 @@ import { RecommendationModule } from './modules/recommendation/recommendation.mo
     ActivityModule,
     SearchModule,
     ItineraryModule,
+    ItineraryTrackingModule,
     RecommendationModule,
     BusinessModule,
     AuthModule,
@@ -84,6 +87,7 @@ import { RecommendationModule } from './modules/recommendation/recommendation.mo
     AdminReviewsModule,
     AdminItineraryReviewsModule,
     AdminDashboardModule,
+    AdminAlgorithmPipelineModule,
 
     /*
     Business

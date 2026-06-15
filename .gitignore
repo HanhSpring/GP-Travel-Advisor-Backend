@@ -178,3 +178,5 @@ secrets/
 
 
 .claude/
+ai-service/data/Places.csv
+ai-service/recommender_artifacts/*.npy

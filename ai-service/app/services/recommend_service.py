@@ -72,3 +72,15 @@ def recommend_cf(user_id: str, top_k: int) -> tuple[list[str], list[float]]:
     if model is None:
         raise RuntimeError("CF model chưa được load")
     raise NotImplementedError("Implement sau khi có weights")
+
+
+def recommend_for_place(
+    place_id: str, user_id: int | None, k: int
+) -> list[dict]:
+    """Gợi ý "Có thể bạn sẽ thích" cho 1 địa điểm đang xem (Hybrid CB + CF + khoảng cách)."""
+    engine = get_model("hybrid_recommender")
+    if engine is None:
+        raise RuntimeError(
+            "Hybrid Recommender chưa được load (thiếu artifact trong recommender_artifacts/ hoặc data/)"
+        )
+    return engine.recommend(user_id, place_id, k=k)

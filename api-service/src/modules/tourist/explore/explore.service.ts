@@ -3,6 +3,7 @@ import {
   Injectable,
   InternalServerErrorException,
   NotFoundException,
+  OnModuleInit,
 } from '@nestjs/common';
 import { supabase } from '../../../config/supabase';
 
@@ -154,7 +155,7 @@ export interface ExplorePlacesResponse {
 }
 
 @Injectable()
-export class ExploreService {
+export class ExploreService implements OnModuleInit {
   private readonly defaultImageUrl =
     process.env.DEFAULT_PLACE_IMAGE_URL ||
     'https://placehold.co/1080x720?text=No+Image';
@@ -175,12 +176,45 @@ export class ExploreService {
 
   // Simple in-memory cache to reduce repeated DB work for high-traffic explore queries
   private readonly _cache = new Map<string, { ts: number; value: unknown }>();
-  // Cache for category keyword -> resolved category ids to avoid repeated
-  // `ilike` scans on the categories table.
+  // Permanent cache: category keyword -> resolved category ids
   private readonly _categoryIdCache = new Map<string, string[]>();
+  // Permanent cache: resolved category id list (joined) -> type ids
+  // Types rarely change, so this is safe to keep indefinitely per process.
+  private readonly _typeIdCacheMap = new Map<string, string[]>();
+  // All-categories cache — fetched once per process. The categories table is
+  // small and rarely changes so a permanent cache is safe.
+  private _allCategoriesCache: CategoryRow[] | null = null;
+
+  onModuleInit(): void {
+    // Pre-warm caches at startup so the first user request hits the cache
+    // rather than the raw DB. Fire-and-forget; failures are harmless.
+    // cspell:disable-next-line
+    const restaurantKey = 'ẩm thực'; // ẩm thực
+    // cspell:disable-next-line
+    const hotelKey = 'lưu trú'; // lưu trú
+    void Promise.allSettled([
+      this.getAllCategories(),
+      this.getPlacesByCategory(restaurantKey, 1, 10),
+      this.getPlacesByCategory(hotelKey, 1, 10),
+    ]);
+  }
+
+  private async getAllCategories(): Promise<CategoryRow[]> {
+    if (this._allCategoriesCache) return this._allCategoriesCache;
+    const { data } = await supabase
+      .schema('travel')
+      .from('categories')
+      .select('id, name')
+      .returns<CategoryRow[]>();
+    if (data && data.length > 0) this._allCategoriesCache = data;
+    return data ?? [];
+  }
+
   private getCacheTtlMs(): number {
-    const parsed = Number(process.env.EXPLORE_CACHE_TTL_MS ?? '30000');
-    if (!Number.isFinite(parsed) || parsed <= 0) return 30000;
+    // Default 5 minutes — long enough to avoid thundering-herd timeouts while
+    // still refreshing data at a reasonable cadence.
+    const parsed = Number(process.env.EXPLORE_CACHE_TTL_MS ?? '300000');
+    if (!Number.isFinite(parsed) || parsed <= 0) return 300000;
     return Math.floor(parsed);
   }
 
@@ -203,9 +237,9 @@ export class ExploreService {
   }
 
   private getSafeInFilterLimit(): number {
-    const parsed = Number(process.env.EXPLORE_MAX_IN_FILTER_IDS ?? '50');
+    const parsed = Number(process.env.EXPLORE_MAX_IN_FILTER_IDS ?? '500');
     if (!Number.isFinite(parsed) || parsed <= 0) {
-      return 50;
+      return 500;
     }
 
     return Math.floor(parsed);
@@ -458,10 +492,23 @@ export class ExploreService {
       throw new BadRequestException('tourist_id is required');
     }
 
-    const publicKey = `explore:public_itineraries:1:5`;
-    const featuredKey = `explore:featured_places:1:5`;
-    const restaurantsKey = `explore:places:ẩm thực:1:5`;
-    const hotelsKey = `explore:places:lưu trú:1:5`;
+    // Use limit=10 so the sub-method caches are warmed for the "Xem tất cả"
+    // first page (which also requests page=1 limit=10). The frontend trims to 5
+    // for the home carousel, but the cached result is reused instantly for
+    // "Xem tất cả" without an extra DB round-trip.
+    const PAGE_SIZE = 10;
+    const publicKey = `explore:public_itineraries:1:${PAGE_SIZE}`;
+    const featuredKey = `explore:featured_places:1:${PAGE_SIZE}`;
+
+    const emptyItineraries: ExplorePublicItinerariesResponse = {
+      data: [],
+      pagination: { page: 1, limit: PAGE_SIZE, total: 0, pages: 0 },
+    };
+    const emptyPlaces = (category: string | null): ExplorePlacesResponse => ({
+      category,
+      data: [],
+      pagination: { page: 1, limit: PAGE_SIZE, total: 0, pages: 0 },
+    });
 
     const [
       publicItinerariesResult,
@@ -469,14 +516,20 @@ export class ExploreService {
       restaurantsResult,
       hotelsResult,
     ] = await Promise.all([
-      this.getFromCache<ExplorePublicItinerariesResponse>(publicKey) ??
-        this.getPublicItineraries(1, 5),
-      this.getFromCache<ExplorePlacesResponse>(featuredKey) ??
-        this.getFeaturedCities(1, 5),
-      this.getFromCache<ExplorePlacesResponse>(restaurantsKey) ??
-        this.getPlacesByCategory('ẩm thực', 1, 5),
-      this.getFromCache<ExplorePlacesResponse>(hotelsKey) ??
-        this.getPlacesByCategory('lưu trú', 1, 5),
+      Promise.resolve(
+        this.getFromCache<ExplorePublicItinerariesResponse>(publicKey) ??
+          this.getPublicItineraries(1, PAGE_SIZE),
+      ).catch(() => emptyItineraries),
+      Promise.resolve(
+        this.getFromCache<ExplorePlacesResponse>(featuredKey) ??
+          this.getFeaturedCities(1, PAGE_SIZE),
+      ).catch(() => emptyPlaces(null)),
+      this.getPlacesByCategory('ẩm thực', 1, PAGE_SIZE).catch(() =>
+        emptyPlaces('ẩm thực'),
+      ),
+      this.getPlacesByCategory('lưu trú', 1, PAGE_SIZE).catch(() =>
+        emptyPlaces('lưu trú'),
+      ),
     ]);
 
     let restaurants = restaurantsResult.data;
@@ -485,35 +538,44 @@ export class ExploreService {
     if (restaurants.length === 0 || hotels.length === 0) {
       const fallbackCity = featuredPlacesResult.data[0];
       if (fallbackCity) {
-        const cityOverview = await this.getCityOverview(fallbackCity.id);
+        try {
+          const cityOverview = await this.getCityOverview(fallbackCity.id);
 
-        if (restaurants.length === 0) {
-          const fallbackRestaurants = (cityOverview.restaurants ?? []).slice(
-            0,
-            5,
-          );
-          restaurants = fallbackRestaurants.map((item) => ({
-            id: (item as { id?: string }).id ?? '',
-            name: (item as { name?: string }).name ?? 'Nhà hàng',
-            image: this.resolveImage((item as { imageUrl?: string }).imageUrl),
-            rating: (item as { rating?: number }).rating ?? 0,
-            review_count: (item as { reviewCount?: number }).reviewCount ?? 0,
-            city: cityOverview.city.name,
-            category: 'ẩm thực',
-          }));
-        }
+          if (restaurants.length === 0) {
+            const fallbackRestaurants = (cityOverview.restaurants ?? []).slice(
+              0,
+              5,
+            );
+            restaurants = fallbackRestaurants.map((item) => ({
+              id: (item as { id?: string }).id ?? '',
+              name: (item as { name?: string }).name ?? 'Nhà hàng',
+              image: this.resolveImage(
+                (item as { imageUrl?: string }).imageUrl,
+              ),
+              rating: (item as { rating?: number }).rating ?? 0,
+              review_count: (item as { reviewCount?: number }).reviewCount ?? 0,
+              city: cityOverview.city.name,
+              category: 'ẩm thực',
+            }));
+          }
 
-        if (hotels.length === 0) {
-          const fallbackHotels = (cityOverview.hotels ?? []).slice(0, 5);
-          hotels = fallbackHotels.map((item) => ({
-            id: (item as { id?: string }).id ?? '',
-            name: (item as { name?: string }).name ?? 'Khách sạn',
-            image: this.resolveImage((item as { imageUrl?: string }).imageUrl),
-            rating: (item as { rating?: number }).rating ?? 0,
-            review_count: (item as { reviewCount?: number }).reviewCount ?? 0,
-            city: cityOverview.city.name,
-            category: 'lưu trú',
-          }));
+          if (hotels.length === 0) {
+            const fallbackHotels = (cityOverview.hotels ?? []).slice(0, 5);
+            hotels = fallbackHotels.map((item) => ({
+              id: (item as { id?: string }).id ?? '',
+              name: (item as { name?: string }).name ?? 'Khách sạn',
+              image: this.resolveImage(
+                (item as { imageUrl?: string }).imageUrl,
+              ),
+              rating: (item as { rating?: number }).rating ?? 0,
+              review_count: (item as { reviewCount?: number }).reviewCount ?? 0,
+              city: cityOverview.city.name,
+              category: 'lưu trú',
+            }));
+          }
+        } catch {
+          // getCityOverview failed — return home page with empty sections
+          // rather than crashing the entire endpoint.
         }
       }
     }
@@ -807,35 +869,29 @@ export class ExploreService {
   ): Promise<string[]> {
     const cacheKey = keywords.join('|');
     const cached = this._categoryIdCache.get(cacheKey);
-    if (cached && cached.length > 0) {
-      return cached;
-    }
-    const ids = new Set<string>();
+    if (cached && cached.length > 0) return cached;
+    if (keywords.length === 0) return [];
 
-    for (const keyword of keywords) {
-      const { data: categories, error } = await supabase
-        .schema('travel')
-        .from('categories')
-        .select('id, name')
-        .ilike('name', `%${keyword}%`)
-        .returns<CategoryRow[]>();
+    // Fetch all categories once and filter in JavaScript. This is more
+    // reliable than PostgreSQL ILIKE for Vietnamese text — JS toLowerCase()
+    // handles Unicode case-folding (e.g. 'Ẩm thực' → 'ẩm thực') correctly
+    // even when the DB uses the C locale where ILIKE cannot.
+    const allCategories = await this.getAllCategories();
+    const lowerKeywords = keywords.map((k) => k.toLowerCase());
+    const resolved = Array.from(
+      new Set(
+        allCategories
+          .filter((c) =>
+            lowerKeywords.some((kw) => c.name.toLowerCase().includes(kw)),
+          )
+          .map((c) => c.id),
+      ),
+    );
 
-      if (error) {
-        throw new InternalServerErrorException(error.message);
-      }
-
-      for (const item of categories ?? []) {
-        ids.add(item.id);
-      }
-    }
-
-    const resolved = Array.from(ids);
     try {
-      if (resolved.length > 0) {
-        this._categoryIdCache.set(cacheKey, resolved);
-      }
+      if (resolved.length > 0) this._categoryIdCache.set(cacheKey, resolved);
     } catch {
-      // ignore cache errors
+      // ignore
     }
 
     return resolved;
@@ -849,45 +905,45 @@ export class ExploreService {
     const safeLimit = limit > 0 ? limit : 5;
     const offset = (safePage - 1) * safeLimit;
 
-    const {
-      data: cities,
-      error: cityError,
-      count,
-    } = await supabase
-      .schema('travel')
-      .from('cities')
-      .select('id, name', { count: 'exact' })
-      .returns<CityRow[]>();
+    // Run 3 lightweight queries in parallel to reduce total latency
+    const [citiesResult, placeCityResult, favoriteResult] = await Promise.all([
+      supabase
+        .schema('travel')
+        .from('cities')
+        .select('id, name', { count: 'exact' })
+        .returns<CityRow[]>(),
+      supabase
+        .schema('travel')
+        .from('places')
+        .select('id, city_id')
+        .eq('is_approved', true)
+        .eq('is_active', true)
+        .limit(3000)
+        .returns<{ id: string; city_id: string | null }[]>(),
+      supabase
+        .schema('travel')
+        .from('favorite_places')
+        .select('place_id')
+        .limit(3000)
+        .returns<FavoritePlaceRow[]>(),
+    ]);
 
-    if (cityError) {
+    if (citiesResult.error) {
       throw new InternalServerErrorException(
-        `getCityOverview.city_lookup: ${cityError.message}`,
+        `getCityOverview.city_lookup: ${citiesResult.error.message}`,
       );
     }
-
-    const { data: places, error: placesError } = await supabase
-      .schema('travel')
-      .from('places')
-      .select(
-        'id, city_id, image_url, average_rating, review_count, type_id, types(id, name, category_id, categories(id, name))',
-      )
-      .eq('is_approved', true)
-      .eq('is_active', true)
-      .returns<PlaceWithTypeRow[]>();
-
-    if (placesError) {
-      throw new InternalServerErrorException(placesError.message);
+    if (placeCityResult.error) {
+      throw new InternalServerErrorException(placeCityResult.error.message);
+    }
+    if (favoriteResult.error) {
+      throw new InternalServerErrorException(favoriteResult.error.message);
     }
 
-    const { data: favoritePlaces, error: favoritePlacesError } = await supabase
-      .schema('travel')
-      .from('favorite_places')
-      .select('place_id')
-      .returns<FavoritePlaceRow[]>();
-
-    if (favoritePlacesError) {
-      throw new InternalServerErrorException(favoritePlacesError.message);
-    }
+    const cities = citiesResult.data;
+    const count = citiesResult.count;
+    const placeCityRows = placeCityResult.data;
+    const favoritePlaces = favoriteResult.data;
 
     const favoriteCountByPlace = new Map<string, number>();
     for (const item of favoritePlaces ?? []) {
@@ -902,16 +958,11 @@ export class ExploreService {
     }
 
     const favoriteCountByCity = new Map<string, number>();
-    const placesByCity = new Map<string, PlaceWithTypeRow[]>();
 
-    for (const item of places ?? []) {
+    for (const item of placeCityRows ?? []) {
       if (!item.city_id) {
         continue;
       }
-
-      const existing = placesByCity.get(item.city_id) ?? [];
-      existing.push(item);
-      placesByCity.set(item.city_id, existing);
 
       const placeFavoriteCount = favoriteCountByPlace.get(item.id) ?? 0;
       favoriteCountByCity.set(
@@ -933,50 +984,80 @@ export class ExploreService {
     });
 
     const pagedCities = sortedCities.slice(offset, offset + safeLimit);
+    const pagedCityIds = pagedCities.map((c) => c.id);
     const cityImageMap = new Map<string, string>();
 
-    for (const city of pagedCities) {
-      const candidates = placesByCity.get(city.id) ?? [];
-      const prioritizedGroups = new Map<number, PlaceWithTypeRow[]>();
+    // Only fetch places with type/category joins for the paged cities (much smaller set)
+    if (pagedCityIds.length > 0) {
+      const { data: placesWithTypes, error: placesError } = await supabase
+        .schema('travel')
+        .from('places')
+        .select(
+          'id, city_id, image_url, type_id, types(id, name, category_id, categories(id, name))',
+        )
+        .in('city_id', pagedCityIds)
+        .eq('is_approved', true)
+        .eq('is_active', true)
+        .returns<PlaceWithTypeRow[]>();
 
-      for (const item of candidates) {
-        const typeData = Array.isArray(item.types)
-          ? item.types?.[0]
-          : item.types;
-        const typeNames = this.extractTypeNames(typeData);
-        const priorityIndex = this.getTypePriorityIndex(typeNames);
-
-        if (priorityIndex === null) {
-          continue;
-        }
-
-        const group = prioritizedGroups.get(priorityIndex) ?? [];
-        group.push(item);
-        prioritizedGroups.set(priorityIndex, group);
+      if (placesError) {
+        throw new InternalServerErrorException(placesError.message);
       }
 
-      for (
-        let index = 0;
-        index < this.featuredPlaceTypePriority.length;
-        index += 1
-      ) {
-        const group = prioritizedGroups.get(index) ?? [];
-        if (group.length === 0) {
+      const placesByCity = new Map<string, PlaceWithTypeRow[]>();
+      for (const item of placesWithTypes ?? []) {
+        if (!item.city_id) {
           continue;
         }
 
-        const imageReadyGroup = group.filter((place) => {
-          return this.toImageList(place.image_url).length > 0;
-        });
+        const existing = placesByCity.get(item.city_id) ?? [];
+        existing.push(item);
+        placesByCity.set(item.city_id, existing);
+      }
 
-        if (imageReadyGroup.length === 0) {
-          continue;
+      for (const city of pagedCities) {
+        const candidates = placesByCity.get(city.id) ?? [];
+        const prioritizedGroups = new Map<number, PlaceWithTypeRow[]>();
+
+        for (const item of candidates) {
+          const typeData = Array.isArray(item.types)
+            ? item.types?.[0]
+            : item.types;
+          const typeNames = this.extractTypeNames(typeData);
+          const priorityIndex = this.getTypePriorityIndex(typeNames);
+
+          if (priorityIndex === null) {
+            continue;
+          }
+
+          const group = prioritizedGroups.get(priorityIndex) ?? [];
+          group.push(item);
+          prioritizedGroups.set(priorityIndex, group);
         }
 
-        const picked = this.pickRandomItem(imageReadyGroup);
-        const images = this.toImageList(picked?.image_url);
-        cityImageMap.set(city.id, images[0]);
-        break;
+        for (
+          let index = 0;
+          index < this.featuredPlaceTypePriority.length;
+          index += 1
+        ) {
+          const group = prioritizedGroups.get(index) ?? [];
+          if (group.length === 0) {
+            continue;
+          }
+
+          const imageReadyGroup = group.filter((place) => {
+            return this.toImageList(place.image_url).length > 0;
+          });
+
+          if (imageReadyGroup.length === 0) {
+            continue;
+          }
+
+          const picked = this.pickRandomItem(imageReadyGroup);
+          const images = this.toImageList(picked?.image_url);
+          cityImageMap.set(city.id, images[0]);
+          break;
+        }
       }
     }
 
@@ -1041,6 +1122,7 @@ export class ExploreService {
       .eq('city_id', cityId)
       .eq('is_approved', true)
       .eq('is_active', true)
+      .order('average_rating', { ascending: false })
       .order('review_count', { ascending: false })
       .returns<PlaceWithTypeRow[]>();
 
@@ -1074,6 +1156,7 @@ export class ExploreService {
       )
       .eq('is_public', true)
       .order('created_at', { ascending: false })
+      .limit(100)
       .returns<ItineraryRow[]>();
 
     if (itineraryError) {
@@ -1301,32 +1384,49 @@ export class ExploreService {
       // This returns the complete dataset for a category instead of only a
       // limited candidate window.
       if (resolvedCategoryIdList.length > 0) {
-        const { data: typeRows, error: typeError } = await supabase
-          .schema('travel')
-          .from('types')
-          .select('id, category_id')
-          .in('category_id', resolvedCategoryIdList)
-          .returns<TypeRow[]>();
+        const typeCacheKey = resolvedCategoryIdList.join(',');
+        const cachedTypeIds = this._typeIdCacheMap.get(typeCacheKey);
+        let typeIds: string[];
 
-        if (typeError) {
-          throw new InternalServerErrorException(typeError.message);
+        if (cachedTypeIds) {
+          typeIds = cachedTypeIds;
+        } else {
+          const { data: typeRows, error: typeError } = await supabase
+            .schema('travel')
+            .from('types')
+            .select('id, category_id')
+            .in('category_id', resolvedCategoryIdList)
+            .limit(1000)
+            .returns<TypeRow[]>();
+
+          if (typeError) {
+            throw new InternalServerErrorException(typeError.message);
+          }
+
+          typeIds = Array.from(
+            new Set(
+              (typeRows ?? [])
+                .map((item) => item.id)
+                .filter((id) => id.trim().length > 0),
+            ),
+          );
+
+          try {
+            if (typeIds.length > 0)
+              this._typeIdCacheMap.set(typeCacheKey, typeIds);
+          } catch {
+            // ignore
+          }
         }
 
-        const typeIds = Array.from(
-          new Set(
-            (typeRows ?? [])
-              .map((item) => item.id)
-              .filter((id) => id.trim().length > 0),
-          ),
-        );
-
         if (typeIds.length > 0 && typeIds.length <= safeInFilterLimit) {
-          const { data, error, count } = await supabase
+          // Simplified SELECT — no types/categories join needed since the
+          // category is already known (from the input parameter).
+          const { data, error } = await supabase
             .schema('travel')
             .from('places')
             .select(
-              'id, name, city_id, cities(name), average_rating, review_count, image_url, type_id, types(id, category_id, categories(id, name))',
-              { count: 'exact' },
+              'id, name, city_id, cities(name), average_rating, review_count, image_url',
             )
             .eq('is_approved', true)
             .eq('is_active', true)
@@ -1334,19 +1434,13 @@ export class ExploreService {
             .order('average_rating', { ascending: false })
             .order('review_count', { ascending: false })
             .range(offset, offset + safeLimit - 1)
-            .returns<
-              Array<
-                PlaceRow & {
-                  type_id?: string | null;
-                  types?: PlaceTypeRow | PlaceTypeRow[] | null;
-                }
-              >
-            >();
+            .returns<PlaceRow[]>();
 
           if (error) {
             throw new InternalServerErrorException(error.message);
           }
 
+          const rowCount = (data ?? []).length;
           const result: ExplorePlacesResponse = {
             category: categoryName,
             data: (data ?? []).map((item) => ({
@@ -1361,8 +1455,8 @@ export class ExploreService {
             pagination: {
               page: safePage,
               limit: safeLimit,
-              total: count ?? 0,
-              pages: Math.ceil((count ?? 0) / safeLimit),
+              total: offset + rowCount,
+              pages: rowCount >= safeLimit ? safePage + 1 : safePage,
             },
           };
 
@@ -1371,60 +1465,57 @@ export class ExploreService {
         }
       }
 
-      // Fetch a larger candidate set and match by category names on the
-      // joined type/category data so mismatched IDs do not hide sections.
-      const fallbackMultiplier = Number(
-        process.env.EXPLORE_FALLBACK_FETCH_MULTIPLIER ?? '3',
-      );
-      const multiplier =
-        Number.isFinite(fallbackMultiplier) && fallbackMultiplier > 0
-          ? Math.floor(fallbackMultiplier)
-          : 10;
-      const candidateEnd = offset + safeLimit * multiplier - 1;
+      // Fallback: no category IDs resolved (or typeIds exceeds the safe IN-filter
+      // limit). Scan the top 500 places by rating, filter by category via the
+      // types/categories JOIN, and cache ALL matching items under a single key.
+      // Every page is then sliced from that cached array — this fixes the previous
+      // sliding-window bug where page 2+ could return empty results when fewer
+      // than `offset` matches existed inside the candidate window.
+      type PlaceItem = ExplorePlacesResponse['data'][number];
+      const fallbackAllKey = `explore:places_all:${categoryName}`;
+      let allFallbackItems = this.getFromCache<PlaceItem[]>(fallbackAllKey);
 
-      const { data: candidateData, error: candidateError } = await supabase
-        .schema('travel')
-        .from('places')
-        .select(
-          'id, name, city_id, cities(name), average_rating, review_count, image_url, type_id, types(id, category_id, categories(id, name))',
-          { count: 'exact' },
-        )
-        .eq('is_approved', true)
-        .eq('is_active', true)
-        .order('average_rating', { ascending: false })
-        .order('review_count', { ascending: false })
-        .range(0, candidateEnd)
-        .returns<
-          Array<
-            PlaceRow & {
-              type_id?: string | null;
-              types?: PlaceTypeRow | PlaceTypeRow[] | null;
-            }
-          >
-        >();
+      if (!allFallbackItems) {
+        const { data: allData, error: allError } = await supabase
+          .schema('travel')
+          .from('places')
+          .select(
+            'id, name, city_id, cities(name), average_rating, review_count, image_url, type_id, types(id, category_id, categories(id, name))',
+          )
+          .eq('is_approved', true)
+          .eq('is_active', true)
+          .order('average_rating', { ascending: false })
+          .order('review_count', { ascending: false })
+          .limit(500)
+          .returns<
+            Array<
+              PlaceRow & {
+                type_id?: string | null;
+                types?: PlaceTypeRow | PlaceTypeRow[] | null;
+              }
+            >
+          >();
 
-      if (candidateError) {
-        throw new InternalServerErrorException(candidateError.message);
-      }
-
-      const filtered = (candidateData ?? []).filter((item) => {
-        const typeData = Array.isArray(item.types)
-          ? item.types?.[0]
-          : item.types;
-        if (!typeData) return false;
-        if (this.hasAnyCategoryId(typeData.category_id, resolvedCategoryIds)) {
-          return true;
+        if (allError) {
+          throw new InternalServerErrorException(allError.message);
         }
-        const categoryNames = this.extractCategoryNames(typeData.categories);
-        if (categoryNames.length === 0) return false;
-        return this.matchesAnyCategory(categoryNames, categoryFilter);
-      });
 
-      const paginated = filtered.slice(offset, offset + safeLimit);
+        const filtered = (allData ?? []).filter((item) => {
+          const typeData = Array.isArray(item.types)
+            ? item.types?.[0]
+            : item.types;
+          if (!typeData) return false;
+          if (
+            this.hasAnyCategoryId(typeData.category_id, resolvedCategoryIds)
+          ) {
+            return true;
+          }
+          const categoryNames = this.extractCategoryNames(typeData.categories);
+          if (categoryNames.length === 0) return false;
+          return this.matchesAnyCategory(categoryNames, categoryFilter);
+        });
 
-      const result = {
-        category: categoryName,
-        data: paginated.map((item) => ({
+        allFallbackItems = filtered.map((item) => ({
           id: item.id,
           name: item.name,
           image: this.resolveImage(item.image_url),
@@ -1432,12 +1523,20 @@ export class ExploreService {
           review_count: item.review_count || 0,
           city: this.extractCityName(item.cities),
           category: categoryName,
-        })),
+        }));
+
+        this.setCache(fallbackAllKey, allFallbackItems);
+      }
+
+      const paginated = allFallbackItems.slice(offset, offset + safeLimit);
+      const result: ExplorePlacesResponse = {
+        category: categoryName,
+        data: paginated,
         pagination: {
           page: safePage,
           limit: safeLimit,
-          total: filtered.length,
-          pages: Math.ceil(filtered.length / safeLimit),
+          total: allFallbackItems.length,
+          pages: Math.ceil(allFallbackItems.length / safeLimit) || 1,
         },
       };
 

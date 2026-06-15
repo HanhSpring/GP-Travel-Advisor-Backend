@@ -1,0 +1,109 @@
+"""
+review_filter_service.py
+
+Thin wrapper: nhận PipelineRunRequest, kết nối Supabase, chạy pipeline,
+ghi kết quả về DB và trả về dict summary cho endpoint.
+"""
+
+from __future__ import annotations
+
+from pathlib import Path
+from typing import Any, Dict
+
+from app.core.config import settings
+from app.core.logger import get_logger
+from app.schemas.review_pipeline import PipelineRunRequest
+from app.services.review_filter_pipeline import (
+    DEFAULT_EMBEDDING_MODEL,
+    DEFAULT_SENTIMENT_MODEL,
+    DEFAULT_TOPIC_MODEL,
+    DEFAULT_ZEROSHOT_MODEL,
+    PipelineConfig,
+    ReviewFilteringPipeline,
+    _create_supabase_client,
+    fetch_pending_reviews,
+    utc_now,
+    write_conflicts_to_db,
+    write_contents_to_db,
+)
+
+logger = get_logger(__name__)
+
+
+def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
+    """Thực thi pipeline phân loại review. Trả về dict summary."""
+
+    now = utc_now()
+    batch_label = f"supabase_batch_{now.strftime('%Y%m%d_%H%M%S')}"
+    batch_output_dir = Path(settings.pipeline_output_dir) / batch_label
+    use_pretrained = not request.no_pretrained
+
+    logger.info(f"[pipeline] Khởi động batch '{batch_label}', pretrained={use_pretrained}")
+
+    supabase = _create_supabase_client()
+
+    reviews = fetch_pending_reviews(supabase, limit=request.limit)
+    logger.info(f"[pipeline] Fetched {len(reviews)} pending reviews")
+
+    empty_result: Dict[str, Any] = {
+        "run_id": batch_label,
+        "total_reviews": 0,
+        "contents_processed": 0,
+        "conflicts_detected": 0,
+        "long_term_summaries": 0,
+        "hidden_reviews": 0,
+        "output_dir": str(batch_output_dir),
+        "embedding_model_active": False,
+        "sentiment_model_active": False,
+        "zeroshot_model_active": False,
+        "phobert_model_active": False,
+    }
+
+    if not reviews:
+        logger.info("[pipeline] Không có review pending. Kết thúc.")
+        return empty_result
+
+    config = PipelineConfig(
+        input_label=batch_label,
+        output_dir=batch_output_dir,
+        now=now,
+        use_pretrained_model=use_pretrained,
+        embedding_model_name=DEFAULT_EMBEDDING_MODEL,
+        use_pretrained_classifiers=use_pretrained,
+        sentiment_model_name=DEFAULT_SENTIMENT_MODEL,
+        zeroshot_model_name=DEFAULT_ZEROSHOT_MODEL,
+        topic_model_name=DEFAULT_TOPIC_MODEL,
+        classifier_confidence_threshold=0.55,
+        classifier_ambiguity_margin=0.10,
+        topic_other_threshold=request.topic_other_threshold,
+        candidate_mode=request.candidate_mode,
+        top_k=5,
+        old_lookback_multiplier=6,
+        promotion_mode=request.promotion_mode,
+        phobert_time_model_path=settings.phobert_time_model_path,
+    )
+
+    pipeline = ReviewFilteringPipeline(config)
+    report, contents, conflicts = pipeline.run(reviews)
+
+    if not request.dry_run:
+        logger.info(f"[pipeline] Ghi {len(contents)} contents về Supabase...")
+        write_contents_to_db(supabase, contents)
+        logger.info(f"[pipeline] Ghi {len(conflicts)} conflicts về Supabase...")
+        write_conflicts_to_db(supabase, conflicts)
+    else:
+        logger.info("[pipeline] dry_run=True — bỏ qua ghi DB.")
+
+    return {
+        "run_id": batch_label,
+        "total_reviews": report["total_reviews"],
+        "contents_processed": report["algorithm1_total_contents"],
+        "conflicts_detected": report["algorithm2_total_conflicts"],
+        "long_term_summaries": report["algorithm3_total_long_term_summaries"],
+        "hidden_reviews": report["algorithm3_total_hidden_reviews"],
+        "output_dir": str(batch_output_dir),
+        "embedding_model_active": report["embedding_model"]["active"],
+        "sentiment_model_active": report["classifier_models"]["sentiment"]["active"],
+        "zeroshot_model_active": report["classifier_models"]["zeroshot"]["active"],
+        "phobert_model_active": report["classifier_models"]["phobert_time"]["active"],
+    }
