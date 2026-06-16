@@ -54,5 +54,9 @@ class Settings(BaseSettings):
     two_tower_vocab_path:   str = "weights/vocab.pkl"
     two_tower_weights_path: str = "weights/best_model.weights.h5"
 
+    # R2 object keys cho Two-Tower weights
+    two_tower_vocab_r2_key:    str = "two-tower/vocab.pkl"
+    two_tower_weights_r2_key:  str = "two-tower/best_model.weights.h5"
+
 
 settings = Settings()
