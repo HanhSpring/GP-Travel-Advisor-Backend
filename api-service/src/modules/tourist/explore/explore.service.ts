@@ -515,6 +515,7 @@ export class ExploreService implements OnModuleInit {
       featuredPlacesResult,
       restaurantsResult,
       hotelsResult,
+      currentItineraryResult,
     ] = await Promise.all([
       Promise.resolve(
         this.getFromCache<ExplorePublicItinerariesResponse>(publicKey) ??
@@ -530,6 +531,7 @@ export class ExploreService implements OnModuleInit {
       this.getPlacesByCategory('lưu trú', 1, PAGE_SIZE).catch(() =>
         emptyPlaces('lưu trú'),
       ),
+      this.getCurrentItinerary(touristId).catch(() => null),
     ]);
 
     let restaurants = restaurantsResult.data;
@@ -586,7 +588,7 @@ export class ExploreService implements OnModuleInit {
         notifications_target: `/notifications?tourist_id=${touristId}`,
       },
       current_location: 'Vị trí của bạn (Hồ Chí Minh)',
-      current_itinerary: null,
+      current_itinerary: currentItineraryResult,
       current_itinerary_target: `/explore/current?tourist_id=${touristId}`,
       suggestion_itineraries: publicItinerariesResult.data,
       featured_places: featuredPlacesResult.data,
@@ -779,10 +781,12 @@ export class ExploreService implements OnModuleInit {
     }
 
     const itineraryIds = (data ?? []).map((item) => item.id);
-    const creatorNameMap = await this.getCreatorNameMap(
-      (data ?? []).map((item) => item.creator_id),
-    );
-    const itineraryImages = await this.getItineraryImageMap(itineraryIds);
+    const creatorIds = (data ?? []).map((item) => item.creator_id);
+
+    const [creatorNameMap, itineraryImages] = await Promise.all([
+      this.getCreatorNameMap(creatorIds),
+      this.getItineraryImageMap(itineraryIds),
+    ]);
 
     const mapped = (data ?? []).map((item) => {
       const gallery = itineraryImages.get(item.id) ?? [];
