@@ -13,7 +13,18 @@ import {
   TwoTowerRetrievalResponseDto,
   CandidatePlaceDto,
 } from '../itinerary/dto/retrieval-response.dto';
-import { diversifyTopK, getStratifiedFetchPlan, PlaceCandidate } from './utils/mmr-rerank';
+import {
+  diversifyTopK,
+  getStratifiedFetchPlan,
+  PlaceCandidate,
+  parseTripIntents,
+  dedupeByPlaceIdKeepBestScore,
+} from './utils/mmr-rerank';
+import { resolveIntentVibe } from './utils/intent-vibe';
+import {
+  DEFAULT_TWO_TOWER_RUNTIME_CONFIG,
+  TwoTowerRuntimeConfig,
+} from './two-tower-config.types';
 
 @Injectable()
 export class RecommendationService {
@@ -23,69 +34,89 @@ export class RecommendationService {
   constructor(private readonly mlClient: MlClientService) {}
 
   /**
-   * Two-Tower retrieval pipeline (khớp notebook retrieve_diverse_topk):
-   *   1. Encode query embedding
-   *   2. Tính số ngày → slot limits
-   *   3. Gọi recommend_places_by_slot riêng cho từng slot (song song)
-   *      - Slot filter TRƯỚC, ANN search TRONG pool đó
-   *   4. Gộp kết quả → diversifyTopK lấy top theo quota
+   * Two-Tower retrieval pipeline với late fusion cho multi-intent:
+   *   1. Parse intents từ dto.tripIntent, resolve intent_vibe
+   *   2. Với mỗi intent: encode query riêng + stratified slot fetch
+   *   3. Gộp tất cả pools → dedupe giữ score cao nhất → diversifyTopK
+   *
+   * Đảm bảo mỗi lần gọi AI-service chỉ nhận 1 scalar trip_intent hợp lệ,
+   * nhất quán với cách model v15 được train.
    */
   async retrieveCandidates(
     dto: CreateItineraryDto,
     topK = 100,
+    config: TwoTowerRuntimeConfig = DEFAULT_TWO_TOWER_RUNTIME_CONFIG,
   ): Promise<TwoTowerRetrievalResponseDto> {
-    // ── 1. City name ──────────────────────────────────────────────────────────
-    const cityName = await this.getCityName(dto.destinationLocationId);
-
-    // ── 2. Encode query via FastAPI Two-Tower ─────────────────────────────────
-    let embedding: number[];
-    try {
-      embedding = await this.mlClient.encodeQuery({
-        user_id: dto.userId,
-        city: cityName,
-        trip_intent: dto.tripIntent,
-        intent_vibe: '',
-        history_types: [],
-        history_vibes: [],
-        history_biz: [],
-      });
-    } catch (err: any) {
-      const detail = err?.message ?? String(err);
-      throw new ServiceUnavailableException(`AI Service lỗi: ${detail}`);
+    const runtimeConfig = config.isActive
+      ? config
+      : DEFAULT_TWO_TOWER_RUNTIME_CONFIG;
+    if (!config.isActive) {
+      this.logger.warn(
+        'Two Tower config is inactive; using default runtime config for safety',
+      );
     }
+    const safeTopK = Math.min(
+      Math.max(Math.trunc(topK) || runtimeConfig.defaultTopK, 1),
+      runtimeConfig.maxTopK,
+    );
 
-    // ── 3. Tính số ngày ───────────────────────────────────────────────────────
+    // ── 1. City name + số ngày ────────────────────────────────────────────────
+    const cityName = await this.getCityName(dto.destinationLocationId);
     const numDays = this.calcNumDays(dto.startDate, dto.endDate);
 
-    // ── 4. Stratified slot fetch — mỗi slot 1 RPC call (song song) ───────────
-    //    Slot filter TRƯỚC, ANN trong pool đó → đảm bảo đa dạng như notebook
-    const fetchPlan = getStratifiedFetchPlan(dto.tripIntent, numDays);
-    const poolChunks = await Promise.all(
-      fetchPlan.map(({ slotType, limit, travelType }) =>
-        this.fetchBySlot(embedding, dto.destinationLocationId, slotType, limit, travelType),
+    // ── 2. Parse intents + resolve vibe ──────────────────────────────────────
+    const selectedIntents = parseTripIntents(dto.tripIntent);
+    // Nếu "Khám phá tổng hợp" đi cùng intent cụ thể → bỏ intent tổng hợp
+    const specificIntents = selectedIntents.filter(
+      (i) => i !== 'Khám phá tổng hợp',
+    );
+    const rawIntents =
+      specificIntents.length > 0 ? specificIntents : selectedIntents;
+    // Fallback khi không parse được intent nào hợp lệ
+    const intents =
+      rawIntents.length > 0
+        ? rawIntents.slice(0, runtimeConfig.maxIntents)
+        : ['Khám phá tổng hợp'];
+    const intentVibe = resolveIntentVibe(dto.adultCount, dto.childCount);
+
+    this.logger.debug(
+      { selectedIntents: intents, intentVibe, numDays, topK: safeTopK },
+      'multi-intent late fusion retrieval',
+    );
+
+    // ── 3. Late fusion: retrieval riêng cho từng intent (song song) ──────────
+    const allPools = await Promise.all(
+      intents.map((intent) =>
+        this.retrieveCandidatesForSingleIntent({
+          dto,
+          cityId: dto.destinationLocationId,
+          cityName,
+          intent,
+          intentVibe,
+          numDays,
+          config: runtimeConfig,
+        }),
       ),
     );
 
-    // ── 5. Gộp + deduplicate ──────────────────────────────────────────────────
-    const seenIds = new Set<string>();
-    const pool: PlaceCandidate[] = [];
-    for (const chunk of poolChunks) {
-      for (const c of chunk) {
-        if (!seenIds.has(c.place_id)) {
-          seenIds.add(c.place_id);
-          pool.push(c);
-        }
-      }
-    }
+    // ── 4. Merge + dedupe giữ score cao nhất ─────────────────────────────────
+    const merged = dedupeByPlaceIdKeepBestScore(allPools.flat());
+    this.logger.debug(`merged=${merged.length} final before diversify`);
 
-    this.logger.debug(
-      `Pool: ${pool.length} places (${fetchPlan.map(p => `${p.slotType}:${p.limit / 2}`).join(', ')})`,
+    // ── 5. Diversity-aware top-K ──────────────────────────────────────────────
+    const diversePool = diversifyTopK(
+      merged,
+      numDays,
+      intents.join(', '),
+      safeTopK,
+      {
+        intentQuota: runtimeConfig.intentQuota,
+        enableDiversityBudget: runtimeConfig.enableDiversityBudget,
+      },
     );
+    this.logger.debug(`final=${diversePool.length}`);
 
-    // ── 6. Diversity-aware top-K (phase 2 fill nếu 1 slot thiếu) ─────────────
-    const diversePool = diversifyTopK(pool, numDays, dto.tripIntent, topK);
-
-    // ── 7. Map → response DTO ─────────────────────────────────────────────────
+    // ── 6. Map → response DTO ─────────────────────────────────────────────────
     const candidates: CandidatePlaceDto[] = diversePool.map((c) => ({
       place_id: c.place_id,
       place_name: c.place_name,
@@ -104,6 +135,64 @@ export class RecommendationService {
     };
   }
 
+  /**
+   * Retrieval cho một intent đơn lẻ: encode query → stratified slot fetch.
+   * Chỉ truyền scalar trip_intent vào AI-service, không truyền chuỗi ghép.
+   */
+  private async retrieveCandidatesForSingleIntent(args: {
+    dto: CreateItineraryDto;
+    cityId: string;
+    cityName: string;
+    intent: string;
+    intentVibe: string;
+    numDays: number;
+    config: TwoTowerRuntimeConfig;
+  }): Promise<PlaceCandidate[]> {
+    const { dto, cityId, cityName, intent, intentVibe, numDays, config } = args;
+
+    let embedding: number[];
+    try {
+      embedding = await this.mlClient.encodeQuery({
+        user_id: dto.userId,
+        city: cityName,
+        trip_intent: intent,
+        intent_vibe: intentVibe,
+        history_types: [],
+        history_vibes: [],
+        history_biz: [],
+      });
+    } catch (err: any) {
+      const detail = err?.message ?? String(err);
+      throw new ServiceUnavailableException(`AI Service lỗi: ${detail}`);
+    }
+
+    const fetchPlan = getStratifiedFetchPlan(intent, numDays, {
+      intentQuota: config.intentQuota,
+      fetchBufferMultiplier: config.fetchBufferMultiplier,
+      enableAttractionTravelTypeFilter: config.enableAttractionTravelTypeFilter,
+    });
+    const poolChunks = await Promise.all(
+      fetchPlan.map(({ slotType, limit, travelType }) =>
+        this.fetchBySlot(embedding, cityId, slotType, limit, travelType),
+      ),
+    );
+
+    // Dedupe trong pool của 1 intent (các slot khác nhau có thể trả về cùng place)
+    const seenIds = new Set<string>();
+    const pool: PlaceCandidate[] = [];
+    for (const chunk of poolChunks) {
+      for (const c of chunk) {
+        if (!seenIds.has(c.place_id)) {
+          seenIds.add(c.place_id);
+          pool.push(c);
+        }
+      }
+    }
+
+    this.logger.debug(`intent=${intent} pool=${pool.length}`);
+    return pool;
+  }
+
   async planItinerary(dto: CreateItineraryDto, topK = 60): Promise<unknown> {
     const numDays = this.calcNumDays(dto.startDate, dto.endDate);
     const runStartedAt = Date.now();
@@ -115,7 +204,9 @@ export class RecommendationService {
     const details = await this.fetchPlannerPlaceDetails(plannerCandidates);
     const detailsMs = Date.now() - detailsStartedAt;
     if (!details.length) {
-      throw new NotFoundException('No place details found for itinerary planning');
+      throw new NotFoundException(
+        'No place details found for itinerary planning',
+      );
     }
     if (!details.some((place) => place.place_type === 'hotel')) {
       throw new NotFoundException(
@@ -175,8 +266,7 @@ export class RecommendationService {
   private calcNumDays(startDate: string, endDate: string): number {
     const start = new Date(startDate);
     const end = new Date(endDate);
-    const days =
-      Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
+    const days = Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
     return Math.max(1, days);
   }
 
@@ -292,7 +382,11 @@ export class RecommendationService {
     if (category === 'accommodation' || category === 'hotel') {
       return 'hotel';
     }
-    if (category === 'cafe' || type.includes('cafe') || type.includes('coffee')) {
+    if (
+      category === 'cafe' ||
+      type.includes('cafe') ||
+      type.includes('coffee')
+    ) {
       return 'cafe';
     }
     if (category === 'entertainment') {
@@ -332,18 +426,23 @@ export class RecommendationService {
   }
 
   private formatCandidateCounts(candidates: CandidatePlaceDto[]): string {
-    const counts = candidates.reduce<Record<string, number>>((acc, candidate) => {
-      const key = candidate.category ?? 'unknown';
-      acc[key] = (acc[key] ?? 0) + 1;
-      return acc;
-    }, {});
+    const counts = candidates.reduce<Record<string, number>>(
+      (acc, candidate) => {
+        const key = candidate.category ?? 'unknown';
+        acc[key] = (acc[key] ?? 0) + 1;
+        return acc;
+      },
+      {},
+    );
     return Object.entries(counts)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([key, value]) => `${key}=${value}`)
       .join(', ');
   }
 
-  private countCandidates(candidates: CandidatePlaceDto[]): Record<string, number> {
+  private countCandidates(
+    candidates: CandidatePlaceDto[],
+  ): Record<string, number> {
     return candidates.reduce<Record<string, number>>((acc, candidate) => {
       const key = candidate.category ?? 'unknown';
       acc[key] = (acc[key] ?? 0) + 1;
@@ -435,7 +534,7 @@ export class RecommendationService {
                 ? 'return_to_hotel'
                 : entry.is_restaurant
                   ? 'restaurant'
-                  : entry.place_type ?? 'attraction',
+                  : (entry.place_type ?? 'attraction'),
               arrivalTime: entry.arrival_time,
               serviceStartTime: entry.service_start_time,
               departureTime: entry.departure_time,
@@ -465,10 +564,14 @@ export class RecommendationService {
       mkdirSync(dir, { recursive: true });
 
       const request = report.request ?? {};
-      const generatedAt = String(report.generatedAt ?? new Date().toISOString());
+      const generatedAt = String(
+        report.generatedAt ?? new Date().toISOString(),
+      );
       const timestamp = generatedAt.replace(/[:.]/g, '-');
       const intent = this.slugifyFilePart(request.tripIntent ?? 'unknown');
-      const destination = this.slugifyFilePart(request.destinationName ?? 'unknown');
+      const destination = this.slugifyFilePart(
+        request.destinationName ?? 'unknown',
+      );
       const days = request.numDays ?? 'x';
       const topK = request.topK ?? 'x';
       const filename = `${timestamp}_${destination}_${intent}_${days}days_top${topK}.json`;
@@ -485,12 +588,14 @@ export class RecommendationService {
   }
 
   private slugifyFilePart(value: unknown): string {
-    return String(value)
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/[^a-zA-Z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .toLowerCase()
-      .slice(0, 48) || 'unknown';
+    return (
+      String(value)
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .toLowerCase()
+        .slice(0, 48) || 'unknown'
+    );
   }
 }

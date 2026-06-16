@@ -16,11 +16,15 @@ import {
 import { RecommendationService } from './recommendation.service';
 import { CreateItineraryDto } from '../itinerary/dto/create-itinerary.dto';
 import { TwoTowerRetrievalResponseDto } from '../itinerary/dto/retrieval-response.dto';
+import { TwoTowerConfigService } from './two-tower-config.service';
 
 @ApiTags('Recommendation')
 @Controller('recommendation')
 export class RecommendationController {
-  constructor(private readonly service: RecommendationService) {}
+  constructor(
+    private readonly service: RecommendationService,
+    private readonly twoTowerConfig: TwoTowerConfigService,
+  ) {}
 
   /**
    * Two-Tower retrieval: encode query → pgvector → diversity-aware top-K candidates.
@@ -77,7 +81,12 @@ export class RecommendationController {
     @Body() dto: CreateItineraryDto,
     @Query('top_k') topK?: string,
   ): Promise<TwoTowerRetrievalResponseDto> {
-    const k = topK ? Math.min(parseInt(topK, 10) || 100, 200) : 100;
-    return this.service.retrieveCandidates(dto, k);
+    const config = await this.twoTowerConfig.getConfig();
+    const requestedTopK = topK ? parseInt(topK, 10) : NaN;
+    const rawTopK = Number.isFinite(requestedTopK)
+      ? requestedTopK
+      : config.defaultTopK;
+    const k = Math.min(Math.max(rawTopK, 1), config.maxTopK);
+    return this.service.retrieveCandidates(dto, k, config);
   }
 }

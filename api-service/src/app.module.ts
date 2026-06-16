@@ -33,6 +33,7 @@ import { AdminReviewsModule } from './modules/admin/reviews/admin-reviews.module
 import { AdminItineraryReviewsModule } from './modules/admin/itinerary-reviews/admin-itinerary-reviews.module';
 import { AdminDashboardModule } from './modules/admin/dashboard/admin-dashboard.module';
 import { AdminAlgorithmPipelineModule } from './modules/admin/algorithm-pipeline/admin-algorithm-pipeline.module';
+import { AdminAlgorithmSettingsModule } from './modules/admin/algorithm-settings/admin-algorithm-settings.module';
 
 /*
 Business modules
@@ -88,6 +89,7 @@ import { RecommendationModule } from './modules/recommendation/recommendation.mo
     AdminItineraryReviewsModule,
     AdminDashboardModule,
     AdminAlgorithmPipelineModule,
+    AdminAlgorithmSettingsModule,
 
     /*
     Business
