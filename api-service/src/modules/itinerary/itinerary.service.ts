@@ -3,32 +3,171 @@ import {
   InternalServerErrorException,
   NotFoundException,
   BadRequestException,
+  Logger,
 } from '@nestjs/common';
 import axios from 'axios';
 import { supabase } from '../../config/supabase';
 import { EditActivityDto } from './dto/edit-activity.dto';
 import { AddActivityDto } from './dto/add-activity.dto';
 
+import { CreateItineraryDto } from './dto/create-itinerary.dto';
+
 // ─── Địa chỉ FastAPI optimizer (đọc từ env hoặc dùng mặc định) ───
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL ?? 'http://localhost:8000';
 
+interface ScheduleEntry {
+  location_id: string;
+  location_name: string;
+  arrival_time: string;
+  service_start_time: string;
+  departure_time: string;
+  active_duration_minutes: number;
+  travel_minutes: number;
+  distance_km: number;
+  is_return_to_hotel: boolean;
+}
+
+interface PlanDay {
+  day: number;
+  visited_count: number;
+  schedule: ScheduleEntry[];
+}
+
+export interface AIPlanResult {
+  hotel_id?: string;
+  hotel_name?: string;
+  num_days: number;
+  total_visited: number;
+  days: PlanDay[];
+}
+
 @Injectable()
 export class ItineraryService {
+  private readonly logger = new Logger(ItineraryService.name);
+
   // ════════════════════════════════════════════════════════════════
-  // CÁC PHƯƠNG THỨC CŨ (GIỮ NGUYÊN)
+  // ITINERARY CRUD + LIST QUERIES
   // ════════════════════════════════════════════════════════════════
 
-  /** Lấy danh sách lịch trình của user (dùng Supabase RPC) */
-  async getMyItineraries(userId: string) {
+  /**
+   * Returns the current user's itinerary list through the Supabase RPC.
+   *
+   * `query` comes from GET /itinerary/my-itineraries?q=...
+   * The RPC currently searches the trip name stored in `itineraries.description`.
+   * Keep this in sync with travel.get_my_itineraries(p_user_id, p_query).
+   */
+  async getMyItineraries(userId: string, query?: string) {
+    const trimmedQuery = query?.trim() || null;
     const { data, error } = await supabase
       .schema('travel')
-      .rpc('get_my_itineraries', { p_user_id: userId });
+      .rpc('get_my_itineraries', {
+        p_user_id: userId,
+        p_query: trimmedQuery,
+      });
 
     if (error) {
       console.error('[ItineraryService] getMyItineraries error:', error);
       throw error;
     }
     return data;
+  }
+
+  async createGeneratedItinerary(
+    dto: CreateItineraryDto,
+    plan: AIPlanResult,
+  ): Promise<{ id: string; totalDetails: number; status: string }> {
+    this.assertPlanIsUsable(plan);
+
+    const [departureName, destinationName] = await Promise.all([
+      this.getCityNameOrNull(dto.departureLocationId),
+      this.getCityNameOrNull(dto.destinationLocationId),
+    ]);
+
+    const { data: itinerary, error: itineraryError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .insert({
+        creator_id: dto.userId,
+        // [TRIP_NAME_INPUT] Lưu tên chuyến đi user đặt vào cột description
+        description: dto.description ?? null,
+        start_date: dto.startDate,
+        end_date: dto.endDate,
+        estimated_cost: dto.budget,
+        status: 'pending',
+        departure_point: departureName ?? dto.departureLocationId,
+        destination: destinationName ?? dto.destinationLocationId,
+        is_public: false,
+        adult_count: dto.adultCount,
+        children_count: dto.childCount ?? 0,
+      })
+      .select('id')
+      .single();
+
+    if (itineraryError || !itinerary) {
+      throw new InternalServerErrorException(
+        'Lỗi khi tạo lịch trình: ' + itineraryError?.message,
+      );
+    }
+
+    const detailRows = plan.days.flatMap((day) => {
+      const schedule = Array.isArray(day.schedule) ? day.schedule : [];
+      const visitDate = this.addDays(dto.startDate, day.day - 1);
+      const hotelRow = this.buildHotelDetailRow(
+        (itinerary as any).id,
+        plan,
+        visitDate,
+        dto.dailyStartTime,
+      );
+      const activityRows = schedule
+        .filter((entry) => this.shouldPersistScheduleEntry(entry))
+        .map((entry, index) => ({
+          itinerary_id: (itinerary as any).id,
+          place_id: entry.location_id,
+          visit_date: visitDate,
+          arrival_time: entry.arrival_time,
+          departure_time: entry.departure_time,
+          duration_minutes: entry.active_duration_minutes,
+          sequence_order: index + 1,
+          is_locked: false,
+        }));
+      return [hotelRow, ...activityRows];
+    });
+
+    if (detailRows.length === 0) {
+      await supabase
+        .schema('travel')
+        .from('itineraries')
+        .delete()
+        .eq('id', (itinerary as any).id);
+      throw new BadRequestException(
+        'AI planner did not return any valid places to persist',
+      );
+    }
+
+    if (detailRows.length > 0) {
+      const { error: detailsError } = await supabase
+        .schema('travel')
+        .from('itinerary_details')
+        .insert(detailRows);
+
+      if (detailsError) {
+        // Rollback: xóa itinerary nếu insert detail thất bại
+        await supabase
+          .schema('travel')
+          .from('itineraries')
+          .delete()
+          .eq('id', (itinerary as any).id);
+        throw new InternalServerErrorException(
+          'Lỗi khi lưu chi tiết lịch trình: ' + detailsError.message,
+        );
+      }
+    }
+
+    return {
+      id: (itinerary as any).id as string,
+      totalDetails: detailRows.length,
+      status: 'pending',
+    };
   }
 
   /** Tạo lịch trình mới */
@@ -57,18 +196,65 @@ export class ItineraryService {
 
   /** Bật/Tắt trạng thái công khai của lịch trình */
   async toggleVisibility(id: string, isPublic: boolean) {
-    const { error } = await supabase
+    const { data, error } = await supabase
       .schema('travel')
       .from('itineraries')
       .update({ is_public: isPublic })
-      .eq('id', id);
+      .eq('id', id)
+      .select('id')
+      .maybeSingle();
 
     if (error) {
       throw new InternalServerErrorException(
         'Lỗi khi cập nhật trạng thái: ' + error.message,
       );
     }
+    if (!data) {
+      throw new NotFoundException(`Itinerary not found: ${id}`);
+    }
     return true;
+  }
+
+  async deleteItinerary(id: string) {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .delete()
+      .eq('id', id)
+      .select('id')
+      .maybeSingle();
+    if (error) {
+      throw new InternalServerErrorException(
+        'Lỗi khi xóa lịch trình: ' + error.message,
+      );
+    }
+    if (!data) {
+      throw new NotFoundException(`Itinerary not found: ${id}`);
+    }
+    return true;
+  }
+
+  async updateItinerary(id: string, dto: { description?: string }) {
+    const updates: Record<string, any> = {};
+    if (dto.description !== undefined) updates.description = dto.description;
+    if (!Object.keys(updates).length) return { id };
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .update(updates)
+      .eq('id', id)
+      .select('id, description')
+      .maybeSingle();
+    if (error) {
+      throw new InternalServerErrorException(
+        'Lỗi khi cập nhật lịch trình: ' + error.message,
+      );
+    }
+    if (!data) {
+      throw new NotFoundException(`Itinerary not found: ${id}`);
+    }
+    return { success: true, ...data };
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -88,18 +274,26 @@ export class ItineraryService {
    * @param dto         - Dữ liệu chỉnh sửa
    * @returns Danh sách hoạt động đã sắp xếp lại trong ngày bị ảnh hưởng
    */
-  async editActivity(itineraryId: string, activityId: string, dto: EditActivityDto) {
+  async editActivity(
+    itineraryId: string,
+    activityId: string,
+    dto: EditActivityDto,
+  ) {
     // ─── Bước 1: Kiểm tra bản ghi có tồn tại không ───────────────
     const { data: existing, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('id, itinerary_id, visit_date, arrival_time, duration_minutes, is_locked')
+      .select(
+        'id, itinerary_id, visit_date, arrival_time, duration_minutes, is_locked',
+      )
       .eq('id', activityId)
       .eq('itinerary_id', itineraryId)
       .single();
 
     if (fetchErr || !existing) {
-      throw new NotFoundException(`Không tìm thấy hoạt động với id: ${activityId}`);
+      throw new NotFoundException(
+        `Không tìm thấy hoạt động với id: ${activityId}`,
+      );
     }
 
     // ─── Bước 2: Xây dựng object cập nhật ────────────────────────
@@ -140,16 +334,18 @@ export class ItineraryService {
 
     if (updateErr) {
       console.error('[ItineraryService] editActivity update error:', updateErr);
-      throw new InternalServerErrorException('Lỗi khi cập nhật hoạt động: ' + updateErr.message);
+      throw new InternalServerErrorException(
+        'Lỗi khi cập nhật hoạt động: ' + updateErr.message,
+      );
     }
 
     // ─── Bước 4: Quyết định có cần re-optimize không ─────────────
     // Chỉ gọi FastAPI khi thay đổi ảnh hưởng đến lịch thời gian.
     // Nếu chỉ sửa userNotes → lưu DB rồi trả về ngay, không gọi FastAPI.
     const needsReOptimize =
-      dto.arriveTime !== undefined ||      // Đổi giờ đến → các điểm xung quanh phải dịch chuyển
+      dto.arriveTime !== undefined || // Đổi giờ đến → các điểm xung quanh phải dịch chuyển
       dto.durationMinutes !== undefined || // Đổi thời gian tham quan → giờ rời đi thay đổi
-      dto.isLocked === false;              // Bỏ ghim → optimizer có thể sắp xếp lại
+      dto.isLocked === false; // Bỏ ghim → optimizer có thể sắp xếp lại
 
     const visitDate: string = existing.visit_date;
 
@@ -178,7 +374,9 @@ export class ItineraryService {
       .single();
 
     if (fetchErr || !existing) {
-      throw new NotFoundException(`Không tìm thấy hoạt động với id: ${activityId}`);
+      throw new NotFoundException(
+        `Không tìm thấy hoạt động với id: ${activityId}`,
+      );
     }
 
     // ─── Bước 2: Xóa khỏi DB ─────────────────────────────────────
@@ -190,7 +388,9 @@ export class ItineraryService {
 
     if (deleteErr) {
       console.error('[ItineraryService] deleteActivity error:', deleteErr);
-      throw new InternalServerErrorException('Lỗi khi xóa hoạt động: ' + deleteErr.message);
+      throw new InternalServerErrorException(
+        'Lỗi khi xóa hoạt động: ' + deleteErr.message,
+      );
     }
 
     // ─── Bước 3: Tối ưu lại ngày bị ảnh hưởng ───────────────────
@@ -215,7 +415,9 @@ export class ItineraryService {
       .single();
 
     if (itnErr || !itinerary) {
-      throw new NotFoundException(`Không tìm thấy lịch trình với id: ${itineraryId}`);
+      throw new NotFoundException(
+        `Không tìm thấy lịch trình với id: ${itineraryId}`,
+      );
     }
 
     // ─── Bước 2: Tính toán visit_date từ dayNumber ────────────────
@@ -227,12 +429,16 @@ export class ItineraryService {
     const { data: place, error: placeErr } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, name, address, image_url, average_rating, estimated_cost, category_id')
+      .select(
+        'id, name, address, image_url, average_rating, estimated_cost, category_id',
+      )
       .eq('id', dto.placeId)
       .single();
 
     if (placeErr || !place) {
-      throw new NotFoundException(`Không tìm thấy địa điểm với id: ${dto.placeId}`);
+      throw new NotFoundException(
+        `Không tìm thấy địa điểm với id: ${dto.placeId}`,
+      );
     }
 
     // ─── Bước 4: Lấy sequence_order lớn nhất trong ngày đó ───────
@@ -273,7 +479,9 @@ export class ItineraryService {
 
     if (insertErr) {
       console.error('[ItineraryService] addActivity insert error:', insertErr);
-      throw new InternalServerErrorException('Lỗi khi thêm hoạt động: ' + insertErr.message);
+      throw new InternalServerErrorException(
+        'Lỗi khi thêm hoạt động: ' + insertErr.message,
+      );
     }
 
     // ─── Bước 7: Tối ưu lại ngày để sắp xếp địa điểm mới vào đúng chỗ ─
@@ -288,18 +496,26 @@ export class ItineraryService {
    * @param activityId    - ID bản ghi cần thay thế
    * @param newPlaceId    - ID địa điểm mới từ travel.places
    */
-  async replaceActivity(itineraryId: string, activityId: string, newPlaceId: string) {
+  async replaceActivity(
+    itineraryId: string,
+    activityId: string,
+    newPlaceId: string,
+  ) {
     // ─── Bước 1: Lấy thông tin bản ghi cần thay thế ──────────────
     const { data: existing, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('id, visit_date, sequence_order, is_locked, locked_arrive_time, duration_minutes')
+      .select(
+        'id, visit_date, sequence_order, is_locked, locked_arrive_time, duration_minutes',
+      )
       .eq('id', activityId)
       .eq('itinerary_id', itineraryId)
       .single();
 
     if (fetchErr || !existing) {
-      throw new NotFoundException(`Không tìm thấy hoạt động với id: ${activityId}`);
+      throw new NotFoundException(
+        `Không tìm thấy hoạt động với id: ${activityId}`,
+      );
     }
 
     // ─── Bước 2: Kiểm tra địa điểm mới có tồn tại không ─────────
@@ -311,7 +527,9 @@ export class ItineraryService {
       .single();
 
     if (placeErr || !newPlace) {
-      throw new NotFoundException(`Không tìm thấy địa điểm với id: ${newPlaceId}`);
+      throw new NotFoundException(
+        `Không tìm thấy địa điểm với id: ${newPlaceId}`,
+      );
     }
 
     // ─── Bước 3: Cập nhật place_id và chi phí mới, giữ nguyên thứ tự & ghim giờ ─
@@ -326,8 +544,13 @@ export class ItineraryService {
       .eq('id', activityId);
 
     if (updateErr) {
-      console.error('[ItineraryService] replaceActivity update error:', updateErr);
-      throw new InternalServerErrorException('Lỗi khi thay thế địa điểm: ' + updateErr.message);
+      console.error(
+        '[ItineraryService] replaceActivity update error:',
+        updateErr,
+      );
+      throw new InternalServerErrorException(
+        'Lỗi khi thay thế địa điểm: ' + updateErr.message,
+      );
     }
 
     // ─── Bước 4: Tối ưu lại ngày ─────────────────────────────────
@@ -346,7 +569,8 @@ export class ItineraryService {
     const { data: current, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select(`
+      .select(
+        `
         id,
         place_id,
         places:place_id (
@@ -356,13 +580,16 @@ export class ItineraryService {
           latitude,
           longitude
         )
-      `)
+      `,
+      )
       .eq('id', activityId)
       .eq('itinerary_id', itineraryId)
       .single();
 
     if (fetchErr || !current) {
-      throw new NotFoundException(`Không tìm thấy hoạt động với id: ${activityId}`);
+      throw new NotFoundException(
+        `Không tìm thấy hoạt động với id: ${activityId}`,
+      );
     }
 
     const currentPlace = (current as any).places;
@@ -374,13 +601,16 @@ export class ItineraryService {
       .select('place_id')
       .eq('itinerary_id', itineraryId);
 
-    const excludedPlaceIds = (existingDetails ?? []).map((d: any) => d.place_id);
+    const excludedPlaceIds = (existingDetails ?? []).map(
+      (d: any) => d.place_id,
+    );
 
     // ─── Bước 3: Tìm địa điểm cùng danh mục, cùng thành phố, chưa có trong lịch trình ─
     const { data: suggestions, error: suggestErr } = await supabase
       .schema('travel')
       .from('places')
-      .select(`
+      .select(
+        `
         id,
         name,
         address,
@@ -390,7 +620,8 @@ export class ItineraryService {
         latitude,
         longitude,
         categories:category_id (name)
-      `)
+      `,
+      )
       .eq('city_id', currentPlace.city_id)
       .eq('category_id', currentPlace.category_id)
       .not('id', 'in', `(${excludedPlaceIds.join(',')})`)
@@ -450,7 +681,8 @@ export class ItineraryService {
     const { data: activities, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select(`
+      .select(
+        `
         id,
         place_id,
         arrival_time,
@@ -475,7 +707,8 @@ export class ItineraryService {
           close_time,
           categories:category_id (name)
         )
-      `)
+      `,
+      )
       .eq('itinerary_id', itineraryId)
       .eq('visit_date', visitDate)
       .order('sequence_order', { ascending: true });
@@ -491,18 +724,20 @@ export class ItineraryService {
       const optimizePayload = {
         itinerary_id: itineraryId,
         visit_date: visitDate,
-        activities: activities.map((a: any) => ({
-          id: a.id,
-          place_id: a.place_id,
-          duration_minutes: a.duration_minutes ?? 60,
-          is_locked: a.is_locked ?? false,
-          locked_arrive_time: a.locked_arrive_time ?? null,
-          lat: a.places?.latitude ?? null,
-          lng: a.places?.longitude ?? null,
-          open_time: a.places?.open_time ?? '07:00',
-          close_time: a.places?.close_time ?? '22:00',
-          estimated_cost: a.estimated_cost ?? 0,
-        })),
+        activities: activities
+          .filter((a: any) => !this.isStartPointDetail(a))
+          .map((a: any) => ({
+            id: a.id,
+            place_id: a.place_id,
+            duration_minutes: a.duration_minutes ?? 60,
+            is_locked: a.is_locked ?? false,
+            locked_arrive_time: a.locked_arrive_time ?? null,
+            lat: a.places?.latitude ?? null,
+            lng: a.places?.longitude ?? null,
+            open_time: a.places?.open_time ?? '07:00',
+            close_time: a.places?.close_time ?? '22:00',
+            estimated_cost: a.estimated_cost ?? 0,
+          })),
         // Mặc định ngày bắt đầu lúc 08:00, kết thúc lúc 21:00
         day_start_time: '08:00',
         day_end_time: '21:00',
@@ -516,7 +751,10 @@ export class ItineraryService {
       optimizedSchedule = response.data.optimized_activities;
     } catch (aiErr) {
       // AI Service không khả dụng → giữ nguyên thứ tự cũ, không throw lỗi
-      console.warn('[ItineraryService] AI optimizer không khả dụng, giữ nguyên thứ tự:', aiErr.message);
+      console.warn(
+        '[ItineraryService] AI optimizer không khả dụng, giữ nguyên thứ tự:',
+        aiErr instanceof Error ? aiErr.message : String(aiErr),
+      );
     }
 
     // ─── Cập nhật DB theo kết quả tối ưu (nếu có) ────────────────
@@ -552,7 +790,8 @@ export class ItineraryService {
     const { data: updatedActivities } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select(`
+      .select(
+        `
         id,
         place_id,
         arrival_time,
@@ -573,7 +812,8 @@ export class ItineraryService {
           review_count,
           categories:category_id (name)
         )
-      `)
+      `,
+      )
       .eq('itinerary_id', itineraryId)
       .eq('visit_date', visitDate)
       .order('sequence_order', { ascending: true });
@@ -593,7 +833,9 @@ export class ItineraryService {
       const start = new Date(itn.start_date);
       const visit = new Date(visitDate);
       affectedDay =
-        Math.round((visit.getTime() - start.getTime()) / (1000 * 60 * 60 * 24)) + 1;
+        Math.round(
+          (visit.getTime() - start.getTime()) / (1000 * 60 * 60 * 24),
+        ) + 1;
     }
 
     return {
@@ -644,7 +886,9 @@ export class ItineraryService {
     const dLng = this._toRad(lng2 - lng1);
     const a =
       Math.sin(dLat / 2) ** 2 +
-      Math.cos(this._toRad(lat1)) * Math.cos(this._toRad(lat2)) * Math.sin(dLng / 2) ** 2;
+      Math.cos(this._toRad(lat1)) *
+        Math.cos(this._toRad(lat2)) *
+        Math.sin(dLng / 2) ** 2;
     const distanceKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
     // Ước tính thời gian với vận tốc xe máy ~25km/h trong thành phố
@@ -661,7 +905,11 @@ export class ItineraryService {
 
   async updateActivities(id: string, days: any[]) {
     // Gom tất cả activities từ mọi ngày thành một mảng phẳng
-    const allActivities: Array<{ id: string; startTime: string; endTime: string }> = [];
+    const allActivities: Array<{
+      id: string;
+      startTime: string;
+      endTime: string;
+    }> = [];
     for (const day of days) {
       if (day.activities && Array.isArray(day.activities)) {
         for (const act of day.activities) {
@@ -685,14 +933,15 @@ export class ItineraryService {
           .eq('id', act.id);
 
         if (error) {
-          console.warn(`[Supabase] Không thể cập nhật activity ${act.id}: ${error.message}`);
+          console.warn(
+            `[Supabase] Không thể cập nhật activity ${act.id}: ${error.message}`,
+          );
         }
       }),
     );
 
     return true;
   }
-
 
   async getItineraryDetail(id: string) {
     const { data: itinerary, error: itinError } = await supabase
@@ -702,14 +951,24 @@ export class ItineraryService {
       .eq('id', id)
       .maybeSingle();
 
-    if (itinError || !itinerary) {
-      throw new Error('Itinerary not found');
+    if (itinError) {
+      this.logger.error(
+        `getItineraryDetail itinerary query failed id=${id}: ${itinError.message}`,
+      );
+      throw new InternalServerErrorException(
+        `Failed to load itinerary: ${itinError.message}`,
+      );
+    }
+
+    if (!itinerary) {
+      throw new NotFoundException(`Itinerary not found: ${id}`);
     }
 
     const { data: details, error: detailError } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select(`
+      .select(
+        `
         id,
         itinerary_id,
         place_id,
@@ -723,8 +982,37 @@ export class ItineraryService {
         duration_minutes,
         sequence_order,
         user_notes,
-        locked_arrive_time,
-        place:place_id (
+        locked_arrive_time
+      `,
+      )
+      .eq('itinerary_id', id)
+      .order('visit_date', { ascending: true })
+      .order('arrival_time', { ascending: true, nullsFirst: true });
+
+    if (detailError) {
+      this.logger.error(
+        `getItineraryDetail details query failed id=${id}: ${detailError.message}`,
+      );
+      throw new InternalServerErrorException(
+        `Failed to load itinerary details: ${detailError.message}`,
+      );
+    }
+
+    const placeIds = Array.from(
+      new Set(
+        (details || [])
+          .map((detail: any) => detail.place_id)
+          .filter((placeId: unknown): placeId is string => typeof placeId === 'string' && placeId.length > 0),
+      ),
+    );
+
+    const placesById = new Map<string, any>();
+    if (placeIds.length > 0) {
+      const { data: places, error: placesError } = await supabase
+        .schema('travel')
+        .from('places')
+        .select(
+          `
           id,
           name,
           address,
@@ -735,21 +1023,38 @@ export class ItineraryService {
           review_count,
           open_hour_compressed,
           types(categories(name))
+        `,
         )
-      `)
-      .eq('itinerary_id', id)
-      .order('visit_date', { ascending: true })
-      .order('arrival_time', { ascending: true, nullsFirst: true });
+        .in('id', placeIds);
 
-    if (detailError) {
-      throw detailError;
+      if (placesError) {
+        this.logger.error(
+          `getItineraryDetail places query failed id=${id}: ${placesError.message}`,
+        );
+        throw new InternalServerErrorException(
+          `Failed to load itinerary places: ${placesError.message}`,
+        );
+      }
+
+      for (const place of places || []) {
+        placesById.set((place as any).id, place);
+      }
     }
 
     const daysMap = new Map<string, any[]>();
     for (const detail of details || []) {
       const dateStr = detail.visit_date;
+      if (!dateStr) {
+        this.logger.warn(
+          `Skipping itinerary_detail without visit_date id=${detail.id} itinerary=${id}`,
+        );
+        continue;
+      }
       const list = daysMap.get(dateStr) || [];
-      list.push(detail);
+      list.push({
+        ...detail,
+        place: placesById.get(detail.place_id) ?? null,
+      });
       daysMap.set(dateStr, list);
     }
 
@@ -758,11 +1063,16 @@ export class ItineraryService {
     const days = sortedDates.map((dateStr, index) => {
       const dayNumber = index + 1;
       const activitiesRaw = daysMap.get(dateStr) || [];
-      
+
       const activities = activitiesRaw.map((act, actIndex) => {
         const place = act.place;
         const images = place?.image_url;
-        const imageUrl = Array.isArray(images) && images.length > 0 ? images[0] : (typeof images === 'string' ? images : 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80');
+        const imageUrl =
+          Array.isArray(images) && images.length > 0
+            ? images[0]
+            : typeof images === 'string'
+              ? images
+              : 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80';
 
         // Tính thời gian di chuyển đến địa điểm kế tiếp
         const nextAct = activitiesRaw[actIndex + 1];
@@ -773,18 +1083,31 @@ export class ItineraryService {
           transitInfo = this._calcTransitLabel(departureStr, nextArrivalStr);
         }
 
-        const typeData = Array.isArray(place?.types) ? place.types[0] : place?.types;
-        const catData = Array.isArray(typeData?.categories) ? typeData.categories[0] : typeData?.categories;
+        const typeData = Array.isArray(place?.types)
+          ? place.types[0]
+          : place?.types;
+        const catData = Array.isArray(typeData?.categories)
+          ? typeData.categories[0]
+          : typeData?.categories;
         const category: string | null = catData?.name ?? null;
+        const durationMinutes = act.duration_minutes ?? 0;
+        const sequenceOrder = act.sequence_order ?? actIndex + 1;
+        const isAccommodation = this.isAccommodationCategory(category);
+        const isStartPoint =
+          isAccommodation && durationMinutes === 0 && sequenceOrder === 0;
 
         return {
           id: act.id,
+          placeId: act.place_id,
+          sequenceOrder,
           startTime: act.arrival_time || '08:00',
           endTime: act.departure_time || '09:00',
           placeName: place?.name || 'Điểm tham quan',
           address: place?.address || '',
           imageUrl: imageUrl,
-          priceLabel: act.estimated_cost ? `${act.estimated_cost}đ` : 'MIỄN PHÍ',
+          priceLabel: act.estimated_cost
+            ? `${act.estimated_cost}đ`
+            : 'MIỄN PHÍ',
           tags: [],
           transitToNext: transitInfo ? { durationStr: transitInfo } : null,
           transport_info: transitInfo,
@@ -794,6 +1117,9 @@ export class ItineraryService {
           currency: 'VNĐ',
           isFree: !act.estimated_cost,
           category,
+          durationMinutes,
+          isAccommodation,
+          isStartPoint,
           open_hour_compressed: place?.open_hour_compressed ?? null,
           latitude: place?.latitude,
           longitude: place?.longitude,
@@ -803,10 +1129,14 @@ export class ItineraryService {
         };
       });
 
-      let totalDuration = '0 tiếng';
-      if (activities.length > 0) {
-        totalDuration = `${activities.length * 2} tiếng`;
-      }
+      const totalDurationMinutes = activities.reduce(
+        (sum, activity) => sum + (activity.durationMinutes ?? 0),
+        0,
+      );
+      const totalDuration = this.formatDuration(totalDurationMinutes);
+      const activityCount = activities.filter(
+        (activity) => !activity.isStartPoint,
+      ).length;
 
       let dateLabel = dateStr;
       try {
@@ -828,7 +1158,7 @@ export class ItineraryService {
         totalTransitTimeStr: '0 phút',
         activities: activities,
         day_number: dayNumber,
-        locations_count: activities.length,
+        locations_count: activityCount,
         day_budget: activities.reduce((sum, a) => sum + a.price, 0),
         total_duration: totalDuration,
       };
@@ -839,9 +1169,26 @@ export class ItineraryService {
 
     let diffDays = 1;
     try {
-      const diffTime = Math.abs(new Date(endStr).getTime() - new Date(startStr).getTime());
+      const diffTime = Math.abs(
+        new Date(endStr).getTime() - new Date(startStr).getTime(),
+      );
       diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
     } catch (_) {}
+
+    const hotelDetailsCount = (details || []).filter((detail: any) => {
+      const place = detail.place;
+      const typeData = Array.isArray(place?.types)
+        ? place.types[0]
+        : place?.types;
+      const catData = Array.isArray(typeData?.categories)
+        ? typeData.categories[0]
+        : typeData?.categories;
+      return this.isAccommodationCategory(catData?.name);
+    }).length;
+    const nonHotelDetailsCount = Math.max(
+      0,
+      (details?.length || 0) - hotelDetailsCount,
+    );
 
     return {
       id: itinerary.id,
@@ -851,21 +1198,22 @@ export class ItineraryService {
       isPublic: itinerary.is_public || false,
       totalBudget: itinerary.estimated_cost || 0,
       totalDays: diffDays || days.length || 1,
-      totalPlaces: details?.length || 0,
+      totalPlaces: nonHotelDetailsCount,
+      hotelsCount: hotelDetailsCount,
       days: days,
       destination: itinerary.destination || '',
       start_date: startStr,
       end_date: endStr,
       durationDays: diffDays || days.length || 1,
-      activitiesCount: details?.length || 0,
+      activitiesCount: nonHotelDetailsCount,
       estimatedBudget: itinerary.estimated_cost || 0,
       spentBudget: itinerary.actual_cost || 0,
       centerCoordinate: [10.7769, 106.7009],
       notes: [
         'Chuẩn bị quần áo thoải mái và phù hợp.',
-        'Đem theo các giấy tờ tùy thân đầy đủ.'
+        'Đem theo các giấy tờ tùy thân đầy đủ.',
       ],
-      visitedRestaurants: []
+      visitedRestaurants: [],
     };
   }
 
@@ -875,7 +1223,10 @@ export class ItineraryService {
    * @param nextArrivalStr - Giờ đến địa điểm kế tiếp "HH:mm" hoặc "HH:mm:ss"
    * @returns Chuỗi mô tả như "15 phút di chuyển", "1 giờ 10 phút di chuyển", hoặc null nếu dữ liệu không hợp lệ
    */
-  private _calcTransitLabel(departureStr: string, nextArrivalStr: string): string | null {
+  private _calcTransitLabel(
+    departureStr: string,
+    nextArrivalStr: string,
+  ): string | null {
     if (!departureStr || !nextArrivalStr) return null;
     try {
       const toMinutes = (t: string): number => {
@@ -898,27 +1249,27 @@ export class ItineraryService {
     try {
       // ─── Chuẩn bị payload cho TSPTW optimizer (đầy đủ ràng buộc) ─
       const payload = {
-        itinerary_id: 'client-optimize',   // placeholder — không cần lưu DB
+        itinerary_id: 'client-optimize', // placeholder — không cần lưu DB
         visit_date: new Date().toISOString().split('T')[0],
         day_start_time: '08:00',
         day_end_time: '21:00',
         activities: activities.map((a: any) => {
           // Tính duration từ startTime/endTime nếu không có sẵn
           const startMin = this.toMinutes(a.startTime || '08:00');
-          const endMin   = this.toMinutes(a.endTime   || '09:00');
+          const endMin = this.toMinutes(a.endTime || '09:00');
           const duration = endMin - startMin > 0 ? endMin - startMin : 60;
 
           return {
-            id:                 a.id,
-            place_id:           a.id,                        // dùng id làm place_id
-            duration_minutes:   a.durationMinutes ?? duration,
-            is_locked:          a.isLocked ?? false,
+            id: a.id,
+            place_id: a.id, // dùng id làm place_id
+            duration_minutes: a.durationMinutes ?? duration,
+            is_locked: a.isLocked ?? false,
             locked_arrive_time: a.lockedArriveTime ?? null,
-            lat:                a.latitude  ?? null,
-            lng:                a.longitude ?? null,
-            open_time:          a.openTime  ?? '07:00',
-            close_time:         a.closeTime ?? '22:00',
-            estimated_cost:     a.price     ?? 0,
+            lat: a.latitude ?? null,
+            lng: a.longitude ?? null,
+            open_time: a.openTime ?? '07:00',
+            close_time: a.closeTime ?? '22:00',
+            estimated_cost: a.price ?? 0,
           };
         }),
       };
@@ -937,8 +1288,8 @@ export class ItineraryService {
         const original = activities.find((a: any) => a.id === opt.id) ?? {};
         return {
           ...original,
-          startTime:     opt.arrival_time,
-          endTime:       opt.departure_time,
+          startTime: opt.arrival_time,
+          endTime: opt.departure_time,
           transportInfo: opt.transport_to_next ?? original.transportInfo,
         };
       });
@@ -958,5 +1309,98 @@ export class ItineraryService {
     const h = Math.floor(m / 60) % 24;
     const min = m % 60;
     return `${h.toString().padStart(2, '0')}:${min.toString().padStart(2, '0')}`;
+  }
+
+  // ─── Missing helpers (restored after rebase) ─────────────────────
+
+  /** Cắt bỏ phần giây nếu có, chuẩn hoá về "HH:mm" */
+  private trimTime(t: string | null | undefined): string {
+    if (!t) return '';
+    return t.slice(0, 5);
+  }
+
+  /** Ném lỗi nếu plan AI trả về không dùng được */
+  private assertPlanIsUsable(plan: AIPlanResult): void {
+    if (!plan || !Array.isArray(plan.days) || plan.days.length === 0) {
+      throw new BadRequestException(
+        'AI planner returned an empty or invalid itinerary plan',
+      );
+    }
+    if (!plan.hotel_id || plan.hotel_id === 'demo_hotel') {
+      throw new BadRequestException(
+        'AI planner did not return a real hotel for this itinerary',
+      );
+    }
+  }
+
+  /** Lấy tên thành phố theo locationId, trả null nếu không tìm thấy */
+  private async getCityNameOrNull(locationId: string): Promise<string | null> {
+    if (!locationId) return null;
+    const { data } = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('name')
+      .eq('id', locationId)
+      .maybeSingle();
+    return (data as any)?.name ?? null;
+  }
+
+  /** Trả true nếu entry nên được lưu vào DB (bỏ qua điểm trả về khách sạn) */
+  private shouldPersistScheduleEntry(entry: ScheduleEntry): boolean {
+    return !entry.is_return_to_hotel && !!entry.location_id;
+  }
+
+  private buildHotelDetailRow(
+    itineraryId: string,
+    plan: AIPlanResult,
+    visitDate: string,
+    dailyStartTime: string,
+  ) {
+    const startTime = this.trimTime(dailyStartTime) || '08:00';
+    return {
+      itinerary_id: itineraryId,
+      place_id: plan.hotel_id,
+      visit_date: visitDate,
+      arrival_time: startTime,
+      departure_time: startTime,
+      duration_minutes: 0,
+      sequence_order: 0,
+      is_locked: true,
+      notes: 'Hotel/start point selected by GA planner',
+    };
+  }
+
+  private formatDuration(totalMinutes: number): string {
+    if (!totalMinutes || totalMinutes <= 0) return '0 phút';
+    const hours = Math.floor(totalMinutes / 60);
+    const minutes = totalMinutes % 60;
+    if (hours > 0 && minutes > 0) return `${hours} giờ ${minutes} phút`;
+    if (hours > 0) return `${hours} giờ`;
+    return `${minutes} phút`;
+  }
+  private isAccommodationCategory(category?: string | null): boolean {
+    const normalized = (category ?? '')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+    return (
+      normalized.includes('luu tru') ||
+      normalized.includes('khach san') ||
+      normalized.includes('hotel') ||
+      normalized.includes('accommodation')
+    );
+  }
+
+  private isStartPointDetail(detail: any): boolean {
+    return (
+      (detail?.sequence_order ?? null) === 0 &&
+      (detail?.duration_minutes ?? 0) === 0
+    );
+  }
+  /** Cộng thêm N ngày vào chuỗi ngày 'YYYY-MM-DD', trả về chuỗi mới */
+  private addDays(dateStr: string, days: number): string {
+    const d = new Date(dateStr);
+    d.setUTCDate(d.getUTCDate() + days);
+    return d.toISOString().split('T')[0];
   }
 }

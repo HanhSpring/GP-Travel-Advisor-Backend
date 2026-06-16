@@ -1,7 +1,7 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from app.api.deps import load_all_models
-from app.api.routes import recommend, embedding, review, ai_config
+from app.api.routes import recommend, embedding, review, ai_config, itinerary
 from app.api.v1.api_router import api_router as v1_api_router
 from app.core.config import settings
 from app.core.logger import get_logger
@@ -27,10 +27,11 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
-app.include_router(recommend.router, prefix="/recommend", tags=["Recommend"])
-app.include_router(embedding.router, prefix="/embedding", tags=["Embedding"])
-app.include_router(review.router,    prefix="/review",    tags=["Review"])
-app.include_router(ai_config.router, prefix="/ai-config", tags=["AI Config"])
+app.include_router(recommend.router,   prefix="/recommend",   tags=["Recommend"])
+app.include_router(embedding.router,   prefix="/embedding",   tags=["Embedding"])
+app.include_router(review.router,      prefix="/review",      tags=["Review"])
+app.include_router(ai_config.router,   prefix="/ai-config",   tags=["AI Config"])
+app.include_router(itinerary.router,   prefix="/itinerary",   tags=["Itinerary Plan"])
 # Tính năng tối ưu lịch trình (merge từ develop): /api/v1/itinerary/*
 app.include_router(v1_api_router)
 

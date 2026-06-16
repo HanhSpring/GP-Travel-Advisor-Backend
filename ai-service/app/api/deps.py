@@ -59,19 +59,59 @@ def _load_bge_m3():
         logger.warning(f"BGE-M3 load failed: {e}")
 
 
+def _download_two_tower_weights(vocab_path: str, weights_path: str) -> None:
+    """Download Two-Tower weights từ R2 về local nếu chưa có."""
+    import os
+    try:
+        from app.core.config import settings
+        from app.core.r2_downloader import _r2_configured, _make_client
+
+        if not _r2_configured(settings):
+            logger.warning("R2 chưa cấu hình — bỏ qua download Two-Tower weights")
+            return
+
+        client = _make_client(settings)
+        bucket = settings.r2_bucket_name
+
+        for local_path, r2_key in [
+            (vocab_path, settings.two_tower_vocab_r2_key),
+            (weights_path, settings.two_tower_weights_r2_key),
+        ]:
+            # if os.path.exists(local_path):
+            #     continue
+            os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
+            logger.info("⬇ Downloading r2://%s/%s → %s", bucket, r2_key, local_path)
+            client.download_file(bucket, r2_key, local_path)
+            logger.info("  ✓ Download hoàn tất: %s", local_path)
+    except Exception as e:
+        logger.error("Không thể download Two-Tower weights từ R2: %s", e)
+
+
 def _load_two_tower():
     import os
-    path = "weights/two_tower.pt"
-    if os.path.exists(path):
-        import torch
-        from app.models.two_tower import TwoTowerModel
-        model = TwoTowerModel()
-        model.load_state_dict(torch.load(path, map_location="cpu"))
-        model.eval()
-        _models["two_tower"] = model
-        logger.info("Loaded: Two Tower")
-    else:
-        logger.warning("Two Tower weights not found — skipping")
+    from app.core.config import settings
+
+    vocab_path   = settings.two_tower_vocab_path
+    weights_path = settings.two_tower_weights_path
+
+    # Nếu file chưa có local → thử download từ R2
+    # if not os.path.exists(vocab_path) or not os.path.exists(weights_path):
+    _download_two_tower_weights(vocab_path, weights_path)
+
+    if not os.path.exists(vocab_path):
+        logger.warning(f"Two Tower vocab not found at {vocab_path!r} — skipping")
+        return
+    if not os.path.exists(weights_path):
+        logger.warning(f"Two Tower weights not found at {weights_path!r} — skipping")
+        return
+
+    try:
+        from app.models.two_tower import build_inference_model
+        query_tower = build_inference_model(vocab_path, weights_path)
+        _models["two_tower"] = query_tower
+        logger.info("Loaded: Two Tower (QueryTower ready for inference)")
+    except Exception as e:
+        logger.error(f"Two Tower load failed: {e}")
 
 
 def _load_content_based():

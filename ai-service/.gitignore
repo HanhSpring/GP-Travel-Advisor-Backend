@@ -15,6 +15,7 @@ weights/*.bin
 
 *.egg-info/
 dist/
+weights/
 
 # Recommender
 data/

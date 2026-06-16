@@ -28,8 +28,8 @@ interface PlaceListRow {
   address: string | null;
   is_approved: boolean | null;
   vendor_id: string | null;
+  type_id: string | null;
   registered_date: string | null;
-  types: TypeRow | TypeRow[] | null;
 }
 
 interface PlaceDetailRow {
@@ -65,9 +65,24 @@ interface TypeFilterRow {
 }
 
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
+type SupabaseCountAlgorithm = 'exact' | 'planned' | 'estimated';
 
 @Injectable()
 export class AdminPlacesService {
+  private readonly metadataCacheTtlMs = Number(
+    process.env.ADMIN_PLACES_METADATA_CACHE_TTL_MS ?? '300000',
+  );
+
+  private readonly categoryTypeIdsCache = new Map<
+    string,
+    { expiresAt: number; typeIds: string[] }
+  >();
+
+  private readonly typeRowsCache = new Map<
+    string,
+    { expiresAt: number; type: TypeRow }
+  >();
+
   private getCurrentMonthRange(): { start: string; end: string } {
     const now = new Date();
     const start = new Date(now.getFullYear(), now.getMonth(), 1);
@@ -148,6 +163,57 @@ export class AdminPlacesService {
     return cat?.name ?? '';
   }
 
+  private getCacheExpiry(): number {
+    return Date.now() + this.metadataCacheTtlMs;
+  }
+
+  private getCachedCategoryTypeIds(categoryName: string): string[] | null {
+    const cached = this.categoryTypeIdsCache.get(categoryName);
+    if (!cached || cached.expiresAt <= Date.now()) {
+      this.categoryTypeIdsCache.delete(categoryName);
+      return null;
+    }
+
+    return cached.typeIds;
+  }
+
+  private setCachedCategoryTypeIds(
+    categoryName: string,
+    typeIds: string[],
+  ): void {
+    this.categoryTypeIdsCache.set(categoryName, {
+      expiresAt: this.getCacheExpiry(),
+      typeIds,
+    });
+  }
+
+  private getCachedTypeRows(typeIds: string[]): Map<string, TypeRow> {
+    const now = Date.now();
+    const cachedTypes = new Map<string, TypeRow>();
+
+    for (const typeId of typeIds) {
+      const cached = this.typeRowsCache.get(typeId);
+      if (!cached || cached.expiresAt <= now) {
+        this.typeRowsCache.delete(typeId);
+        continue;
+      }
+
+      cachedTypes.set(typeId, cached.type);
+    }
+
+    return cachedTypes;
+  }
+
+  private setCachedTypeRows(types: TypeRow[]): void {
+    const expiresAt = this.getCacheExpiry();
+
+    for (const type of types) {
+      if (type.id) {
+        this.typeRowsCache.set(type.id, { expiresAt, type });
+      }
+    }
+  }
+
   private mapStatus(
     isApproved: boolean | null,
   ): 'pending' | 'approved' | 'rejected' {
@@ -166,6 +232,7 @@ export class AdminPlacesService {
     status: PlaceStatus = 'all',
     registeredFrom?: string,
     registeredTo?: string,
+    countAlgorithm: SupabaseCountAlgorithm = 'estimated',
   ): Promise<number> {
     if (!['all', 'pending', 'approved', 'rejected'].includes(status)) {
       throw new BadRequestException(
@@ -176,7 +243,7 @@ export class AdminPlacesService {
     let query = supabase
       .schema('travel')
       .from('places')
-      .select('id', { count: 'exact', head: true });
+      .select('id', { count: countAlgorithm, head: true });
 
     if (status === 'pending') {
       query = query.is('is_approved', null);
@@ -219,6 +286,87 @@ export class AdminPlacesService {
     };
   }
 
+  private async getTypesById(typeIds: string[]): Promise<Map<string, TypeRow>> {
+    if (typeIds.length === 0) {
+      return new Map();
+    }
+
+    const cachedTypes = this.getCachedTypeRows(typeIds);
+    const missingTypeIds = typeIds.filter((typeId) => !cachedTypes.has(typeId));
+
+    if (missingTypeIds.length === 0) {
+      return cachedTypes;
+    }
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('types')
+      .select('id, name, categories(id, name)')
+      .in('id', missingTypeIds);
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    const freshTypes = ((data ?? []) as TypeRow[]).filter((item) => item.id);
+    this.setCachedTypeRows(freshTypes);
+
+    for (const type of freshTypes) {
+      cachedTypes.set(type.id, type);
+    }
+
+    return cachedTypes;
+  }
+
+  private async getTypeIdsByCategoryName(
+    categoryName: string,
+  ): Promise<string[]> {
+    const normalizedCategoryName = categoryName.trim().toLowerCase();
+    const cachedTypeIds = this.getCachedCategoryTypeIds(normalizedCategoryName);
+
+    if (cachedTypeIds) {
+      return cachedTypeIds;
+    }
+
+    const { data: categories, error: categoriesError } = await supabase
+      .schema('travel')
+      .from('categories')
+      .select('id')
+      .ilike('name', `%${categoryName}%`);
+
+    if (categoriesError) {
+      throw new InternalServerErrorException(categoriesError.message);
+    }
+
+    const categoryIds = (categories ?? [])
+      .map((item) => (item as CategoryFilterRow).id)
+      .filter(Boolean);
+
+    if (categoryIds.length === 0) {
+      this.setCachedCategoryTypeIds(normalizedCategoryName, []);
+      return [];
+    }
+
+    const { data: types, error: typesError } = await supabase
+      .schema('travel')
+      .from('types')
+      .select('id')
+      .in('category_id', categoryIds);
+
+    if (typesError) {
+      throw new InternalServerErrorException(typesError.message);
+    }
+
+    const typeIds = Array.from(
+      new Set(
+        (types ?? []).map((item) => (item as TypeFilterRow).id).filter(Boolean),
+      ),
+    );
+
+    this.setCachedCategoryTypeIds(normalizedCategoryName, typeIds);
+    return typeIds;
+  }
+
   async getPlaces(
     status: PlaceStatus = 'all',
     page: number = 1,
@@ -240,49 +388,7 @@ export class AdminPlacesService {
 
     let typeIdsByCategoryName: string[] | null = null;
     if (categoryName) {
-      const { data: categories, error: categoriesError } = await supabase
-        .schema('travel')
-        .from('categories')
-        .select('id')
-        .ilike('name', `%${categoryName}%`);
-
-      if (categoriesError) {
-        throw new InternalServerErrorException(categoriesError.message);
-      }
-
-      const categoryIds = (categories ?? [])
-        .map((item) => (item as CategoryFilterRow).id)
-        .filter(Boolean);
-
-      if (categoryIds.length === 0) {
-        return {
-          data: [],
-          pagination: {
-            page,
-            limit,
-            total: 0,
-            pages: 0,
-          },
-        };
-      }
-
-      const { data: types, error: typesError } = await supabase
-        .schema('travel')
-        .from('types')
-        .select('id')
-        .in('category_id', categoryIds);
-
-      if (typesError) {
-        throw new InternalServerErrorException(typesError.message);
-      }
-
-      typeIdsByCategoryName = Array.from(
-        new Set(
-          (types ?? [])
-            .map((item) => (item as TypeFilterRow).id)
-            .filter(Boolean),
-        ),
-      );
+      typeIdsByCategoryName = await this.getTypeIdsByCategoryName(categoryName);
 
       if (typeIdsByCategoryName.length === 0) {
         return {
@@ -301,8 +407,8 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, image_url, name, address, is_approved, vendor_id, registered_date, types(id, name, categories(id, name))',
-        { count: 'exact' },
+        'id, image_url, name, address, is_approved, vendor_id, type_id, registered_date',
+        { count: 'estimated' },
       );
 
     if (status === 'pending') {
@@ -331,10 +437,12 @@ export class AdminPlacesService {
       }
     }
 
-    query = query.order('registered_date', {
-      ascending: false,
-      nullsFirst: false,
-    });
+    query = query
+      .order('registered_date', {
+        ascending: false,
+        nullsFirst: false,
+      })
+      .order('id', { ascending: false });
 
     const { data, error, count } = await query.range(
       offset,
@@ -354,24 +462,38 @@ export class AdminPlacesService {
           .filter((id): id is string => Boolean(id)),
       ),
     );
+    const typeIds = Array.from(
+      new Set(
+        placeRows
+          .map((item) => item.type_id)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
 
     let vendors: UserRow[] = [];
+    let typesById = new Map<string, TypeRow>();
 
-    if (vendorIds.length > 0) {
-      const { data: vendorData, error: vendorError } = await supabase
-        .schema('public')
-        .from('users')
-        .select('id, full_name, email, phone_number')
-        .in('id', vendorIds);
+    const [vendorDataResult, typeDataResult] = await Promise.all([
+      vendorIds.length > 0
+        ? supabase
+            .schema('public')
+            .from('users')
+            .select('id, full_name, email, phone_number')
+            .in('id', vendorIds)
+        : Promise.resolve({ data: [], error: null }),
+      this.getTypesById(typeIds),
+    ]);
 
-      if (!vendorError) {
-        vendors = (vendorData ?? []) as UserRow[];
-      }
+    if (!vendorDataResult.error) {
+      vendors = (vendorDataResult.data ?? []) as UserRow[];
     }
+    typesById = typeDataResult;
 
     const places = placeRows.map((place) => {
       const vendor = vendors.find((v) => v.id === place.vendor_id);
-      const category = this.extractCategoryFromType(place.types);
+      const category = this.extractCategoryFromType(
+        place.type_id ? (typesById.get(place.type_id) ?? null) : null,
+      );
       const primaryImage = this.normalizeImageUrls(place.image_url)[0] ?? '';
 
       return {

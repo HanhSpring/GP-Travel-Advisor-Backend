@@ -3,6 +3,8 @@ from app.schemas.recommend import (
     RecommendRequest,
     RecommendResponse,
     PlaceRecommendationsResponse,
+    EncodeQueryRequest,
+    EncodeQueryResponse,
 )
 from app.services import recommend_service
 
@@ -17,6 +19,7 @@ STRATEGY_MAP = {
 
 @router.post("/", response_model=RecommendResponse)
 def get_recommendations(req: RecommendRequest):
+    """Generic recommend endpoint — dùng strategy_map để chọn model."""
     fn = STRATEGY_MAP.get(req.strategy)
     if fn is None:
         raise HTTPException(status_code=400, detail=f"Strategy không hợp lệ: {req.strategy}")
@@ -49,3 +52,26 @@ def place_recommendations(
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     return {"place_id": place_id, "count": len(items), "items": items}
+
+
+@router.post("/encode-query", response_model=EncodeQueryResponse)
+def encode_query(req: EncodeQueryRequest):
+    """
+    Two-Tower query encoding.
+
+    Nhận user context → trả về 256-dim embedding vector.
+    NestJS dùng vector này để query pgvector trên Supabase.
+    """
+    try:
+        embedding = recommend_service.encode_query_two_tower(
+            user_id=req.user_id,
+            city=req.city,
+            trip_intent=req.trip_intent,
+            intent_vibe=req.intent_vibe,
+            history_types=req.history_types,
+            history_vibes=req.history_vibes,
+            history_biz=req.history_biz,
+        )
+        return EncodeQueryResponse(embedding=embedding, dim=len(embedding))
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))

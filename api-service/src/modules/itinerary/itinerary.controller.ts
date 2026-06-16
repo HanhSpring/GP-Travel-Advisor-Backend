@@ -9,6 +9,7 @@ import {
   Patch,
   Delete,
   Query,
+  Logger,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -16,81 +17,215 @@ import {
   ApiResponse,
   ApiParam,
   ApiBody,
+  ApiQuery,
 } from '@nestjs/swagger';
 import { ItineraryService } from './itinerary.service';
+import { RecommendationService } from '../recommendation/recommendation.service';
 import { GetItinerariesDto } from './dto/get-itineraries.dto';
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
-import { ItinerarySummaryResponseDto } from './dto/itinerary-summary-response.dto';
 import { ItineraryDetailResponseDto } from './dto/itinerary-detail-response.dto';
 import { ItineraryResponseDto } from './dto/itinerary-response.dto';
 import { ToggleVisibilityDto } from './dto/toggle-visibility.dto';
 import { EditActivityDto } from './dto/edit-activity.dto';
 import { AddActivityDto } from './dto/add-activity.dto';
+import { UpdateItineraryDto } from './dto/update-itinerary.dto';
 import {
   CustomizeActivityResponseDto,
   SuggestionsResponseDto,
 } from './dto/customize-response.dto';
+import { TwoTowerRetrievalResponseDto } from './dto/retrieval-response.dto';
 
 @ApiTags('Itinerary')
 @Controller('itinerary')
 export class ItineraryController {
-  constructor(private readonly service: ItineraryService) {}
+  private readonly logger = new Logger(ItineraryController.name);
 
-  // ════════════════════════════════════════════════════════════════
-  // CÁC ENDPOINT CŨ (GIỮ NGUYÊN)
-  // ════════════════════════════════════════════════════════════════
+  constructor(
+    private readonly service: ItineraryService,
+    private readonly recommendationService: RecommendationService,
+  ) {}
 
   @Get('my-itineraries')
   @ApiOperation({ summary: 'Lấy danh sách lịch trình của user' })
   @ApiResponse({ type: ItineraryResponseDto })
   getMyItineraries(@Query() query: GetItinerariesDto) {
-    return this.service.getMyItineraries(query.userId);
+    return this.service.getMyItineraries(query.userId, query.q);
   }
 
+  /**
+   * Two-Tower retrieval: nhận tham số chuyến đi → trả top-K địa điểm
+   * (cosine_score, predict_ranking = null chờ ranking model).
+   */
   @Post()
   @HttpCode(HttpStatus.CREATED)
-  @ApiOperation({ summary: 'Tạo lịch trình du lịch mới bằng AI' })
+  @ApiOperation({
+    summary: 'Two-Tower retrieval — trả top-K địa điểm phù hợp',
+    description:
+      'Gọi FastAPI encode-query → pgvector search → trả danh sách candidates. ' +
+      'predict_ranking sẽ được điền bởi ranking model (thành viên khác).',
+  })
+  @ApiQuery({
+    name: 'top_k',
+    required: false,
+    type: Number,
+    example: 100,
+    description: 'Số lượng candidates tối đa (mặc định 100)',
+  })
   @ApiResponse({
     status: 201,
-    description: 'Lịch trình đã được khởi tạo thành công',
-    type: ItinerarySummaryResponseDto,
+    description: 'Top-K địa điểm theo cosine similarity',
+    type: TwoTowerRetrievalResponseDto,
   })
-  create(@Body() body: CreateItineraryDto): ItinerarySummaryResponseDto {
+  async create(
+    @Body() body: CreateItineraryDto,
+    @Query('top_k') topK?: string,
+  ): Promise<TwoTowerRetrievalResponseDto> {
+    const k = topK ? Math.min(parseInt(topK, 10) || 100, 200) : 100;
+    return this.recommendationService.retrieveCandidates(body, k);
+  }
+
+  @Post('plan')
+  @HttpCode(HttpStatus.CREATED)
+  @ApiOperation({
+    summary: 'Create a full itinerary from Two-Tower candidates and GA planner',
+    description:
+      'Runs candidate retrieval, fetches full place details, calls FastAPI /itinerary/plan, then persists to DB.',
+  })
+  @ApiQuery({
+    name: 'top_k',
+    required: false,
+    type: Number,
+    example: 60,
+    description:
+      'Số candidates Two-Tower tối đa. Nếu không truyền, backend tự scale theo số ngày: min(200, max(60, days * 20)). Số điểm đưa vào GA/Goong được cap riêng.',
+  })
+  @ApiBody({
+    type: CreateItineraryDto,
+    examples: {
+      createFromSwagger: {
+        summary: 'Create and persist itinerary',
+        description:
+          'Replace userId, departureLocationId and destinationLocationId with real UUIDs from Supabase before trying it in Swagger.',
+        value: {
+          userId: '00000000-0000-0000-0000-000000000000',
+          tripType: 'ROUND_TRIP',
+          departureLocationId: '11111111-1111-1111-1111-111111111111',
+          destinationLocationId: '22222222-2222-2222-2222-222222222222',
+          transportMode: 'ROAD',
+          startDate: '2026-06-10',
+          endDate: '2026-06-12',
+          dailyStartTime: '08:00',
+          dailyEndTime: '21:00',
+          tripIntent: 'KhÃ¡m phÃ¡ tá»•ng há»£p',
+          adultCount: 2,
+          childCount: 0,
+          budget: 5000000,
+          foodPreferences: ['LOCAL'],
+        },
+      },
+    },
+  })
+  async plan(@Body() body: CreateItineraryDto, @Query('top_k') topK?: string) {
+    const startedAt = Date.now();
+    const requestedDays = this.calcRequestedDays(body.startDate, body.endDate);
+    const k = topK
+      ? Math.min(parseInt(topK, 10) || 60, 200)
+      : this.calcRetrievalTopK(requestedDays);
+
+    const planStartedAt = Date.now();
+    const plan = await this.recommendationService.planItinerary(body, k);
+    const planTimeMs = Date.now() - planStartedAt;
+    this.logPlanSummary(plan as any);
+
+    const persistStartedAt = Date.now();
+    const created = await this.service.createGeneratedItinerary(
+      body,
+      plan as any,
+    );
+    const persistTimeMs = Date.now() - persistStartedAt;
+    const executionTimeMs = Date.now() - startedAt;
+    const sparseResult = created.totalDetails < requestedDays * 2;
+
+    this.logger.warn(
+      `POST /itinerary/plan completed in ${executionTimeMs}ms ` +
+        `(planner=${planTimeMs}ms, persist=${persistTimeMs}ms, ` +
+        `details=${created.totalDetails}, days=${requestedDays}, topK=${k})`,
+    );
+
     return {
-      id: 'uuid-123',
-      destinationName: 'Hà Nội',
-      dateRangeLabel: '15 Th10 - 20 Th10, 2023',
-      mainTransportMode: 'AIRPLANE',
-      statistics: {
-        totalDays: 6,
-        totalActivities: 12,
-        totalHotels: 2,
-        totalTransfers: 5,
+      id: created.id,
+      itineraryId: created.id,
+      status: created.status,
+      totalDetails: created.totalDetails,
+      executionTimeMs,
+      executionTimeSeconds: Number((executionTimeMs / 1000).toFixed(2)),
+      metrics: {
+        topK: k,
+        requestedDays,
+        plannerMs: planTimeMs,
+        persistMs: persistTimeMs,
+        totalMs: executionTimeMs,
+        totalDetails: created.totalDetails,
+        sparseResult,
       },
-      dailySummaries: [
-        { dayNumber: 1, dateLabel: '15 Th10', title: 'Đến nơi & Nhận phòng', iconType: 'FLIGHT' },
-        { dayNumber: 2, dateLabel: '16 Th10', title: 'Khám phá Hồ Gươm & Lăng Bác', iconType: 'CAMERA' },
-        { dayNumber: 3, dateLabel: '17 Th10', title: 'Tham quan Đền chùa & Văn hóa', iconType: 'TEMPLE' },
-        { dayNumber: 4, dateLabel: '18 Th10', title: 'Mua sắm tại Aeon Mall Long Biên', iconType: 'SHOPPING' },
-        { dayNumber: 5, dateLabel: '19 Th10', title: 'Nhà tù Hoả Lò & Chợ Đồng Xuân', iconType: 'STAR' },
-      ],
-      budget: {
-        estimatedCost: 4500000,
-        totalBudget: 7500000,
-        statusTag: 'Trong tầm kiểm soát',
+      warning: sparseResult
+        ? 'Khu vực này hiện có ít địa điểm phù hợp, lịch trình có thể ngắn hơn số ngày yêu cầu.'
+        : null,
+    };
+  }
+
+  @Post('plan/preview')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Preview itinerary from Two-Tower candidates and GA planner',
+    description:
+      'Runs candidate retrieval and GA planner, returns the full plan JSON, but does not persist anything to DB.',
+  })
+  @ApiQuery({
+    name: 'top_k',
+    required: false,
+    type: Number,
+    example: 120,
+    description: 'Số candidates Two-Tower tối đa dùng để chạy thử planner.',
+  })
+  @ApiBody({ type: CreateItineraryDto })
+  async previewPlan(
+    @Body() body: CreateItineraryDto,
+    @Query('top_k') topK?: string,
+  ) {
+    const startedAt = Date.now();
+    const requestedDays = this.calcRequestedDays(body.startDate, body.endDate);
+    const k = topK
+      ? Math.min(parseInt(topK, 10) || 60, 200)
+      : this.calcRetrievalTopK(requestedDays);
+
+    const plan = await this.recommendationService.planItinerary(body, k);
+    const executionTimeMs = Date.now() - startedAt;
+    this.logPlanSummary(plan as any);
+
+    this.logger.warn(
+      `POST /itinerary/plan/preview completed in ${executionTimeMs}ms ` +
+        `(persist=skipped, days=${requestedDays}, topK=${k})`,
+    );
+
+    return {
+      mode: 'preview',
+      persisted: false,
+      executionTimeMs,
+      executionTimeSeconds: Number((executionTimeMs / 1000).toFixed(2)),
+      metrics: {
+        topK: k,
+        requestedDays,
+        totalMs: executionTimeMs,
       },
-      importantNotes: [
-        'Mang theo hộ chiếu/ CCCD và bảo hiểm du lịch.',
-        'Chuẩn bị quần áo phù hợp với thời tiết.',
-        'Pin dự phòng cho điện thoại.',
-      ],
+      plan,
     };
   }
 
   @Get(':id')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
-    summary: 'Lấy chi tiết toàn bộ lịch trình, từng ngày và từng điểm đến',
+    summary: 'Lấy chi tiết lịch trình',
   })
   @ApiParam({
     name: 'id',
@@ -99,6 +234,26 @@ export class ItineraryController {
   })
   async getItineraryDetail(@Param('id') id: string): Promise<any> {
     return this.service.getItineraryDetail(id);
+  }
+
+  @Delete(':id')
+  @HttpCode(HttpStatus.NO_CONTENT)
+  @ApiOperation({ summary: 'Xoá lịch trình' })
+  @ApiParam({ name: 'id', description: 'ID lịch trình cần xoá' })
+  async deleteItinerary(@Param('id') id: string): Promise<void> {
+    await this.service.deleteItinerary(id);
+  }
+
+  @Patch(':id')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Cập nhật tên / mô tả lịch trình' })
+  @ApiParam({ name: 'id', description: 'ID lịch trình' })
+  @ApiBody({ type: UpdateItineraryDto })
+  async updateItinerary(
+    @Param('id') id: string,
+    @Body() dto: UpdateItineraryDto,
+  ) {
+    return this.service.updateItinerary(id, dto);
   }
 
   @Patch(':id/visibility')
@@ -139,7 +294,10 @@ export class ItineraryController {
       'Sau khi lưu, FastAPI tự động sắp xếp lại các hoạt động còn lại trong ngày.',
   })
   @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
-  @ApiParam({ name: 'activityId', description: 'ID hoạt động (itinerary_details.id)' })
+  @ApiParam({
+    name: 'activityId',
+    description: 'ID hoạt động (itinerary_details.id)',
+  })
   @ApiBody({ type: EditActivityDto })
   @ApiResponse({ status: 200, type: CustomizeActivityResponseDto })
   async editActivity(
@@ -192,7 +350,8 @@ export class ItineraryController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
     summary: 'Xóa một hoạt động khỏi lịch trình',
-    description: 'Hard delete. Sau khi xóa, các hoạt động còn lại trong ngày được sắp xếp lại.',
+    description:
+      'Hard delete. Sau khi xóa, các hoạt động còn lại trong ngày được sắp xếp lại.',
   })
   @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
   @ApiParam({ name: 'activityId', description: 'ID hoạt động cần xóa' })
@@ -263,7 +422,10 @@ export class ItineraryController {
       'chưa có trong lịch trình, sắp xếp theo điểm đánh giá.',
   })
   @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
-  @ApiParam({ name: 'activityId', description: 'ID hoạt động cần tìm gợi ý thay thế' })
+  @ApiParam({
+    name: 'activityId',
+    description: 'ID hoạt động cần tìm gợi ý thay thế',
+  })
   @ApiResponse({ status: 200, type: SuggestionsResponseDto })
   async getSuggestions(
     @Param('itineraryId') itineraryId: string,
@@ -273,7 +435,9 @@ export class ItineraryController {
   }
 
   @Patch(':id/activities')
-  @ApiOperation({ summary: 'Cập nhật danh sách hoạt động/thời gian của lịch trình' })
+  @ApiOperation({
+    summary: 'Cập nhật danh sách hoạt động/thời gian của lịch trình',
+  })
   @ApiParam({ name: 'id', description: 'ID của lịch trình' })
   async updateActivities(
     @Param('id') id: string,
@@ -287,12 +451,43 @@ export class ItineraryController {
   }
 
   @Post('optimize-day')
-  @ApiOperation({ summary: 'Tối ưu hoá các hoạt động trong một ngày bằng AI Service (OR-Tools)' })
+  @ApiOperation({
+    summary:
+      'Tối ưu hoá các hoạt động trong một ngày bằng AI Service (OR-Tools)',
+  })
   async optimizeDay(@Body() body: { activities: any[] }) {
     if (!body.activities || body.activities.length === 0) {
       return { optimized: [] };
     }
     const optimized = await this.service.optimizeDayRoute(body.activities);
     return { optimized };
+  }
+
+  private calcRequestedDays(startDate: string, endDate: string): number {
+    const start = new Date(`${startDate}T00:00:00.000Z`);
+    const end = new Date(`${endDate}T00:00:00.000Z`);
+    const diff = Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
+    return Math.max(1, diff);
+  }
+
+  private calcRetrievalTopK(numDays: number): number {
+    return Math.min(200, Math.max(60, numDays * 20));
+  }
+
+  private logPlanSummary(plan: any): void {
+    const days = Array.isArray(plan?.days) ? plan.days : [];
+    this.logger.warn(
+      `GA plan summary: hotel=${plan?.hotel_name ?? 'unknown'} ` +
+        `(${plan?.hotel_id ?? 'unknown'}), days=${days.length}, ` +
+        `visited=${plan?.total_visited ?? 0}`,
+    );
+    for (const day of days) {
+      this.logger.warn(
+        `GA day ${day.day}: fitness=${day.fitness}, ` +
+          `visited=${day.visited_count}, travel=${day.total_travel_minutes}m, ` +
+          `wait=${day.total_wait_minutes}m, visit=${day.total_visit_minutes}m, ` +
+          `restaurant=${day.restaurant_count}, stopped=${day.stopped_reason}`,
+      );
+    }
   }
 }

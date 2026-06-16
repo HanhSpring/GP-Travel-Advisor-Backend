@@ -1,10 +1,21 @@
+from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 from typing import Optional
+from pydantic import ConfigDict
+
+
+load_dotenv(".env", override=False)
 
 
 class Settings(BaseSettings):
-    app_env: str = "development"
-    app_port: int = 8000
+    model_config = ConfigDict(
+        env_file=".env",
+        extra="ignore",
+        protected_namespaces=(),
+    )
+
+    app_env:    str = "development"
+    app_port:   int = 8000
     model_weights_dir: str = "weights"
     api_service_url: str = "http://localhost:3000"
     hf_home: str = ".cache/huggingface"
@@ -39,8 +50,13 @@ class Settings(BaseSettings):
     supabase_key: str = ""
     ai_config_schema: str = "ai_config"
 
-    class Config:
-        env_file = ".env"
+    # Two-Tower model paths (relative to ai-service root)
+    two_tower_vocab_path:   str = "weights/vocab.pkl"
+    two_tower_weights_path: str = "weights/best_model.weights.h5"
+
+    # R2 object keys cho Two-Tower weights
+    two_tower_vocab_r2_key:    str = "two-tower/vocab.pkl"
+    two_tower_weights_r2_key:  str = "two-tower/best_model.weights.h5"
 
 
 settings = Settings()

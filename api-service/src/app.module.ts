@@ -33,6 +33,7 @@ import { AdminReviewsModule } from './modules/admin/reviews/admin-reviews.module
 import { AdminItineraryReviewsModule } from './modules/admin/itinerary-reviews/admin-itinerary-reviews.module';
 import { AdminDashboardModule } from './modules/admin/dashboard/admin-dashboard.module';
 import { AdminAlgorithmPipelineModule } from './modules/admin/algorithm-pipeline/admin-algorithm-pipeline.module';
+import { AdminAlgorithmSettingsModule } from './modules/admin/algorithm-settings/admin-algorithm-settings.module';
 
 /*
 Business modules
@@ -48,6 +49,10 @@ Upload module
 import { UploadModule } from './modules/upload/upload.module';
 import { AiTestModule } from './modules/ai-test/ai-test.module';
 
+// City module
+import { CitiesModule } from './modules/city/city.module';
+import { RecommendationModule } from './modules/recommendation/recommendation.module';
+
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
@@ -56,6 +61,7 @@ import { AiTestModule } from './modules/ai-test/ai-test.module';
     SearchModule,
     ItineraryModule,
     ItineraryTrackingModule,
+    RecommendationModule,
     BusinessModule,
     AuthModule,
     ProfileModule,
@@ -83,6 +89,7 @@ import { AiTestModule } from './modules/ai-test/ai-test.module';
     AdminItineraryReviewsModule,
     AdminDashboardModule,
     AdminAlgorithmPipelineModule,
+    AdminAlgorithmSettingsModule,
 
     /*
     Business
@@ -97,6 +104,9 @@ import { AiTestModule } from './modules/ai-test/ai-test.module';
 
     UploadModule,
     AiTestModule,
+
+    // City module
+    CitiesModule,
   ],
 })
 export class AppModule {}
