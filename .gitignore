@@ -151,6 +151,8 @@ $RECYCLE.BIN/
 # ==============================================
 # Logs
 logs/
+api-service/logs/
+ai-service/logs/
 *.log
 npm-debug.log*
 pids
@@ -163,6 +165,17 @@ tmp/
 temp/
 .tmp/
 Note/
+tmp-run-logs/
+
+# Generated planner/debug artifacts
+api-service/logs/
+ai-service/logs/
+docs/itinerary_planner_report.*
+docs/*_debug.*
+docs/*_tmp.*
+docs/places_rows_after_fill.csv
+
+# Keep the planner price/duration dataset local; it is too large for GitHub.
 
 # Secrets & Certificates
 *.pem

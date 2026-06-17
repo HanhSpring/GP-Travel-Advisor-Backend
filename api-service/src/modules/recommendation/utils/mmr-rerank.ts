@@ -3,67 +3,23 @@ export interface PlaceCandidate {
   place_name: string;
   address: string | null;
   image_url: string | null;
-  /** slot_type từ RPC: 'attraction'|'restaurant'|'cafe'|'entertainment'|'accommodation'|'shopping' */
+  /** slot_type from DB/RPC: attraction | restaurant | cafe | entertainment | accommodation | shopping */
   category: string;
-  /** type_name từ types_rows.csv để phân biệt cafe trong Ẩm thực */
+  /** type_name from DB, used only as fallback when slot_type is missing/unknown. */
   type_name?: string;
   score: number;
 }
 
-// Per-day slot quota theo tripIntent — khớp với TRIP_INTENT_OPTIONS trong DTO
 export const INTENT_QUOTA: Record<string, Record<string, number>> = {
-  'Khám phá tổng hợp': {
-    attraction: 4,
-    restaurant: 2,
-    cafe: 1,
-    entertainment: 1,
-    accommodation: 1,
-  },
-  'Ẩm thực & Bản địa': {
-    attraction: 1,
-    restaurant: 4,
-    cafe: 2,
-    entertainment: 0,
-    accommodation: 1,
-  },
-  'Đô thị & Vui chơi': {
-    attraction: 2,
-    restaurant: 2,
-    cafe: 1,
-    entertainment: 3,
-    accommodation: 1,
-  },
-  'Khám phá & Sinh thái': {
-    attraction: 5,
-    restaurant: 2,
-    cafe: 0,
-    entertainment: 0,
-    accommodation: 1,
-  },
-  'Nghỉ dưỡng & Biển': {
-    attraction: 3,
-    restaurant: 2,
-    cafe: 1,
-    entertainment: 1,
-    accommodation: 1,
-  },
-  'Văn hóa & Lịch sử': {
-    attraction: 5,
-    restaurant: 2,
-    cafe: 1,
-    entertainment: 2,
-    accommodation: 1,
-  },
+  'Khám phá tổng hợp': { attraction: 4, restaurant: 2, cafe: 1, entertainment: 1, accommodation: 1 },
+  'Ẩm thực & Bản địa': { attraction: 1, restaurant: 4, cafe: 2, entertainment: 0, accommodation: 1 },
+  'Đô thị & Vui chơi': { attraction: 2, restaurant: 2, cafe: 1, entertainment: 3, accommodation: 1 },
+  'Khám phá & Sinh thái': { attraction: 5, restaurant: 2, cafe: 0, entertainment: 0, accommodation: 1 },
+  'Nghỉ dưỡng & Biển': { attraction: 3, restaurant: 2, cafe: 1, entertainment: 1, accommodation: 1 },
+  'Văn hóa & Lịch sử': { attraction: 5, restaurant: 2, cafe: 1, entertainment: 1, accommodation: 1 },
 };
 
-const DEFAULT_QUOTA = {
-  attraction: 4,
-  restaurant: 2,
-  cafe: 1,
-  entertainment: 1,
-  accommodation: 1,
-};
-
+const DEFAULT_QUOTA = { attraction: 4, restaurant: 2, cafe: 1, entertainment: 1, accommodation: 1 };
 export interface RetrievalTuning {
   intentQuota?: Record<string, Record<string, number>>;
   fetchBufferMultiplier?: number;
@@ -71,13 +27,17 @@ export interface RetrievalTuning {
   enableDiversityBudget?: boolean;
 }
 
-/**
- * Exact-match map: cả category names (từ categories_rows.csv)
- * lẫn travel_type values (từ training vocab) → slot group.
- * Thứ tự ưu tiên: exact match trước, keyword fallback sau.
- */
+const KNOWN_SLOT_TYPES = new Set([
+  'attraction',
+  'restaurant',
+  'cafe',
+  'entertainment',
+  'accommodation',
+  'hotel',
+  'shopping',
+]);
+
 const TRAVEL_TYPE_SLOT: Record<string, string> = {
-  // ── Category names thực tế trong DB (categories_rows.csv) ──
   'Ẩm thực': 'restaurant',
   'Giải trí & Vui chơi': 'entertainment',
   'Thư giãn & Thể thao': 'entertainment',
@@ -85,13 +45,9 @@ const TRAVEL_TYPE_SLOT: Record<string, string> = {
   'Lưu trú': 'accommodation',
   'Tham quan & Khám phá': 'attraction',
   'Mua sắm & Dịch vụ': 'shopping',
-
-  // ── Type names cần tách cafe ra khỏi Ẩm thực (types_rows.csv) ──
   'Cafe & Đồ uống': 'cafe',
   'Tiệm bánh & Tráng miệng': 'cafe',
-  'Pub/Bar': 'restaurant',
-
-  // ── Training vocab travel_type values (phòng khi travel_type column được dùng) ──
+  'Pub/Bar': 'entertainment',
   'Ẩm thực & Bản địa': 'restaurant',
   'Đô thị & Vui chơi': 'entertainment',
   'Khám phá & Sinh thái': 'attraction',
@@ -100,69 +56,80 @@ const TRAVEL_TYPE_SLOT: Record<string, string> = {
   'Văn hóa & Lịch sử': 'attraction',
 };
 
-/**
- * Chuẩn hóa category/type_name từ DB → slot group.
- * Ưu tiên: type_name (chi tiết hơn) → category name → keyword fallback.
- * Truyền type_name để phân biệt cafe vs restaurant trong category Ẩm thực.
- */
+export interface SlotFetchPlan {
+  slotType: string;
+  limit: number;
+  travelType?: string;
+  dailyTarget?: number;
+  reason?: string;
+}
+
+export interface PlannerTargets {
+  availableMinutes: number;
+  dailyQuota: Record<string, number>;
+  notes: string[];
+}
+
 export function normalizeCategory(category: string, typeName?: string): string {
-  // Type-level check trước (phân biệt cafe trong category Ẩm thực)
+  const raw = (category ?? '').trim();
+  const lower = raw.toLowerCase();
+  if (KNOWN_SLOT_TYPES.has(lower)) {
+    return lower === 'hotel' ? 'accommodation' : lower;
+  }
+
   if (typeName) {
     const typeSlot = TRAVEL_TYPE_SLOT[typeName.trim()];
     if (typeSlot) return typeSlot;
   }
 
-  const trimmed = (category ?? '').trim();
-  if (TRAVEL_TYPE_SLOT[trimmed]) return TRAVEL_TYPE_SLOT[trimmed];
+  if (TRAVEL_TYPE_SLOT[raw]) return TRAVEL_TYPE_SLOT[raw];
 
-  const lower = trimmed.toLowerCase();
-
+  if (
+    lower.includes('cafe') ||
+    lower.includes('coffee') ||
+    lower.includes('cà phê') ||
+    lower.includes('trà sữa')
+  ) {
+    return 'cafe';
+  }
   if (
     lower.includes('ẩm thực') ||
     lower.includes('nhà hàng') ||
     lower.includes('quán ăn') ||
+    lower.includes('buffet') ||
     lower.includes('restaurant') ||
     lower.includes('food')
-  )
+  ) {
     return 'restaurant';
-
-  if (
-    lower.includes('café') ||
-    lower.includes('cafe') ||
-    lower.includes('cà phê') ||
-    lower.includes('coffee')
-  )
-    return 'cafe';
-
+  }
   if (
     lower.includes('giải trí') ||
     lower.includes('vui chơi') ||
     lower.includes('entertainment') ||
     lower.includes('bar') ||
-    lower.includes('pub')
-  )
+    lower.includes('pub') ||
+    lower.includes('karaoke') ||
+    lower.includes('rạp phim') ||
+    lower.includes('spa')
+  ) {
     return 'entertainment';
-
+  }
   if (
     lower.includes('lưu trú') ||
     lower.includes('hotel') ||
     lower.includes('khách sạn') ||
     lower.includes('accommodation') ||
-    lower.includes('resort')
-  )
+    lower.includes('resort') ||
+    lower.includes('homestay')
+  ) {
     return 'accommodation';
-
-  if (
-    lower.includes('mua sắm') ||
-    lower.includes('shopping') ||
-    lower.includes('dịch vụ')
-  )
+  }
+  if (lower.includes('mua sắm') || lower.includes('shopping') || lower.includes('dịch vụ')) {
     return 'shopping';
-
+  }
   return 'attraction';
 }
 
-/** Trả về daily quota theo tripIntent */
 function getQuotaForIntent(
   intent: string,
   tuning: RetrievalTuning,
@@ -189,7 +156,6 @@ export function getDailyQuota(
       slots.add(slot);
     }
   }
-
   for (const slot of slots) {
     const total = intents.reduce(
       (sum, intent) => sum + (getQuotaForIntent(intent, tuning)[slot] ?? 0),
@@ -197,33 +163,23 @@ export function getDailyQuota(
     );
     merged[slot] = Math.ceil(total / intents.length);
   }
-
   return { ...DEFAULT_QUOTA, ...merged };
 }
 
-/** Tập các trip_intent hợp lệ trong vocab model v15 */
 export const VALID_TRIP_INTENTS = new Set(Object.keys(INTENT_QUOTA));
 
-/**
- * Parse chuỗi comma-separated tripIntent thành mảng các intent hợp lệ.
- * Trim whitespace, bỏ giá trị không thuộc vocab, deduplicate giữ thứ tự.
- */
 export function parseTripIntents(tripIntent: string): string[] {
   const seen = new Set<string>();
   return (tripIntent ?? '')
     .split(',')
-    .map((v) => v.trim())
-    .filter((v) => {
-      if (!VALID_TRIP_INTENTS.has(v) || seen.has(v)) return false;
-      seen.add(v);
+    .map((value) => value.trim())
+    .filter((value) => {
+      if (!VALID_TRIP_INTENTS.has(value) || seen.has(value)) return false;
+      seen.add(value);
       return true;
     });
 }
 
-/**
- * Deduplicate candidates theo place_id, giữ bản có score cao nhất.
- * Kết quả sort descending theo score.
- */
 export function dedupeByPlaceIdKeepBestScore(
   candidates: PlaceCandidate[],
 ): PlaceCandidate[] {
@@ -239,99 +195,163 @@ export function dedupeByPlaceIdKeepBestScore(
   return [...byId.values()].sort((a, b) => b.score - a.score);
 }
 
-/**
- * Fetch plan cho 1 slot: gọi recommend_places_by_slot RPC.
- * travelType chỉ truyền cho attraction để filter theo trip_intent.
- */
-export interface SlotFetchPlan {
-  slotType: string;
-  limit: number;
-  travelType?: string; // chỉ dùng cho slot attraction
+function parseTimeToMinutes(value?: string): number | null {
+  const match = /^(\d{1,2}):([0-5]\d)$/.exec(value ?? '');
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  if (hours < 0 || hours > 23) return null;
+  return hours * 60 + minutes;
 }
 
-/**
- * Trả về fetch plan theo đúng notebook:
- * - Mỗi slot (attraction/restaurant/cafe/entertainment/accommodation) → 1 RPC call riêng
- * - limit = dailyQuota × numDays × 2 (buffer để ANN có lựa chọn)
- * - Attraction filter thêm travelType để khớp trip_intent
- */
+function clamp(value: number, min: number, max: number): number {
+  return Math.max(min, Math.min(max, value));
+}
+
+function overlaps(start: number, end: number, windowStart: number, windowEnd: number): boolean {
+  return Math.max(start, windowStart) < Math.min(end, windowEnd);
+}
+
+export function getPlannerTargets(
+  tripIntent: string,
+  dailyStartTime = '08:00',
+  dailyEndTime = '21:00',
+): PlannerTargets {
+  const start = parseTimeToMinutes(dailyStartTime) ?? 480;
+  const end = parseTimeToMinutes(dailyEndTime) ?? 1260;
+  const availableMinutes = Math.max(0, end - start);
+  const baseQuota = getDailyQuota(tripIntent);
+  const hasLunchWindow = overlaps(start, end, 11 * 60 + 30, 13 * 60 + 30);
+  const restaurantTarget = hasLunchWindow ? 1 : 0;
+
+  // This only sizes the candidate pool. The GA still uses DB visit_duration,
+  // Goong travel time, opening hours, and lunch feasibility to build the route.
+  const nonFoodAvailable = Math.max(0, availableMinutes - restaurantTarget * 80);
+  const minNonFood = availableMinutes >= 360 ? 2 : 1;
+  const nonFoodTarget = clamp(Math.floor(nonFoodAvailable / 130), minNonFood, 7);
+  const nonFoodSlots = ['attraction', 'cafe', 'entertainment'];
+  const baseNonFoodTotal =
+    nonFoodSlots.reduce((sum, slot) => sum + (baseQuota[slot] ?? 0), 0) || 1;
+  const dailyQuota: Record<string, number> = {
+    attraction: 0,
+    restaurant: restaurantTarget,
+    cafe: 0,
+    entertainment: 0,
+    accommodation: 1,
+  };
+
+  let assigned = 0;
+  for (const slot of nonFoodSlots) {
+    const value = Math.floor(((baseQuota[slot] ?? 0) / baseNonFoodTotal) * nonFoodTarget);
+    dailyQuota[slot] = value;
+    assigned += value;
+  }
+  while (assigned < nonFoodTarget) {
+    const slot = [...nonFoodSlots].sort((a, b) => {
+      const aFrac = ((baseQuota[a] ?? 0) / baseNonFoodTotal) * nonFoodTarget - dailyQuota[a];
+      const bFrac = ((baseQuota[b] ?? 0) / baseNonFoodTotal) * nonFoodTarget - dailyQuota[b];
+      return bFrac - aFrac;
+    })[0];
+    dailyQuota[slot] += 1;
+    assigned += 1;
+  }
+
+  return {
+    availableMinutes,
+    dailyQuota,
+    notes: [
+      'quota is time-aware candidate fetching, not a hard GA daily count',
+      'restaurant target currently means lunch; cafe is snack/light stop, not meal',
+      'hotel/accommodation is fetched as trip-level options, not per-day visits',
+    ],
+  };
+}
+
 export function getStratifiedFetchPlan(
   tripIntent: string,
   numDays: number,
-  tuning: RetrievalTuning = {},
+  tuningOrDailyStartTime: RetrievalTuning | string = '08:00',
+  dailyEndTime = '21:00',
 ): SlotFetchPlan[] {
-  const quota = getDailyQuota(tripIntent, tuning);
+  const tuning =
+    typeof tuningOrDailyStartTime === 'string' ? {} : tuningOrDailyStartTime;
+  const targets =
+    typeof tuningOrDailyStartTime === 'string'
+      ? getPlannerTargets(tripIntent, tuningOrDailyStartTime, dailyEndTime)
+      : null;
+  const quota = targets?.dailyQuota ?? getDailyQuota(tripIntent, tuning);
   const knownIntents = parseTripIntents(tripIntent);
   const plan: SlotFetchPlan[] = [];
   const multiplier = tuning.fetchBufferMultiplier ?? 2;
 
   for (const [slot, dailyQ] of Object.entries(quota)) {
     if (dailyQ === 0) continue;
-    const limit = Math.ceil(dailyQ * numDays * multiplier);
-    const entry: SlotFetchPlan = { slotType: slot, limit };
-    // Chỉ filter attraction theo travelType khi intent đó có primary slot là 'attraction'.
-    // Với "Ẩm thực & Bản địa" (primary=restaurant) hay "Đô thị & Vui chơi" (primary=entertainment),
-    // KHÔNG filter → vector search tự tìm attraction phù hợp nhất.
-    // Với "Văn hóa & Lịch sử", "Khám phá & Sinh thái", "Nghỉ dưỡng & Biển" (primary=attraction),
-    // filter để chỉ lấy attraction có travel_type khớp trong DB.
+    const limit =
+      targets && slot === 'accommodation'
+        ? 12
+        : Math.max(
+            Math.ceil(dailyQ * numDays * (targets ? 3 : multiplier)),
+            dailyQ * numDays,
+          );
+    const entry: SlotFetchPlan = {
+      slotType: slot,
+      limit,
+      dailyTarget: dailyQ,
+      reason: targets
+        ? slot === 'accommodation'
+          ? 'trip-level hotel options'
+          : 'time-aware target x 3 buffer'
+        : undefined,
+    };
     if (
-      tuning.enableAttractionTravelTypeFilter !== false &&
       slot === 'attraction' &&
-      knownIntents.length === 1
+      knownIntents.length === 1 &&
+      tuning.enableAttractionTravelTypeFilter !== false
     ) {
       const primarySlot = TRAVEL_TYPE_SLOT[knownIntents[0]];
-      if (primarySlot === 'attraction') {
+      if (targets || primarySlot === 'attraction') {
         entry.travelType = knownIntents[0];
       }
     }
     plan.push(entry);
   }
-
   return plan;
 }
 
-/**
- * Diversity-aware top-K selection theo 2 phase:
- *
- * Phase 1 — Proportional fill:
- *   Mỗi slot type được cấp budget = max(proportional_share * topK, daily_quota * numDays).
- *   Duyệt danh sách đã sort theo score, thêm vào selected nếu còn budget.
- *
- * Phase 2 — Fill remaining:
- *   Các candidate bị reject ở phase 1 (vượt budget) được thêm vào cho đến khi đủ topK.
- *
- * Kết quả cuối được sort lại theo score descending.
- *
- * candidates: pool lớn (nên >= topK * 3) từ pgvector để đảm bảo đủ từng loại.
- */
 export function diversifyTopK(
   candidates: PlaceCandidate[],
   numDays: number,
   tripIntent: string,
   topK: number,
-  tuning: RetrievalTuning = {},
+  tuningOrFetchPlan: RetrievalTuning | SlotFetchPlan[] = {},
 ): PlaceCandidate[] {
+  const fetchPlan = Array.isArray(tuningOrFetchPlan)
+    ? tuningOrFetchPlan
+    : undefined;
+  const tuning = Array.isArray(tuningOrFetchPlan) ? {} : tuningOrFetchPlan;
+
   if (tuning.enableDiversityBudget === false) {
     return [...candidates]
       .sort((a, b) => b.score - a.score)
       .slice(0, topK)
-      .map((c) => ({
-        ...c,
-        category: normalizeCategory(c.category, c.type_name),
+      .map((candidate) => ({
+        ...candidate,
+        category: normalizeCategory(candidate.category, candidate.type_name),
       }));
   }
 
-  const dailyQuota = getDailyQuota(tripIntent, tuning);
-  const totalDailySlots = Object.values(dailyQuota).reduce((a, b) => a + b, 0);
-
-  // Budget mỗi category: lấy max giữa proportional share và minimum cần thiết
+  const dailyQuota = fetchPlan
+    ? Object.fromEntries(fetchPlan.map((plan) => [plan.slotType, plan.dailyTarget ?? 0]))
+    : getDailyQuota(tripIntent, tuning);
+  const totalDailySlots = Object.values(dailyQuota).reduce((a, b) => a + b, 0) || 1;
   const budgetPerCat: Record<string, number> = {};
+
   for (const [cat, q] of Object.entries(dailyQuota)) {
-    if (q > 0) {
-      const proportional = Math.round((q / totalDailySlots) * topK);
-      const minimum = q * numDays;
-      budgetPerCat[cat] = Math.max(proportional, minimum);
-    }
+    if (q <= 0) continue;
+    const proportional = Math.round((q / totalDailySlots) * topK);
+    const minimum = q * numDays;
+    const fetchLimit = fetchPlan?.find((plan) => normalizeCategory(plan.slotType) === cat)?.limit;
+    budgetPerCat[cat] = fetchLimit ?? Math.max(proportional, minimum);
   }
 
   const sorted = [...candidates].sort((a, b) => b.score - a.score);
@@ -339,26 +359,22 @@ export function diversifyTopK(
   const slotUsed: Record<string, number> = {};
   const remainder: PlaceCandidate[] = [];
 
-  // Phase 1: fill quota-limited buckets
-  for (const c of sorted) {
-    const cat = normalizeCategory(c.category, c.type_name);
+  for (const candidate of sorted) {
+    const cat = normalizeCategory(candidate.category, candidate.type_name);
     const used = slotUsed[cat] ?? 0;
-    const budget = budgetPerCat[cat] ?? 0; // shopping / unknown: no reserved budget
+    const budget = budgetPerCat[cat] ?? 0;
+    const normalized = { ...candidate, category: cat };
     if (budget > 0 && used < budget) {
       slotUsed[cat] = used + 1;
-      selected.push({ ...c, category: cat });
+      selected.push(normalized);
     } else {
-      remainder.push({
-        ...c,
-        category: normalizeCategory(c.category, c.type_name),
-      });
+      remainder.push(normalized);
     }
   }
 
-  // Phase 2: fill up to topK with best-scoring leftovers (already sorted)
-  for (const c of remainder) {
+  for (const candidate of remainder) {
     if (selected.length >= topK) break;
-    selected.push(c);
+    selected.push(candidate);
   }
 
   selected.sort((a, b) => b.score - a.score);

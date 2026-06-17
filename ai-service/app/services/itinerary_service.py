@@ -13,6 +13,7 @@ from app.schemas.itinerary import (
     ScheduleEntryResponse,
 )
 from app.services.itinerary import planner
+from app.services.itinerary.validator import FeasibilityValidator, ValidationResult
 
 logger = logging.getLogger(__name__)
 FOOD_CATEGORY_ID = "97029cfb-069b-4dba-a152-dfb3d36634d3"
@@ -20,7 +21,11 @@ FOOD_CATEGORY_ID = "97029cfb-069b-4dba-a152-dfb3d36634d3"
 
 def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
     started_at = time.perf_counter()
-    places = [_to_planner_place(item.model_dump()) for item in req.places]
+    trip_start_date = _parse_trip_start_date(req.trip_start_date)
+    places = [
+        _to_planner_place(item.model_dump(), day_idx=0, start_date=trip_start_date)
+        for item in req.places
+    ]
     if not any(place.place_type == "hotel" for place in places):
         raise ValueError("No real hotel/accommodation place provided for itinerary planning.")
 
@@ -49,8 +54,8 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
         vehicle=req.travel_vehicle,
         cache_path=travel_cache,
         speed_kmh=req.speed_kmh,
+        require_goong=req.require_goong,
     )
-    matrix_ms = round((time.perf_counter() - matrix_started_at) * 1000)
 
     engine = planner.MultiDayTripPlanner(
         places=places,
@@ -66,9 +71,23 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
         generations=req.generations,
         mutation_rate=req.mutation_rate,
         return_to_hotel=req.return_to_hotel,
+        require_goong_edges=req.require_goong,
+        budget_per_person=req.budget_per_person,
+        adult_count=req.adult_count,
+        child_count=req.child_count,
+        travel_vehicle=req.travel_vehicle,
+        trip_start_date=req.trip_start_date,
     )
+    matrix_ms = round((time.perf_counter() - matrix_started_at) * 1000)
     ga_started_at = time.perf_counter()
     result = engine.run(seed=req.seed)
+    places_map = {place.id: place for place in places}
+    for day_idx in range(req.num_days):
+        weekday_idx = (trip_start_date.weekday() + day_idx) % 7
+        for place in places:
+            places_map[(day_idx + 1, place.id)] = place.to_poi_for_day(weekday_idx)
+    validation = FeasibilityValidator().validate(result, places_map)
+    result.validation_result = validation
     ga_ms = round((time.perf_counter() - ga_started_at) * 1000)
     total_ms = round((time.perf_counter() - started_at) * 1000)
 
@@ -83,11 +102,12 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
     for day in result.days:
         ga = day.ga_result
         logger.info(
-            "[GA][Day %s] fitness=%.4f candidates=%s visited=%s travel=%s wait=%s idle=%s visit=%s restaurant=%s stopped=%s@%s",
+            "[GA][Day %s] fitness=%.4f candidates=%s visited=%s skipped=%s travel=%s wait=%s idle=%s visit=%s restaurant=%s stopped=%s@%s",
             day.day,
             ga.fitness,
             len(day.pois),
             len(day.visited_pois),
+            ga.skipped_count,
             ga.total_travel_time,
             ga.total_wait_time,
             ga.idle_time,
@@ -96,19 +116,27 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
             ga.stopped_reason,
             ga.generations_run,
         )
-    planner.print_multi_day_schedule(result)
+    try:
+        planner.print_multi_day_schedule(result)
+    except UnicodeEncodeError as exc:
+        logger.warning("[Planner] skipped console schedule print due to encoding: %s", exc)
     return _serialize_result(
         result,
         input_places=len(req.places),
         total_ms=total_ms,
         matrix_ms=matrix_ms,
         ga_ms=ga_ms,
+        validation=validation,
     )
 
 
-def _to_planner_place(raw: dict[str, Any]) -> planner.Place:
+def _to_planner_place(
+    raw: dict[str, Any],
+    day_idx: int = 0,
+    start_date: datetime.date | None = None,
+) -> planner.Place:
     place_type = _normalize_place_type(raw)
-    open_time, close_time, unknown_hours = _extract_time_window(raw)
+    open_time, close_time, unknown_hours = _extract_time_window(raw, day_idx, start_date)
     default_duration = 60 if place_type == "restaurant" else 90
     if place_type == "cafe":
         default_duration = 45
@@ -131,6 +159,11 @@ def _to_planner_place(raw: dict[str, Any]) -> planner.Place:
         unknown_hours=unknown_hours,
         open_hour=str(raw.get("open_hour") or ""),
         open_hour_compressed=str(raw.get("open_hour_compressed") or ""),
+        candidate_rank=int(raw.get("candidate_rank") or 0),
+        candidate_total=max(1, int(raw.get("candidate_total") or 1)),
+        estimated_cost=float(raw.get("estimated_cost") or 0),
+        price_basis=str(raw.get("price_basis") or "unknown"),
+        price_inferred=raw.get("price_inferred"),
     )
 
 
@@ -161,8 +194,22 @@ def _normalize_place_type(raw: dict[str, Any]) -> str:
     return "attraction"
 
 
-def _extract_time_window(raw: dict[str, Any]) -> tuple[int, int, bool]:
-    today_idx = datetime.date.today().weekday()
+def _parse_trip_start_date(value: str | None) -> datetime.date:
+    if not value:
+        return datetime.date.today()
+    try:
+        return datetime.date.fromisoformat(value)
+    except ValueError:
+        return datetime.date.today()
+
+
+def _extract_time_window(
+    raw: dict[str, Any],
+    day_idx: int = 0,
+    start_date: datetime.date | None = None,
+) -> tuple[int, int, bool]:
+    base_date = start_date or datetime.date.today()
+    today_idx = (base_date.weekday() + day_idx) % 7
     compressed = raw.get("open_hour_compressed") or ""
     open_hour = raw.get("open_hour") or ""
     time_window = planner.get_time_for_day_json(open_hour, today_idx)
@@ -181,8 +228,25 @@ def _serialize_result(
     total_ms: int = 0,
     matrix_ms: int = 0,
     ga_ms: int = 0,
+    validation: ValidationResult | None = None,
 ) -> ItineraryPlanResponse:
     days = [_serialize_day(day) for day in result.days]
+    assignment_warnings = (
+        result.assignment_result.warnings
+        if result.assignment_result is not None
+        else []
+    )
+    assignment_day_loads = (
+        result.assignment_result.day_loads
+        if result.assignment_result is not None
+        else []
+    )
+    validation_result = validation or result.validation_result
+    validation_dict = (
+        validation_result.to_dict()
+        if validation_result is not None and hasattr(validation_result, "to_dict")
+        else {"is_feasible": True, "violations": [], "warnings": []}
+    )
     return ItineraryPlanResponse(
         hotel_id=result.hotel.id,
         hotel_name=result.hotel.name,
@@ -192,27 +256,65 @@ def _serialize_result(
         total_ms=total_ms,
         matrix_ms=matrix_ms,
         ga_ms=ga_ms,
+        assignment_day_loads=assignment_day_loads,
+        assignment_warnings=assignment_warnings,
+        validation_is_feasible=bool(validation_dict["is_feasible"]),
+        validation_violations=validation_dict["violations"],
+        validation_warnings=validation_dict["warnings"],
         days=days,
     )
 
 
 def _serialize_day(day_result: planner.DayResult) -> ItineraryDayResponse:
     ga = day_result.ga_result
+    schedule = [_serialize_entry(entry) for entry in ga.schedule]
+    total_visit_minutes = sum(
+        entry.active_duration_minutes
+        for entry in schedule
+        if not entry.is_return_to_hotel
+    )
     return ItineraryDayResponse(
         day=day_result.day,
         visited_count=len(day_result.visited_pois),
+        target_visited_count=max(
+            planner.POI_TARGET_MIN_PER_DAY,
+            min(
+                planner.POI_TARGET_MAX_PER_DAY,
+                (ga.total_visit_time + ga.total_travel_time + ga.total_wait_time + ga.idle_time)
+                // planner.POI_TARGET_TIME_SLICE_MINUTES,
+            ),
+        ),
         total_travel_minutes=ga.total_travel_time,
         total_distance_km=round(ga.total_distance_km, 2),
-        total_visit_minutes=ga.total_visit_time,
+        total_visit_minutes=total_visit_minutes,
         total_wait_minutes=ga.total_wait_time,
+        total_activity_cost=round(ga.total_activity_cost),
+        total_transport_cost=round(ga.total_transport_cost),
+        total_day_cost=round(ga.total_day_cost),
+        budget_limit=round(ga.budget_limit),
+        budget_overage=round(ga.budget_overage),
+        budget_penalty=round(ga.budget_penalty, 4),
+        skipped_count=ga.skipped_count,
+        total_hard_violations=ga.total_hard_violations,
+        meal_violations=ga.meal_violations,
         restaurant_count=ga.restaurant_count,
         fitness=round(ga.fitness, 4),
         stopped_reason=f"{ga.stopped_reason}@{ga.generations_run}",
-        schedule=[_serialize_entry(entry) for entry in ga.schedule],
+        schedule=schedule,
     )
 
 
 def _serialize_entry(entry: planner.ScheduleEntry) -> ScheduleEntryResponse:
+    base_duration = max(0, int(entry.base_duration or 0))
+    active_duration = 0 if entry.is_return_to_hotel else (
+        base_duration if base_duration > 0 else entry.active_duration
+    )
+    departure_time = entry.departure_str
+    if active_duration > 0:
+        departure_time = planner.minutes_to_time(
+            entry.service_start_time + active_duration
+        )
+
     return ScheduleEntryResponse(
         location_id=entry.location_id,
         location_name=entry.location_name,
@@ -226,9 +328,13 @@ def _serialize_entry(entry: planner.ScheduleEntry) -> ScheduleEntryResponse:
         travel_source=entry.travel_source,
         arrival_time=entry.arrival_str,
         service_start_time=entry.service_start_str,
-        departure_time=entry.departure_str,
+        departure_time=departure_time,
         wait_minutes=entry.wait_time,
-        active_duration_minutes=entry.active_duration,
+        base_duration_minutes=base_duration,
+        active_duration_minutes=active_duration,
+        estimated_cost=round(entry.estimated_cost),
+        price_basis=entry.price_basis,
+        price_inferred=entry.price_inferred,
         place_type=entry.place_type,
         is_restaurant=entry.is_restaurant,
         unknown_hours=entry.unknown_hours,

@@ -33,6 +33,8 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
+from app.services.itinerary.assignment import AssignmentConfig, AssignmentModule, AssignmentResult
+
 try:
     from dotenv import load_dotenv
     _dotenv_available = True
@@ -110,18 +112,46 @@ LUNCH_END = 13 * 60 + 30
 # Gia tri nay lon hon can tren cac thanh phan fitness mem trong mot ngay tour,
 # nen chromosome thieu an trua gan nhu khong duoc chon lam parent.
 MISSING_LUNCH_PENALTY = 10_000
-MAX_EXPANSION_RESTAURANT = 60
-MAX_EXPANSION_ATTRACTION = 120
+DAILY_TYPE_LIMITS = {
+    "restaurant": 1,
+    "cafe": 1,
+    "entertainment": 1,
+}
+SOFT_TYPE_LIMIT_PENALTY = 80
+ATTRACTION_LATEST_START = 18 * 60
+ENTERTAINMENT_EARLIEST_START = 15 * 60
+LATE_ENTERTAINMENT_START = 17 * 60
+CAFE_EARLIEST_START = 9 * 60
+TIME_PREFERENCE_PENALTY = 80
 FEASIBILITY_PENALTY = 100_000
-UTILITY_TRAVEL_WEIGHT = 0.5
-UTILITY_SCALE = 100
+MAX_NON_MEAL_WAIT_MINUTES = 90
+UTILITY_TRAVEL_WEIGHT = 0.9
+UTILITY_SCALE = 200
 ALPHA_DEFAULT = 0.7
+GOONG_TRAVEL_SOURCES = {"goong", "goong_cache"}
 # Default sau thuc nghiem tren tap 50 POI co dinh.
 DEFAULT_POPULATION_SIZE = 50
 DEFAULT_MUTATION_RATE = 0.30
 EARLY_STOP_PATIENCE = 30
 TRAVEL_TIME_WEIGHT = 0.1
-WAIT_TIME_WEIGHT = 0.3
+WAIT_TIME_WEIGHT = 0.8
+BUDGET_OVERAGE_UNIT_VND = 1_000
+BUDGET_PENALTY_WEIGHT = 3.0
+# Budget estimate only. This is not an official ride-hailing fare formula.
+# bike is closer to fuel/operating cost; car is a conservative service-car estimate.
+TRANSPORT_COST_PER_KM = {
+    "bike": 3_000,
+    "car": 15_000,
+    "taxi": 18_000,
+    "truck": 20_000,
+}
+TRANSPORT_COST_DEFAULT = 10_000
+POI_TARGET_MIN_PER_DAY = 4
+POI_TARGET_MAX_PER_DAY = 10
+POI_TARGET_TIME_SLICE_MINUTES = 90
+CHILD_COST_FACTOR = 0.5
+ROOM_CAPACITY = 2
+FALLBACK_HOTEL_COST_PER_NIGHT = 400_000
 DEFAULT_TRAVEL_BUFFER_PERCENT = 0.20
 DEFAULT_TRAVEL_BUFFER_MIN = 5
 DEFAULT_TRAVEL_BUFFER_MAX = 15
@@ -558,6 +588,7 @@ def build_travel_matrix(
     speed_kmh: float = 30.0,
     refresh_cache: bool = False,
     goong_workers: int = 1,
+    require_goong: bool = False,
 ) -> Tuple[Dict[Tuple[str, str], int], Dict[Tuple[str, str], float], Dict[Tuple[str, str], str], Dict[Tuple[str, str], List[dict]]]:
     """
     Build travel minutes, distance km, and source per pair.
@@ -584,7 +615,9 @@ def build_travel_matrix(
                 times[(from_id, to_id)] = int(cached["minutes"])
                 if cached.get("distance_source") == "goong" and "distance_km" in cached:
                     distances[(from_id, to_id)] = float(cached["distance_km"])
-                sources[(from_id, to_id)] = "cache"
+                sources[(from_id, to_id)] = (
+                    "goong_cache" if cached.get("distance_source") == "goong" else "haversine_cache"
+                )
             else:
                 missing.append((from_id, to_id))
 
@@ -622,7 +655,140 @@ def build_travel_matrix(
             times[pair] = fallback_times[pair]
             sources[pair] = "haversine"
 
+    if require_goong:
+        non_goong_pairs = sum(1 for source in sources.values() if source not in GOONG_TRAVEL_SOURCES)
+        if non_goong_pairs:
+            print(
+                "  [WARNING] Goong is required for final routing, "
+                f"but {non_goong_pairs} matrix pairs are non-Goong. "
+                "GA will avoid non-Goong edges."
+            )
+
     return times, distances, sources, reliability
+
+
+def refresh_travel_matrix_for_day_pools(
+    coords: Dict[str, Tuple[float, float]],
+    day_pools: List[dict],
+    hotel_id: str,
+    travel_times: Dict[Tuple[str, str], int],
+    travel_distances: Dict[Tuple[str, str], float],
+    travel_sources: Dict[Tuple[str, str], str],
+    travel_reliability: Dict[Tuple[str, str], List[dict]],
+    api_key: str,
+    vehicle: str = "car",
+    cache_path: str = TRAVEL_CACHE_PATH,
+    speed_kmh: float = 30.0,
+    require_goong: bool = False,
+) -> int:
+    """
+    Refresh Goong data only for dense per-day route pools.
+
+    Building a full Goong matrix for 100+ candidates creates O(N^2) pairs and
+    can make the planner request unstable. Daily GA only needs edges between
+    the hotel and places assigned to the same day, so this function refreshes
+    those smaller sub-matrices and keeps Haversine/cache values for everything
+    else.
+    """
+    if not api_key:
+        if require_goong:
+            raise RuntimeError("GOONG_API_KEY is required when require_goong=True.")
+        return 0
+
+    cache = _load_travel_cache(cache_path)
+    refreshed_pairs: set[Tuple[str, str]] = set()
+    processed_subsets: set[Tuple[str, ...]] = set()
+
+    for pool in day_pools:
+        places = [
+            *(pool.get("attractions") or []),
+            *(pool.get("restaurants") or []),
+        ]
+        ids = [hotel_id, *[place.id for place in places if place.id in coords]]
+        ids = list(dict.fromkeys(ids))
+        if len(ids) <= 1:
+            continue
+
+        subset_key = tuple(sorted(ids))
+        if subset_key in processed_subsets:
+            continue
+        processed_subsets.add(subset_key)
+
+        needs_refresh = False
+        for from_id in ids:
+            for to_id in ids:
+                if from_id == to_id:
+                    continue
+                source = travel_sources.get((from_id, to_id), "")
+                cache_key = f"{vehicle}:{from_id}:{to_id}"
+                cached = cache.get(cache_key)
+                if source in GOONG_TRAVEL_SOURCES:
+                    continue
+                if cached and cached.get("distance_source") == "goong" and "minutes" in cached:
+                    minutes = int(cached["minutes"])
+                    travel_times[(from_id, to_id)] = minutes
+                    travel_distances[(from_id, to_id)] = float(cached.get("distance_km") or 0.0)
+                    travel_sources[(from_id, to_id)] = "goong_cache"
+                    travel_reliability[(from_id, to_id)] = cached.get("history") or []
+                    continue
+                needs_refresh = True
+
+        if not needs_refresh:
+            continue
+
+        subset_coords = {place_id: coords[place_id] for place_id in ids}
+        goong_times, goong_distances = build_travel_data_goong(
+            subset_coords,
+            api_key,
+            vehicle=vehicle,
+            max_workers=1,
+        )
+        for pair, minutes in goong_times.items():
+            travel_times[pair] = minutes
+            if goong_distances.get(pair, 0) > 0:
+                travel_distances[pair] = goong_distances[pair]
+            elif pair not in travel_distances:
+                lon1, lat1 = coords[pair[0]]
+                lon2, lat2 = coords[pair[1]]
+                travel_distances[pair] = _haversine_km(lon1, lat1, lon2, lat2)
+            travel_sources[pair] = "goong"
+            cache_key = f"{vehicle}:{pair[0]}:{pair[1]}"
+            cache_entry = cache.get(cache_key) or {}
+            cache_entry.update({
+                "minutes": minutes,
+                "distance_km": round(travel_distances.get(pair, 0.0), 3),
+                "distance_source": "goong" if goong_distances.get(pair, 0) > 0 else "haversine",
+            })
+            _append_travel_history(cache_entry, minutes)
+            travel_reliability[pair] = cache_entry.get("history") or []
+            cache[cache_key] = cache_entry
+            refreshed_pairs.add(pair)
+
+    if refreshed_pairs:
+        _save_travel_cache(cache_path, cache)
+
+    if require_goong:
+        required_non_goong = 0
+        for pool in day_pools:
+            places = [
+                *(pool.get("attractions") or []),
+                *(pool.get("restaurants") or []),
+            ]
+            ids = [hotel_id, *[place.id for place in places if place.id in coords]]
+            ids = list(dict.fromkeys(ids))
+            for from_id in ids:
+                for to_id in ids:
+                    if from_id == to_id:
+                        continue
+                    if travel_sources.get((from_id, to_id)) not in GOONG_TRAVEL_SOURCES:
+                        required_non_goong += 1
+        if required_non_goong:
+            print(
+                "  [WARNING] Goong is required, but "
+                f"{required_non_goong} daily route edges are non-Goong."
+            )
+
+    return len(refreshed_pairs)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -913,6 +1079,9 @@ class POI:
     latitude: float = 0.0
     candidate_rank: int = 0
     candidate_total: int = 1
+    estimated_cost: float = 0.0
+    price_basis: str = "unknown"
+    price_inferred: Optional[bool] = None
 
 
 @dataclass
@@ -920,6 +1089,9 @@ class Hotel:
     """A hotel serving as the tour's base / start location."""
     id: str
     name: str
+    estimated_cost: float = 0.0
+    price_basis: str = "per_room_per_night"
+    price_inferred: Optional[bool] = None
 
 
 @dataclass
@@ -949,6 +1121,9 @@ class Place:
     candidate_total: int = 1
     open_hour: str = ""
     open_hour_compressed: str = ""
+    estimated_cost: float = 0.0
+    price_basis: str = "unknown"
+    price_inferred: Optional[bool] = None
 
     def to_poi(self) -> "POI":
         return POI(
@@ -964,6 +1139,9 @@ class Place:
             latitude=self.latitude,
             candidate_rank=self.candidate_rank,
             candidate_total=self.candidate_total,
+            estimated_cost=self.estimated_cost,
+            price_basis=self.price_basis,
+            price_inferred=self.price_inferred,
         )
 
     def to_poi_for_day(self, day_idx: int) -> "POI":
@@ -993,10 +1171,19 @@ class Place:
             latitude=self.latitude,
             candidate_rank=self.candidate_rank,
             candidate_total=self.candidate_total,
+            estimated_cost=self.estimated_cost,
+            price_basis=self.price_basis,
+            price_inferred=self.price_inferred,
         )
 
     def to_hotel(self) -> "Hotel":
-        return Hotel(self.id, self.name)
+        return Hotel(
+            self.id,
+            self.name,
+            self.estimated_cost,
+            self.price_basis or "per_room_per_night",
+            self.price_inferred,
+        )
 
 
 @dataclass
@@ -1031,6 +1218,10 @@ class ScheduleEntry:
     unknown_hours: bool = False
     is_return_to_hotel: bool = False
     place_type: str = "attraction"
+    base_duration: int = 0
+    estimated_cost: float = 0.0
+    price_basis: str = "unknown"
+    price_inferred: Optional[bool] = None
 
     @property
     def arrival_str(self) -> str:
@@ -1070,6 +1261,13 @@ class GAResult:
     total_hard_violations: int
     meal_violations: int
     restaurant_count: int
+    total_activity_cost: float
+    total_transport_cost: float
+    total_day_cost: float
+    budget_limit: float
+    budget_overage: float
+    budget_penalty: float
+    skipped_count: int
     idle_time: int
     generation_found: int
     generations_run: int
@@ -1092,8 +1290,13 @@ class DayResult:
         """POIs actually visited today, in visit order."""
         if self.ga_result.visited_poi_indices:
             return [self.pois[i] for i in self.ga_result.visited_poi_indices]
-        # Fallback for non-greedy runs: all pois in chromosome order
-        return [self.pois[i] for i in self.ga_result.best_chromosome]
+        scheduled_ids = [
+            entry.location_id
+            for entry in self.ga_result.schedule
+            if not entry.is_return_to_hotel
+        ]
+        by_id = {poi.id: poi for poi in self.pois}
+        return [by_id[place_id] for place_id in scheduled_ids if place_id in by_id]
 
 
 @dataclass
@@ -1102,6 +1305,8 @@ class MultiDayResult:
     hotel: Hotel
     num_days: int
     days: List[DayResult]
+    assignment_result: Optional[AssignmentResult] = None
+    validation_result: Optional[object] = None
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -1144,6 +1349,10 @@ class TSP_TW_GA:
         travel_buffer_percent: float = DEFAULT_TRAVEL_BUFFER_PERCENT,
         travel_buffer_min: int = DEFAULT_TRAVEL_BUFFER_MIN,
         travel_buffer_max: int = DEFAULT_TRAVEL_BUFFER_MAX,
+        require_goong_edges: bool = False,
+        day_budget: float = 0.0,
+        adult_equivalent: float = 1.0,
+        travel_vehicle: str = "car",
     ):
         self.pois = pois
         self.travel_times = travel_times
@@ -1160,6 +1369,14 @@ class TSP_TW_GA:
         self.travel_buffer_percent = travel_buffer_percent
         self.travel_buffer_min = travel_buffer_min
         self.travel_buffer_max = travel_buffer_max
+        self.require_goong_edges = require_goong_edges
+        self.day_budget = max(0.0, float(day_budget or 0))
+        self.adult_equivalent = max(0.0, float(adult_equivalent or 0))
+        self.travel_vehicle = travel_vehicle if travel_vehicle in TRANSPORT_COST_PER_KM else "car"
+        self.cost_per_km = TRANSPORT_COST_PER_KM.get(
+            self.travel_vehicle,
+            TRANSPORT_COST_DEFAULT,
+        )
         self.n = len(pois)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -1229,39 +1446,45 @@ class TSP_TW_GA:
             ALPHA_DEFAULT * rank_score + (1 - ALPHA_DEFAULT) * rating_score
         )
 
-    def _duration_expansion(
-        self,
-        poi: POI,
-        base_depart: int,
-        next_idx: Optional[int],
-    ) -> int:
-        max_expansion = (
-            MAX_EXPANSION_RESTAURANT
-            if poi.place_type == "restaurant"
-            else MAX_EXPANSION_ATTRACTION
+    def _poi_cost(self, poi: POI) -> float:
+        if poi.estimated_cost <= 0:
+            return 0.0
+        if poi.price_basis == "per_person":
+            return poi.estimated_cost * self.adult_equivalent
+        return poi.estimated_cost
+
+    def _is_late_entertainment(self, poi: POI) -> bool:
+        text = normalize_text(f"{poi.name} {poi.place_type}")
+        return any(
+            keyword in text
+            for keyword in (
+                "karaoke", "bar", "pub", "club", "cinema", "rap phim",
+                "billiard", "bida", "game", "escape", "bowling",
+            )
         )
-        if max_expansion <= 0:
-            return 0
 
-        if next_idx is not None:
-            next_poi = self.pois[next_idx]
-            next_arrival = base_depart + self._travel(poi.id, next_poi.id)
-            next_wait = max(0, next_poi.open_time - next_arrival)
-            if next_poi.place_type == "restaurant":
-                next_wait = max(next_wait, LUNCH_START - next_arrival)
-            return min(next_wait, max_expansion)
+    def _earliest_service_start(self, poi: POI) -> int:
+        if self._is_late_entertainment(poi):
+            return LATE_ENTERTAINMENT_START
+        if poi.place_type == "entertainment":
+            return ENTERTAINMENT_EARLIEST_START
+        if poi.place_type == "cafe":
+            return CAFE_EARLIEST_START
+        return 0
 
-        end_anchor = self.config.end_time
-        if self.return_to_hotel:
-            end_anchor -= self._travel(poi.id, self.start_location_id)
-        return min(max(0, end_anchor - base_depart), max_expansion)
+    def _time_preference_penalty(self, poi: POI, service_start: int) -> int:
+        if poi.place_type == "attraction" and service_start >= ATTRACTION_LATEST_START:
+            return TIME_PREFERENCE_PENALTY
+        if service_start < self._earliest_service_start(poi):
+            return TIME_PREFERENCE_PENALTY
+        return 0
 
     # ?? Schedule simulation ???????????????????????????????????????????????
 
     def _objective(self, chromosome: List[int]) -> dict:
         """
         Utility-based TOPTW fitness for a single day.
-        Fitness = feasibility_penalty + 0.5 * travel - sum(utility).
+        Fitness = feasibility_penalty + 0.5 * travel + 0.8 * wait - sum(utility).
         """
         config = self.config
         schedule: List[ScheduleEntry] = []
@@ -1275,7 +1498,11 @@ class TSP_TW_GA:
         total_penalty = 0
         hard_violations = 0
         restaurant_count = 0
+        type_counts: Dict[str, int] = {}
+        soft_preference_penalty = 0
         total_utility = 0.0
+        total_activity_cost = 0.0
+        skipped_count = 0
         visited_indices: List[int] = []
 
         for pos, poi_idx in enumerate(chromosome):
@@ -1284,54 +1511,90 @@ class TSP_TW_GA:
             buffer_t, buffer_source = self._travel_buffer(current_loc, poi.id, raw_t, current_time)
             travel = raw_t + buffer_t
             distance = self._distance(current_loc, poi.id)
+            travel_source = self._travel_source(current_loc, poi.id)
+            if self.require_goong_edges and travel_source not in GOONG_TRAVEL_SOURCES:
+                if self.greedy_fit:
+                    continue
+                hard_violations += 1
+                total_penalty += FEASIBILITY_PENALTY
             arrival = current_time + travel
             wait = max(0, poi.open_time - arrival)
+            service_start = arrival + wait
+            earliest_start = self._earliest_service_start(poi)
+
+            if (
+                self.greedy_fit
+                and poi.place_type != "restaurant"
+                and not poi.unknown_hours
+                and wait > MAX_NON_MEAL_WAIT_MINUTES
+            ):
+                skipped_count += 1
+                continue
+            if self.greedy_fit and earliest_start > 0 and service_start < earliest_start:
+                skipped_count += 1
+                continue
+
+            type_limit = DAILY_TYPE_LIMITS.get(poi.place_type)
+            candidate_soft_penalty = 0
+            if type_limit is not None and poi.place_type != "restaurant":
+                over_count = max(0, type_counts.get(poi.place_type, 0) - type_limit + 1)
+                candidate_soft_penalty += over_count * SOFT_TYPE_LIMIT_PENALTY
 
             if poi.place_type == "restaurant":
-                if restaurant_count >= 1 or poi.unknown_hours:
+                if restaurant_count >= 1:
                     continue
+                if poi.unknown_hours:
+                    candidate_soft_penalty += 30
                 wait = max(wait, LUNCH_START - arrival)
-                if arrival + wait > LUNCH_END:
+                if not poi.unknown_hours and arrival + wait > LUNCH_END:
                     continue
-                restaurant_count += 1
+                service_start = arrival + wait
 
-            base_depart = arrival + wait + poi.visit_duration
-            next_idx = chromosome[pos + 1] if pos + 1 < len(chromosome) else None
-            actual_duration = poi.visit_duration + self._duration_expansion(
-                poi,
-                base_depart,
-                next_idx,
-            )
+            time_preference_penalty = self._time_preference_penalty(poi, service_start)
+            candidate_soft_penalty += time_preference_penalty
+
+            actual_duration = poi.visit_duration
             depart = arrival + wait + actual_duration
             if self.greedy_fit:
                 dep_est = depart
                 if self.return_to_hotel:
                     dep_est += self._travel(poi.id, self.start_location_id)
                 if dep_est > config.end_time:
+                    skipped_count += 1
                     continue
 
             total_travel += travel
             total_distance += distance
             total_visit += actual_duration
             total_wait += wait
+            poi_cost = self._poi_cost(poi)
+            total_activity_cost += poi_cost
             if arrival > poi.close_time:
                 hard_violations += 1
                 total_penalty += FEASIBILITY_PENALTY
             if depart > poi.close_time:
                 hard_violations += 1
                 total_penalty += FEASIBILITY_PENALTY
+            soft_preference_penalty += candidate_soft_penalty
+            if poi.place_type == "restaurant":
+                restaurant_count += 1
             total_utility += self._poi_utility(poi)
             schedule.append(
                 ScheduleEntry(
                     poi.id, poi.name, current_loc, current_name,
                     travel, raw_t, buffer_t, buffer_source, distance,
-                    self._travel_source(current_loc, poi.id),
+                    travel_source,
                     arrival, depart, wait,
                     poi.place_type == "restaurant", poi.unknown_hours,
                     place_type=poi.place_type,
+                    base_duration=poi.visit_duration,
+                    estimated_cost=poi_cost,
+                    price_basis=poi.price_basis,
+                    price_inferred=poi.price_inferred,
                 )
             )
             visited_indices.append(poi_idx)
+            type_counts[poi.place_type] = type_counts.get(poi.place_type, 0) + 1
             current_loc = poi.id
             current_name = poi.name
             current_time = depart
@@ -1341,14 +1604,18 @@ class TSP_TW_GA:
             return_buffer, return_buffer_source = self._travel_buffer(current_loc, self.start_location_id, raw_return_travel, current_time)
             return_travel = raw_return_travel + return_buffer
             return_distance = self._distance(current_loc, self.start_location_id)
+            return_source = self._travel_source(current_loc, self.start_location_id)
             arrival = current_time + return_travel
             total_travel += return_travel
             total_distance += return_distance
+            if self.require_goong_edges and return_source not in GOONG_TRAVEL_SOURCES:
+                hard_violations += 1
+                total_penalty += FEASIBILITY_PENALTY
             schedule.append(
                 ScheduleEntry(
                     self.start_location_id, "Hotel", current_loc, current_name,
                     return_travel, raw_return_travel, return_buffer, return_buffer_source,
-                    return_distance, self._travel_source(current_loc, self.start_location_id),
+                    return_distance, return_source,
                     arrival, arrival, 0, False, False, True,
                     place_type="hotel",
                 )
@@ -1361,7 +1628,19 @@ class TSP_TW_GA:
         meal_violations = 1 if has_restaurant_candidate and restaurant_count == 0 else 0
         if meal_violations:
             total_penalty += FEASIBILITY_PENALTY
-        fitness = total_penalty + (UTILITY_TRAVEL_WEIGHT * total_travel) - total_utility
+        total_transport_cost = total_distance * self.cost_per_km
+        total_day_cost = total_activity_cost + total_transport_cost
+        budget_overage = max(0.0, total_day_cost - self.day_budget) if self.day_budget > 0 else 0.0
+        budget_penalty = (budget_overage / BUDGET_OVERAGE_UNIT_VND) * BUDGET_PENALTY_WEIGHT
+        fitness = (
+            total_penalty
+            + soft_preference_penalty
+            + (UTILITY_TRAVEL_WEIGHT * total_travel)
+            + (WAIT_TIME_WEIGHT * total_wait)
+            + budget_penalty
+            + (25 * skipped_count)
+            - total_utility
+        )
         return {
             "schedule": schedule,
             "fitness": fitness,
@@ -1374,6 +1653,13 @@ class TSP_TW_GA:
             "hard_violations": hard_violations,
             "meal_violations": meal_violations,
             "restaurant_count": restaurant_count,
+            "total_activity_cost": total_activity_cost,
+            "total_transport_cost": total_transport_cost,
+            "total_day_cost": total_day_cost,
+            "budget_limit": self.day_budget,
+            "budget_overage": budget_overage,
+            "budget_penalty": budget_penalty,
+            "skipped_count": skipped_count,
             "idle_time": idle_time,
             "visited_indices": visited_indices,
         }
@@ -1463,6 +1749,40 @@ class TSP_TW_GA:
         result[i], result[j] = result[j], result[i]
         return result
 
+    def _refine_visit_order(self, chromosome: List[int]) -> Tuple[List[int], dict]:
+        """Local route refinement for the selected POIs after GA convergence."""
+        best_chrom = chromosome[:]
+        best_result = self._objective(best_chrom)
+        if len(best_chrom) < 3:
+            return best_chrom, best_result
+
+        improved = True
+        passes = 0
+        while improved and passes < 3:
+            passes += 1
+            improved = False
+
+            for i in range(len(best_chrom) - 1):
+                for j in range(i + 1, len(best_chrom)):
+                    candidate = best_chrom[:]
+                    candidate[i], candidate[j] = candidate[j], candidate[i]
+                    result = self._objective(candidate)
+                    if result["fitness"] < best_result["fitness"]:
+                        best_chrom = candidate
+                        best_result = result
+                        improved = True
+
+            for i in range(len(best_chrom) - 2):
+                for j in range(i + 2, len(best_chrom) + 1):
+                    candidate = best_chrom[:i] + list(reversed(best_chrom[i:j])) + best_chrom[j:]
+                    result = self._objective(candidate)
+                    if result["fitness"] < best_result["fitness"]:
+                        best_chrom = candidate
+                        best_result = result
+                        improved = True
+
+        return best_chrom, best_result
+
     # ?? Main run ???????????????????????????????????????????????????????????
 
     def run(self, seed: Optional[int] = None) -> GAResult:
@@ -1518,6 +1838,21 @@ class TSP_TW_GA:
                     new_pop.append(c2)
             population = new_pop[:self.population_size]
 
+        if best_result is None:
+            best_chromosome = population[0][:]
+            best_result = self._objective(best_chromosome)
+            best_fitness = best_result["fitness"]
+
+        if self.greedy_fit and best_result.get("visited_indices"):
+            refined_chromosome, refined_result = self._refine_visit_order(
+                best_result["visited_indices"],
+            )
+            if refined_result["fitness"] < best_result["fitness"]:
+                best_chromosome = refined_chromosome
+                best_result = refined_result
+                best_fitness = refined_result["fitness"]
+                stopped_reason = f"{stopped_reason}|local_refined"
+
         return GAResult(
             best_chromosome=best_chromosome or [],
             schedule=best_result["schedule"],
@@ -1531,6 +1866,13 @@ class TSP_TW_GA:
             total_hard_violations=best_result["hard_violations"],
             meal_violations=best_result["meal_violations"],
             restaurant_count=best_result["restaurant_count"],
+            total_activity_cost=best_result["total_activity_cost"],
+            total_transport_cost=best_result["total_transport_cost"],
+            total_day_cost=best_result["total_day_cost"],
+            budget_limit=best_result["budget_limit"],
+            budget_overage=best_result["budget_overage"],
+            budget_penalty=best_result["budget_penalty"],
+            skipped_count=best_result["skipped_count"],
             idle_time=best_result["idle_time"],
             generation_found=best_gen,
             generations_run=generations_run,
@@ -1572,25 +1914,42 @@ class MultiDayTripPlanner:
         travel_buffer_percent: float = DEFAULT_TRAVEL_BUFFER_PERCENT,
         travel_buffer_min: int = DEFAULT_TRAVEL_BUFFER_MIN,
         travel_buffer_max: int = DEFAULT_TRAVEL_BUFFER_MAX,
+        require_goong_edges: bool = False,
+        budget_per_person: float = 0.0,
+        adult_count: int = 1,
+        child_count: int = 0,
+        travel_vehicle: str = "car",
+        trip_start_date: Optional[str] = None,
     ):
         if num_days < 1:
             raise ValueError("num_days must be >= 1.")
+        self.num_days = num_days
         total_candidates = max(1, len(places))
         for rank, place in enumerate(places):
-            place.candidate_rank = rank
-            place.candidate_total = total_candidates
+            if place.candidate_total <= 1 and total_candidates > 1:
+                place.candidate_rank = rank
+                place.candidate_total = total_candidates
+            else:
+                place.candidate_rank = min(max(place.candidate_rank, 0), max(0, place.candidate_total - 1))
+                place.candidate_total = max(1, place.candidate_total)
         hotels = [p for p in places if p.place_type == "hotel"]
         if not hotels:
             raise ValueError("No hotels found in places list.")
+        self.adult_count = max(1, int(adult_count or 1))
+        self.child_count = max(0, int(child_count or 0))
+        self.full_people = self.adult_count + self.child_count
+        self.adult_equivalent = self.adult_count + self.child_count * CHILD_COST_FACTOR
+        self.rooms = max(1, math.ceil(self.full_people / ROOM_CAPACITY))
+        self.budget_per_person = max(0.0, float(budget_per_person or 0))
+        self.trip_budget = self.budget_per_person * self.full_people
         if selected_hotel_id is not None:
             hotel_place = next((p for p in hotels if p.id == selected_hotel_id), None)
             if hotel_place is None:
                 raise ValueError(f"Hotel '{selected_hotel_id}' not found in places list.")
         else:
-            hotel_place = random.choice(hotels)
+            hotel_place = self._select_hotel(hotels)
 
         self.hotel = hotel_place.to_hotel()
-        self.num_days = num_days
         self.travel_times = travel_times
         self.travel_distances = travel_distances or {}
         self.travel_sources = travel_sources or {}
@@ -1604,14 +1963,49 @@ class MultiDayTripPlanner:
         self.travel_buffer_percent = travel_buffer_percent
         self.travel_buffer_min = travel_buffer_min
         self.travel_buffer_max = travel_buffer_max
+        self.require_goong_edges = require_goong_edges
+        self.travel_vehicle = travel_vehicle if travel_vehicle in TRANSPORT_COST_PER_KM else "car"
+        try:
+            self.start_date = (
+                datetime.date.fromisoformat(trip_start_date)
+                if trip_start_date
+                else datetime.date.today()
+            )
+        except ValueError:
+            self.start_date = datetime.date.today()
         self.hotel_place = hotel_place
+        self.hotel_total_cost = self._hotel_total_cost(hotel_place)
+        residual_budget = max(0.0, self.trip_budget - self.hotel_total_cost)
+        self.daily_budget = residual_budget / self.num_days if self.num_days > 0 else 0.0
 
         self.attractions: List[Place] = [
             p for p in places if p.place_type in {"attraction", "cafe", "entertainment"}
         ]
         self.restaurants: List[Place] = [p for p in places if p.place_type == "restaurant"]
         self.pois: List[POI] = [p.to_poi() for p in self.attractions + self.restaurants]
-        self.day_pool = self._preallocate_days()
+        self.target_pois_per_day = self._target_pois_per_day()
+        self.target_nonmeal_per_day = max(1, self.target_pois_per_day - 1)
+        self.assignment_result = self._preallocate_days()
+        self.day_pool = self.assignment_result.day_pools
+
+    def _hotel_total_cost(self, hotel: Place) -> float:
+        nightly = hotel.estimated_cost if hotel.estimated_cost > 0 else FALLBACK_HOTEL_COST_PER_NIGHT
+        nights = max(1, self.num_days - 1)
+        return nightly * nights * self.rooms
+
+    def _select_hotel(self, hotels: List[Place]) -> Place:
+        if not hotels:
+            raise ValueError("No hotels found in places list.")
+        if self.trip_budget <= 0:
+            return min(hotels, key=lambda hotel: hotel.candidate_rank)
+        target_hotel_budget = self.trip_budget * 0.40
+        return min(
+            hotels,
+            key=lambda hotel: (
+                max(0.0, self._hotel_total_cost(hotel) - target_hotel_budget) / BUDGET_OVERAGE_UNIT_VND,
+                hotel.candidate_rank,
+            ),
+        )
 
     def _new_day_pool(self) -> List[dict]:
         return [
@@ -1643,38 +2037,148 @@ class MultiDayTripPlanner:
         diff = abs(self._angle_from_hotel(place) - center)
         return min(diff, 2 * math.pi - diff)
 
+    def _distance_from_hotel(self, place: Place) -> float:
+        return math.hypot(
+            place.latitude - self.hotel_place.latitude,
+            place.longitude - self.hotel_place.longitude,
+        )
+
+    def _estimated_place_load(self, place: Place) -> int:
+        hotel_travel = self.travel_times.get((self.hotel.id, place.id), 20)
+        # This load is only for pre-allocation, not final scheduling.
+        # Final route still uses the full Goong matrix and DB visit_duration.
+        local_travel_allowance = min(60, max(15, round(hotel_travel * 0.65)))
+        return max(30, place.visit_duration) + local_travel_allowance
+
+    def _target_pois_per_day(self) -> int:
+        available_minutes = max(0, self.day_end_time - self.day_start_time)
+        time_target = max(
+            POI_TARGET_MIN_PER_DAY,
+            math.floor(available_minutes / POI_TARGET_TIME_SLICE_MINUTES),
+        )
+        time_target = min(POI_TARGET_MAX_PER_DAY, time_target)
+        candidate_avg = math.ceil(
+            (len(self.attractions) + len(self.restaurants)) / max(1, self.num_days)
+        )
+        if candidate_avg <= 0:
+            return POI_TARGET_MIN_PER_DAY
+        return max(1, min(time_target, candidate_avg))
+
+    def _balanced_count_targets(self, total_count: int) -> List[int]:
+        if self.num_days <= 0:
+            return []
+        base = total_count // self.num_days
+        remainder = total_count % self.num_days
+        return [base + (1 if idx < remainder else 0) for idx in range(self.num_days)]
+
+    def _assign_balanced_sweep(self, day_pool: List[dict], places: List[Place]) -> None:
+        if not places:
+            return
+        ordered = sorted(
+            places,
+            key=lambda place: (
+                self._angle_from_hotel(place),
+                self._distance_from_hotel(place),
+                place.candidate_rank,
+            ),
+        )
+        count_targets = self._balanced_count_targets(len(ordered))
+        total_load = sum(self._estimated_place_load(place) for place in ordered)
+        target_load = total_load / max(1, self.num_days)
+        cursor = 0
+
+        for day_idx in range(self.num_days):
+            remaining_days = self.num_days - day_idx
+            remaining_places = len(ordered) - cursor
+            if remaining_places <= 0:
+                break
+
+            target_count = count_targets[day_idx]
+            if target_count <= 0:
+                continue
+
+            min_left_for_rest = sum(count_targets[day_idx + 1 :])
+            day_load = 0
+            while cursor < len(ordered):
+                places_left_after_take = len(ordered) - cursor - 1
+                current_count = len(day_pool[day_idx]["attractions"])
+                if current_count >= target_count and places_left_after_take >= min_left_for_rest:
+                    if day_load >= target_load * 0.85 or remaining_days > 1:
+                        break
+
+                place = ordered[cursor]
+                cursor += 1
+                day_pool[day_idx]["attractions"].append(place)
+                day_load += self._estimated_place_load(place)
+
+        # Any rounding leftovers go to the currently lightest adjacent day pool.
+        while cursor < len(ordered):
+            place = ordered[cursor]
+            cursor += 1
+            target_idx = min(
+                range(self.num_days),
+                key=lambda idx: (
+                    len(day_pool[idx]["attractions"]),
+                    sum(self._estimated_place_load(p) for p in day_pool[idx]["attractions"]),
+                ),
+            )
+            day_pool[target_idx]["attractions"].append(place)
+
+    def _preallocate_non_meal_places(self, day_pool: List[dict]) -> None:
+        if not self.attractions:
+            return
+
+        # Role-aware hotel-centered sweep:
+        # Each role is geographically swept and balanced separately. This keeps
+        # every day supplied with visitable attraction/cafe/entertainment options
+        # instead of accidentally giving one day mostly cafes or mostly closed POIs.
+        for role in ("attraction", "cafe", "entertainment"):
+            self._assign_balanced_sweep(
+                day_pool,
+                [place for place in self.attractions if place.place_type == role],
+            )
+
     def _rebalance_empty_days(self, day_pool: List[dict]) -> None:
         if len(self.attractions) < self.num_days:
             return
         for idx, pool in enumerate(day_pool):
-            if pool["attractions"]:
-                continue
-            donors = [
-                donor_idx
-                for donor_idx, donor in enumerate(day_pool)
-                if len(donor["attractions"]) > 1
-            ]
-            if not donors:
-                continue
-            donor_idx = min(
-                donors,
-                key=lambda donor_idx: (
-                    -len(day_pool[donor_idx]["attractions"]),
-                    min(
-                        abs(idx - donor_idx),
-                        self.num_days - abs(idx - donor_idx),
+            while len(pool["attractions"]) < self.target_nonmeal_per_day:
+                donors = [
+                    donor_idx
+                    for donor_idx, donor in enumerate(day_pool)
+                    if len(donor["attractions"]) > self.target_nonmeal_per_day
+                ]
+                if not donors:
+                    donors = [
+                        donor_idx
+                        for donor_idx, donor in enumerate(day_pool)
+                        if len(donor["attractions"]) > 1
+                    ]
+                if not donors:
+                    break
+                donor_idx = min(
+                    donors,
+                    key=lambda donor_idx: (
+                        -len(day_pool[donor_idx]["attractions"]),
+                        min(
+                            abs(idx - donor_idx),
+                            self.num_days - abs(idx - donor_idx),
+                        ),
                     ),
-                ),
-            )
-            donor = day_pool[donor_idx]["attractions"]
-            moved = min(donor, key=lambda p: self._sector_distance(p, idx))
-            donor.remove(moved)
-            pool["attractions"].append(moved)
+                )
+                donor = day_pool[donor_idx]["attractions"]
+                moved = min(donor, key=lambda p: self._sector_distance(p, idx))
+                donor.remove(moved)
+                pool["attractions"].append(moved)
 
     def _load_balance_attractions(self, day_pool: List[dict]) -> None:
         if not self.attractions or self.num_days <= 1:
             return
-        target_max = max(1, math.ceil(len(self.attractions) / self.num_days * 1.5))
+        avg_per_day = len(self.attractions) / self.num_days
+        target_max = max(
+            self.target_nonmeal_per_day + 2,
+            math.ceil(avg_per_day * 1.2),
+        )
         changed = True
         guard = 0
         while changed and guard < len(self.attractions) * 2:
@@ -1696,19 +2200,19 @@ class MultiDayTripPlanner:
                 day_pool[target_idx]["attractions"].append(moved)
                 changed = True
 
-    def _preallocate_days(self) -> List[dict]:
-        day_pool = self._new_day_pool()
-
-        for idx, restaurant in enumerate(self.restaurants):
-            day_pool[idx % self.num_days]["restaurants"].append(restaurant)
-
-        for attraction in self.attractions:
-            day_pool[self._sector_index(attraction)]["attractions"].append(attraction)
-
-        self._rebalance_empty_days(day_pool)
-        self._load_balance_attractions(day_pool)
-        self._rebalance_empty_days(day_pool)
-        return day_pool
+    def _preallocate_days(self) -> AssignmentResult:
+        assignment = AssignmentModule(
+            AssignmentConfig(
+                num_days=self.num_days,
+                daily_start_time=self.day_start_time,
+                daily_end_time=self.day_end_time,
+                trip_intent="",
+                hotel=self.hotel_place,
+                target_nonmeal_per_day=self.target_nonmeal_per_day,
+            ),
+            self.travel_times,
+        )
+        return assignment.assign(self.attractions + self.restaurants)
 
     def _empty_day_result(self) -> GAResult:
         return GAResult(
@@ -1724,6 +2228,13 @@ class MultiDayTripPlanner:
             total_hard_violations=0,
             meal_violations=0,
             restaurant_count=0,
+            total_activity_cost=0.0,
+            total_transport_cost=0.0,
+            total_day_cost=0.0,
+            budget_limit=self.daily_budget,
+            budget_overage=0.0,
+            budget_penalty=0.0,
+            skipped_count=0,
             idle_time=max(0, self.day_end_time - self.day_start_time),
             generation_found=0,
             generations_run=0,
@@ -1737,7 +2248,7 @@ class MultiDayTripPlanner:
             raise ValueError("No POIs provided.")
 
         day_results: List[DayResult] = []
-        start_day_idx = datetime.date.today().weekday()
+        start_day_idx = self.start_date.weekday()
         for day_idx in range(self.num_days):
             pool = self.day_pool[day_idx]
             daily_places: List[Place] = [
@@ -1773,6 +2284,10 @@ class MultiDayTripPlanner:
                 travel_buffer_percent=self.travel_buffer_percent,
                 travel_buffer_min=self.travel_buffer_min,
                 travel_buffer_max=self.travel_buffer_max,
+                require_goong_edges=self.require_goong_edges,
+                day_budget=self.daily_budget,
+                adult_equivalent=self.adult_equivalent,
+                travel_vehicle=self.travel_vehicle,
             )
             day_seed = None if seed is None else seed + day_idx
             result = ga.run(seed=day_seed)
@@ -1786,7 +2301,12 @@ class MultiDayTripPlanner:
                 result.stopped_reason = f"{result.stopped_reason}|no_fit_daily_ga"
             day_results.append(DayResult(day=day_idx + 1, pois=day_pois, ga_result=result))
 
-        return MultiDayResult(hotel=self.hotel, num_days=self.num_days, days=day_results)
+        return MultiDayResult(
+            hotel=self.hotel,
+            num_days=self.num_days,
+            days=day_results,
+            assignment_result=self.assignment_result,
+        )
 
 
 def debug_objective_breakdown(day_result: DayResult) -> None:

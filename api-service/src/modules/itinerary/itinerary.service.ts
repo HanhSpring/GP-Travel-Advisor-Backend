@@ -22,6 +22,7 @@ interface ScheduleEntry {
   service_start_time: string;
   departure_time: string;
   active_duration_minutes: number;
+  estimated_cost?: number;
   travel_minutes: number;
   distance_km: number;
   is_return_to_hotel: boolean;
@@ -127,6 +128,7 @@ export class ItineraryService {
           arrival_time: entry.arrival_time,
           departure_time: entry.departure_time,
           duration_minutes: entry.active_duration_minutes,
+          estimated_cost: entry.estimated_cost ?? 0,
           sequence_order: index + 1,
           is_locked: false,
         }));
@@ -1113,6 +1115,7 @@ export class ItineraryService {
           transport_info: transitInfo,
           title: place?.name || 'Điểm tham quan',
           locationName: place?.name || 'Điểm tham quan',
+          estimatedCost: act.estimated_cost || 0,
           price: act.estimated_cost || 0,
           currency: 'VNĐ',
           isFree: !act.estimated_cost,

@@ -21,6 +21,15 @@ class ItineraryPlaceInput(BaseModel):
     open_hour_compressed: str | None = None
     visit_duration: int | None = None
     average_rating: float | None = None
+    retrieval_score: float | None = None
+    candidate_rank: int | None = None
+    candidate_total: int | None = None
+    estimated_cost: float | None = None
+    price_min: float | None = None
+    price_max: float | None = None
+    price_basis: str | None = None
+    price_inferred: bool | None = None
+    planner_source: str | None = None
 
 
 class ItineraryPlanRequest(BaseModel):
@@ -28,11 +37,16 @@ class ItineraryPlanRequest(BaseModel):
     num_days: int = Field(..., ge=1)
     daily_start_time: str = Field(default="08:00", pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$")
     daily_end_time: str = Field(default="21:00", pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$")
+    trip_start_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
+    adult_count: int = Field(default=1, ge=1)
+    child_count: int = Field(default=0, ge=0)
+    budget_per_person: float = Field(default=0, ge=0)
     selected_hotel_id: str | None = None
     return_to_hotel: bool = False
     use_goong: bool = False
+    require_goong: bool = False
     goong_api_key: str = ""
-    travel_vehicle: str = Field(default="car", pattern=r"^(car|bike|taxi|truck)$")
+    travel_vehicle: str = Field(default="car", pattern=r"^(car|bike)$")
     travel_cache_path: str | None = None
     speed_kmh: float = 30.0
     population_size: int = Field(default=50, ge=2)
@@ -122,7 +136,11 @@ class ScheduleEntryResponse(BaseModel):
     service_start_time: str
     departure_time: str
     wait_minutes: int
+    base_duration_minutes: int = 0
     active_duration_minutes: int
+    estimated_cost: float = 0
+    price_basis: str | None = None
+    price_inferred: bool | None = None
     place_type: str = "attraction"
     is_restaurant: bool
     unknown_hours: bool
@@ -132,10 +150,20 @@ class ScheduleEntryResponse(BaseModel):
 class ItineraryDayResponse(BaseModel):
     day: int
     visited_count: int
+    target_visited_count: int = 4
     total_travel_minutes: int
     total_distance_km: float
     total_visit_minutes: int
     total_wait_minutes: int
+    total_activity_cost: float = 0
+    total_transport_cost: float = 0
+    total_day_cost: float = 0
+    budget_limit: float = 0
+    budget_overage: float = 0
+    budget_penalty: float = 0
+    skipped_count: int = 0
+    total_hard_violations: int = 0
+    meal_violations: int = 0
     restaurant_count: int
     fitness: float
     stopped_reason: str
@@ -151,4 +179,9 @@ class ItineraryPlanResponse(BaseModel):
     total_ms: int = 0
     matrix_ms: int = 0
     ga_ms: int = 0
+    assignment_day_loads: list[int] = Field(default_factory=list)
+    assignment_warnings: list[str] = Field(default_factory=list)
+    validation_is_feasible: bool = True
+    validation_violations: list[dict] = Field(default_factory=list)
+    validation_warnings: list[str] = Field(default_factory=list)
     days: list[ItineraryDayResponse]

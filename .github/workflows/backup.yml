@@ -1,0 +1,46 @@
+name: Database Manual & Daily Backup
+
+on:
+  push:
+    branches:
+      - main  # Chạy mỗi khi bạn push code mới lên main
+  schedule:
+    - cron: '0 0 * * *' # Tự động chạy lúc 12h đêm hàng ngày
+  workflow_dispatch: # QUAN TRỌNG: Dòng này tạo nút "Run workflow" để bạn bấm chạy thử ngay lập tức
+
+jobs:
+  supabase_backup:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v3
+
+      - name: Install Postgres Client
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y postgresql-client
+
+      - name: Create Backup Folder
+        run: mkdir -p backups
+
+      - name: Execute pg_dump
+        env:
+          # Lấy chuỗi kết nối từ GitHub Secrets mà bạn đã thiết lập
+          DATABASE_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          FILENAME="backups/backup_$(date +'%Y-%m-%d_%H-%M-%S').sql"
+          # Backup toàn bộ database để đảm bảo an toàn tuyệt đối
+          pg_dump "$DATABASE_URL" > "$FILENAME"
+          echo "BACKUP_FILE=$FILENAME" >> $GITHUB_ENV
+
+      - name: Commit and Push Backup File
+        run: |
+          git config --local user.email "github-actions[bot]@users.noreply.github.com"
+          git config --local user.name "github-actions[bot]"
+          # Tạo hoặc chuyển sang nhánh database-backups
+          git checkout -b database-backups || git checkout database-backups
+          git add backups/
+          git commit -m "Auto-backup: ${{ env.BACKUP_FILE }}" || echo "No changes to commit"
+          # Push thẳng lên nhánh database-backups
+          git push origin database-backups

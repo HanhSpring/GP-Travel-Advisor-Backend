@@ -6,7 +6,7 @@ from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
 from openpyxl.utils import get_column_letter
 
 # Paths
-DOCS_DIR = r"C:\Users\PC\Documents\QNHU\US\TN\Project\GP-Travel-Advisor-Backend\docs"
+DOCS_DIR = r"C:\Users\PC\Documents\QNHU\US\TN\Project\GP-Travel-Advisor-Backend\docs\price_reports"
 MD_PATH = os.path.join(DOCS_DIR, "missing_prices_report.md")
 EXCEL_PATH = os.path.join(DOCS_DIR, "missing_prices_report.xlsx")
 CSV_SLOT_TYPE_PATH = os.path.join(DOCS_DIR, "missing_prices_by_slot_type.csv")

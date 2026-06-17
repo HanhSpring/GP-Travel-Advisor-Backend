@@ -31,13 +31,27 @@ export interface ItineraryPlanPayload {
     open_hour_compressed?: string | null;
     visit_duration?: number | null;
     average_rating?: number | null;
+    retrieval_score?: number | null;
+    candidate_rank?: number | null;
+    candidate_total?: number | null;
+    estimated_cost?: number | null;
+    price_min?: number | null;
+    price_max?: number | null;
+    price_basis?: string | null;
+    price_inferred?: boolean | null;
+    planner_source?: string | null;
   }>;
   num_days: number;
   daily_start_time: string;
   daily_end_time: string;
+  trip_start_date?: string | null;
+  adult_count?: number;
+  child_count?: number;
+  budget_per_person?: number;
   selected_hotel_id?: string | null;
   return_to_hotel?: boolean;
   use_goong?: boolean;
+  require_goong?: boolean;
   travel_vehicle?: string;
   population_size?: number;
   generations?: number;
@@ -64,7 +78,12 @@ export class MlClientService {
     const url = `${this.aiServiceUrl}/recommend/encode-query`;
     try {
       const response: { data: { embedding: number[]; dim: number } } = await firstValueFrom(
-        this.http.post<{ embedding: number[]; dim: number }>(url, payload),
+        this.http.post<{ embedding: number[]; dim: number }>(url, payload, {
+          timeout: 120_000,
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+          headers: { Connection: 'close' },
+        }),
       );
       return response.data.embedding;
     } catch (error) {
@@ -78,7 +97,12 @@ export class MlClientService {
     const url = `${this.aiServiceUrl}/itinerary/plan`;
     try {
       const response: { data: unknown } = await firstValueFrom(
-        this.http.post<unknown>(url, payload),
+        this.http.post<unknown>(url, payload, {
+          timeout: 300_000,
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+          headers: { Connection: 'close' },
+        }),
       );
       return response.data;
     } catch (error) {

@@ -53,6 +53,24 @@ class ItineraryActivityDto {
   priceLabel: string;
 
   @ApiProperty({
+    example: 120000,
+    description: 'Chi phí ước tính dạng số (VNĐ)',
+  })
+  estimatedCost: number;
+
+  @ApiProperty({
+    example: 120000,
+    description: 'Alias cho estimatedCost để mobile UI hiển thị giá',
+  })
+  price: number;
+
+  @ApiProperty({
+    example: false,
+    description: 'Địa điểm miễn phí hay không',
+  })
+  isFree: boolean;
+
+  @ApiProperty({
     example: ['Vé vào cổng'],
     description: 'Các tag thông tin thêm',
     isArray: true,

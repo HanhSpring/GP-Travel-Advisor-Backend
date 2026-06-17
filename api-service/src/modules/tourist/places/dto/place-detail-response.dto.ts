@@ -102,4 +102,10 @@ export class PlaceDetailResponseDto {
 
   @ApiProperty({ type: [RelatedPlaceDto] })
   related_places: RelatedPlaceDto[];
+
+  @ApiProperty({ required: false, nullable: true })
+  latitude?: number | null;
+
+  @ApiProperty({ required: false, nullable: true })
+  longitude?: number | null;
 }

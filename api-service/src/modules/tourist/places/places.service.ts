@@ -21,6 +21,12 @@ interface PlaceRow {
   is_approved: boolean;
   is_active: boolean;
   image_url: unknown;
+  place_tags: Array<{
+    tag_id: string;
+    tags: { name: string | null } | { name: string | null }[] | null;
+  }> | null;
+  latitude: number | null;
+  longitude: number | null;
   vibes: string | string[] | null;
   type_id: string | null;
   types: {
@@ -286,6 +292,8 @@ export class PlacesService {
         breakdown,
         list: reviewList,
       },
+      latitude: place.latitude,
+      longitude: place.longitude,
       related_places: relatedPlaces,
     };
   }
