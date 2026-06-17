@@ -16,6 +16,9 @@ import {
 import { defaultImageUrl, getDays, toParticipantCount, toImageList } from './explore.utils';
 
 @Injectable()
+/**
+ * Service responsible for interacting with the AI model to generate and process itineraries.
+ */
 export class ExploreItineraryService {
   constructor(private readonly cacheService: ExploreCacheService) {}
 
