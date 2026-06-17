@@ -1,4 +1,5 @@
 import * as dotenv from 'dotenv';
+process.env.DOTENV_QUIET = 'true';
 dotenv.config();
 
 export const AppConfig = {
