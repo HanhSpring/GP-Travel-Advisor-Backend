@@ -1,3 +1,4 @@
+import { AppConfig } from '../../../config/app.config';
 import {
   Injectable,
   InternalServerErrorException,
@@ -17,7 +18,7 @@ export class AdminAlgorithmPipelineService {
   private readonly aiServiceUrl: string;
 
   constructor(private readonly httpService: HttpService) {
-    this.aiServiceUrl = process.env.AI_SERVICE_URL || 'http://127.0.0.1:8000';
+    this.aiServiceUrl = AppConfig.AI_SERVICE_URL;
   }
 
   async runPipeline(dto: PipelineRunRequestDto): Promise<PipelineRunResponseDto> {

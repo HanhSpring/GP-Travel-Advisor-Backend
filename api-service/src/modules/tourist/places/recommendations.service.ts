@@ -1,3 +1,4 @@
+import { AppConfig } from '../../../config/app.config';
 import { Injectable, Logger } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
@@ -30,8 +31,8 @@ interface RecommendationsResponse {
 export class RecommendationsService {
   private readonly logger = new Logger(RecommendationsService.name);
   private readonly baseUrl =
-    process.env.AI_SERVICE_URL || 'http://127.0.0.1:8000';
-  private readonly timeoutMs = Number(process.env.AI_SERVICE_TIMEOUT_MS || 2500);
+    AppConfig.AI_SERVICE_URL;
+  private readonly timeoutMs = AppConfig.AI_SERVICE_TIMEOUT_MS;
 
   constructor(private readonly http: HttpService) {}
 

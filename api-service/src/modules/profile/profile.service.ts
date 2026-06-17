@@ -1,4 +1,5 @@
 // src/profile/profile.service.ts
+import { AppConfig } from '../../config/app.config';
 import {
   Injectable,
   NotFoundException,
@@ -9,8 +10,8 @@ import { TouristProfileDto } from './dto/tourist-profile.dto';
 
 @Injectable()
 export class ProfileService {
-  private supabaseUrl = process.env.SUPABASE_URL || '';
-  private supabaseAnonKey = process.env.SUPABASE_KEY || '';
+  private supabaseUrl = AppConfig.SUPABASE_URL;
+  private supabaseAnonKey = AppConfig.SUPABASE_KEY;
 
   // Hàm helper tạo client dựa trên token của user gửi lên
   private getSupabaseUserClient(accessToken: string) {

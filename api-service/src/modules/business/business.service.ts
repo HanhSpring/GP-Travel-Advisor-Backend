@@ -1,3 +1,4 @@
+import { AppConfig } from '../../config/app.config';
 import {
   Injectable,
   NotFoundException,
@@ -13,8 +14,8 @@ import { GetOrdersDto } from './dto/get-orders.dto';
 
 @Injectable()
 export class BusinessService {
-  private supabaseUrl = process.env.SUPABASE_URL || '';
-  private supabaseAnonKey = process.env.SUPABASE_KEY || '';
+  private supabaseUrl = AppConfig.SUPABASE_URL;
+  private supabaseAnonKey = AppConfig.SUPABASE_KEY;
 
   async getVendorPlaces(vendorId: string) {
     const { data, error } = await supabase
@@ -299,8 +300,8 @@ export class BusinessService {
     updateDto: BusinessProfileDto,
   ) {
     const userClient = this.getSupabaseUserClient(accessToken);
-    const supabaseUrl = process.env.SUPABASE_URL as string;
-    const supabaseKey = process.env.SUPABASE_KEY as string;
+    const supabaseUrl = AppConfig.SUPABASE_URL;
+    const supabaseKey = AppConfig.SUPABASE_KEY;
 
     const isChangingPassword = updateDto.oldPassword && updateDto.newPassword;
     const isMissingOnePassword =

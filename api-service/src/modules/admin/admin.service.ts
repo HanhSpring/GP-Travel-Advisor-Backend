@@ -1,3 +1,4 @@
+import { AppConfig } from '../../config/app.config';
 import {
   Injectable,
   InternalServerErrorException,
@@ -17,8 +18,8 @@ import { CreateUserByAdminDto } from './dto/create-user-by-admin.dto';
 export class AdminService {
   private supabase: SupabaseClient;
   constructor() {
-    const supabaseUrl = process.env.SUPABASE_URL;
-    const supabaseKey = process.env.SUPABASE_KEY;
+    const supabaseUrl = AppConfig.SUPABASE_URL;
+    const supabaseKey = AppConfig.SUPABASE_KEY;
     if (!supabaseUrl || !supabaseKey) {
       throw new Error('Missing Supabase URL or Anon Key');
     }
@@ -73,8 +74,8 @@ export class AdminService {
     else if (deleteStatus === UserDeleteStatus.UNDELETED) bitDeleteStatus = '0';
 
     const supabaseAdmin = createClient(
-      process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_KEY as string,
+      AppConfig.SUPABASE_URL,
+      AppConfig.SUPABASE_KEY,
     );
 
     const { data, error } = await supabaseAdmin.rpc('get_users_list', {
@@ -124,8 +125,8 @@ export class AdminService {
 
   async getUserDetail(id: string) {
     const supabaseAdmin = createClient(
-      process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_KEY as string,
+      AppConfig.SUPABASE_URL,
+      AppConfig.SUPABASE_KEY,
     );
 
     const { data, error } = await supabaseAdmin.rpc(
@@ -169,8 +170,8 @@ export class AdminService {
   }
   async updateUserStatus(id: string, newStatus: UserActiveStatus) {
     const supabaseAdmin = createClient(
-      process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_KEY as string,
+      AppConfig.SUPABASE_URL,
+      AppConfig.SUPABASE_KEY,
     );
     const bitStatus = newStatus === UserActiveStatus.ACTIVE ? '1' : '0';
 
@@ -198,8 +199,8 @@ export class AdminService {
     }
 
     const supabaseAdmin = createClient(
-      process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_KEY as string,
+      AppConfig.SUPABASE_URL,
+      AppConfig.SUPABASE_KEY,
     );
 
     const { data: deletedCount, error } = await supabaseAdmin.rpc(
@@ -233,8 +234,8 @@ export class AdminService {
   }
   async createUserByAdmin(createDto: CreateUserByAdminDto) {
     const supabaseAdmin = createClient(
-      process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_KEY as string,
+      AppConfig.SUPABASE_URL,
+      AppConfig.SUPABASE_KEY,
     );
 
     const { data, error } = await supabaseAdmin.auth.admin.createUser({
@@ -268,8 +269,8 @@ export class AdminService {
   }
   async getUserStats() {
     const supabaseAdmin = createClient(
-      process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_KEY as string,
+      AppConfig.SUPABASE_URL,
+      AppConfig.SUPABASE_KEY,
     );
 
     const { data, error } = await supabaseAdmin.rpc('get_user_statistics');

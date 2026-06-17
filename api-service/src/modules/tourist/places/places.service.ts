@@ -1,3 +1,4 @@
+import { AppConfig } from '../../../config/app.config';
 import {
   Injectable,
   InternalServerErrorException,
@@ -70,8 +71,7 @@ interface ReviewContentRow {
 @Injectable()
 export class PlacesService {
   private readonly defaultPlaceImageUrl =
-    process.env.DEFAULT_PLACE_IMAGE_URL ||
-    'https://placehold.co/1080x720?text=No+Image';
+    AppConfig.DEFAULT_PLACE_IMAGE_URL;
 
   private readonly emptyUsers: Array<{ id: string; full_name: string | null }> =
     [];

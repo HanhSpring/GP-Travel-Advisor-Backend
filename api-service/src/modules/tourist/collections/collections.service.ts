@@ -1,3 +1,4 @@
+import { AppConfig } from '../../../config/app.config';
 import {
   BadRequestException,
   Injectable,
@@ -56,8 +57,7 @@ interface ItineraryDetailPlaceRow {
 @Injectable()
 export class CollectionsService {
   private readonly defaultImageUrl =
-    process.env.DEFAULT_PLACE_IMAGE_URL ||
-    'https://placehold.co/1080x720?text=No+Image';
+    AppConfig.DEFAULT_PLACE_IMAGE_URL;
 
   private toParticipantCount(itinerary: ItineraryRow): number {
     const adults = itinerary.adult_count ?? 0;

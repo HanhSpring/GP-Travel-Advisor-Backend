@@ -4,7 +4,7 @@ import {
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
-import { EventEmitter2 } from '@nestjs/event-emitter';
+import { ItineraryTrackingQueryService } from './services/itinerary-tracking-query.service';
 import { randomUUID } from 'crypto';
 import { supabase } from '../../config/supabase';
 import { ACTIVITY_LOG_EVENT } from '../activity/activity.listener';
@@ -30,387 +30,18 @@ import {
   TrackingStatusQueryDto,
 } from './dto/tracking-query.dto';
 
-interface ItineraryRow {
-  id: string;
-  creator_id: string;
-  status: string | null;
-  start_date: string | null;
-  end_date: string | null;
-}
-
-interface DetailRow {
-  id: string;
-  itinerary_id: string;
-  place_id: string;
-  visit_date: string | null;
-  duration_minutes: number | null;
-  arrival_time: string | null;
-  sequence_order: number | null;
-}
-
-interface PlaceRow {
-  id: string;
-  name: string | null;
-  latitude: number | null;
-  longitude: number | null;
-  address: string | null;
-  visit_duration: number | null;
-}
-
-/** Bản ghi tracking.geofences (đã thêm place_id + radius_m so với bản gốc). */
-interface GeofenceRow {
-  id: string;
-  place_id: string | null;
-  name: string | null;
-  radius_m: number | null;
-  is_active: boolean | null;
-}
-
-/**
- * Bản ghi tracking.geofence_visits.
- * PK ghép (geofence_id, itinerary_detail_id). Các cột dwell/audit được thêm
- * qua migration để giữ nguyên logic dwell time của use case.
- */
-interface VisitRow {
-  geofence_id: string;
-  itinerary_detail_id: string;
-  itinerary_id: string | null;
-  tourist_id: string | null;
-  track_date: string | null;
-  status: VisitStatus;
-  recorded_at: string | null;
-  dwell_seconds: number;
-  dwell_threshold_seconds: number;
-  expected_duration_minutes: number | null;
-  entered_at: string | null;
-  exited_at: string | null;
-  enter_count: number;
-  checked_in_at: string | null;
-  last_event_type: string | null;
-  // geofence nhúng kèm khi select (PostgREST embedding cùng schema).
-  geofences?: GeofenceRow | null;
-}
-
-const VISIT_COLS =
-  'geofence_id, itinerary_detail_id, itinerary_id, tourist_id, track_date, status, recorded_at, dwell_seconds, dwell_threshold_seconds, expected_duration_minutes, entered_at, exited_at, enter_count, checked_in_at, last_event_type, geofences ( id, place_id, name, radius_m, is_active )';
+import { ItineraryRow, DetailRow, PlaceRow, GeofenceRow, VisitRow } from './itinerary-tracking.types';
 
 @Injectable()
 export class ItineraryTrackingService {
-  constructor(private readonly eventEmitter: EventEmitter2) {}
-
-  // ───────────────────────── Helpers ─────────────────────────
-
-  /** Ngày hiện tại theo giờ VN (YYYY-MM-DD). */
-  private todayVN(): string {
-    return new Date(Date.now() + 7 * 3600 * 1000).toISOString().slice(0, 10);
-  }
-
-  private resolveDate(date?: string): string {
-    return date && date.trim() ? date.trim() : this.todayVN();
-  }
-
-  /** Chuẩn hoá lỗi DB; nhắc chạy migration nếu thiếu bảng/cột tracking. */
-  private dbError(error: unknown, context: string): never {
-    const err = error as { code?: string; message?: string };
-    const msg = err?.message ?? String(error);
-    const missingSchema =
-      err?.code === 'PGRST205' ||
-      err?.code === '42P01' || // undefined_table
-      err?.code === '42703' || // undefined_column
-      ((/geofence|tracking/i.test(msg) || /column/i.test(msg)) &&
-        /(could not find|schema cache|does not exist)/i.test(msg));
-
-    if (missingSchema) {
-      throw new InternalServerErrorException(
-        'Schema/bảng/cột tracking chưa khớp. Hãy chạy migration ' +
-          'api-service/sql/2026_tracking_geofence.sql trong Supabase SQL Editor ' +
-          '(thêm place_id/radius_m cho tracking.geofences và các cột dwell cho ' +
-          'tracking.geofence_visits) rồi thử lại.',
-      );
-    }
-    throw new InternalServerErrorException(`[${context}] ${msg}`);
-  }
-
-  private statusFields(status: VisitStatus) {
-    return {
-      statusLabelVi: STATUS_LABEL_VI[status],
-      mapColor: STATUS_MAP_COLOR[status],
-      mapIcon: STATUS_MAP_ICON[status],
-    };
-  }
-
-  private async loadItinerary(
-    itineraryId: string,
-    touristId?: string,
-  ): Promise<ItineraryRow> {
-    const { data, error } = await supabase
-      .schema('travel')
-      .from('itineraries')
-      .select('id, creator_id, status, start_date, end_date')
-      .eq('id', itineraryId)
-      .maybeSingle<ItineraryRow>();
-
-    if (error) this.dbError(error, 'loadItinerary');
-    if (!data) throw new NotFoundException('Không tìm thấy lịch trình');
-    if (touristId && data.creator_id !== touristId) {
-      throw new NotFoundException('Lịch trình không thuộc về người dùng này');
-    }
-    return data;
-  }
-
-  private async loadDetailsByDay(
-    itineraryId: string,
-    date: string,
-  ): Promise<DetailRow[]> {
-    const { data, error } = await supabase
-      .schema('travel')
-      .from('itinerary_details')
-      .select(
-        'id, itinerary_id, place_id, visit_date, duration_minutes, arrival_time, sequence_order',
-      )
-      .eq('itinerary_id', itineraryId)
-      .eq('visit_date', date)
-      .order('sequence_order', { ascending: true })
-      .order('arrival_time', { ascending: true })
-      .returns<DetailRow[]>();
-
-    if (error) this.dbError(error, 'loadDetailsByDay');
-    return data ?? [];
-  }
-
-  private async loadPlacesMap(
-    placeIds: string[],
-  ): Promise<Map<string, PlaceRow>> {
-    const map = new Map<string, PlaceRow>();
-    if (placeIds.length === 0) return map;
-
-    const { data, error } = await supabase
-      .schema('travel')
-      .from('places')
-      .select('id, name, latitude, longitude, address, visit_duration')
-      .in('id', placeIds)
-      .returns<PlaceRow[]>();
-
-    if (error) this.dbError(error, 'loadPlaces');
-    for (const place of data ?? []) map.set(place.id, place);
-    return map;
-  }
-
-  /** Lấy các bản ghi ghé của một ngày (kèm geofence nhúng). */
-  private async loadVisitsByDay(
-    itineraryId: string,
-    trackDate: string,
-  ): Promise<VisitRow[]> {
-    const { data, error } = await supabase
-      .schema('tracking')
-      .from('geofence_visits')
-      .select(VISIT_COLS)
-      .eq('itinerary_id', itineraryId)
-      .eq('track_date', trackDate)
-      .order('recorded_at', { ascending: true })
-      .returns<VisitRow[]>();
-
-    if (error) this.dbError(error, 'loadVisitsByDay');
-    return data ?? [];
-  }
-
-  /**
-   * Tìm hoặc tạo geofence cho 1 place (1 place ↔ 1 geofence, gắn place_id).
-   * Polygon là vòng tròn xấp xỉ quanh toạ độ place.
-   */
-  private async ensureGeofenceForPlace(
-    place: PlaceRow,
-    radiusM: number,
-  ): Promise<GeofenceRow> {
-    const { data: existing, error: selErr } = await supabase
-      .schema('tracking')
-      .from('geofences')
-      .select('id, place_id, name, radius_m, is_active')
-      .eq('place_id', place.id)
-      .limit(1)
-      .returns<GeofenceRow[]>();
-    if (selErr) this.dbError(selErr, 'ensureGeofence.select');
-    if (existing && existing.length > 0) return existing[0];
-
-    const row: Record<string, unknown> = {
-      id: randomUUID(),
-      place_id: place.id,
-      name: place.name ?? 'Địa điểm',
-      radius_m: radiusM,
-      is_active: true,
-      created_at: new Date().toISOString(),
-    };
-    // Chỉ tạo polygon khi có toạ độ hợp lệ.
-    if (place.latitude != null && place.longitude != null) {
-      row.polygon = buildCirclePolygonEWKT(
-        Number(place.longitude),
-        Number(place.latitude),
-        radiusM,
-      );
-    }
-
-    const { data: inserted, error: insErr } = await supabase
-      .schema('tracking')
-      .from('geofences')
-      .insert(row)
-      .select('id, place_id, name, radius_m, is_active')
-      .single<GeofenceRow>();
-    if (insErr) this.dbError(insErr, 'ensureGeofence.insert');
-    return inserted!;
-  }
-
-  /** Tìm 1 visit theo itineraryDetailId, hoặc theo (itineraryId, placeId, date). */
-  private async resolveVisitRow(args: {
-    itineraryDetailId?: string;
-    itineraryId?: string;
-    placeId?: string;
-    date?: string;
-  }): Promise<VisitRow> {
-    let detailId = args.itineraryDetailId;
-
-    if (!detailId) {
-      if (!args.itineraryId || !args.placeId) {
-        throw new BadRequestException(
-          'Cần cung cấp itineraryDetailId, hoặc cả itineraryId + placeId',
-        );
-      }
-      const { data, error } = await supabase
-        .schema('travel')
-        .from('itinerary_details')
-        .select('id')
-        .eq('itinerary_id', args.itineraryId)
-        .eq('place_id', args.placeId)
-        .eq('visit_date', this.resolveDate(args.date))
-        .limit(1)
-        .returns<{ id: string }[]>();
-      if (error) this.dbError(error, 'resolveVisit.detail');
-      if (!data || data.length === 0) {
-        throw new NotFoundException(
-          'Không tìm thấy điểm dừng tương ứng trong lịch trình.',
-        );
-      }
-      detailId = data[0].id;
-    }
-
-    const { data, error } = await supabase
-      .schema('tracking')
-      .from('geofence_visits')
-      .select(VISIT_COLS)
-      .eq('itinerary_detail_id', detailId)
-      .limit(1)
-      .returns<VisitRow[]>();
-
-    if (error) this.dbError(error, 'resolveVisitRow');
-    if (!data || data.length === 0) {
-      throw new NotFoundException(
-        'Không tìm thấy bản ghi theo dõi. Hãy gọi /start cho ngày này trước.',
-      );
-    }
-    return data[0];
-  }
-
-  private async placeName(placeId: string): Promise<string> {
-    const { data } = await supabase
-      .schema('travel')
-      .from('places')
-      .select('name')
-      .eq('id', placeId)
-      .maybeSingle<{ name: string | null }>();
-    return data?.name ?? 'địa điểm';
-  }
-
-  /** Tạo thông báo push "Bạn đã đến ..." (không throw nếu lỗi). */
-  private async createVisitNotification(
-    touristId: string,
-    placeName: string,
-  ): Promise<string | null> {
-    const message = `Bạn đã đến ${placeName}`;
-    try {
-      const notificationId = randomUUID();
-      const nowIso = new Date().toISOString();
-
-      const { error: nErr } = await supabase
-        .schema('public')
-        .from('notifications')
-        .insert({
-          id: notificationId,
-          title: 'Check-in lịch trình',
-          content: message,
-          type: 'itinerary', // -> icon "map" ở màn hình thông báo
-          is_global: false,
-          created_at: nowIso,
-        });
-      if (nErr) throw nErr;
-
-      const { error: uErr } = await supabase
-        .schema('public')
-        .from('users_notifications')
-        .insert({
-          id: randomUUID(),
-          user_id: touristId,
-          notification_id: notificationId,
-          is_read: false,
-          sent_at: nowIso,
-        });
-      if (uErr) throw uErr;
-
-      return message;
-    } catch (e) {
-      console.warn(
-        '[ItineraryTracking] Tạo thông báo thất bại:',
-        (e as Error).message,
-      );
-      return null;
-    }
-  }
-
-  private nextDayInfo(nextDayDate: string | null) {
-    return {
-      nextDayDate,
-      nextDayAlarmAt: nextDayDate
-        ? vnTimestamp(nextDayDate, NEXT_DAY_ALARM_HOUR)
-        : null,
-    };
-  }
-
-  private async findNextDay(
-    itineraryId: string,
-    afterDate: string,
-  ): Promise<string | null> {
-    const { data, error } = await supabase
-      .schema('travel')
-      .from('itinerary_details')
-      .select('visit_date')
-      .eq('itinerary_id', itineraryId)
-      .gt('visit_date', afterDate)
-      .order('visit_date', { ascending: true })
-      .limit(1)
-      .returns<{ visit_date: string | null }[]>();
-
-    if (error) this.dbError(error, 'findNextDay');
-    return data && data.length ? (data[0].visit_date ?? null) : null;
-  }
-
-  private buildSummary(rows: VisitRow[]) {
-    const total = rows.length;
-    const visited = rows.filter((r) => r.status === 'visited').length;
-    const skipped = rows.filter((r) => r.status === 'skipped').length;
-    const pending = rows.filter((r) => r.status === 'not_visited').length;
-    return {
-      total,
-      visited,
-      pending,
-      skipped,
-      progressPercent: total > 0 ? Math.round((visited / total) * 100) : 0,
-    };
-  }
+  constructor(private readonly queryService: ItineraryTrackingQueryService) {}
 
   // ───────────────────────── Use case steps ─────────────────────────
 
   /** Bước 1-4: "Bắt đầu" — tạo geofence + visit cho các địa điểm của ngày. */
   async start(dto: StartTrackingDto) {
-    const date = this.resolveDate(dto.date);
-    const itinerary = await this.loadItinerary(dto.itineraryId, dto.touristId);
+    const date = this.queryService.resolveDate(dto.date);
+    const itinerary = await this.queryService.loadItinerary(dto.itineraryId, dto.touristId);
 
     // Đánh dấu lịch trình đang diễn ra + bật cờ tracking_active.
     if ((itinerary.status ?? '').toLowerCase() !== 'completed') {
@@ -419,13 +50,13 @@ export class ItineraryTrackingService {
         .from('itineraries')
         .update({ status: 'ongoing', tracking_active: true })
         .eq('id', dto.itineraryId);
-      if (error) this.dbError(error, 'start.updateStatus');
+      if (error) this.queryService.dbError(error, 'start.updateStatus');
     }
 
-    const details = await this.loadDetailsByDay(dto.itineraryId, date);
+    const details = await this.queryService.loadDetailsByDay(dto.itineraryId, date);
 
-    const { nextDayDate, nextDayAlarmAt } = this.nextDayInfo(
-      await this.findNextDay(dto.itineraryId, date),
+    const { nextDayDate, nextDayAlarmAt } = this.queryService.nextDayInfo(
+      await this.queryService.findNextDay(dto.itineraryId, date),
     );
     const dayEndAt = vnTimestamp(date, DAY_END_HOUR);
 
@@ -443,8 +74,8 @@ export class ItineraryTrackingService {
       };
     }
 
-    const placesMap = await this.loadPlacesMap(details.map((d) => d.place_id));
-    const existing = await this.loadVisitsByDay(dto.itineraryId, date);
+    const placesMap = await this.queryService.loadPlacesMap(details.map((d) => d.place_id));
+    const existing = await this.queryService.loadVisitsByDay(dto.itineraryId, date);
     const existingByDetail = new Map(
       existing.map((r) => [r.itinerary_detail_id, r]),
     );
@@ -479,7 +110,7 @@ export class ItineraryTrackingService {
         continue;
       }
 
-      const geofence = await this.ensureGeofenceForPlace(place, radius);
+      const geofence = await this.queryService.ensureGeofenceForPlace(place, radius);
       const existingRow = existingByDetail.get(detail.id);
 
       built.push({
@@ -519,7 +150,7 @@ export class ItineraryTrackingService {
           onConflict: 'geofence_id,itinerary_detail_id',
           ignoreDuplicates: true,
         });
-      if (error) this.dbError(error, 'start.insertVisits');
+      if (error) this.queryService.dbError(error, 'start.insertVisits');
     }
 
     const skippedNoCoordinates = details.length - built.length;
@@ -552,14 +183,14 @@ export class ItineraryTrackingService {
 
   /** Lấy danh sách geofence của 1 ngày (cho AlarmManager đăng ký lại). */
   async getGeofences(query: GeofencesQueryDto) {
-    const date = this.resolveDate(query.date);
-    await this.loadItinerary(query.itineraryId);
+    const date = this.queryService.resolveDate(query.date);
+    await this.queryService.loadItinerary(query.itineraryId);
 
-    const visits = await this.loadVisitsByDay(query.itineraryId, date);
+    const visits = await this.queryService.loadVisitsByDay(query.itineraryId, date);
     const radius = clampGeofenceRadius(query.radiusM);
 
-    const { nextDayDate, nextDayAlarmAt } = this.nextDayInfo(
-      await this.findNextDay(query.itineraryId, date),
+    const { nextDayDate, nextDayAlarmAt } = this.queryService.nextDayInfo(
+      await this.queryService.findNextDay(query.itineraryId, date),
     );
 
     // Đã /start: dựng từ visit. Chưa: dựng tạm từ lịch trình.
@@ -567,7 +198,7 @@ export class ItineraryTrackingService {
       const placeIds = visits
         .map((v) => v.geofences?.place_id)
         .filter((id): id is string => !!id);
-      const placesMap = await this.loadPlacesMap(placeIds);
+      const placesMap = await this.queryService.loadPlacesMap(placeIds);
 
       let skippedNoCoordinates = 0;
       const geofences = visits
@@ -608,8 +239,8 @@ export class ItineraryTrackingService {
       };
     }
 
-    const details = await this.loadDetailsByDay(query.itineraryId, date);
-    const placesMap = await this.loadPlacesMap(details.map((d) => d.place_id));
+    const details = await this.queryService.loadDetailsByDay(query.itineraryId, date);
+    const placesMap = await this.queryService.loadPlacesMap(details.map((d) => d.place_id));
 
     let skippedNoCoordinates = 0;
     const geofences = details
@@ -654,18 +285,18 @@ export class ItineraryTrackingService {
 
   /** Bước 5-6: nhận sự kiện geofence ENTER / DWELL / EXIT. */
   async handleEvent(dto: GeofenceEventDto) {
-    const row = await this.resolveVisitRow(dto);
+    const row = await this.queryService.resolveVisitRow(dto);
     if (row.tourist_id && row.tourist_id !== dto.touristId) {
       throw new BadRequestException('touristId không khớp với bản ghi theo dõi');
     }
 
     const occurredAt = dto.occurredAt ?? new Date().toISOString();
-    const name = await this.placeName(row.geofences?.place_id ?? '');
+    const name = await this.queryService.placeName(row.geofences?.place_id ?? '');
     const nowIso = new Date().toISOString();
 
     // Đã "Đã ghé" rồi -> idempotent, không xử lý lại.
     if (row.status === 'visited') {
-      return this.eventResponse(
+      return this.queryService.eventResponse(
         row,
         name,
         false,
@@ -684,8 +315,8 @@ export class ItineraryTrackingService {
       // Bước 5: ghi nhận thời gian vào + bắt đầu tính dwell.
       updates.entered_at = row.entered_at ?? occurredAt;
       updates.enter_count = row.enter_count + 1;
-      const updated = await this.applyUpdate(row, updates);
-      return this.eventResponse(
+      const updated = await this.queryService.applyUpdate(row, updates);
+      return this.queryService.eventResponse(
         updated,
         name,
         false,
@@ -718,13 +349,13 @@ export class ItineraryTrackingService {
       updates.status = 'visited';
       updates.checked_in_at = occurredAt;
       updates.recorded_at = occurredAt;
-      const updated = await this.applyUpdate(row, updates);
-      const notificationMessage = await this.createVisitNotification(
+      const updated = await this.queryService.applyUpdate(row, updates);
+      const notificationMessage = await this.queryService.createVisitNotification(
         dto.touristId,
         name,
       );
-      this.emitVisited(dto.touristId, row.geofences?.place_id ?? null);
-      return this.eventResponse(
+      this.queryService.emitVisited(dto.touristId, row.geofences?.place_id ?? null);
+      return this.queryService.eventResponse(
         updated,
         name,
         true,
@@ -735,8 +366,8 @@ export class ItineraryTrackingService {
     }
 
     // Bước phụ 6.1: dwell chưa đủ -> ghi log, giữ "Chưa ghé".
-    const updated = await this.applyUpdate(row, updates);
-    return this.eventResponse(
+    const updated = await this.queryService.applyUpdate(row, updates);
+    return this.queryService.eventResponse(
       updated,
       name,
       false,
@@ -748,14 +379,14 @@ export class ItineraryTrackingService {
 
   /** Đánh dấu "Đã ghé" thủ công (nút "Tôi đã đến đây"). */
   async checkIn(dto: CheckInDto) {
-    const row = await this.resolveVisitRow(dto);
+    const row = await this.queryService.resolveVisitRow(dto);
     if (row.tourist_id && row.tourist_id !== dto.touristId) {
       throw new BadRequestException('touristId không khớp với bản ghi theo dõi');
     }
-    const name = await this.placeName(row.geofences?.place_id ?? '');
+    const name = await this.queryService.placeName(row.geofences?.place_id ?? '');
 
     if (row.status === 'visited') {
-      return this.eventResponse(
+      return this.queryService.eventResponse(
         row,
         name,
         false,
@@ -766,7 +397,7 @@ export class ItineraryTrackingService {
     }
 
     const nowIso = new Date().toISOString();
-    const updated = await this.applyUpdate(row, {
+    const updated = await this.queryService.applyUpdate(row, {
       status: 'visited',
       checked_in_at: nowIso,
       recorded_at: nowIso,
@@ -776,13 +407,13 @@ export class ItineraryTrackingService {
       updated_at: nowIso,
     });
 
-    const notificationMessage = await this.createVisitNotification(
+    const notificationMessage = await this.queryService.createVisitNotification(
       dto.touristId,
       name,
     );
-    this.emitVisited(dto.touristId, row.geofences?.place_id ?? null);
+    this.queryService.emitVisited(dto.touristId, row.geofences?.place_id ?? null);
 
-    return this.eventResponse(
+    return this.queryService.eventResponse(
       updated,
       name,
       true,
@@ -794,19 +425,19 @@ export class ItineraryTrackingService {
 
   /** Bước map: trạng thái từng địa điểm + marker cho bản đồ. */
   async getStatus(query: TrackingStatusQueryDto) {
-    const date = this.resolveDate(query.date);
-    await this.loadItinerary(query.itineraryId);
-    const rows = await this.loadVisitsByDay(query.itineraryId, date);
+    const date = this.queryService.resolveDate(query.date);
+    await this.queryService.loadItinerary(query.itineraryId);
+    const rows = await this.queryService.loadVisitsByDay(query.itineraryId, date);
 
     const placeIds = rows
       .map((r) => r.geofences?.place_id)
       .filter((id): id is string => !!id);
-    const placesMap = await this.loadPlacesMap(placeIds);
+    const placesMap = await this.queryService.loadPlacesMap(placeIds);
 
     const places = rows.map((row) => {
       const placeId = row.geofences?.place_id ?? null;
       const place = placeId ? placesMap.get(placeId) : undefined;
-      const sf = this.statusFields(row.status);
+      const sf = this.queryService.statusFields(row.status);
       return {
         itineraryDetailId: row.itinerary_detail_id,
         geofenceId: row.geofence_id,
@@ -829,15 +460,15 @@ export class ItineraryTrackingService {
     return {
       itineraryId: query.itineraryId,
       date,
-      summary: this.buildSummary(rows),
+      summary: this.queryService.buildSummary(rows),
       places,
     };
   }
 
   /** Bước 8: kết thúc ngày — gỡ geofence, đánh dấu Bỏ qua, đặt lịch ngày kế. */
   async endDay(dto: EndDayDto) {
-    const date = this.resolveDate(dto.date);
-    const itinerary = await this.loadItinerary(dto.itineraryId);
+    const date = this.queryService.resolveDate(dto.date);
+    const itinerary = await this.queryService.loadItinerary(dto.itineraryId);
     const markSkipped = dto.markPendingAsSkipped !== false; // mặc định true
     const nowIso = new Date().toISOString();
 
@@ -849,11 +480,11 @@ export class ItineraryTrackingService {
         .eq('itinerary_id', dto.itineraryId)
         .eq('track_date', date)
         .eq('status', 'not_visited');
-      if (error) this.dbError(error, 'endDay.markSkipped');
+      if (error) this.queryService.dbError(error, 'endDay.markSkipped');
     }
 
-    const rows = await this.loadVisitsByDay(dto.itineraryId, date);
-    const nextDayDate = await this.findNextDay(dto.itineraryId, date);
+    const rows = await this.queryService.loadVisitsByDay(dto.itineraryId, date);
+    const nextDayDate = await this.queryService.findNextDay(dto.itineraryId, date);
 
     let itineraryStatus = (itinerary.status ?? 'ongoing').toLowerCase();
     const isExplicitStop = dto.markPendingAsSkipped === false;
@@ -865,7 +496,7 @@ export class ItineraryTrackingService {
         .from('itineraries')
         .update({ status: 'completed', tracking_active: false })
         .eq('id', dto.itineraryId);
-      if (error) this.dbError(error, 'endDay.complete');
+      if (error) this.queryService.dbError(error, 'endDay.complete');
       itineraryStatus = 'completed';
     } else if (isExplicitStop) {
       // User bấm Dừng → tắt tracking_active, giữ status = ongoing.
@@ -874,14 +505,14 @@ export class ItineraryTrackingService {
         .from('itineraries')
         .update({ tracking_active: false })
         .eq('id', dto.itineraryId);
-      if (error) this.dbError(error, 'endDay.stopTracking');
+      if (error) this.queryService.dbError(error, 'endDay.stopTracking');
       itineraryStatus = 'ongoing';
     } else {
       // Hết ngày (AlarmManager), sang ngày tiếp theo → tracking vẫn active.
       itineraryStatus = 'ongoing';
     }
 
-    const { nextDayAlarmAt } = this.nextDayInfo(nextDayDate);
+    const { nextDayAlarmAt } = this.queryService.nextDayInfo(nextDayDate);
 
     return {
       itineraryId: dto.itineraryId,
@@ -891,7 +522,7 @@ export class ItineraryTrackingService {
       removedPlaceIds: rows
         .map((r) => r.geofences?.place_id)
         .filter((id): id is string => !!id),
-      summary: this.buildSummary(rows),
+      summary: this.queryService.buildSummary(rows),
       nextDayDate,
       nextDayAlarmAt,
       itineraryStatus,
@@ -901,53 +532,4 @@ export class ItineraryTrackingService {
     };
   }
 
-  // ───────────────────────── Internal ─────────────────────────
-
-  private async applyUpdate(
-    row: VisitRow,
-    updates: Record<string, unknown>,
-  ): Promise<VisitRow> {
-    const { error } = await supabase
-      .schema('tracking')
-      .from('geofence_visits')
-      .update(updates)
-      .eq('geofence_id', row.geofence_id)
-      .eq('itinerary_detail_id', row.itinerary_detail_id);
-    if (error) this.dbError(error, 'applyUpdate');
-    return { ...row, ...(updates as Partial<VisitRow>) };
-  }
-
-  private emitVisited(touristId: string, placeId: string | null): void {
-    if (!placeId) return;
-    this.eventEmitter.emit(ACTIVITY_LOG_EVENT, {
-      tourist_id: touristId,
-      action_type: 'visited',
-      place_id: placeId,
-    });
-  }
-
-  private eventResponse(
-    row: VisitRow,
-    placeName: string,
-    statusChanged: boolean,
-    notificationCreated: boolean,
-    notificationMessage: string | null,
-    message: string,
-  ) {
-    return {
-      itineraryDetailId: row.itinerary_detail_id,
-      geofenceId: row.geofence_id,
-      placeId: row.geofences?.place_id ?? null,
-      placeName,
-      status: row.status,
-      statusLabelVi: STATUS_LABEL_VI[row.status],
-      statusChanged,
-      dwellSeconds: row.dwell_seconds,
-      dwellThresholdSeconds: row.dwell_threshold_seconds,
-      checkedInAt: row.checked_in_at,
-      notificationCreated,
-      notificationMessage,
-      message,
-    };
-  }
 }

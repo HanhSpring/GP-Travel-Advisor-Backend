@@ -1,3 +1,4 @@
+import { AppConfig } from '../../config/app.config';
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { supabase } from 'src/config/supabase';
 
@@ -16,8 +17,7 @@ export interface AutocompleteItem {
 @Injectable()
 export class SearchService {
   private readonly defaultPlaceImageUrl =
-    process.env.DEFAULT_PLACE_IMAGE_URL ||
-    'https://placehold.co/1080x720?text=No+Image';
+    AppConfig.DEFAULT_PLACE_IMAGE_URL;
 
   private asString(value: unknown): string {
     return typeof value === 'string' ? value : '';

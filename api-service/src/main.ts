@@ -1,3 +1,4 @@
+import { AppConfig } from './config/app.config';
 import 'dotenv/config';
 import { NestFactory } from '@nestjs/core';
 import { AppModule } from './app.module';
@@ -11,7 +12,7 @@ async function bootstrap() {
     logger: ['error', 'warn'],
   });
 
-  const corsOrigin = process.env.CORS_ORIGIN || 'http://localhost:5173';
+  const corsOrigin = AppConfig.CORS_ORIGIN;
   const allowedOrigins = corsOrigin
     .split(',')
     .map((origin) => origin.trim())
@@ -86,9 +87,9 @@ async function bootstrap() {
 
   SwaggerModule.setup('api-docs', app, document);
 
-  const host = process.env.API_SERVICE_HOST || '0.0.0.0';
-  const preferredPort = Number(process.env.API_SERVICE_PORT || 3000);
-  const maxPortAttempts = Number(process.env.API_SERVICE_PORT_RETRIES || 20); // Added max port attempts
+  const host = AppConfig.API_SERVICE_HOST;
+  const preferredPort = AppConfig.API_SERVICE_PORT;
+  const maxPortAttempts = AppConfig.API_SERVICE_PORT_RETRIES; // Added max port attempts
 
   for (let attempt = 0; attempt <= maxPortAttempts; attempt += 1) {
     const port = preferredPort + attempt;

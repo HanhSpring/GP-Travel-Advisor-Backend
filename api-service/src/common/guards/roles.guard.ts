@@ -1,3 +1,4 @@
+import { AppConfig } from '../../config/app.config';
 import {
   Injectable,
   CanActivate,
@@ -36,8 +37,8 @@ export class RolesGuard implements CanActivate {
     // 3. KẾT NỐI DATABASE ĐỂ KIỂM TRA THỜI GIAN THỰC (Real-time Security Check)
     // Việc này giúp xử lý lỗi thiếu Role ở Token Google và kiểm tra trạng thái Khóa/Xóa
     const supabaseAdmin = createClient(
-      process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_KEY as string,
+      AppConfig.SUPABASE_URL,
+      AppConfig.SUPABASE_KEY,
     );
 
     const { data: dbUser, error } = await supabaseAdmin

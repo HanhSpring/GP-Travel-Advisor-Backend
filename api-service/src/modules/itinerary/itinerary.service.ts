@@ -1,3 +1,4 @@
+import { AppConfig } from '../../config/app.config';
 import {
   Injectable,
   InternalServerErrorException,
@@ -13,7 +14,7 @@ import { AddActivityDto } from './dto/add-activity.dto';
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
 
 // ─── Địa chỉ FastAPI optimizer (đọc từ env hoặc dùng mặc định) ───
-const AI_SERVICE_URL = process.env.AI_SERVICE_URL ?? 'http://localhost:8000';
+const AI_SERVICE_URL = AppConfig.AI_SERVICE_URL;
 
 interface ScheduleEntry {
   location_id: string;

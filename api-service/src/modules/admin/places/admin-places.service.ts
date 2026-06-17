@@ -1,3 +1,4 @@
+import { AppConfig } from '../../../config/app.config';
 import {
   BadRequestException,
   Injectable,
@@ -95,7 +96,7 @@ export class AdminPlacesService {
   }
 
   private getSafeInFilterLimit(): number {
-    const parsed = Number(process.env.ADMIN_PLACES_MAX_IN_FILTER_IDS ?? '200');
+    const parsed = AppConfig.ADMIN_PLACES_MAX_IN_FILTER_IDS;
     if (!Number.isFinite(parsed) || parsed <= 0) {
       return 200;
     }

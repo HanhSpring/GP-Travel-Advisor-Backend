@@ -1,3 +1,4 @@
+import { AppConfig } from '../../config/app.config';
 import {
   Injectable,
   UnauthorizedException,
@@ -20,8 +21,8 @@ export class AuthService {
   private supabaseAdmin: SupabaseClient;
 
   constructor() {
-    const supabaseUrl = process.env.SUPABASE_URL?.trim();
-    const supabaseKey = process.env.SUPABASE_KEY?.trim();
+    const supabaseUrl = AppConfig.SUPABASE_URL.trim();
+    const supabaseKey = AppConfig.SUPABASE_KEY.trim();
 
     if (!supabaseUrl || !supabaseKey) {
       const missing: string[] = [];
@@ -52,8 +53,8 @@ export class AuthService {
   async updatePassword(updateDto: UpdatePasswordDto) {
     const { accessToken, newPassword } = updateDto;
 
-    const supabaseUrl = process.env.SUPABASE_URL?.trim();
-    const supabaseAnonKey = process.env.SUPABASE_KEY?.trim(); // Chỉ dùng chìa khóa khách bình thường
+    const supabaseUrl = AppConfig.SUPABASE_URL.trim();
+    const supabaseAnonKey = AppConfig.SUPABASE_KEY.trim(); // Chỉ dùng chìa khóa khách bình thường
 
     if (!supabaseUrl || !supabaseAnonKey) {
       throw new InternalServerErrorException(
