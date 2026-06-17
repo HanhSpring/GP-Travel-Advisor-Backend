@@ -57,7 +57,6 @@ export interface VisitRow {
   enter_count: number;
   checked_in_at: string | null;
   last_event_type: string | null;
-  // geofence nhúng kèm khi select (PostgREST embedding cùng schema).
   geofences?: GeofenceRow | null;
 }
 

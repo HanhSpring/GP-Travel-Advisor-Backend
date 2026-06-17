@@ -6,7 +6,7 @@ import {
   IsEnum,
   Matches,
 } from 'class-validator';
-import { UserRole } from './get-users-query.dto'; // Import lại Enum Role đã tạo lúc nãy
+import { UserRole } from './get-users-query.dto';
 
 export class UpdateUserByAdminDto {
   @ApiPropertyOptional({ example: 'Nguyen Admin', description: 'Họ và tên' })

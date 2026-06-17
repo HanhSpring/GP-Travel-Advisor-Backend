@@ -125,16 +125,13 @@ export class BusinessController {
   private parseFlexible(value: any) {
     if (!value) return [];
 
-    // 👉 nếu là array rồi
     if (Array.isArray(value)) return value;
 
-    // 👉 nếu là JSON string
     if (typeof value === 'string') {
       try {
         const parsed = JSON.parse(value);
         return Array.isArray(parsed) ? parsed : [parsed];
       } catch {
-        // 👉 nếu chỉ là string đơn (Restaurant)
         return [value];
       }
     }

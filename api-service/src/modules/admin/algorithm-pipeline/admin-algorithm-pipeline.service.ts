@@ -28,7 +28,7 @@ export class AdminAlgorithmPipelineService {
         this.httpService.post<PipelineRunResponseDto>(
           `${this.aiServiceUrl}/api/v1/review-pipeline/run`,
           dto,
-          { timeout: 600_000 }, // 10 phút — pipeline ML có thể chạy lâu
+          { timeout: 600_000 },
         ),
       );
       return response.data;

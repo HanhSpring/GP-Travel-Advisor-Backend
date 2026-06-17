@@ -6,7 +6,7 @@ import { AdminAlgorithmPipelineService } from './admin-algorithm-pipeline.servic
 @Module({
   imports: [
     HttpModule.register({
-      timeout: 600_000, // 10 phút — pipeline ML có thể chạy lâu
+      timeout: 600_000,
     }),
   ],
   controllers: [AdminAlgorithmPipelineController],

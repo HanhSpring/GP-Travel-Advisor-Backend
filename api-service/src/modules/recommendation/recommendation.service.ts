@@ -60,19 +60,16 @@ export class RecommendationService {
       runtimeConfig.maxTopK,
     );
 
-    // ── 1. City name + số ngày ────────────────────────────────────────────────
     const cityName = await this.getCityName(dto.destinationLocationId);
     const numDays = this.calcNumDays(dto.startDate, dto.endDate);
 
     // ── 2. Parse intents + resolve vibe ──────────────────────────────────────
     const selectedIntents = parseTripIntents(dto.tripIntent);
-    // Nếu "Khám phá tổng hợp" đi cùng intent cụ thể → bỏ intent tổng hợp
     const specificIntents = selectedIntents.filter(
       (i) => i !== 'Khám phá tổng hợp',
     );
     const rawIntents =
       specificIntents.length > 0 ? specificIntents : selectedIntents;
-    // Fallback khi không parse được intent nào hợp lệ
     const intents =
       rawIntents.length > 0
         ? rawIntents.slice(0, runtimeConfig.maxIntents)
@@ -84,7 +81,6 @@ export class RecommendationService {
       'multi-intent late fusion retrieval',
     );
 
-    // ── 3. Late fusion: retrieval riêng cho từng intent (song song) ──────────
     const allPools = await Promise.all(
       intents.map((intent) =>
         this.retrieveCandidatesForSingleIntent({
@@ -99,7 +95,6 @@ export class RecommendationService {
       ),
     );
 
-    // ── 4. Merge + dedupe giữ score cao nhất ─────────────────────────────────
     const merged = dedupeByPlaceIdKeepBestScore(allPools.flat());
     this.logger.debug(`merged=${merged.length} final before diversify`);
 
@@ -177,7 +172,6 @@ export class RecommendationService {
       ),
     );
 
-    // Dedupe trong pool của 1 intent (các slot khác nhau có thể trả về cùng place)
     const seenIds = new Set<string>();
     const pool: PlaceCandidate[] = [];
     for (const chunk of poolChunks) {

@@ -2,7 +2,6 @@ import { ApiProperty } from '@nestjs/swagger';
 import { IsString, IsOptional, MinLength, Matches } from 'class-validator';
 
 export class BusinessProfileDto {
-  // --- NHÓM 1: THÔNG TIN CƠ BẢN ---
   @ApiProperty({
     example: 'Nguyễn Văn A',
     description: 'Họ và tên người đại diện',
@@ -52,7 +51,6 @@ export class BusinessProfileDto {
   @IsString()
   address?: string;
 
-  // --- NHÓM 2: ĐỔI MẬT KHẨU (Gửi kèm khi user bật Toggle) ---
   @ApiProperty({
     example: '123456',
     description: 'Mật khẩu hiện tại (Chỉ bắt buộc nếu muốn đổi mật khẩu)',

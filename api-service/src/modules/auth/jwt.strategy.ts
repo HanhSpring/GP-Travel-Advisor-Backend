@@ -7,11 +7,9 @@ import { passportJwtSecret } from 'jwks-rsa';
 export class JwtStrategy extends PassportStrategy(Strategy) {
   constructor() {
     super({
-      // 1. Trích xuất Token từ Header
       jwtFromRequest: ExtractJwt.fromAuthHeaderAsBearerToken(),
       ignoreExpiration: false,
 
-      // 2. Cấu hình tự động lấy khóa từ Supabase (JWKS)
       secretOrKeyProvider: passportJwtSecret({
         cache: true,
         rateLimit: true,

@@ -43,7 +43,6 @@ export class ItineraryTrackingService {
     const date = this.queryService.resolveDate(dto.date);
     const itinerary = await this.queryService.loadItinerary(dto.itineraryId, dto.touristId);
 
-    // Đánh dấu lịch trình đang diễn ra + bật cờ tracking_active.
     if ((itinerary.status ?? '').toLowerCase() !== 'completed') {
       const { error } = await supabase
         .schema('travel')
@@ -99,7 +98,6 @@ export class ItineraryTrackingService {
       const expected = detail.duration_minutes ?? place?.visit_duration ?? null;
       const threshold = computeDwellThresholdSeconds(expected);
 
-      // Bỏ qua địa điểm không có toạ độ (không thể tạo geofence/đăng ký).
       if (
         !place ||
         place.latitude == null ||
@@ -122,7 +120,6 @@ export class ItineraryTrackingService {
         status: existingRow?.status ?? DEFAULT_VISIT_STATUS,
       });
 
-      // Chỉ tạo mới nếu chưa có (giữ nguyên tiến độ khi gọi lại — idempotent).
       if (!existingRow) {
         toUpsert.push({
           geofence_id: geofence.id,
@@ -193,7 +190,6 @@ export class ItineraryTrackingService {
       await this.queryService.findNextDay(query.itineraryId, date),
     );
 
-    // Đã /start: dựng từ visit. Chưa: dựng tạm từ lịch trình.
     if (visits.length > 0) {
       const placeIds = visits
         .map((v) => v.geofences?.place_id)
@@ -254,7 +250,7 @@ export class ItineraryTrackingService {
           detail.duration_minutes ?? place?.visit_duration ?? null;
         return {
           itineraryDetailId: detail.id,
-          geofenceId: '', // chưa /start nên chưa có geofence
+          geofenceId: '',
           placeId: detail.place_id,
           name: place?.name ?? 'Địa điểm',
           latitude: Number(place.latitude),
@@ -294,7 +290,6 @@ export class ItineraryTrackingService {
     const name = await this.queryService.placeName(row.geofences?.place_id ?? '');
     const nowIso = new Date().toISOString();
 
-    // Đã "Đã ghé" rồi -> idempotent, không xử lý lại.
     if (row.status === 'visited') {
       return this.queryService.eventResponse(
         row,
@@ -312,7 +307,6 @@ export class ItineraryTrackingService {
     };
 
     if (dto.eventType === 'ENTER') {
-      // Bước 5: ghi nhận thời gian vào + bắt đầu tính dwell.
       updates.entered_at = row.entered_at ?? occurredAt;
       updates.enter_count = row.enter_count + 1;
       const updated = await this.queryService.applyUpdate(row, updates);
@@ -326,7 +320,6 @@ export class ItineraryTrackingService {
       );
     }
 
-    // DWELL hoặc EXIT: tính dwell time và kiểm tra ngưỡng.
     const enteredAt = row.entered_at ?? occurredAt;
     if (!row.entered_at) updates.entered_at = enteredAt;
 
@@ -345,7 +338,6 @@ export class ItineraryTrackingService {
     const meetsThreshold = newDwell >= row.dwell_threshold_seconds;
 
     if (meetsThreshold) {
-      // Bước 6: dwell đủ -> "Đã ghé".
       updates.status = 'visited';
       updates.checked_in_at = occurredAt;
       updates.recorded_at = occurredAt;
@@ -365,7 +357,6 @@ export class ItineraryTrackingService {
       );
     }
 
-    // Bước phụ 6.1: dwell chưa đủ -> ghi log, giữ "Chưa ghé".
     const updated = await this.queryService.applyUpdate(row, updates);
     return this.queryService.eventResponse(
       updated,
@@ -469,7 +460,7 @@ export class ItineraryTrackingService {
   async endDay(dto: EndDayDto) {
     const date = this.queryService.resolveDate(dto.date);
     const itinerary = await this.queryService.loadItinerary(dto.itineraryId);
-    const markSkipped = dto.markPendingAsSkipped !== false; // mặc định true
+    const markSkipped = dto.markPendingAsSkipped !== false;
     const nowIso = new Date().toISOString();
 
     if (markSkipped) {
@@ -490,7 +481,6 @@ export class ItineraryTrackingService {
     const isExplicitStop = dto.markPendingAsSkipped === false;
 
     if (!nextDayDate) {
-      // Hết ngày cuối -> hoàn thành lịch trình, tắt tracking.
       const { error } = await supabase
         .schema('travel')
         .from('itineraries')
@@ -499,7 +489,6 @@ export class ItineraryTrackingService {
       if (error) this.queryService.dbError(error, 'endDay.complete');
       itineraryStatus = 'completed';
     } else if (isExplicitStop) {
-      // User bấm Dừng → tắt tracking_active, giữ status = ongoing.
       const { error } = await supabase
         .schema('travel')
         .from('itineraries')
@@ -508,7 +497,6 @@ export class ItineraryTrackingService {
       if (error) this.queryService.dbError(error, 'endDay.stopTracking');
       itineraryStatus = 'ongoing';
     } else {
-      // Hết ngày (AlarmManager), sang ngày tiếp theo → tracking vẫn active.
       itineraryStatus = 'ongoing';
     }
 

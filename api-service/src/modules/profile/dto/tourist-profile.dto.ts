@@ -7,7 +7,6 @@ import {
   IsArray,
 } from 'class-validator';
 
-// Định nghĩa các lựa chọn cố định bằng Enum để tránh lưu sai chính tả vào DB
 export enum Gender {
   MALE = 'MALE',
   FEMALE = 'FEMALE',

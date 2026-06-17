@@ -36,7 +36,6 @@ import { CreateUserByAdminDto } from './dto/create-user-by-admin.dto';
 @ApiBearerAuth('access-token')
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles(Role.ADMIN)
-// @UseGuards(JwtAuthGuard, RolesGuard) -> Sau này nhớ bật guard để chặn người lạ gọi API này
 // @Roles(Role.Admin)
 export class AdminUserController {
   constructor(private readonly adminService: AdminService) {}
@@ -57,7 +56,6 @@ export class AdminUserController {
   async getUsers(@Query() query: GetUsersQueryDto) {
     return this.adminService.getUsers(query);
   }
-  // API xử lý khi chọn nhiều Checkbox (Xóa nhiều user)
   @Delete('bulk')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Xóa hàng loạt người dùng (Bulk Soft Delete)' })
@@ -69,7 +67,6 @@ export class AdminUserController {
     return this.adminService.bulkDeleteUsers(bulkDeleteDto.userIds);
   }
 
-  // API xử lý nút icon Thùng rác (Xóa 1 user)
   @Delete(':id')
   @ApiOperation({ summary: 'Xóa một người dùng (Soft Delete)' })
   @ApiParam({ name: 'id', description: 'ID của người dùng cần xóa' })
@@ -103,7 +100,7 @@ export class AdminUserController {
   })
   async updateUserStatus(
     @Param('id') id: string,
-    @Body('status') newStatus: UserActiveStatus, // Ép kiểu bằng Enum của bạn
+    @Body('status') newStatus: UserActiveStatus,
   ) {
     return this.adminService.updateUserStatus(id, newStatus);
   }

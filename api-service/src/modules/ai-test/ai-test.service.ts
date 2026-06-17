@@ -12,13 +12,11 @@ export class AiTestService {
     this.logger.log('Đang gọi thử sang AI Service (FastAPI)...');
     
     try {
-      // 1. Gọi Health Check (GET)
       const healthResponse = await firstValueFrom(
         this.httpService.get('http://127.0.0.1:8000/health')
       );
       this.logger.log('✅ Gọi Health Check thành công');
 
-      // 2. Gọi Recommendation Endpoint (POST)
       const recommendResponse = await firstValueFrom(
         this.httpService.post('http://127.0.0.1:8000/recommend/', {
           user_id: "test_user_nest",
@@ -34,7 +32,6 @@ export class AiTestService {
         fastapi_recommend: recommendResponse.data
       };
     } catch (error) {
-      // Nếu API recommend trả về lỗi (ví dụ 501 Not Implemented), HTTP status sẽ ở trong error.response
       if (error.response) {
         this.logger.warn(`FastAPI trả về lỗi với HTTP Status: ${error.response.status}`);
         return {

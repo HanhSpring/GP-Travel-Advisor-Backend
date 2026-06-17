@@ -33,9 +33,6 @@ async function bootstrap() {
         return;
       }
 
-      // Cho phép localhost/127.0.0.1 và IP LAN nội bộ (192.168.x.x, 10.x.x.x,
-      // 172.16-31.x.x) với mọi port — phục vụ web build dev + truy cập qua
-      // LAN IP (Swagger/điện thoại cùng mạng).
       const isLocalDevOrigin =
         /^https?:\/\/localhost:\d+$/i.test(origin) ||
         /^https?:\/\/127\.0\.0\.1:\d+$/i.test(origin) ||
@@ -50,8 +47,6 @@ async function bootstrap() {
         return;
       }
 
-      // Từ chối origin lạ bằng cách KHÔNG bật CORS header (callback(null, false)).
-      // Tránh ném Error vì middleware `cors` sẽ biến nó thành 500.
       callback(null, false);
     },
     methods: 'GET,HEAD,PUT,PATCH,POST,DELETE,OPTIONS',
@@ -107,8 +102,6 @@ async function bootstrap() {
 
       return;
     } catch (error) {
-      // EADDRINUSE: port đang bị chiếm. EACCES: port bị OS reserve (vd dải
-      // Hyper-V/WinNAT trên Windows). Cả hai -> thử port kế tiếp.
       const code = (error as NodeJS.ErrnoException).code;
       if (code !== 'EADDRINUSE' && code !== 'EACCES') {
         throw error;

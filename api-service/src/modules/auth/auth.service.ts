@@ -54,7 +54,7 @@ export class AuthService {
     const { accessToken, newPassword } = updateDto;
 
     const supabaseUrl = AppConfig.SUPABASE_URL.trim();
-    const supabaseAnonKey = AppConfig.SUPABASE_KEY.trim(); // Chỉ dùng chìa khóa khách bình thường
+    const supabaseAnonKey = AppConfig.SUPABASE_KEY.trim();
 
     if (!supabaseUrl || !supabaseAnonKey) {
       throw new InternalServerErrorException(
@@ -82,7 +82,6 @@ export class AuthService {
         message: 'Đổi mật khẩu thành công. Vui lòng đăng nhập lại.',
       };
     } catch (error: any) {
-      // Bắt lỗi nếu Token hết hạn hoặc sai
       console.error('Lỗi API Supabase:', error.response?.data || error.message);
 
       const errorMessage =
@@ -123,11 +122,9 @@ export class AuthService {
   async login(loginDto: LoginDto) {
     const { emailOrPhone, password } = loginDto;
 
-    // 1. Kiểm tra xem input là Email hay Số điện thoại bằng Regex
     const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(emailOrPhone);
     let finalEmail = emailOrPhone;
 
-    // 2. Nếu là Số điện thoại -> Truy vấn vào public.users để lấy Email tương ứng
     if (!isEmail) {
       const { data: userData, error: dbError } = await this.supabaseAdmin
         .from('users')
@@ -143,8 +140,6 @@ export class AuthService {
 
       finalEmail = userData.email;
     }
-    // 3. CHỈNH SỬA Ở ĐÂY:
-    // Dù user nhập SĐT hay Email ban đầu, cuối cùng ta vẫn dùng 'finalEmail' để xác thực với Supabase
     const credentials = {
       email: finalEmail,
       password: password,
@@ -152,7 +147,6 @@ export class AuthService {
 
     console.log('Xác thực với credentials:', credentials);
 
-    // 4. Gửi lên Supabase
     const { data, error } =
       await this.supabase.auth.signInWithPassword(credentials);
 
@@ -219,7 +213,6 @@ export class AuthService {
   }
 
   async forgotPassword(email: string, returnUrl?: string) {
-    // Gọi hàm reset mật khẩu có sẵn của Supabase
     const redirectTo = returnUrl || 'http://localhost:5173/reset-password';
     const { data, error } = await supabase.auth.resetPasswordForEmail(email, {
       redirectTo: redirectTo,
@@ -237,7 +230,6 @@ export class AuthService {
   }
 
   async updateUserMetadata(userId: string, metadata: any) {
-    // DÙNG SUPABASE ADMIN Ở ĐÂY
     const { data, error } = await this.supabaseAdmin.auth.admin.updateUserById(
       userId,
       { user_metadata: metadata },
@@ -281,7 +273,6 @@ export class AuthService {
       );
     }
 
-    // 3. XỬ LÝ PHÂN LUỒNG & DỌN DẸP DỮ LIỆU THỪA DO TRIGGER
     if (role === 'BUSINESS') {
       await this.supabaseAdmin.from('tourists').delete().eq('id', userId);
       const { error: businessError } = await this.supabaseAdmin
@@ -303,7 +294,6 @@ export class AuthService {
     } else if (role === 'TOURIST') {
       await this.supabaseAdmin.from('businesses').delete().eq('id', userId);
 
-      // 3.4 Đảm bảo có record trong bảng tourists
       await this.supabaseAdmin
         .from('tourists')
         .upsert({ id: userId }, { onConflict: 'id' });
@@ -316,7 +306,6 @@ export class AuthService {
   ) {
     const { currentPassword, newPassword } = changePasswordDto;
 
-    // 1. Xác thực Access Token và lấy thông tin User hiện tại
     const {
       data: { user },
       error: userError,
@@ -332,7 +321,6 @@ export class AuthService {
       throw new BadRequestException('Tài khoản không có email để xác thực.');
     }
 
-    // 2. Kiểm tra "Mật khẩu hiện tại" bằng cách thử đăng nhập ngầm
     const { error: signInError } = await this.supabase.auth.signInWithPassword({
       email: user.email,
       password: currentPassword,
@@ -342,7 +330,6 @@ export class AuthService {
       throw new BadRequestException('Mật khẩu hiện tại không chính xác.');
     }
 
-    // 3. Nếu mật khẩu cũ đúng, tiến hành cập nhật mật khẩu mới bằng Admin API
     const { error: updateError } =
       await this.supabaseAdmin.auth.admin.updateUserById(user.id, {
         password: newPassword,

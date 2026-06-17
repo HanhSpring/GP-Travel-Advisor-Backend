@@ -9,7 +9,5 @@ export class UpdateActivityNoteDto {
   })
   @IsString()
 
-  // Có thể dùng @IsOptional() nếu cho phép user xóa trắng ghi chú,
-  // nhưng ở đây dùng @IsString() đã bao hàm cả chuỗi rỗng ''
   personalNote: string;
 }

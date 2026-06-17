@@ -41,7 +41,7 @@ export class CreateUserByAdminDto {
   @ApiProperty({ enum: UserActiveStatus, description: 'Trạng thái hoạt động' })
   @IsOptional()
   @IsEnum(UserActiveStatus)
-  status?: UserActiveStatus = UserActiveStatus.ACTIVE; // Mặc định là Hoạt động
+  status?: UserActiveStatus = UserActiveStatus.ACTIVE;
 
   @ApiPropertyOptional({
     description: 'Link ảnh đại diện (Đã upload lên storage)',

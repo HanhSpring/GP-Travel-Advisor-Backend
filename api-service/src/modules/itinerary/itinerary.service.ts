@@ -13,7 +13,6 @@ import { AddActivityDto } from './dto/add-activity.dto';
 
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
 
-// ─── Địa chỉ FastAPI optimizer (đọc từ env hoặc dùng mặc định) ───
 const AI_SERVICE_URL = AppConfig.AI_SERVICE_URL;
 
 interface ScheduleEntry {
@@ -89,7 +88,6 @@ export class ItineraryService {
       .from('itineraries')
       .insert({
         creator_id: dto.userId,
-        // [TRIP_NAME_INPUT] Lưu tên chuyến đi user đặt vào cột description
         description: dto.description ?? null,
         start_date: dto.startDate,
         end_date: dto.endDate,
@@ -152,7 +150,6 @@ export class ItineraryService {
         .insert(detailRows);
 
       if (detailsError) {
-        // Rollback: xóa itinerary nếu insert detail thất bại
         await supabase
           .schema('travel')
           .from('itineraries')
@@ -259,7 +256,6 @@ export class ItineraryService {
   }
 
   // ════════════════════════════════════════════════════════════════
-  // TÍNH NĂNG TÙY CHỈNH LỊCH TRÌNH
   // ════════════════════════════════════════════════════════════════
 
   /**
@@ -280,7 +276,6 @@ export class ItineraryService {
     activityId: string,
     dto: EditActivityDto,
   ) {
-    // ─── Bước 1: Kiểm tra bản ghi có tồn tại không ───────────────
     const { data: existing, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -297,18 +292,15 @@ export class ItineraryService {
       );
     }
 
-    // ─── Bước 2: Xây dựng object cập nhật ────────────────────────
     const updates: Record<string, any> = {};
 
     if (dto.arriveTime !== undefined) {
-      // User set giờ mới → tự động ghim
       updates.arrival_time = dto.arriveTime;
       updates.locked_arrive_time = dto.arriveTime;
       updates.is_locked = true;
     }
 
     if (dto.isLocked === false) {
-      // User chủ động bỏ ghim
       updates.is_locked = false;
       updates.locked_arrive_time = null;
     }
@@ -321,12 +313,10 @@ export class ItineraryService {
       updates.user_notes = dto.userNotes;
     }
 
-    // Không có gì để cập nhật
     if (Object.keys(updates).length === 0) {
       throw new BadRequestException('Không có dữ liệu nào để cập nhật');
     }
 
-    // ─── Bước 3: Lưu vào DB ──────────────────────────────────────
     const { error: updateErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -340,13 +330,10 @@ export class ItineraryService {
       );
     }
 
-    // ─── Bước 4: Quyết định có cần re-optimize không ─────────────
-    // Chỉ gọi FastAPI khi thay đổi ảnh hưởng đến lịch thời gian.
-    // Nếu chỉ sửa userNotes → lưu DB rồi trả về ngay, không gọi FastAPI.
     const needsReOptimize =
-      dto.arriveTime !== undefined || // Đổi giờ đến → các điểm xung quanh phải dịch chuyển
-      dto.durationMinutes !== undefined || // Đổi thời gian tham quan → giờ rời đi thay đổi
-      dto.isLocked === false; // Bỏ ghim → optimizer có thể sắp xếp lại
+      dto.arriveTime !== undefined ||
+      dto.durationMinutes !== undefined ||
+      dto.isLocked === false;
 
     const visitDate: string = existing.visit_date;
 
@@ -365,7 +352,6 @@ export class ItineraryService {
    * @param activityId  - ID bản ghi itinerary_details cần xóa
    */
   async deleteActivity(itineraryId: string, activityId: string) {
-    // ─── Bước 1: Lấy thông tin trước khi xóa (cần visit_date để re-optimize) ─
     const { data: existing, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -380,7 +366,6 @@ export class ItineraryService {
       );
     }
 
-    // ─── Bước 2: Xóa khỏi DB ─────────────────────────────────────
     const { error: deleteErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -394,7 +379,6 @@ export class ItineraryService {
       );
     }
 
-    // ─── Bước 3: Tối ưu lại ngày bị ảnh hưởng ───────────────────
     const visitDate: string = existing.visit_date;
     return this._reOptimizeDay(itineraryId, visitDate);
   }
@@ -407,7 +391,6 @@ export class ItineraryService {
    * @param dto         - Thông tin địa điểm muốn thêm
    */
   async addActivity(itineraryId: string, dto: AddActivityDto) {
-    // ─── Bước 1: Lấy thông tin lịch trình (cần start_date) ───────
     const { data: itinerary, error: itnErr } = await supabase
       .schema('travel')
       .from('itineraries')
@@ -421,12 +404,10 @@ export class ItineraryService {
       );
     }
 
-    // ─── Bước 2: Tính toán visit_date từ dayNumber ────────────────
     const startDate = new Date(itinerary.start_date);
     startDate.setDate(startDate.getDate() + (dto.dayNumber - 1));
     const visitDate = startDate.toISOString().split('T')[0]; // 'YYYY-MM-DD'
 
-    // ─── Bước 3: Lấy thông tin địa điểm từ travel.places ─────────
     const { data: place, error: placeErr } = await supabase
       .schema('travel')
       .from('places')
@@ -442,7 +423,6 @@ export class ItineraryService {
       );
     }
 
-    // ─── Bước 4: Lấy sequence_order lớn nhất trong ngày đó ───────
     const { data: maxSeqData } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -455,11 +435,9 @@ export class ItineraryService {
 
     const nextSequence = maxSeqData ? (maxSeqData.sequence_order ?? 0) + 1 : 1;
 
-    // ─── Bước 5: Xác định thời gian và ghim giờ (nếu user có yêu cầu) ─
-    const durationMinutes = dto.durationMinutes ?? 60; // Mặc định 60 phút
+    const durationMinutes = dto.durationMinutes ?? 60;
     const isLocked = !!dto.preferredTime;
 
-    // ─── Bước 6: Chèn bản ghi mới vào itinerary_details ─────────
     const { data: inserted, error: insertErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -472,8 +450,8 @@ export class ItineraryService {
         estimated_cost: place.estimated_cost ?? 0,
         is_locked: isLocked,
         locked_arrive_time: dto.preferredTime ?? null,
-        arrival_time: dto.preferredTime ?? null, // Sẽ được optimizer ghi đè nếu không ghim
-        added_by: 'user', // Đánh dấu user tự thêm (khác với 'ai' do hệ thống tạo)
+        arrival_time: dto.preferredTime ?? null,
+        added_by: 'user',
       })
       .select()
       .single();
@@ -485,7 +463,6 @@ export class ItineraryService {
       );
     }
 
-    // ─── Bước 7: Tối ưu lại ngày để sắp xếp địa điểm mới vào đúng chỗ ─
     return this._reOptimizeDay(itineraryId, visitDate);
   }
 
@@ -502,7 +479,6 @@ export class ItineraryService {
     activityId: string,
     newPlaceId: string,
   ) {
-    // ─── Bước 1: Lấy thông tin bản ghi cần thay thế ──────────────
     const { data: existing, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -519,7 +495,6 @@ export class ItineraryService {
       );
     }
 
-    // ─── Bước 2: Kiểm tra địa điểm mới có tồn tại không ─────────
     const { data: newPlace, error: placeErr } = await supabase
       .schema('travel')
       .from('places')
@@ -533,14 +508,12 @@ export class ItineraryService {
       );
     }
 
-    // ─── Bước 3: Cập nhật place_id và chi phí mới, giữ nguyên thứ tự & ghim giờ ─
     const { error: updateErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
       .update({
         place_id: newPlaceId,
         estimated_cost: newPlace.estimated_cost ?? 0,
-        // Giữ nguyên: sequence_order, is_locked, locked_arrive_time, duration_minutes
       })
       .eq('id', activityId);
 
@@ -554,7 +527,6 @@ export class ItineraryService {
       );
     }
 
-    // ─── Bước 4: Tối ưu lại ngày ─────────────────────────────────
     return this._reOptimizeDay(itineraryId, existing.visit_date);
   }
 
@@ -566,7 +538,6 @@ export class ItineraryService {
    * @param activityId  - ID hoạt động cần tìm gợi ý thay thế
    */
   async getSuggestions(itineraryId: string, activityId: string) {
-    // ─── Bước 1: Lấy thông tin địa điểm hiện tại ─────────────────
     const { data: current, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -595,7 +566,6 @@ export class ItineraryService {
 
     const currentPlace = (current as any).places;
 
-    // ─── Bước 2: Lấy tất cả place_id đã có trong lịch trình (để loại trừ) ─
     const { data: existingDetails } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -606,7 +576,6 @@ export class ItineraryService {
       (d: any) => d.place_id,
     );
 
-    // ─── Bước 3: Tìm địa điểm cùng danh mục, cùng thành phố, chưa có trong lịch trình ─
     const { data: suggestions, error: suggestErr } = await supabase
       .schema('travel')
       .from('places')
@@ -631,11 +600,9 @@ export class ItineraryService {
 
     if (suggestErr) {
       console.error('[ItineraryService] getSuggestions error:', suggestErr);
-      // Trả về mảng rỗng thay vì ném lỗi để UX mượt hơn
       return { suggestions: [] };
     }
 
-    // ─── Bước 4: Format kết quả với ước tính khoảng cách ────────
     const formatted = (suggestions ?? []).map((p: any) => {
       const timeDiff = this._estimateTimeDiff(
         currentPlace.latitude,
@@ -678,7 +645,6 @@ export class ItineraryService {
    * @param visitDate   - Ngày cần tối ưu ('YYYY-MM-DD')
    */
   private async _reOptimizeDay(itineraryId: string, visitDate: string) {
-    // ─── Lấy toàn bộ hoạt động trong ngày (JOIN với places) ──────
     const { data: activities, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -715,11 +681,9 @@ export class ItineraryService {
       .order('sequence_order', { ascending: true });
 
     if (fetchErr || !activities || activities.length === 0) {
-      // Không còn hoạt động nào → trả về mảng rỗng
       return this._buildDayResponse(itineraryId, visitDate, []);
     }
 
-    // ─── Gọi FastAPI optimizer ────────────────────────────────────
     let optimizedSchedule: any[] | null = null;
     try {
       const optimizePayload = {
@@ -739,7 +703,6 @@ export class ItineraryService {
             close_time: a.places?.close_time ?? '22:00',
             estimated_cost: a.estimated_cost ?? 0,
           })),
-        // Mặc định ngày bắt đầu lúc 08:00, kết thúc lúc 21:00
         day_start_time: '08:00',
         day_end_time: '21:00',
       };
@@ -747,20 +710,17 @@ export class ItineraryService {
       const response = await axios.post(
         `${AI_SERVICE_URL}/api/v1/itinerary/optimize`,
         optimizePayload,
-        { timeout: 10000 }, // 10 giây timeout
+        { timeout: 10000 },
       );
       optimizedSchedule = response.data.optimized_activities;
     } catch (aiErr) {
-      // AI Service không khả dụng → giữ nguyên thứ tự cũ, không throw lỗi
       console.warn(
         '[ItineraryService] AI optimizer không khả dụng, giữ nguyên thứ tự:',
         aiErr instanceof Error ? aiErr.message : String(aiErr),
       );
     }
 
-    // ─── Cập nhật DB theo kết quả tối ưu (nếu có) ────────────────
     if (optimizedSchedule && optimizedSchedule.length > 0) {
-      // Cập nhật từng hoạt động theo batch (song song)
       await Promise.all(
         optimizedSchedule.map((opt: any) =>
           supabase
@@ -776,7 +736,6 @@ export class ItineraryService {
       );
     }
 
-    // ─── Đọc lại dữ liệu mới nhất từ DB để trả về client ────────
     return this._buildDayResponse(itineraryId, visitDate, activities);
   }
 
@@ -821,7 +780,6 @@ export class ItineraryService {
 
     const list = updatedActivities ?? fallbackActivities;
 
-    // ─── Tính số ngày trong lịch trình (để lấy dayNumber) ────────
     const { data: itn } = await supabase
       .schema('travel')
       .from('itineraries')
@@ -878,11 +836,9 @@ export class ItineraryService {
     lat2: number | null,
     lng2: number | null,
   ): string {
-    // Nếu thiếu tọa độ → không ước tính được
     if (!lat1 || !lng1 || !lat2 || !lng2) return 'Gần khu vực';
 
-    // Công thức Haversine tính khoảng cách km
-    const R = 6371; // Bán kính Trái Đất (km)
+    const R = 6371;
     const dLat = this._toRad(lat2 - lat1);
     const dLng = this._toRad(lng2 - lng1);
     const a =
@@ -892,7 +848,6 @@ export class ItineraryService {
         Math.sin(dLng / 2) ** 2;
     const distanceKm = R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
 
-    // Ước tính thời gian với vận tốc xe máy ~25km/h trong thành phố
     const minutes = Math.round((distanceKm / 25) * 60);
 
     if (minutes <= 2) return '~Gần đây';
@@ -905,7 +860,6 @@ export class ItineraryService {
   }
 
   async updateActivities(id: string, days: any[]) {
-    // Gom tất cả activities từ mọi ngày thành một mảng phẳng
     const allActivities: Array<{
       id: string;
       startTime: string;
@@ -919,9 +873,6 @@ export class ItineraryService {
       }
     }
 
-    // Chạy tất cả lệnh UPDATE song song thay vì tuần tự
-    // Trước: 24 activities × ~150ms = ~3.6s
-    // Sau:   Promise.all → ~150ms (chỉ 1 vòng chờ duy nhất)
     await Promise.all(
       allActivities.map(async (act) => {
         const { error } = await supabase
@@ -1075,7 +1026,6 @@ export class ItineraryService {
               ? images
               : 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80';
 
-        // Tính thời gian di chuyển đến địa điểm kế tiếp
         const nextAct = activitiesRaw[actIndex + 1];
         let transitInfo: string | null = null;
         if (nextAct) {
@@ -1248,21 +1198,19 @@ export class ItineraryService {
     if (activities.length <= 2) return activities;
 
     try {
-      // ─── Chuẩn bị payload cho TSPTW optimizer (đầy đủ ràng buộc) ─
       const payload = {
-        itinerary_id: 'client-optimize', // placeholder — không cần lưu DB
+        itinerary_id: 'client-optimize',
         visit_date: new Date().toISOString().split('T')[0],
         day_start_time: '08:00',
         day_end_time: '21:00',
         activities: activities.map((a: any) => {
-          // Tính duration từ startTime/endTime nếu không có sẵn
           const startMin = this.toMinutes(a.startTime || '08:00');
           const endMin = this.toMinutes(a.endTime || '09:00');
           const duration = endMin - startMin > 0 ? endMin - startMin : 60;
 
           return {
             id: a.id,
-            place_id: a.id, // dùng id làm place_id
+            place_id: a.id,
             duration_minutes: a.durationMinutes ?? duration,
             is_locked: a.isLocked ?? false,
             locked_arrive_time: a.lockedArriveTime ?? null,
@@ -1284,7 +1232,6 @@ export class ItineraryService {
       const optimized: any[] = response.data?.optimized_activities ?? [];
       if (optimized.length === 0) return activities;
 
-      // Map kết quả TSPTW về format Flutter mong đợi
       return optimized.map((opt: any) => {
         const original = activities.find((a: any) => a.id === opt.id) ?? {};
         return {
@@ -1296,7 +1243,7 @@ export class ItineraryService {
       });
     } catch (e) {
       console.error('optimizeDayRoute failed:', e);
-      return activities; // Fallback: giữ nguyên thứ tự cũ
+      return activities;
     }
   }
 

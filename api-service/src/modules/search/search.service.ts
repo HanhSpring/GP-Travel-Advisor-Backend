@@ -34,15 +34,12 @@ export class SearchService {
       return [];
     }
 
-    // Chỉ truyền p_query để tương thích cả function cũ (1 tham số) lẫn mới (p_limit có default).
     const { data, error } = await supabase
       .schema('travel')
       .rpc('search_autocomplete', { p_query: q })
       .returns<SearchRow[]>();
 
     if (error) {
-      // Không ném 500: lỗi tạm thời (vd timeout) → trả rỗng để FE hiện "không có kết quả"
-      // thay vì banner đỏ "failed to search locations".
       console.error('Autocomplete error:', error);
       return [];
     }
@@ -59,7 +56,6 @@ export class SearchService {
         id: this.asString(row['id']),
         name: this.asString(row['name']),
         type,
-        // Place không có ảnh → dùng ảnh mặc định; city để rỗng (FE hiện icon).
         image: type === 'place' ? image || this.defaultPlaceImageUrl : image,
         city: this.asString(row['city']),
         rating: Number(row['rating']) || 0,
@@ -116,7 +112,7 @@ export class SearchService {
     lat2: number,
     lon2: number,
   ): number {
-    const R = 6371; // Bán kính Trái Đất (km)
+    const R = 6371;
     const dLat = this.deg2rad(lat2 - lat1);
     const dLon = this.deg2rad(lon2 - lon1);
     const a =

@@ -26,7 +26,6 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 export class UploadController {
   constructor(private readonly uploadService: UploadService) {}
 
-  // 1. LUỒNG UPLOAD AVATAR
   @Post('avatar')
   @ApiOperation({ summary: 'Upload user avatar' })
   @ApiBearerAuth('access-token')
@@ -60,7 +59,6 @@ export class UploadController {
     return this.uploadService.uploadAvatar(file, userId);
   }
 
-  // 2. LUỒNG UPLOAD ẢNH REVIEW (Khách du lịch)
   @Post('review')
   @UseInterceptors(FileInterceptor('file'))
   async uploadReview(
@@ -78,7 +76,6 @@ export class UploadController {
     return this.uploadService.uploadReviewImage(file, reviewId);
   }
 
-  // 3. LUỒNG UPLOAD ẢNH ĐỊA ĐIỂM (Chủ cơ sở)
   @Post('place')
   @UseInterceptors(FileInterceptor('file'))
   async uploadPlace(
@@ -96,7 +93,6 @@ export class UploadController {
     return this.uploadService.uploadPlaceImage(file, placeId);
   }
 
-  // 4. LUỒNG UPLOAD ẢNH MÓN ĂN
   @Post('food')
   @UseInterceptors(FileInterceptor('file'))
   async uploadFood(

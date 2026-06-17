@@ -339,7 +339,6 @@ export class BusinessService {
         throw new BadRequestException('Mật khẩu hiện tại không chính xác.');
       }
 
-      // 3. Mật khẩu cũ đúng -> Cập nhật mật khẩu mới bằng quyền Admin
       if (!supabaseKey) {
         throw new InternalServerErrorException(
           'Server thiếu cấu hình SUPABASE_KEY',
@@ -413,7 +412,6 @@ export class BusinessService {
   async getFilteredOrders(dto: GetOrdersDto) {
     const { placeId, status, restaurant, page, limit } = dto;
 
-    // Gọi stored procedure từ Supabase
     const { data, error } = await supabase
       .schema('order_sys')
       .rpc('get_orders', {

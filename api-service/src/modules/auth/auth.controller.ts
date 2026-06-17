@@ -26,7 +26,6 @@ import { RegisterTouristDto } from './dto/register-tourist.dto';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 import { RolesGuard } from 'src/common/guards/roles.guard';
 import { ChangePasswordDto } from './dto/changePassword.dto';
-// @ApiTags giúp gom tất cả API trong file này vào một thẻ tên là "Auth" trên Swagger
 @ApiTags('Auth')
 @Controller('auth')
 export class AuthController {
@@ -42,11 +41,9 @@ export class AuthController {
   })
   @ApiResponse({ status: 401, description: 'Sai email hoặc mật khẩu' })
   async login(@Body() loginDto: LoginDto) {
-    // Trả thẳng kết quả từ Service ra ngoài
     return await this.authService.login(loginDto);
   }
 
-  // Hàm hỗ trợ đăng nhập qua Google
   @UseGuards(JwtAuthGuard)
   @Post('sync-oauth')
   @ApiOperation({
@@ -59,13 +56,11 @@ export class AuthController {
     const user = req.user;
     const fullNameFromMeta =
       user.user_metadata?.full_name || user.fullName || 'Người dùng Google';
-    // 1. CHỐT CHẶN BẢO MẬT: Không cho phép tự ứng cử làm ADMIN
     let targetRole = requestedRole || 'TOURIST';
     if (targetRole === 'ADMIN') {
       targetRole = 'TOURIST';
     }
 
-    // 2. KỊCH BẢN: USER MỚI (Chưa có role trong hệ thống)
     if (!user.role) {
       await this.authService.syncOAuthData(
         user.userId,
@@ -81,7 +76,6 @@ export class AuthController {
       };
     }
 
-    // 3. KỊCH BẢN: USER CŨ (Đã có role: BUSINESS hoặc ADMIN
     return {
       message: 'User đã có đầy đủ thông tin',
       isNewUser: false,
@@ -144,9 +138,9 @@ export class AuthController {
     return await this.authService.registerBusiness(registerDto);
   }
 
-  @Put('change-password') // Hoặc PATCH tùy chuẩn REST của bạn
+  @Put('change-password')
   @ApiOperation({ summary: 'Đổi mật khẩu trong App (Cần mật khẩu hiện tại)' })
-  @ApiBearerAuth() // Bắt buộc Mobile phải gửi token lên Header
+  @ApiBearerAuth()
   async changePassword(
     @Headers('Authorization') authHeader: string,
     @Body() changePasswordDto: ChangePasswordDto,
@@ -155,7 +149,6 @@ export class AuthController {
       throw new UnauthorizedException('Thiếu hoặc sai định dạng Access Token');
     }
 
-    // Cắt bỏ chữ "Bearer " để lấy token thuần
     const accessToken = authHeader.split(' ')[1];
 
     return this.authService.changePassword(accessToken, changePasswordDto);

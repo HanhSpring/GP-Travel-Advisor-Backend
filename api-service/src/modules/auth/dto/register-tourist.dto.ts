@@ -7,7 +7,6 @@ import {
   IsEnum,
 } from 'class-validator';
 
-// Enum cho phần Dropdown "Chọn giới tính"
 export enum Gender {
   MALE = 'MALE',
   FEMALE = 'FEMALE',

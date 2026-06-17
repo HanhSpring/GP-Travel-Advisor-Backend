@@ -6,33 +6,25 @@
  *   - tracking.geofence_visits  : trạng thái ghé của từng itinerary_detail.
  */
 
-// Bán kính geofence (mét). Use case yêu cầu 80-150m.
 export const DEFAULT_GEOFENCE_RADIUS_M = 100;
 export const MIN_GEOFENCE_RADIUS_M = 80;
 export const MAX_GEOFENCE_RADIUS_M = 150;
 
-// Ngưỡng dwell time: max(30 giây, 5% thời lượng hoạt động dự kiến).
-// 60-phút place → 180s (3 min); 30-phút → 90s; short → 30s.
 export const MIN_DWELL_SECONDS = 30;
 export const DWELL_FRACTION = 0.05;
 export const DEFAULT_EXPECTED_DURATION_MINUTES = 60;
 
-// Lịch tự động cho mobile (AlarmManager).
-export const DAY_END_HOUR = 23; // remove geofence cuối ngày lúc 23h
-export const NEXT_DAY_ALARM_HOUR = 7; // đăng ký lại geofence sáng hôm sau lúc 7h
+export const DAY_END_HOUR = 23;
+export const NEXT_DAY_ALARM_HOUR = 7;
 export const VN_TZ_OFFSET = '+07:00'; // Asia/Ho_Chi_Minh
 
-// Các loại sự kiện geofence (khớp Google Geofencing API transitions).
 export const GEOFENCE_EVENTS = ['ENTER', 'DWELL', 'EXIT'] as const;
 export type GeofenceEventType = (typeof GEOFENCE_EVENTS)[number];
 
-// Trạng thái ghé — khớp enum tracking.visit_status_enum trong DB.
-// not_visited = Chưa đến · visited = Đã đến nơi · skipped = Bỏ qua.
 export const VISIT_STATUSES = ['not_visited', 'visited', 'skipped'] as const;
 export type VisitStatus = (typeof VISIT_STATUSES)[number];
 export const DEFAULT_VISIT_STATUS: VisitStatus = 'not_visited';
 
-// Nhãn tiếng Việt + màu/icon hiển thị trên bản đồ.
 export const STATUS_LABEL_VI: Record<VisitStatus, string> = {
   not_visited: 'Chưa đến',
   visited: 'Đã đến nơi',
@@ -40,9 +32,9 @@ export const STATUS_LABEL_VI: Record<VisitStatus, string> = {
 };
 
 export const STATUS_MAP_COLOR: Record<VisitStatus, string> = {
-  not_visited: '#9CA3AF', // xám
-  visited: '#22C55E', // xanh lá
-  skipped: '#EF4444', // đỏ
+  not_visited: '#9CA3AF',
+  visited: '#22C55E',
+  skipped: '#EF4444',
 };
 
 export const STATUS_MAP_ICON: Record<VisitStatus, string> = {
@@ -74,7 +66,7 @@ export function vnTimestamp(date: string, hour: number): string {
   return `${date}T${hh}:00:00${VN_TZ_OFFSET}`;
 }
 
-const EARTH_RADIUS_M = 6378137; // bán kính Trái Đất (mét) cho phép tính WGS84
+const EARTH_RADIUS_M = 6378137;
 
 /**
  * Sinh polygon (xấp xỉ hình tròn) dạng EWKT để lưu vào cột geometry(Polygon,4326)

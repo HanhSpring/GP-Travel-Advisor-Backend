@@ -281,7 +281,6 @@ export class AdminService {
       );
     }
 
-    // Trả về mặc định là 0 nếu chưa có data
     if (!data || data.length === 0) {
       return { totalUsers: 0, newThisMonth: 0, totalAdmins: 0 };
     }

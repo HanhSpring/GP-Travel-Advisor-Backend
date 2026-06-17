@@ -155,7 +155,6 @@ export class ItineraryTrackingQueryService {
       is_active: true,
       created_at: new Date().toISOString(),
     };
-    // Chỉ tạo polygon khi có toạ độ hợp lệ.
     if (place.latitude != null && place.longitude != null) {
       row.polygon = buildCirclePolygonEWKT(
         Number(place.longitude),
@@ -251,7 +250,7 @@ export class ItineraryTrackingQueryService {
           id: notificationId,
           title: 'Check-in lịch trình',
           content: message,
-          type: 'itinerary', // -> icon "map" ở màn hình thông báo
+          type: 'itinerary',
           is_global: false,
           created_at: nowIso,
         });

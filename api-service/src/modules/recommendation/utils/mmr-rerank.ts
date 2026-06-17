@@ -10,7 +10,6 @@ export interface PlaceCandidate {
   score: number;
 }
 
-// Per-day slot quota theo tripIntent — khớp với TRIP_INTENT_OPTIONS trong DTO
 export const INTENT_QUOTA: Record<string, Record<string, number>> = {
   'Khám phá tổng hợp': {
     attraction: 4,
@@ -77,7 +76,6 @@ export interface RetrievalTuning {
  * Thứ tự ưu tiên: exact match trước, keyword fallback sau.
  */
 const TRAVEL_TYPE_SLOT: Record<string, string> = {
-  // ── Category names thực tế trong DB (categories_rows.csv) ──
   'Ẩm thực': 'restaurant',
   'Giải trí & Vui chơi': 'entertainment',
   'Thư giãn & Thể thao': 'entertainment',
@@ -86,12 +84,10 @@ const TRAVEL_TYPE_SLOT: Record<string, string> = {
   'Tham quan & Khám phá': 'attraction',
   'Mua sắm & Dịch vụ': 'shopping',
 
-  // ── Type names cần tách cafe ra khỏi Ẩm thực (types_rows.csv) ──
   'Cafe & Đồ uống': 'cafe',
   'Tiệm bánh & Tráng miệng': 'cafe',
   'Pub/Bar': 'restaurant',
 
-  // ── Training vocab travel_type values (phòng khi travel_type column được dùng) ──
   'Ẩm thực & Bản địa': 'restaurant',
   'Đô thị & Vui chơi': 'entertainment',
   'Khám phá & Sinh thái': 'attraction',
@@ -106,7 +102,6 @@ const TRAVEL_TYPE_SLOT: Record<string, string> = {
  * Truyền type_name để phân biệt cafe vs restaurant trong category Ẩm thực.
  */
 export function normalizeCategory(category: string, typeName?: string): string {
-  // Type-level check trước (phân biệt cafe trong category Ẩm thực)
   if (typeName) {
     const typeSlot = TRAVEL_TYPE_SLOT[typeName.trim()];
     if (typeSlot) return typeSlot;
@@ -246,7 +241,7 @@ export function dedupeByPlaceIdKeepBestScore(
 export interface SlotFetchPlan {
   slotType: string;
   limit: number;
-  travelType?: string; // chỉ dùng cho slot attraction
+  travelType?: string;
 }
 
 /**
@@ -269,11 +264,6 @@ export function getStratifiedFetchPlan(
     if (dailyQ === 0) continue;
     const limit = Math.ceil(dailyQ * numDays * multiplier);
     const entry: SlotFetchPlan = { slotType: slot, limit };
-    // Chỉ filter attraction theo travelType khi intent đó có primary slot là 'attraction'.
-    // Với "Ẩm thực & Bản địa" (primary=restaurant) hay "Đô thị & Vui chơi" (primary=entertainment),
-    // KHÔNG filter → vector search tự tìm attraction phù hợp nhất.
-    // Với "Văn hóa & Lịch sử", "Khám phá & Sinh thái", "Nghỉ dưỡng & Biển" (primary=attraction),
-    // filter để chỉ lấy attraction có travel_type khớp trong DB.
     if (
       tuning.enableAttractionTravelTypeFilter !== false &&
       slot === 'attraction' &&
@@ -324,7 +314,6 @@ export function diversifyTopK(
   const dailyQuota = getDailyQuota(tripIntent, tuning);
   const totalDailySlots = Object.values(dailyQuota).reduce((a, b) => a + b, 0);
 
-  // Budget mỗi category: lấy max giữa proportional share và minimum cần thiết
   const budgetPerCat: Record<string, number> = {};
   for (const [cat, q] of Object.entries(dailyQuota)) {
     if (q > 0) {

@@ -14,7 +14,6 @@ export class UploadService {
   private supabase: SupabaseClient;
 
   constructor(private configService: ConfigService) {
-    // Khởi tạo R2 Client (dùng SDK của S3)
     this.s3Client = new S3Client({
       region: 'auto',
       endpoint: this.configService.get('CLOUDFLARE_R2_ENDPOINT'),
@@ -38,7 +37,6 @@ export class UploadService {
     this.supabase = createClient(supabaseUrl, supabaseKey);
   }
 
-  // --- HÀM 1: UPLOAD AVATAR (Cắt vuông, tập trung vào tâm) ---
   async uploadAvatar(file: Express.Multer.File, userId: string) {
     try {
       const { data: user } = await this.supabase
@@ -73,7 +71,6 @@ export class UploadService {
     }
   }
 
-  //  HÀM 2: UPLOAD REVIEW
   async uploadReviewImage(file: Express.Multer.File, reviewId: string) {
     try {
       const optimizedBuffer = await sharp(file.buffer)
@@ -95,7 +92,6 @@ export class UploadService {
     }
   }
 
-  //  HÀM 3: UPLOAD ẢNH ĐỊA ĐIỂM
   async uploadPlaceImage(file: Express.Multer.File, placeId: string) {
     try {
       const optimizedBuffer = await sharp(file.buffer)
@@ -111,7 +107,6 @@ export class UploadService {
       throw new InternalServerErrorException('Lỗi upload ảnh địa điểm');
     }
   }
-  //  HÀM 4: UPLOAD ẢNH MÓN ĂN
   async uploadFoodImage(file: Express.Multer.File, foodId: string) {
     try {
       const optimizedBuffer = await sharp(file.buffer)
@@ -137,7 +132,6 @@ export class UploadService {
     }
   }
 
-  // Hàm bổ trợ để đẩy lên R2
   private async pushToR2(buffer: Buffer, key: string): Promise<string> {
     await this.s3Client.send(
       new PutObjectCommand({
@@ -152,7 +146,6 @@ export class UploadService {
 
   private getRelativeKey(url: string): string {
     const publicUrl = this.configService.get('CLOUDFLARE_R2_PUBLIC_URL');
-    // Loại bỏ phần domain để lấy key
     return url.replace(`${publicUrl}/`, '');
   }
 

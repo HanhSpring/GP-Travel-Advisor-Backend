@@ -1,6 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 
-// --- TẦNG 3: CHI TIẾT HOẠT ĐỘNG & DI CHUYỂN ---
 class TransitInfoDto {
   @ApiProperty({
     example: 'BIKE',
@@ -59,7 +58,6 @@ class ItineraryActivityDto {
   })
   tags: string[];
 
-  // Điểm mấu chốt: Liên kết với điểm đến tiếp theo
   @ApiPropertyOptional({
     type: TransitInfoDto,
     description: 'Thông tin di chuyển ĐẾN điểm tiếp theo',
@@ -67,7 +65,6 @@ class ItineraryActivityDto {
   transitToNext?: TransitInfoDto;
 }
 
-// --- TẦNG 2: CHI TIẾT TỪNG NGÀY ---
 class ItineraryDayDto {
   @ApiProperty({ example: '12/06', description: 'Ngày tháng (dùng cho Tab)' })
   dateLabel: string;
@@ -117,7 +114,6 @@ class ItineraryDayDto {
   activities: ItineraryActivityDto[];
 }
 
-// --- TẦNG 1: TỔNG QUAN LỊCH TRÌNH (ROOT) ---
 export class ItineraryDetailResponseDto {
   @ApiProperty({ example: 'itn-uuid-999' })
   id: string;

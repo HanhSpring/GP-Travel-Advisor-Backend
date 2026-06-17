@@ -13,7 +13,6 @@ export class ProfileService {
   private supabaseUrl = AppConfig.SUPABASE_URL;
   private supabaseAnonKey = AppConfig.SUPABASE_KEY;
 
-  // Hàm helper tạo client dựa trên token của user gửi lên
   private getSupabaseUserClient(accessToken: string) {
     return createClient(this.supabaseUrl, this.supabaseAnonKey, {
       global: {
@@ -27,7 +26,6 @@ export class ProfileService {
   async getTouristProfile(userId: string, accessToken: string) {
     const userClient = this.getSupabaseUserClient(accessToken);
 
-    // Gọi procedure get_tourist_profile
     const { data, error } = await userClient.rpc('get_tourist_profile', {
       user_id_param: userId,
     });
@@ -40,7 +38,7 @@ export class ProfileService {
       throw new NotFoundException('Không tìm thấy thông tin hồ sơ');
     }
 
-    const profile = data[0]; // RPC trả về mảng kết quả
+    const profile = data[0];
     return {
       displayName: profile.full_name,
       gender: profile.gender,

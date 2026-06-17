@@ -4,7 +4,7 @@ import { AiTestController } from './ai-test.controller';
 import { AiTestService } from './ai-test.service';
 
 @Module({
-  imports: [HttpModule], // Yêu cầu HttpModule để AiTestService gọi được API
+  imports: [HttpModule],
   controllers: [AiTestController],
   providers: [AiTestService],
 })

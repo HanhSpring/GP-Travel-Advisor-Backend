@@ -1,6 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
 
-// --- CÁC CLASS THÀNH PHẦN ---
 
 class ItineraryStatsDto {
   @ApiProperty({ example: 6, description: 'Tổng số ngày' })
@@ -62,7 +61,6 @@ class BudgetSummaryDto {
   statusTag: string;
 }
 
-// --- CLASS TỔNG TRẢ VỀ CHO FRONTEND ---
 
 export class ItinerarySummaryResponseDto {
   @ApiProperty({

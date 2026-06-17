@@ -26,9 +26,7 @@ import { Role } from 'src/common/enum/role.enum';
 
 @ApiTags('Profile')
 @Controller('profile')
-// 1. Kích hoạt nút Ổ khóa trên Swagger
 @ApiBearerAuth('access-token')
-// 2. Kích hoạt Guard: Bất kỳ ai gọi vào class này đều phải trình Token
 @UseGuards(JwtAuthGuard, RolesGuard)
 @Roles(Role.TOURIST)
 export class ProfileController {

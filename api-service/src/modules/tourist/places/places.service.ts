@@ -342,7 +342,6 @@ export class PlacesService {
         ((data as PlaceRow[] | null) ?? []).map((row) => [row.id, row]),
       );
 
-      // Giữ đúng thứ tự xếp hạng của model, bỏ id không còn approved/active.
       const ordered = recommendedIds
         .map((id) => byId.get(id))
         .filter((row): row is PlaceRow => Boolean(row))
