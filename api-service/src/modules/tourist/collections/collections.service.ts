@@ -281,6 +281,67 @@ export class CollectionsService {
     };
   }
 
+  async addFavoriteItinerary(touristId: string, itineraryId: string) {
+    this.assertFavoriteInput(touristId, itineraryId, 'itinerary_id');
+
+    const { data: existing, error: existingError } = await supabase
+      .schema('travel')
+      .from('favorite_itineraries')
+      .select('tourist_id')
+      .eq('tourist_id', touristId)
+      .eq('itinerary_id', itineraryId)
+      .limit(1)
+      .returns<Array<{ tourist_id: string }>>();
+
+    if (existingError) {
+      throw new InternalServerErrorException(existingError.message);
+    }
+
+    if ((existing ?? []).length > 0) {
+      return {
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        is_favorite: true,
+      };
+    }
+
+    const { error } = await supabase
+      .schema('travel')
+      .from('favorite_itineraries')
+      .insert({ tourist_id: touristId, itinerary_id: itineraryId });
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return {
+      tourist_id: touristId,
+      itinerary_id: itineraryId,
+      is_favorite: true,
+    };
+  }
+
+  async removeFavoriteItinerary(touristId: string, itineraryId: string) {
+    this.assertFavoriteInput(touristId, itineraryId, 'itinerary_id');
+
+    const { error } = await supabase
+      .schema('travel')
+      .from('favorite_itineraries')
+      .delete()
+      .eq('tourist_id', touristId)
+      .eq('itinerary_id', itineraryId);
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return {
+      tourist_id: touristId,
+      itinerary_id: itineraryId,
+      is_favorite: false,
+    };
+  }
+
   async getFavoritePlaces(
     touristId: string,
     page: number = 1,
@@ -353,6 +414,67 @@ export class CollectionsService {
     };
   }
 
+  async addFavoritePlace(touristId: string, placeId: string) {
+    this.assertFavoriteInput(touristId, placeId, 'place_id');
+
+    const { data: existing, error: existingError } = await supabase
+      .schema('travel')
+      .from('favorite_places')
+      .select('tourist_id')
+      .eq('tourist_id', touristId)
+      .eq('place_id', placeId)
+      .limit(1)
+      .returns<Array<{ tourist_id: string }>>();
+
+    if (existingError) {
+      throw new InternalServerErrorException(existingError.message);
+    }
+
+    if ((existing ?? []).length > 0) {
+      return {
+        tourist_id: touristId,
+        place_id: placeId,
+        is_favorite: true,
+      };
+    }
+
+    const { error } = await supabase
+      .schema('travel')
+      .from('favorite_places')
+      .insert({ tourist_id: touristId, place_id: placeId });
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return {
+      tourist_id: touristId,
+      place_id: placeId,
+      is_favorite: true,
+    };
+  }
+
+  async removeFavoritePlace(touristId: string, placeId: string) {
+    this.assertFavoriteInput(touristId, placeId, 'place_id');
+
+    const { error } = await supabase
+      .schema('travel')
+      .from('favorite_places')
+      .delete()
+      .eq('tourist_id', touristId)
+      .eq('place_id', placeId);
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return {
+      tourist_id: touristId,
+      place_id: placeId,
+      is_favorite: false,
+    };
+  }
+
   private resolveImage(imageUrl: unknown): string {
     if (Array.isArray(imageUrl)) {
       const first = imageUrl.find(
@@ -369,6 +491,20 @@ export class CollectionsService {
       return imageUrl.trim();
     }
     return this.defaultImageUrl;
+  }
+
+  private assertFavoriteInput(
+    touristId: string,
+    entityId: string,
+    entityName: string,
+  ) {
+    if (!touristId || !touristId.trim()) {
+      throw new BadRequestException('tourist_id is required');
+    }
+
+    if (!entityId || !entityId.trim()) {
+      throw new BadRequestException(`${entityName} is required`);
+    }
   }
 
   private toImageList(imageUrl?: unknown): string[] {

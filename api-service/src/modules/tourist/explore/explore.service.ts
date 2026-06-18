@@ -131,6 +131,7 @@ export interface ExplorePublicItineraryItem {
   creator_name: string;
   image: string;
   image_gallery: string[];
+  is_favorite?: boolean;
 }
 
 export interface ExplorePublicItinerariesResponse {
@@ -146,6 +147,7 @@ export interface ExplorePlaceItem {
   review_count: number;
   city: string | null;
   category: string | null;
+  is_favorite?: boolean;
 }
 
 export interface ExplorePlacesResponse {
@@ -518,17 +520,19 @@ export class ExploreService implements OnModuleInit {
       currentItineraryResult,
     ] = await Promise.all([
       Promise.resolve(
-        this.getFromCache<ExplorePublicItinerariesResponse>(publicKey) ??
-          this.getPublicItineraries(1, PAGE_SIZE),
+        (touristId
+          ? null
+          : this.getFromCache<ExplorePublicItinerariesResponse>(publicKey)) ??
+          this.getPublicItineraries(1, PAGE_SIZE, touristId),
       ).catch(() => emptyItineraries),
       Promise.resolve(
         this.getFromCache<ExplorePlacesResponse>(featuredKey) ??
           this.getFeaturedCities(1, PAGE_SIZE),
       ).catch(() => emptyPlaces(null)),
-      this.getPlacesByCategory('ẩm thực', 1, PAGE_SIZE).catch(() =>
+      this.getPlacesByCategory('ẩm thực', 1, PAGE_SIZE, touristId).catch(() =>
         emptyPlaces('ẩm thực'),
       ),
-      this.getPlacesByCategory('lưu trú', 1, PAGE_SIZE).catch(() =>
+      this.getPlacesByCategory('lưu trú', 1, PAGE_SIZE, touristId).catch(() =>
         emptyPlaces('lưu trú'),
       ),
       this.getCurrentItinerary(touristId).catch(() => null),
@@ -755,10 +759,13 @@ export class ExploreService implements OnModuleInit {
   async getPublicItineraries(
     page = 1,
     limit = 5,
+    touristId?: string,
   ): Promise<ExplorePublicItinerariesResponse> {
     const cacheKey = `explore:public_itineraries:${page}:${limit}`;
-    const cached =
-      this.getFromCache<ExplorePublicItinerariesResponse>(cacheKey);
+    const useCache = !touristId;
+    const cached = useCache
+      ? this.getFromCache<ExplorePublicItinerariesResponse>(cacheKey)
+      : null;
     if (cached) return cached;
     const safePage = page > 0 ? page : 1;
     const safeLimit = limit > 0 ? limit : 5;
@@ -783,9 +790,11 @@ export class ExploreService implements OnModuleInit {
     const itineraryIds = (data ?? []).map((item) => item.id);
     const creatorIds = (data ?? []).map((item) => item.creator_id);
 
-    const [creatorNameMap, itineraryImages] = await Promise.all([
+    const [creatorNameMap, itineraryImages, favoriteItineraryIds] =
+      await Promise.all([
       this.getCreatorNameMap(creatorIds),
       this.getItineraryImageMap(itineraryIds),
+      this.getFavoriteItinerarySet(touristId, itineraryIds),
     ]);
 
     const mapped = (data ?? []).map((item) => {
@@ -809,6 +818,7 @@ export class ExploreService implements OnModuleInit {
         creator_name: creatorNameMap.get(item.creator_id) ?? 'Traveler',
         image: imageGallery[0],
         image_gallery: imageGallery,
+        is_favorite: favoriteItineraryIds.has(item.id),
       };
     });
 
@@ -822,7 +832,9 @@ export class ExploreService implements OnModuleInit {
       },
     };
 
-    this.setCache(cacheKey, result);
+    if (useCache) {
+      this.setCache(cacheKey, result);
+    }
     return result;
   }
 
@@ -1344,6 +1356,7 @@ export class ExploreService implements OnModuleInit {
     category?: string,
     page = 1,
     limit = 5,
+    touristId?: string,
   ): Promise<ExplorePlacesResponse> {
     const safePage = page > 0 ? page : 1;
     const safeLimit = limit > 0 ? limit : 5;
@@ -1377,7 +1390,10 @@ export class ExploreService implements OnModuleInit {
     const cacheKey = `explore:places:${categoryName}:${safePage}:${safeLimit}:${Array.from(
       resolvedCategoryIds,
     ).join(',')}`;
-    const cached = this.getFromCache<ExplorePlacesResponse>(cacheKey);
+    const useCache = !touristId;
+    const cached = useCache
+      ? this.getFromCache<ExplorePlacesResponse>(cacheKey)
+      : null;
     if (cached) return cached;
 
     if (categoryFilter) {
@@ -1445,6 +1461,11 @@ export class ExploreService implements OnModuleInit {
           }
 
           const rowCount = (data ?? []).length;
+          const favoritePlaceIds = await this.getFavoritePlaceSet(
+            touristId,
+            (data ?? []).map((item) => item.id),
+          );
+
           const result: ExplorePlacesResponse = {
             category: categoryName,
             data: (data ?? []).map((item) => ({
@@ -1455,6 +1476,7 @@ export class ExploreService implements OnModuleInit {
               review_count: item.review_count || 0,
               city: this.extractCityName(item.cities),
               category: categoryName,
+              is_favorite: favoritePlaceIds.has(item.id),
             })),
             pagination: {
               page: safePage,
@@ -1464,7 +1486,9 @@ export class ExploreService implements OnModuleInit {
             },
           };
 
-          this.setCache(cacheKey, result);
+          if (useCache) {
+            this.setCache(cacheKey, result);
+          }
           return result;
         }
       }
@@ -1533,9 +1557,16 @@ export class ExploreService implements OnModuleInit {
       }
 
       const paginated = allFallbackItems.slice(offset, offset + safeLimit);
+      const favoritePlaceIds = await this.getFavoritePlaceSet(
+        touristId,
+        paginated.map((item) => item.id),
+      );
       const result: ExplorePlacesResponse = {
         category: categoryName,
-        data: paginated,
+        data: paginated.map((item) => ({
+          ...item,
+          is_favorite: favoritePlaceIds.has(item.id),
+        })),
         pagination: {
           page: safePage,
           limit: safeLimit,
@@ -1544,7 +1575,9 @@ export class ExploreService implements OnModuleInit {
         },
       };
 
-      this.setCache(cacheKey, result);
+      if (useCache) {
+        this.setCache(cacheKey, result);
+      }
       return result;
     }
 
@@ -1577,6 +1610,11 @@ export class ExploreService implements OnModuleInit {
       throw new InternalServerErrorException(error.message);
     }
 
+    const favoritePlaceIds = await this.getFavoritePlaceSet(
+      touristId,
+      (data ?? []).map((item) => item.id),
+    );
+
     const mapped = (data ?? []).map((item) => ({
       id: item.id,
       name: item.name,
@@ -1585,6 +1623,7 @@ export class ExploreService implements OnModuleInit {
       review_count: item.review_count || 0,
       city: this.extractCityName(item.cities),
       category: categoryName,
+      is_favorite: favoritePlaceIds.has(item.id),
     }));
 
     const result: ExplorePlacesResponse = {
@@ -1598,8 +1637,56 @@ export class ExploreService implements OnModuleInit {
       },
     };
 
-    this.setCache(cacheKey, result);
+    if (useCache) {
+      this.setCache(cacheKey, result);
+    }
     return result;
+  }
+
+  private async getFavoritePlaceSet(
+    touristId: string | undefined,
+    placeIds: string[],
+  ): Promise<Set<string>> {
+    if (!touristId || placeIds.length === 0) {
+      return new Set<string>();
+    }
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('favorite_places')
+      .select('place_id')
+      .eq('tourist_id', touristId)
+      .in('place_id', Array.from(new Set(placeIds)))
+      .returns<FavoritePlaceRow[]>();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return new Set((data ?? []).map((item) => item.place_id));
+  }
+
+  private async getFavoriteItinerarySet(
+    touristId: string | undefined,
+    itineraryIds: string[],
+  ): Promise<Set<string>> {
+    if (!touristId || itineraryIds.length === 0) {
+      return new Set<string>();
+    }
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('favorite_itineraries')
+      .select('itinerary_id')
+      .eq('tourist_id', touristId)
+      .in('itinerary_id', Array.from(new Set(itineraryIds)))
+      .returns<Array<{ itinerary_id: string }>>();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return new Set((data ?? []).map((item) => item.itinerary_id));
   }
 
   async getTimeRange(itineraryId: string): Promise<string> {

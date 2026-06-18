@@ -232,8 +232,12 @@ export class ItineraryController {
     description: 'ID của lịch trình',
     example: 'uuid-sg-3days',
   })
-  async getItineraryDetail(@Param('id') id: string): Promise<any> {
-    return this.service.getItineraryDetail(id);
+  @ApiQuery({ name: 'tourist_id', required: false, type: String })
+  async getItineraryDetail(
+    @Param('id') id: string,
+    @Query('tourist_id') touristId?: string,
+  ): Promise<any> {
+    return this.service.getItineraryDetail(id, touristId);
   }
 
   @Delete(':id')
