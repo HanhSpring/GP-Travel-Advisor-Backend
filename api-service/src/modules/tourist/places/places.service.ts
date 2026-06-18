@@ -17,6 +17,7 @@ interface PlaceRow {
   description: string | null;
   open_time: string | null;
   close_time: string | null;
+  open_hour_compressed: string | null;
   vendor_id: string | null;
   is_approved: boolean;
   is_active: boolean;
@@ -29,21 +30,33 @@ interface PlaceRow {
   longitude: number | null;
   vibes: string | string[] | null;
   type_id: string | null;
-  types: {
-    id: string;
-    category_id: string | null;
-    categories: { id: string; name: string } | { id: string; name: string }[] | null;
-  } | {
-    id: string;
-    category_id: string | null;
-    categories: { id: string; name: string } | { id: string; name: string }[] | null;
-  }[] | null;
+  types:
+    | {
+        id: string;
+        category_id: string | null;
+        categories:
+          | { id: string; name: string }
+          | { id: string; name: string }[]
+          | null;
+      }
+    | {
+        id: string;
+        category_id: string | null;
+        categories:
+          | { id: string; name: string }
+          | { id: string; name: string }[]
+          | null;
+      }[]
+    | null;
 }
 
 interface PlaceTypeRow {
   id: string;
   category_id: string | null;
-  categories: { id: string; name: string } | { id: string; name: string }[] | null;
+  categories:
+    | { id: string; name: string }
+    | { id: string; name: string }[]
+    | null;
 }
 
 interface CategoryRow {
@@ -126,7 +139,9 @@ export class PlacesService {
     const { data: place, error: placeError } = await supabase
       .schema('travel')
       .from('places')
-      .select('*, cities(name), type_id, types(id, category_id, categories(id, name))')
+      .select(
+        '*, cities(name), type_id, types(id, category_id, categories(id, name))',
+      )
       .eq('id', placeId)
       .eq('is_approved', true)
       .eq('is_active', true)
@@ -142,7 +157,9 @@ export class PlacesService {
 
     // Extract category from type relationship
     let categoryList: string[] = [];
-    const typeData = Array.isArray(place.types) ? place.types?.[0] : place.types;
+    const typeData = Array.isArray(place.types)
+      ? place.types?.[0]
+      : place.types;
     if (typeData) {
       const categoryData = Array.isArray(typeData.categories)
         ? typeData.categories?.[0]
@@ -281,10 +298,8 @@ export class PlacesService {
       description: place.description,
       open_time: place.open_time,
       close_time: place.close_time,
-      is_open_now: this.isOpenNow(
-        place.open_time ?? null,
-        place.close_time ?? null,
-      ),
+      open_hour_compressed: place.open_hour_compressed,
+      is_open_now: this.isOpenNowFromCompressed(place.open_hour_compressed),
       phone: vendor?.phone_number ?? null,
       reviews: {
         average: Number(place.average_rating) || 0,
@@ -456,7 +471,7 @@ export class PlacesService {
       return images;
     }
 
-    return [this.defaultPlaceImageUrl];
+    return [];
   }
 
   private isOpenNow(
@@ -485,5 +500,96 @@ export class PlacesService {
     }
 
     return now >= open && now <= close;
+  }
+
+  private isOpenNowFromCompressed(
+    openHourCompressed?: string | null,
+  ): boolean | null {
+    const todayHours = this.getTodayOpeningRanges(openHourCompressed);
+    if (!todayHours) {
+      return null;
+    }
+
+    if (todayHours.length === 0) {
+      return false;
+    }
+
+    const now = new Date();
+
+    return todayHours.some(([openTime, closeTime]) =>
+      this.isCurrentTimeInRange(now, openTime, closeTime),
+    );
+  }
+
+  private getTodayOpeningRanges(
+    openHourCompressed?: string | null,
+  ): Array<[string, string]> | null {
+    if (!openHourCompressed) {
+      return null;
+    }
+
+    try {
+      const parsed = JSON.parse(openHourCompressed) as Record<string, unknown>;
+      const dayName = [
+        'Sunday',
+        'Monday',
+        'Tuesday',
+        'Wednesday',
+        'Thursday',
+        'Friday',
+        'Saturday',
+      ][new Date().getDay()];
+      const dayValue = parsed[dayName];
+
+      if (!Array.isArray(dayValue)) {
+        return [];
+      }
+
+      return dayValue
+        .filter(
+          (range): range is [string, string] =>
+            Array.isArray(range) &&
+            typeof range[0] === 'string' &&
+            typeof range[1] === 'string',
+        )
+        .map(([openTime, closeTime]) => [openTime, closeTime]);
+    } catch {
+      return null;
+    }
+  }
+
+  private isCurrentTimeInRange(
+    now: Date,
+    openTime: string,
+    closeTime: string,
+  ): boolean {
+    const [openHour, openMinute] = openTime.split(':').map(Number);
+    const [closeHour, closeMinute] = closeTime.split(':').map(Number);
+
+    if (
+      Number.isNaN(openHour) ||
+      Number.isNaN(openMinute) ||
+      Number.isNaN(closeHour) ||
+      Number.isNaN(closeMinute)
+    ) {
+      return false;
+    }
+
+    const open = new Date(now);
+    open.setHours(openHour, openMinute, 0, 0);
+
+    const close = new Date(now);
+    close.setHours(closeHour, closeMinute, 0, 0);
+
+    const comparableNow = new Date(now);
+
+    if (close < open) {
+      close.setDate(close.getDate() + 1);
+      if (comparableNow < open) {
+        comparableNow.setDate(comparableNow.getDate() + 1);
+      }
+    }
+
+    return comparableNow >= open && comparableNow <= close;
   }
 }
