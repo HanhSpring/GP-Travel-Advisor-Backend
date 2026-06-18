@@ -435,7 +435,30 @@ export class RecommendationService {
         if (attempt > 1) {
           this.logger.warn(`fetchBySlot [${slotType}] succeeded on attempt ${attempt}`);
         }
-        return (data ?? []) as PlaceCandidate[];
+        const candidates = (data ?? []) as PlaceCandidate[];
+        if (slotType === 'attraction' && travelType && candidates.length === 0) {
+          this.logger.warn(
+            `fetchBySlot [${slotType}] returned 0 with travelType="${travelType}", retrying without travelType`,
+          );
+          const { data: fallbackData, error: fallbackError } = await supabase.rpc(
+            'recommend_places_by_slot',
+            {
+              query_embedding: `[${embedding.join(',')}]`,
+              target_city_id: cityId,
+              p_slot_type: slotType,
+              p_limit: effectiveLimit,
+              p_travel_type: null,
+            },
+          );
+
+          if (!fallbackError) {
+            return (fallbackData ?? []) as PlaceCandidate[];
+          }
+          this.logger.error(
+            `fetchBySlot [${slotType}] fallback without travelType failed: ${fallbackError.message}`,
+          );
+        }
+        return candidates;
       }
 
       this.logger.error(
