@@ -77,14 +77,17 @@ export class PlaceDetailResponseDto {
   @ApiProperty({ type: [String] })
   images: string[];
 
-  @ApiProperty()
-  description: string;
+  @ApiProperty({ required: false, nullable: true })
+  description?: string | null;
 
   @ApiProperty()
   open_time: string;
 
   @ApiProperty()
   close_time: string;
+
+  @ApiProperty({ required: false, nullable: true })
+  open_hour_compressed?: string | null;
 
   @ApiProperty({ required: false, nullable: true })
   is_open_now?: boolean | null;
