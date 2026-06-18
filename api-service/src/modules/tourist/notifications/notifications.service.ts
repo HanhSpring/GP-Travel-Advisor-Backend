@@ -2,6 +2,7 @@ import {
   BadRequestException,
   Injectable,
   InternalServerErrorException,
+  NotFoundException,
 } from '@nestjs/common';
 import { supabase } from '../../../config/supabase';
 
@@ -81,6 +82,27 @@ export class NotificationsService {
     return isRead !== true;
   }
 
+  private buildNotificationItem(
+    link: UserNotificationRow,
+    base: NotificationRow,
+  ) {
+    const sentAt = link.sent_at || base.created_at || new Date().toISOString();
+
+    return {
+      id: base.id,
+      title: base.title ?? 'Thông báo',
+      content: base.content ?? '',
+      notification_type: base.type,
+      status: link.is_read ? 'read' : 'unread',
+      is_global: base.is_global ?? false,
+      read_at: link.read_at,
+      sent_at: sentAt,
+      time_label: this.buildTimeLabel(sentAt),
+      icon_key: this.mapIconKey(base.type),
+      is_unread: this.isUnreadStatus(link.is_read),
+    };
+  }
+
   async getNotifications(touristId: string) {
     if (!touristId) {
       throw new BadRequestException('tourist_id is required');
@@ -134,22 +156,7 @@ export class NotificationsService {
           return null;
         }
 
-        const sentAt =
-          link.sent_at || base.created_at || new Date().toISOString();
-
-        return {
-          id: base.id,
-          title: base.title ?? 'Thông báo',
-          content: base.content ?? '',
-          notification_type: base.type,
-          status: link.is_read ? 'read' : 'unread',
-          is_global: base.is_global ?? false,
-          read_at: link.read_at,
-          sent_at: sentAt,
-          time_label: this.buildTimeLabel(sentAt),
-          icon_key: this.mapIconKey(base.type),
-          is_unread: this.isUnreadStatus(link.is_read),
-        };
+        return this.buildNotificationItem(link, base);
       })
       .filter((item): item is NonNullable<typeof item> => Boolean(item));
 
@@ -160,6 +167,123 @@ export class NotificationsService {
       total: items.length,
       unread_count: unreadCount,
       notifications: items,
+    };
+  }
+
+  async getNotificationDetail(touristId: string, notificationId: string) {
+    if (!touristId) {
+      throw new BadRequestException('tourist_id is required');
+    }
+
+    if (!notificationId) {
+      throw new BadRequestException('notification id is required');
+    }
+
+    const { data: linkRow, error: linkError } = await supabase
+      .schema('public')
+      .from('users_notifications')
+      .select('id, notification_id, user_id, is_read, read_at, sent_at')
+      .eq('user_id', touristId)
+      .eq('notification_id', notificationId)
+      .maybeSingle();
+
+    if (linkError) {
+      throw new InternalServerErrorException(linkError.message);
+    }
+
+    if (!linkRow) {
+      throw new NotFoundException('Notification was not sent to this tourist');
+    }
+
+    const { data: notificationRow, error: notificationError } = await supabase
+      .schema('public')
+      .from('notifications')
+      .select('id, title, content, type, is_global, created_at')
+      .eq('id', notificationId)
+      .maybeSingle();
+
+    if (notificationError) {
+      throw new InternalServerErrorException(notificationError.message);
+    }
+
+    if (!notificationRow) {
+      throw new NotFoundException('Notification not found');
+    }
+
+    return this.buildNotificationItem(
+      linkRow as UserNotificationRow,
+      notificationRow as NotificationRow,
+    );
+  }
+
+  async markAsRead(touristId: string, notificationId: string) {
+    if (!touristId) {
+      throw new BadRequestException('tourist_id is required');
+    }
+
+    if (!notificationId) {
+      throw new BadRequestException('notification id is required');
+    }
+
+    const { data: notificationRow, error: notificationError } = await supabase
+      .schema('public')
+      .from('notifications')
+      .select('id, title, content, type, is_global, created_at')
+      .eq('id', notificationId)
+      .maybeSingle();
+
+    if (notificationError) {
+      throw new InternalServerErrorException(notificationError.message);
+    }
+
+    if (!notificationRow) {
+      throw new NotFoundException('Notification not found');
+    }
+
+    const readAt = new Date().toISOString();
+    const { data: updatedLinks, error: updateError } = await supabase
+      .schema('public')
+      .from('users_notifications')
+      .update({ is_read: true, read_at: readAt })
+      .eq('user_id', touristId)
+      .eq('notification_id', notificationId)
+      .select('id, notification_id, user_id, is_read, read_at, sent_at');
+
+    if (updateError) {
+      throw new InternalServerErrorException(updateError.message);
+    }
+
+    if (!updatedLinks || updatedLinks.length === 0) {
+      throw new NotFoundException('Notification was not sent to this tourist');
+    }
+
+    return this.buildNotificationItem(
+      updatedLinks[0] as UserNotificationRow,
+      notificationRow as NotificationRow,
+    );
+  }
+
+  async markAllAsRead(touristId: string) {
+    if (!touristId) {
+      throw new BadRequestException('tourist_id is required');
+    }
+
+    const readAt = new Date().toISOString();
+    const { data: updatedRows, error } = await supabase
+      .schema('public')
+      .from('users_notifications')
+      .update({ is_read: true, read_at: readAt })
+      .eq('user_id', touristId)
+      .or('is_read.is.null,is_read.eq.false')
+      .select('id');
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return {
+      tourist_id: touristId,
+      updated_count: updatedRows?.length ?? 0,
     };
   }
 }

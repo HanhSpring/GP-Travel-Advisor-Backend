@@ -52,3 +52,5 @@ export class TouristNotificationsResponseDto {
   @ApiProperty({ type: [TouristNotificationItemDto] })
   notifications: TouristNotificationItemDto[];
 }
+
+export class TouristNotificationDetailDto extends TouristNotificationItemDto {}
