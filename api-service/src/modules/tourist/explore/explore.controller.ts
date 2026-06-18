@@ -41,14 +41,17 @@ export class ExploreController {
   @ApiOperation({ summary: 'Get public itineraries for suggestions/view-all' })
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiQuery({ name: 'tourist_id', required: false, type: String })
   @ApiOkResponse({ type: ExplorePublicItinerariesResponseDto })
   getPublicItineraries(
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('tourist_id') touristId?: string,
   ) {
     return this.service.getPublicItineraries(
       page ? parseInt(page, 10) : 1,
       limit ? parseInt(limit, 10) : 5,
+      touristId,
     );
   }
 
@@ -60,16 +63,19 @@ export class ExploreController {
   @ApiQuery({ name: 'category', required: false, type: String })
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiQuery({ name: 'tourist_id', required: false, type: String })
   @ApiOkResponse({ type: ExplorePlacesResponseDto })
   getPlaces(
     @Query('category') category?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('tourist_id') touristId?: string,
   ) {
     return this.service.getPlacesByCategory(
       category,
       page ? parseInt(page, 10) : 1,
       limit ? parseInt(limit, 10) : 5,
+      touristId,
     );
   }
 
