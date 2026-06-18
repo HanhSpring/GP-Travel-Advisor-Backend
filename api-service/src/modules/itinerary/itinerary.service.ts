@@ -945,7 +945,7 @@ export class ItineraryService {
     return true;
   }
 
-  async getItineraryDetail(id: string) {
+  async getItineraryDetail(id: string, touristId?: string) {
     const { data: itinerary, error: itinError } = await supabase
       .schema('travel')
       .from('itineraries')
@@ -1169,6 +1169,9 @@ export class ItineraryService {
 
     const startStr = itinerary.start_date || '';
     const endStr = itinerary.end_date || '';
+    const isFavorite = touristId
+      ? await this.checkFavoriteItinerary(touristId, id)
+      : false;
 
     let diffDays = 1;
     try {
@@ -1199,6 +1202,8 @@ export class ItineraryService {
       dateRangeLabel: `${startStr} - ${endStr}`,
       status: (itinerary.status || 'pending').toUpperCase(),
       isPublic: itinerary.is_public || false,
+      is_favorite: isFavorite,
+      isFavorite,
       totalBudget: itinerary.estimated_cost || 0,
       totalDays: diffDays || days.length || 1,
       totalPlaces: nonHotelDetailsCount,
@@ -1218,6 +1223,25 @@ export class ItineraryService {
       ],
       visitedRestaurants: [],
     };
+  }
+
+  private async checkFavoriteItinerary(
+    touristId: string,
+    itineraryId: string,
+  ): Promise<boolean> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('favorite_itineraries')
+      .select('tourist_id')
+      .eq('tourist_id', touristId)
+      .eq('itinerary_id', itineraryId)
+      .maybeSingle<{ tourist_id: string }>();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return Boolean(data);
   }
 
   /**

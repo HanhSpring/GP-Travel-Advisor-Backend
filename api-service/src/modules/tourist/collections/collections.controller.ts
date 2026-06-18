@@ -1,4 +1,4 @@
-import { Controller, Get, Query } from '@nestjs/common';
+import { Controller, Delete, Get, Param, Post, Query } from '@nestjs/common';
 import {
   ApiOkResponse,
   ApiOperation,
@@ -43,6 +43,26 @@ export class CollectionsController {
     );
   }
 
+  @Post('itineraries/:itineraryId')
+  @ApiOperation({ summary: 'Add itinerary to tourist favorites' })
+  @ApiQuery({ name: 'tourist_id', required: true, type: String })
+  favoriteItinerary(
+    @Param('itineraryId') itineraryId: string,
+    @Query('tourist_id') touristId: string,
+  ) {
+    return this.service.addFavoriteItinerary(touristId, itineraryId);
+  }
+
+  @Delete('itineraries/:itineraryId')
+  @ApiOperation({ summary: 'Remove itinerary from tourist favorites' })
+  @ApiQuery({ name: 'tourist_id', required: true, type: String })
+  unfavoriteItinerary(
+    @Param('itineraryId') itineraryId: string,
+    @Query('tourist_id') touristId: string,
+  ) {
+    return this.service.removeFavoriteItinerary(touristId, itineraryId);
+  }
+
   @Get('places')
   @ApiOperation({ summary: 'Get all favorite places with pagination' })
   @ApiQuery({ name: 'tourist_id', required: true, type: String })
@@ -59,5 +79,25 @@ export class CollectionsController {
       page ? parseInt(page, 10) : 1,
       limit ? parseInt(limit, 10) : 5,
     );
+  }
+
+  @Post('places/:placeId')
+  @ApiOperation({ summary: 'Add place to tourist favorites' })
+  @ApiQuery({ name: 'tourist_id', required: true, type: String })
+  favoritePlace(
+    @Param('placeId') placeId: string,
+    @Query('tourist_id') touristId: string,
+  ) {
+    return this.service.addFavoritePlace(touristId, placeId);
+  }
+
+  @Delete('places/:placeId')
+  @ApiOperation({ summary: 'Remove place from tourist favorites' })
+  @ApiQuery({ name: 'tourist_id', required: true, type: String })
+  unfavoritePlace(
+    @Param('placeId') placeId: string,
+    @Query('tourist_id') touristId: string,
+  ) {
+    return this.service.removeFavoritePlace(touristId, placeId);
   }
 }
