@@ -1,7 +1,9 @@
 import { ApiProperty } from '@nestjs/swagger';
 import {
+  ArrayMaxSize,
   IsArray,
   IsBoolean,
+  IsIn,
   IsInt,
   IsOptional,
   IsString,
@@ -11,6 +13,26 @@ import {
   ValidateNested,
 } from 'class-validator';
 import { Type } from 'class-transformer';
+
+export class SubmitReviewMediaDto {
+  @ApiProperty({
+    example:
+      'reviews/itineraries/11111111-1111-4111-a111-111111111111/images/photo.webp',
+    description: 'Final R2 object key returned by the presigned upload API',
+  })
+  @IsString()
+  object_key: string;
+
+  @ApiProperty({ enum: ['image', 'video'] })
+  @IsIn(['image', 'video'])
+  media_type: 'image' | 'video';
+
+  @ApiProperty({ required: false, minimum: 0 })
+  @IsOptional()
+  @IsInt()
+  @Min(0)
+  sort_order?: number;
+}
 
 export class SubmitItineraryPlaceReviewDto {
   @ApiProperty({
@@ -40,6 +62,14 @@ export class SubmitItineraryPlaceReviewDto {
   @IsArray()
   @IsString({ each: true })
   tags?: string[] | null;
+
+  @ApiProperty({ type: [SubmitReviewMediaDto], required: false })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(6)
+  @ValidateNested({ each: true })
+  @Type(() => SubmitReviewMediaDto)
+  media?: SubmitReviewMediaDto[];
 }
 
 export class SubmitItineraryReviewDto {
@@ -73,6 +103,14 @@ export class SubmitItineraryReviewDto {
   @ValidateNested({ each: true })
   @Type(() => SubmitItineraryPlaceReviewDto)
   place_reviews?: SubmitItineraryPlaceReviewDto[];
+
+  @ApiProperty({ type: [SubmitReviewMediaDto], required: false })
+  @IsOptional()
+  @IsArray()
+  @ArrayMaxSize(6)
+  @ValidateNested({ each: true })
+  @Type(() => SubmitReviewMediaDto)
+  media?: SubmitReviewMediaDto[];
 
   @ApiProperty({
     type: [String],
