@@ -12,6 +12,7 @@ import {
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { UploadService } from './upload.service';
+import { CreateReviewPresignedUrlsDto } from './dto/create-review-presigned-urls.dto';
 import {
   ApiBearerAuth,
   ApiConsumes,
@@ -61,6 +62,17 @@ export class UploadController {
   }
 
   // 2. LUỒNG UPLOAD ẢNH REVIEW (Khách du lịch)
+  @Post('reviews/presigned-urls')
+  @ApiOperation({ summary: 'Create presigned R2 upload URLs for review media' })
+  @ApiBearerAuth('access-token')
+  @UseGuards(JwtAuthGuard)
+  async createReviewPresignedUrls(
+    @Body() dto: CreateReviewPresignedUrlsDto,
+    @Req() req: any,
+  ) {
+    return this.uploadService.createReviewPresignedUrls(dto, req.user.userId);
+  }
+
   @Post('review')
   @UseInterceptors(FileInterceptor('file'))
   async uploadReview(
