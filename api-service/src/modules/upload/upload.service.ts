@@ -7,6 +7,7 @@ import {
 import { ConfigService } from '@nestjs/config';
 import sharp from 'sharp';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { randomUUID } from 'crypto';
 
 @Injectable()
 export class UploadService {
@@ -39,7 +40,7 @@ export class UploadService {
   }
 
   // --- HÀM 1: UPLOAD AVATAR (Cắt vuông, tập trung vào tâm) ---
-  async uploadAvatar(file: Express.Multer.File, userId: string) {
+  async uploadAvatar(file: any, userId: string) {
     try {
       const { data: user } = await this.supabase
         .from('users')
@@ -74,7 +75,7 @@ export class UploadService {
   }
 
   //  HÀM 2: UPLOAD REVIEW
-  async uploadReviewImage(file: Express.Multer.File, reviewId: string) {
+  async uploadReviewImage(file: any, reviewId: string) {
     try {
       const optimizedBuffer = await sharp(file.buffer)
         .resize(1200, null, { fit: 'inside' })
@@ -96,21 +97,40 @@ export class UploadService {
   }
 
   //  HÀM 3: UPLOAD ẢNH ĐỊA ĐIỂM
-  async uploadPlaceImage(file: Express.Multer.File, placeId: string) {
+  async uploadPlaceImage(file: any, placeId: string) {
     try {
       const optimizedBuffer = await sharp(file.buffer)
-        .resize(1920, 1080, { fit: 'inside' })
-        .webp({ quality: 90 })
+        .resize(640, 400, { fit: 'cover' })
+        .webp({ quality: 85 })
         .toBuffer();
 
-      const fileName = `places/place-${placeId}-${Date.now()}.webp`;
-      const url = await this.pushToR2(optimizedBuffer, fileName);
+      // Tạo key: places/{placeId}/{imageId}.webp
+      // VD: places/place-uuid-abc123/img-uuid-001.webp
+      const imageId = randomUUID();
+      const key = `places/${placeId}/${imageId}.webp`;
 
-      // Lưu URL vào bảng travel.place_images
-      await this.supabase
+      const url = await this.pushToR2(optimizedBuffer, key);
+
+      // Lấy mảng image_url hiện tại của địa điểm
+      const { data: place, error: fetchError } = await this.supabase
         .schema('travel')
-        .from('place_images')
-        .insert({ place_id: placeId, image_url: url });
+        .from('places')
+        .select('image_url')
+        .eq('id', placeId)
+        .single();
+
+      if (fetchError) throw fetchError;
+
+      const currentImages: string[] = (place as any)?.image_url ?? [];
+
+      // Append URL mới vào mảng và cập nhật lại travel.places
+      const { error: updateError } = await this.supabase
+        .schema('travel')
+        .from('places')
+        .update({ image_url: [...currentImages, url] })
+        .eq('id', placeId);
+
+      if (updateError) throw updateError;
 
       return { url };
     } catch (error) {
@@ -118,7 +138,7 @@ export class UploadService {
     }
   }
   //  HÀM 4: UPLOAD ẢNH MÓN ĂN
-  async uploadFoodImage(file: Express.Multer.File, foodId: string) {
+  async uploadFoodImage(file: any, foodId: string) {
     try {
       const optimizedBuffer = await sharp(file.buffer)
         .resize(800, 600, {
