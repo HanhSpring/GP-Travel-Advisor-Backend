@@ -29,7 +29,7 @@ interface ItineraryDetailRow {
 interface PlaceRow {
   id: string;
   name: string;
-  image_url: string | null;
+  image_url: string[] | string | null;
 }
 
 interface ItineraryReviewRow {
@@ -61,6 +61,24 @@ export class ItineraryReviewsService {
     }
 
     throw new InternalServerErrorException(error.message || 'Database error');
+  }
+
+  private getFirstPlaceImageUrl(place: PlaceRow | undefined): string | null {
+    const imageUrl = place?.image_url;
+
+    if (Array.isArray(imageUrl)) {
+      const firstValidUrl = imageUrl.find(
+        (item) => typeof item === 'string' && item.trim().length > 0,
+      );
+      return firstValidUrl?.trim() ?? null;
+    }
+
+    if (typeof imageUrl === 'string') {
+      const trimmed = imageUrl.trim();
+      return trimmed.length > 0 ? trimmed : null;
+    }
+
+    return null;
   }
 
   private async getItineraryOrThrow(touristId: string, itineraryId: string) {
@@ -440,7 +458,7 @@ export class ItineraryReviewsService {
     );
     const placeIds = Array.from(new Set(details.map((item) => item.place_id)));
     const places = await this.getPlaces(placeIds);
-    const coverImage = places[0]?.image_url ?? null;
+    const coverImage = this.getFirstPlaceImageUrl(places[0]);
     const isCompleted = (itinerary.status ?? '').toLowerCase() === 'completed';
 
     const showPopup = isCompleted;
@@ -494,7 +512,7 @@ export class ItineraryReviewsService {
         start_date: itinerary.start_date ?? '',
         end_date: itinerary.end_date ?? '',
         status: itinerary.status,
-        cover_image: places[0]?.image_url ?? null,
+        cover_image: this.getFirstPlaceImageUrl(places[0]),
         total_places: details.length,
       },
       general_review: {
@@ -514,7 +532,7 @@ export class ItineraryReviewsService {
           visit_date: item.visit_date ?? '',
           place_id: item.place_id,
           place_name: place?.name ?? 'Địa điểm',
-          place_image_url: place?.image_url ?? null,
+          place_image_url: this.getFirstPlaceImageUrl(place),
           rating: null,
           content: null,
         };
