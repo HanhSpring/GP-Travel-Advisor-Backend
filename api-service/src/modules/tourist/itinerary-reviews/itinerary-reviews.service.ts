@@ -4,9 +4,13 @@ import {
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
+import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
 import { supabase } from '../../../config/supabase';
-import { SubmitItineraryReviewDto } from './dto/submit-itinerary-review.dto';
+import {
+  SubmitItineraryReviewDto,
+  SubmitReviewMediaDto,
+} from './dto/submit-itinerary-review.dto';
 
 interface ItineraryRow {
   id: string;
@@ -40,6 +44,8 @@ interface ItineraryReviewRow {
 
 @Injectable()
 export class ItineraryReviewsService {
+  constructor(private readonly configService: ConfigService) {}
+
   private normalizeOptionalText(value: unknown): string | null {
     if (typeof value !== 'string') {
       return null;
@@ -242,6 +248,28 @@ export class ItineraryReviewsService {
         itinerary_id: itineraryId,
         rating: overallRating,
         content: overallContent,
+        status: 'pending',
+      },
+      {
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        rating: overallRating,
+        content: overallContent,
+      },
+      {
+        rating: overallRating,
+        content: overallContent,
+        status: 'pending',
+      },
+      {
+        rating: overallRating,
+        content: overallContent,
+      },
+      {
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        rating: overallRating,
+        content: overallContent,
         is_approved: null,
       },
       {
@@ -276,6 +304,26 @@ export class ItineraryReviewsService {
     }
 
     const baseCandidates: Array<Record<string, unknown>> = [
+      {
+        id: randomUUID(),
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        status: 'pending',
+      },
+      {
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        status: 'pending',
+      },
+      {
+        id: randomUUID(),
+        itinerary_id: itineraryId,
+        status: 'pending',
+      },
+      {
+        itinerary_id: itineraryId,
+        status: 'pending',
+      },
       {
         id: randomUUID(),
         tourist_id: touristId,
@@ -417,6 +465,127 @@ export class ItineraryReviewsService {
     };
   }
 
+  private getReviewMediaCount(payload: SubmitItineraryReviewDto) {
+    return (
+      (payload.media?.length ?? 0) +
+      (payload.place_reviews ?? []).reduce(
+        (total, item) => total + (item.media?.length ?? 0),
+        0,
+      )
+    );
+  }
+
+  private validateReviewMediaCounts(payload: SubmitItineraryReviewDto) {
+    const totalMediaCount = this.getReviewMediaCount(payload);
+
+    if (totalMediaCount > 30) {
+      throw new BadRequestException(
+        'Review submit is limited to 30 media items',
+      );
+    }
+  }
+
+  private getR2PublicBaseUrl() {
+    const publicR2Url = this.configService
+      .get<string>('CLOUDFLARE_R2_PUBLIC_URL')
+      ?.replace(/\/+$/, '');
+
+    if (!publicR2Url) {
+      throw new InternalServerErrorException(
+        'Missing Cloudflare R2 public URL configuration',
+      );
+    }
+
+    return publicR2Url;
+  }
+
+  private buildR2PublicUrl(objectKey: string) {
+    return `${this.getR2PublicBaseUrl()}/${objectKey}`;
+  }
+
+  private validateReviewMediaObjectKey(params: {
+    expectedPrefix: string;
+    mediaType: 'image' | 'video';
+    objectKey: string;
+  }) {
+    const objectKey = params.objectKey.trim();
+    const expectedFolder = params.mediaType === 'image' ? 'images' : 'videos';
+
+    if (
+      objectKey.length === 0 ||
+      objectKey.includes('\\') ||
+      objectKey.startsWith('/') ||
+      /^https?:\/\//i.test(objectKey) ||
+      /^[a-zA-Z]:[\\/]/.test(objectKey)
+    ) {
+      throw new BadRequestException(
+        `Invalid review media object_key: ${params.objectKey}`,
+      );
+    }
+
+    if (!objectKey.startsWith(params.expectedPrefix)) {
+      throw new BadRequestException(
+        `object_key does not match expected review media prefix: ${objectKey}`,
+      );
+    }
+
+    if (!objectKey.startsWith(`${params.expectedPrefix}${expectedFolder}/`)) {
+      throw new BadRequestException(
+        `object_key folder does not match media_type ${params.mediaType}: ${objectKey}`,
+      );
+    }
+
+    return objectKey;
+  }
+
+  private buildReviewMediaUrls(params: {
+    expectedPrefix: string;
+    media: SubmitReviewMediaDto[];
+  }): string[] {
+    return [...params.media]
+      .map((item, index) => ({
+        objectKey: this.validateReviewMediaObjectKey({
+          expectedPrefix: params.expectedPrefix,
+          mediaType: item.media_type,
+          objectKey: item.object_key,
+        }),
+        sortOrder: item.sort_order ?? index,
+      }))
+      .sort((a, b) => a.sortOrder - b.sortOrder)
+      .map((item) => this.buildR2PublicUrl(item.objectKey));
+  }
+
+  private assertUniqueReviewMediaUrls(mediaUrls: string[]) {
+    const seen = new Set<string>();
+
+    for (const url of mediaUrls) {
+      if (seen.has(url)) {
+        throw new BadRequestException(
+          `Duplicate review media object URL: ${url}`,
+        );
+      }
+
+      seen.add(url);
+    }
+  }
+
+  private async updateItineraryReviewImages(
+    itineraryReviewId: string,
+    mediaUrls: string[],
+  ) {
+    if (mediaUrls.length === 0) {
+      return;
+    }
+
+    const { error } = await supabase
+      .schema('review_ai')
+      .from('itinerary_reviews')
+      .update({ url_image: mediaUrls })
+      .eq('id', itineraryReviewId);
+
+    this.handleTableError(error as { code?: string; message?: string } | null);
+  }
+
   private buildDayInfo(details: ItineraryDetailRow[]) {
     const orderedDates = Array.from(
       new Set(
@@ -556,15 +725,22 @@ export class ItineraryReviewsService {
     const normalizedOverallContent = this.normalizeOptionalText(
       payload.overall_content,
     );
+    this.validateReviewMediaCounts(payload);
 
     const hasOverallRating =
       payload.overall_rating !== null && payload.overall_rating !== undefined;
     const hasOverallContent = Boolean(normalizedOverallContent);
     const hasPlaceReviews = Boolean(payload.place_reviews?.length);
+    const hasItineraryMedia = Boolean(payload.media?.length);
 
-    if (!hasOverallRating && !hasOverallContent && !hasPlaceReviews) {
+    if (
+      !hasOverallRating &&
+      !hasOverallContent &&
+      !hasPlaceReviews &&
+      !hasItineraryMedia
+    ) {
       throw new BadRequestException(
-        'At least one review input is required: overall rating/content or place reviews',
+        'At least one review input is required: overall rating/content, media, or place reviews',
       );
     }
 
@@ -575,13 +751,18 @@ export class ItineraryReviewsService {
       throw new BadRequestException('Itinerary has no place details to review');
     }
 
-    const itineraryReviewId = await this.saveItinerarySummaryReview(
+    let itineraryReviewId = await this.saveItinerarySummaryReview(
       touristId,
       itineraryId,
       hasOverallRating ? (payload.overall_rating as number) : null,
       normalizedOverallContent,
       payload.apply_all_places ?? false,
     );
+
+    if (!itineraryReviewId) {
+      const draft = await this.getOrCreateReviewDraft(touristId, itineraryId);
+      itineraryReviewId = draft.id;
+    }
 
     const detailById = new Map(details.map((item) => [item.id, item]));
     const ratingByDetailId = new Map<
@@ -623,33 +804,57 @@ export class ItineraryReviewsService {
     }
 
     const finalPlaceRatings = Array.from(ratingByDetailId.values());
+    const itineraryMediaUrls = this.buildReviewMediaUrls({
+      expectedPrefix: `reviews/itineraries/${itineraryId}/`,
+      media: payload.media ?? [],
+    });
+    const allMediaUrls = [...itineraryMediaUrls];
 
-    if (finalPlaceRatings.length > 0) {
-      const reviewsWithTags = finalPlaceRatings.map((item) => {
-        const matchingPlaceReview = payload.place_reviews?.find(
-          (placeReview) =>
-            placeReview.itinerary_detail_id === item.itinerary_detail_id,
-        ) as { tags?: string[] | null } | undefined;
+    const reviewsWithTags = finalPlaceRatings.map((item) => {
+      const matchingPlaceReview = payload.place_reviews?.find(
+        (placeReview) =>
+          placeReview.itinerary_detail_id === item.itinerary_detail_id,
+      );
 
-        const tags: string[] | null = Array.isArray(matchingPlaceReview?.tags)
-          ? [...matchingPlaceReview.tags]
-          : null;
+      const tags: string[] | null = Array.isArray(matchingPlaceReview?.tags)
+        ? [...matchingPlaceReview.tags]
+        : null;
 
-        return {
-          id: randomUUID(),
-          tourist_id: touristId,
-          itinerary_id: itineraryId,
-          place_id: item.place_id,
-          rating: item.rating,
-          review_type: item.content ? 'with_content' : 'without_content',
-          tags,
-        };
-      });
+      return {
+        source_itinerary_detail_id: item.itinerary_detail_id,
+        url_image: this.buildReviewMediaUrls({
+          expectedPrefix: `reviews/itinerary-details/${item.itinerary_detail_id}/`,
+          media: matchingPlaceReview?.media ?? [],
+        }),
+        id: randomUUID(),
+        tourist_id: touristId,
+        itinerary_id: itineraryId,
+        place_id: item.place_id,
+        rating: item.rating,
+        review_type: item.content ? 'with_content' : 'without_content',
+        tags,
+      };
+    });
 
+    for (const review of reviewsWithTags) {
+      allMediaUrls.push(...review.url_image);
+    }
+
+    this.assertUniqueReviewMediaUrls(allMediaUrls);
+    await this.updateItineraryReviewImages(
+      itineraryReviewId,
+      itineraryMediaUrls,
+    );
+
+    if (reviewsWithTags.length > 0) {
       const { error: insertReviewsError } = await supabase
         .schema('review_ai')
         .from('reviews')
-        .insert(reviewsWithTags);
+        .insert(
+          reviewsWithTags.map(({ source_itinerary_detail_id, ...review }) => ({
+            ...review,
+          })),
+        );
 
       if (insertReviewsError) {
         throw new InternalServerErrorException(insertReviewsError.message);
@@ -678,11 +883,13 @@ export class ItineraryReviewsService {
       }
     }
 
+    const savedMediaCount = allMediaUrls.length;
+
     return {
       success: true,
-      itinerary_review_id: itineraryReviewId ?? randomUUID(),
+      itinerary_review_id: itineraryReviewId,
       saved_place_reviews: finalPlaceRatings.length,
-      saved_media_count: 0,
+      saved_media_count: savedMediaCount,
       message: 'Itinerary review submitted successfully',
     };
   }
