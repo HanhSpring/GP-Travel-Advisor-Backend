@@ -484,6 +484,23 @@ export class ItineraryReviewsService {
     const placeIds = Array.from(new Set(details.map((item) => item.place_id)));
     const places = await this.getPlaces(placeIds);
     const placeMap = new Map(places.map((item) => [item.id, item]));
+    const { data: visits, error: visitsError } = await supabase
+      .schema('tracking')
+      .from('geofence_visits')
+      .select('itinerary_detail_id, status')
+      .eq('itinerary_id', itineraryId)
+      .eq('tourist_id', touristId);
+
+    if (visitsError) {
+      throw new InternalServerErrorException(visitsError.message);
+    }
+
+    const visitedDetailIds = new Set(
+      (visits ?? [])
+        .filter((item: any) => item.status === 'visited')
+        .map((item: any) => item.itinerary_detail_id)
+        .filter((id: unknown): id is string => typeof id === 'string'),
+    );
 
     const { dayByDate, dayFilters } = this.buildDayInfo(details);
 
@@ -515,6 +532,8 @@ export class ItineraryReviewsService {
           place_id: item.place_id,
           place_name: place?.name ?? 'Địa điểm',
           place_image_url: place?.image_url ?? null,
+          is_visited: visitedDetailIds.has(item.id),
+          isVisited: visitedDetailIds.has(item.id),
           rating: null,
           content: null,
         };

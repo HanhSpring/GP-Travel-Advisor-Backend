@@ -23,6 +23,7 @@ interface ScheduleEntry {
   departure_time: string;
   active_duration_minutes: number;
   estimated_cost?: number;
+  transport_cost?: number;
   travel_minutes: number;
   distance_km: number;
   is_return_to_hotel: boolean;
@@ -70,7 +71,164 @@ export class ItineraryService {
       console.error('[ItineraryService] getMyItineraries error:', error);
       throw error;
     }
-    return data;
+    return this.withCorrectedListCounts(data ?? []);
+  }
+
+  private async withCorrectedListCounts(response: any) {
+    const items = Array.isArray(response)
+      ? response
+      : Array.isArray(response?.itineraries)
+        ? response.itineraries
+        : [];
+    if (items.length === 0) return response;
+
+    const itineraryIds = items
+      .map((item) => item?.id)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+    if (itineraryIds.length === 0) return response;
+
+    const { data: details, error } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select(
+        'id, itinerary_id, visit_date, arrival_time, departure_time, sequence_order, estimated_cost, transport_cost',
+      )
+      .in('itinerary_id', itineraryIds);
+
+    if (error) {
+      console.warn(
+        '[ItineraryService] Could not correct itinerary list counts:',
+        error.message,
+      );
+      return response;
+    }
+
+    const detailToItinerary = new Map<string, string>();
+    const totalByItinerary = new Map<string, number>();
+    const estimatedCostByItinerary = new Map<string, number>();
+    for (const detail of details ?? []) {
+      const itineraryId = (detail as any).itinerary_id;
+      if (!itineraryId) continue;
+      if (((detail as any).sequence_order ?? 1) === 0) continue;
+      const detailId = (detail as any).id;
+      if (typeof detailId === 'string' && detailId.length > 0) {
+        detailToItinerary.set(detailId, itineraryId);
+      }
+      totalByItinerary.set(
+        itineraryId,
+        (totalByItinerary.get(itineraryId) ?? 0) + 1,
+      );
+    }
+
+    const detailsByItineraryDay = new Map<string, any[]>();
+    for (const detail of details ?? []) {
+      const itineraryId = (detail as any).itinerary_id;
+      const visitDate = (detail as any).visit_date;
+      if (!itineraryId || !visitDate) continue;
+      const key = `${itineraryId}:${visitDate}`;
+      const list = detailsByItineraryDay.get(key) ?? [];
+      list.push(detail);
+      detailsByItineraryDay.set(key, list);
+    }
+
+    for (const dayDetails of detailsByItineraryDay.values()) {
+      dayDetails.sort((a: any, b: any) => {
+        const seqA = Number(a.sequence_order ?? 9999);
+        const seqB = Number(b.sequence_order ?? 9999);
+        if (seqA !== seqB) return seqA - seqB;
+        return String(a.arrival_time ?? '').localeCompare(
+          String(b.arrival_time ?? ''),
+        );
+      });
+      for (let index = 0; index < dayDetails.length; index += 1) {
+        const detail = dayDetails[index];
+        const itineraryId = detail.itinerary_id;
+        if (!itineraryId) continue;
+        const isStartPoint =
+          Number(detail.sequence_order ?? 1) === 0;
+        const placeCost = isStartPoint
+          ? this.estimateHotelCostPerNight()
+          : Number(detail.estimated_cost ?? 0);
+        const nextDetail = dayDetails[index + 1];
+        const transportCost = nextDetail
+          ? Number(
+              detail.transport_cost ??
+                this.estimateTransportCostFromTransitLabel(
+                  this._calcTransitLabel(
+                    String(detail.departure_time ?? ''),
+                    String(nextDetail.arrival_time ?? ''),
+                  ),
+                ),
+            )
+          : 0;
+      estimatedCostByItinerary.set(
+        itineraryId,
+        (estimatedCostByItinerary.get(itineraryId) ?? 0) +
+          placeCost +
+          transportCost,
+      );
+      }
+    }
+
+    const { data: visits, error: visitError } = await supabase
+      .schema('tracking')
+      .from('geofence_visits')
+      .select('itinerary_id, itinerary_detail_id, status')
+      .in('itinerary_id', itineraryIds);
+
+    if (visitError) {
+      console.warn(
+        '[ItineraryService] Could not correct itinerary visited counts:',
+        visitError.message,
+      );
+    }
+
+    const visitedByItinerary = new Map<string, number>();
+    if (!visitError) {
+      const visitedDetailIds = new Set<string>();
+      for (const visit of visits ?? []) {
+        if ((visit as any).status !== 'visited') continue;
+        const detailId = (visit as any).itinerary_detail_id;
+        if (typeof detailId !== 'string' || detailId.length === 0) continue;
+        const itineraryId = detailToItinerary.get(detailId);
+        if (!itineraryId) continue;
+        if (visitedDetailIds.has(detailId)) continue;
+        visitedDetailIds.add(detailId);
+        visitedByItinerary.set(
+          itineraryId,
+          (visitedByItinerary.get(itineraryId) ?? 0) + 1,
+        );
+      }
+    }
+
+    const correctedItems = items.map((item) => {
+      const totalLocations = totalByItinerary.get(item.id);
+      if (totalLocations === undefined) return item;
+      const visitedLocations = visitError
+        ? Number(item.visited_locations ?? 0)
+        : (visitedByItinerary.get(item.id) ?? 0);
+      const userBudget = Number(item.estimated_cost ?? 0);
+      const plannerEstimatedCost = estimatedCostByItinerary.get(item.id) ?? 0;
+      return {
+        ...item,
+        user_budget: userBudget,
+        budget_limit: userBudget,
+        estimated_cost: plannerEstimatedCost,
+        estimatedCost: plannerEstimatedCost,
+        planner_estimated_cost: plannerEstimatedCost,
+        total_locations: totalLocations,
+        visited_locations: visitedLocations,
+        totalLocations,
+        visitedLocations,
+        progress:
+          totalLocations > 0
+            ? Math.round((visitedLocations / totalLocations) * 100)
+            : 0,
+      };
+    });
+    return Array.isArray(response)
+      ? correctedItems
+      : { ...response, itineraries: correctedItems };
   }
 
   async createGeneratedItinerary(
@@ -84,25 +242,47 @@ export class ItineraryService {
       this.getCityNameOrNull(dto.destinationLocationId),
     ]);
 
-    const { data: itinerary, error: itineraryError } = await supabase
+    const baseItineraryRow = {
+      creator_id: dto.userId,
+      // [TRIP_NAME_INPUT] Luu ten chuyen di user dat vao cot description.
+      description: dto.description ?? null,
+      start_date: dto.startDate,
+      end_date: dto.endDate,
+      estimated_cost: dto.budget,
+      status: 'pending',
+      departure_point: departureName ?? dto.departureLocationId,
+      destination: destinationName ?? dto.destinationLocationId,
+      is_public: false,
+      adult_count: dto.adultCount,
+      children_count: dto.childCount ?? 0,
+    };
+
+    let { data: itinerary, error: itineraryError } = await supabase
       .schema('travel')
       .from('itineraries')
       .insert({
-        creator_id: dto.userId,
-        // [TRIP_NAME_INPUT] Lưu tên chuyến đi user đặt vào cột description
-        description: dto.description ?? null,
-        start_date: dto.startDate,
-        end_date: dto.endDate,
-        estimated_cost: dto.budget,
-        status: 'pending',
-        departure_point: departureName ?? dto.departureLocationId,
-        destination: destinationName ?? dto.destinationLocationId,
-        is_public: false,
-        adult_count: dto.adultCount,
-        children_count: dto.childCount ?? 0,
+        ...baseItineraryRow,
+        trip_intent: dto.tripIntent,
       })
       .select('id')
       .single();
+
+    if (
+      itineraryError?.message?.includes('trip_intent') &&
+      itineraryError?.message?.includes('does not exist')
+    ) {
+      this.logger.warn(
+        'travel.itineraries.trip_intent column is missing; create itinerary without persisted trip intent.',
+      );
+      const fallbackResult = await supabase
+        .schema('travel')
+        .from('itineraries')
+        .insert(baseItineraryRow)
+        .select('id')
+        .single();
+      itinerary = fallbackResult.data;
+      itineraryError = fallbackResult.error;
+    }
 
     if (itineraryError || !itinerary) {
       throw new InternalServerErrorException(
@@ -129,6 +309,12 @@ export class ItineraryService {
           departure_time: entry.departure_time,
           duration_minutes: entry.active_duration_minutes,
           estimated_cost: entry.estimated_cost ?? 0,
+          transport_cost:
+            entry.transport_cost ??
+            this.estimateSelfDriveTransportCostFromDistance(
+              entry.distance_km,
+              dto.transportMode,
+            ),
           sequence_order: index + 1,
           is_locked: false,
         }));
@@ -1043,6 +1229,27 @@ export class ItineraryService {
       }
     }
 
+    const visitStatusByDetailId = new Map<string, string>();
+    const { data: visitRows, error: visitsError } = await supabase
+      .schema('tracking')
+      .from('geofence_visits')
+      .select('itinerary_detail_id, status')
+      .eq('itinerary_id', id);
+
+    if (visitsError) {
+      this.logger.warn(
+        `getItineraryDetail geofence visits query failed id=${id}: ${visitsError.message}`,
+      );
+    } else {
+      for (const visit of visitRows ?? []) {
+        const detailId = (visit as any).itinerary_detail_id;
+        const status = (visit as any).status;
+        if (typeof detailId === 'string' && detailId.length > 0) {
+          visitStatusByDetailId.set(detailId, String(status ?? ''));
+        }
+      }
+    }
+
     const daysMap = new Map<string, any[]>();
     for (const detail of details || []) {
       const dateStr = detail.visit_date;
@@ -1097,6 +1304,25 @@ export class ItineraryService {
         const isAccommodation = this.isAccommodationCategory(category);
         const isStartPoint =
           isAccommodation && durationMinutes === 0 && sequenceOrder === 0;
+        const trackingStatus = visitStatusByDetailId.get(act.id);
+        const isVisited = trackingStatus === 'visited';
+        const activityStatus = isVisited ? 'visited' : 'chuaDi';
+        const rawPlaceCost = Number(act.estimated_cost ?? 0);
+        const placeCost =
+          isStartPoint && rawPlaceCost <= 0
+            ? this.estimateHotelCostPerNight()
+            : rawPlaceCost;
+        const nextTransportCost = nextAct
+          ? Number(
+              act.transport_cost ??
+                this.estimateSelfDriveTransportCostFromTransitLabel(
+                  transitInfo,
+                ),
+            )
+          : 0;
+        const nextRideHailingCost = nextAct
+          ? this.estimateRideHailingTransportCostFromTransitLabel(transitInfo)
+          : 0;
 
         return {
           id: act.id,
@@ -1107,18 +1333,24 @@ export class ItineraryService {
           placeName: place?.name || 'Điểm tham quan',
           address: place?.address || '',
           imageUrl: imageUrl,
-          priceLabel: act.estimated_cost
+          priceLabel: placeCost
             ? `${act.estimated_cost}đ`
             : 'MIỄN PHÍ',
           tags: [],
           transitToNext: transitInfo ? { durationStr: transitInfo } : null,
           transport_info: transitInfo,
+          transportCost: nextTransportCost,
+          transport_cost: nextTransportCost,
+          fuelTransportCost: nextTransportCost,
+          fuel_transport_cost: nextTransportCost,
+          rideHailingTransportCost: nextRideHailingCost,
+          ride_hailing_transport_cost: nextRideHailingCost,
           title: place?.name || 'Điểm tham quan',
           locationName: place?.name || 'Điểm tham quan',
-          estimatedCost: act.estimated_cost || 0,
-          price: act.estimated_cost || 0,
+          estimatedCost: placeCost,
+          price: placeCost,
           currency: 'VNĐ',
-          isFree: !act.estimated_cost,
+          isFree: !placeCost,
           category,
           durationMinutes,
           isAccommodation,
@@ -1128,7 +1360,10 @@ export class ItineraryService {
           longitude: place?.longitude,
           rating: place?.average_rating || 4.5,
           reviewCount: place?.review_count || 100,
-          status: 'chuaDi',
+          status: activityStatus,
+          is_visited: isVisited,
+          isVisited,
+          is_visted: isVisited,
         };
       });
 
@@ -1140,6 +1375,26 @@ export class ItineraryService {
       const activityCount = activities.filter(
         (activity) => !activity.isStartPoint,
       ).length;
+      const placeCost = activities.reduce(
+        (sum, activity) =>
+          activity.isStartPoint ? sum : sum + Number(activity.price ?? 0),
+        0,
+      );
+      const hotelCost = activities.reduce(
+        (sum, activity) =>
+          activity.isStartPoint ? sum + Number(activity.price ?? 0) : sum,
+        0,
+      );
+      const transportCost = activities.reduce(
+        (sum, activity) => sum + Number(activity.transportCost ?? 0),
+        0,
+      );
+      const rideHailingTransportCost = activities.reduce(
+        (sum, activity) =>
+          sum + Number(activity.rideHailingTransportCost ?? 0),
+        0,
+      );
+      const dayTotalCost = placeCost + hotelCost + transportCost;
 
       let dateLabel = dateStr;
       try {
@@ -1155,14 +1410,20 @@ export class ItineraryService {
         date: dateStr,
         weatherTemp: 30,
         activeTimeStr: totalDuration,
-        dayBudget: activities.reduce((sum, a) => sum + a.price, 0),
+        dayBudget: dayTotalCost,
         progressPercent: 0,
         totalDistanceStr: '0km',
         totalTransitTimeStr: '0 phút',
         activities: activities,
         day_number: dayNumber,
         locations_count: activityCount,
-        day_budget: activities.reduce((sum, a) => sum + a.price, 0),
+        day_budget: dayTotalCost,
+        place_cost: placeCost,
+        hotel_cost: hotelCost,
+        transport_cost: transportCost,
+        fuel_transport_cost: transportCost,
+        ride_hailing_transport_cost: rideHailingTransportCost,
+        total_cost: dayTotalCost,
         total_duration: totalDuration,
       };
     });
@@ -1178,20 +1439,59 @@ export class ItineraryService {
       diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
     } catch (_) {}
 
-    const hotelDetailsCount = (details || []).filter((detail: any) => {
-      const place = detail.place;
-      const typeData = Array.isArray(place?.types)
-        ? place.types[0]
-        : place?.types;
-      const catData = Array.isArray(typeData?.categories)
-        ? typeData.categories[0]
-        : typeData?.categories;
-      return this.isAccommodationCategory(catData?.name);
-    }).length;
+    const startPointDetails = (details || []).filter((detail: any) =>
+      this.isStartPointDetail(detail),
+    );
+    const uniqueHotelPlaceIds = new Set(
+      startPointDetails
+        .map((detail: any) => detail.place_id)
+        .filter(
+          (placeId: unknown): placeId is string =>
+            typeof placeId === 'string' && placeId.length > 0,
+        ),
+    );
+    const hotelDetailsCount = uniqueHotelPlaceIds.size;
     const nonHotelDetailsCount = Math.max(
       0,
-      (details?.length || 0) - hotelDetailsCount,
+      (details?.length || 0) - startPointDetails.length,
     );
+    const visitedLocationsCount = (details || []).filter((detail: any) => {
+      if (this.isStartPointDetail(detail)) return false;
+      return visitStatusByDetailId.get(detail.id) === 'visited';
+    }).length;
+    const spentBudget = days.reduce(
+      (sum: number, day: any) =>
+        sum +
+        (day.activities || []).reduce((daySum: number, activity: any) => {
+          if (activity.isStartPoint || activity.status !== 'visited') {
+            return daySum;
+          }
+          return (
+            daySum +
+            Number(activity.price ?? 0) +
+            Number(activity.transportCost ?? 0)
+          );
+        }, 0),
+      0,
+    );
+    const placeCost = days.reduce(
+      (sum: number, day: any) => sum + Number(day.place_cost ?? 0),
+      0,
+    );
+    const hotelCost = days.reduce(
+      (sum: number, day: any) => sum + Number(day.hotel_cost ?? 0),
+      0,
+    );
+    const transportCost = days.reduce(
+      (sum: number, day: any) => sum + Number(day.transport_cost ?? 0),
+      0,
+    );
+    const rideHailingTransportCost = days.reduce(
+      (sum: number, day: any) =>
+        sum + Number(day.ride_hailing_transport_cost ?? 0),
+      0,
+    );
+    const totalEstimatedCost = placeCost + hotelCost + transportCost;
 
     return {
       id: itinerary.id,
@@ -1199,18 +1499,37 @@ export class ItineraryService {
       dateRangeLabel: `${startStr} - ${endStr}`,
       status: (itinerary.status || 'pending').toUpperCase(),
       isPublic: itinerary.is_public || false,
-      totalBudget: itinerary.estimated_cost || 0,
+      totalBudget: totalEstimatedCost,
+      userBudget: itinerary.estimated_cost || 0,
+      user_budget: itinerary.estimated_cost || 0,
       totalDays: diffDays || days.length || 1,
       totalPlaces: nonHotelDetailsCount,
+      visitedLocations: visitedLocationsCount,
+      visited_locations: visitedLocationsCount,
       hotelsCount: hotelDetailsCount,
+      tracking_active: itinerary.tracking_active || false,
       days: days,
       destination: itinerary.destination || '',
+      tripIntent: itinerary.trip_intent || null,
+      trip_intent: itinerary.trip_intent || null,
       start_date: startStr,
       end_date: endStr,
       durationDays: diffDays || days.length || 1,
       activitiesCount: nonHotelDetailsCount,
-      estimatedBudget: itinerary.estimated_cost || 0,
-      spentBudget: itinerary.actual_cost || 0,
+      estimatedBudget: totalEstimatedCost,
+      estimated_budget: totalEstimatedCost,
+      placeCost,
+      place_cost: placeCost,
+      hotelCost,
+      hotel_cost: hotelCost,
+      transportCost,
+      transport_cost: transportCost,
+      fuelTransportCost: transportCost,
+      fuel_transport_cost: transportCost,
+      rideHailingTransportCost,
+      ride_hailing_transport_cost: rideHailingTransportCost,
+      spentBudget,
+      spent_budget: spentBudget,
       centerCoordinate: [10.7769, 106.7009],
       notes: [
         'Chuẩn bị quần áo thoải mái và phù hợp.',
@@ -1367,10 +1686,86 @@ export class ItineraryService {
       arrival_time: startTime,
       departure_time: startTime,
       duration_minutes: 0,
+      estimated_cost: this.estimateHotelCostPerNight(),
       sequence_order: 0,
       is_locked: true,
       notes: 'Hotel/start point selected by GA planner',
     };
+  }
+
+  private estimateHotelCostPerNight(): number {
+    return 400000;
+  }
+
+  private estimateTransportCostFromDistance(distanceKm?: number | null): number {
+    return this.estimateSelfDriveTransportCostFromDistance(distanceKm);
+  }
+
+  private estimateSelfDriveTransportCostFromDistance(
+    distanceKm?: number | null,
+    transportMode?: string | null,
+  ): number {
+    const km = Number(distanceKm ?? 0);
+    if (!Number.isFinite(km) || km <= 0) return 0;
+    const mode = (transportMode ?? '').toUpperCase();
+    const costPerKm = mode === 'MOTORBIKE' ? 800 : 3000;
+    return Math.round(km * costPerKm);
+  }
+
+  private estimateSelfDriveTransportCostFromTransitLabel(
+    label?: string | null,
+    transportMode?: string | null,
+  ): number {
+    const minutes = this.extractTransitMinutes(label);
+    if (minutes <= 0) return 0;
+    const estimatedKm = (minutes / 60) * 25;
+    return this.estimateSelfDriveTransportCostFromDistance(
+      estimatedKm,
+      transportMode,
+    );
+  }
+
+  private estimateTransportCostFromTransitLabel(label?: string | null): number {
+    return this.estimateSelfDriveTransportCostFromTransitLabel(label);
+  }
+
+  private estimateRideHailingTransportCostFromTransitLabel(
+    label?: string | null,
+    transportMode?: string | null,
+  ): number {
+    const minutes = this.extractTransitMinutes(label);
+    if (minutes <= 0) return 0;
+    const estimatedKm = (minutes / 60) * 25;
+    return this.estimateRideHailingTransportCostFromDistance(
+      estimatedKm,
+      transportMode,
+    );
+  }
+
+  private estimateRideHailingTransportCostFromDistance(
+    distanceKm?: number | null,
+    transportMode?: string | null,
+  ): number {
+    const km = Number(distanceKm ?? 0);
+    if (!Number.isFinite(km) || km <= 0) return 0;
+    const mode = (transportMode ?? '').toUpperCase();
+    if (mode === 'MOTORBIKE') {
+      return Math.max(15000, Math.round(km * 5000));
+    }
+    return Math.max(25000, Math.round(km * 12000));
+  }
+
+  private extractTransitMinutes(label?: string | null): number {
+    if (!label) return 0;
+    const normalized = label
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+    const hourMatch = normalized.match(/(\d+)\s*(?:gio|h)/);
+    const minuteMatch = normalized.match(/(\d+)\s*(?:phut|p)/);
+    const hours = hourMatch ? Number(hourMatch[1]) : 0;
+    const minutes = minuteMatch ? Number(minuteMatch[1]) : 0;
+    return hours * 60 + minutes;
   }
 
   private formatDuration(totalMinutes: number): string {

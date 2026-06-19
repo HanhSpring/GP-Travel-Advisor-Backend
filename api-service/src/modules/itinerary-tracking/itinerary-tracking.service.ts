@@ -175,7 +175,7 @@ export class ItineraryTrackingService {
       .returns<DetailRow[]>();
 
     if (error) this.dbError(error, 'loadDetailsByDay');
-    return data ?? [];
+    return (data ?? []).filter((detail) => (detail.sequence_order ?? 1) !== 0);
   }
 
   private async loadPlacesMap(
