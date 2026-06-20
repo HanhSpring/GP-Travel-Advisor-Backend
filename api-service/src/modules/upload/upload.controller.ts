@@ -1,5 +1,6 @@
 import {
   Controller,
+  Logger,
   Post,
   UseInterceptors,
   UploadedFile,
@@ -25,6 +26,8 @@ import { JwtAuthGuard } from '../auth/jwt-auth.guard';
 @ApiTags('Upload Resources')
 @Controller('upload')
 export class UploadController {
+  private readonly logger = new Logger(UploadController.name);
+
   constructor(private readonly uploadService: UploadService) {}
 
   // 1. LUỒNG UPLOAD AVATAR
@@ -70,7 +73,33 @@ export class UploadController {
     @Body() dto: CreateReviewPresignedUrlsDto,
     @Req() req: any,
   ) {
-    return this.uploadService.createReviewPresignedUrls(dto, req.user.userId);
+    try {
+      return await this.uploadService.createReviewPresignedUrls(
+        dto,
+        req.user.userId,
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      const stack = error instanceof Error ? error.stack : undefined;
+
+      this.logger.error(
+        `POST /upload/reviews/presigned-urls failed: ${message} | context=${JSON.stringify(
+          {
+            userId: req.user?.userId,
+            scope: dto.scope,
+            itineraryId: dto.itinerary_id,
+            itineraryDetailId: dto.itinerary_detail_id,
+            fileCount: dto.files?.length ?? 0,
+            contentTypes: dto.files?.map((file) => file.content_type) ?? [],
+            totalSize:
+              dto.files?.reduce((sum, file) => sum + file.size, 0) ?? 0,
+          },
+        )}`,
+        stack,
+      );
+
+      throw error;
+    }
   }
 
   @Post('review')

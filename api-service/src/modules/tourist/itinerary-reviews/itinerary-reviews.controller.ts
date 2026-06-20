@@ -1,4 +1,12 @@
-import { Controller, Get, Param, Post, Query, Body } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Get,
+  Logger,
+  Param,
+  Post,
+  Query,
+} from '@nestjs/common';
 import {
   ApiCreatedResponse,
   ApiOkResponse,
@@ -24,7 +32,23 @@ type SubmitReviewResponse = {
 @ApiTags('Tourist Itinerary Reviews')
 @Controller('itinerary-reviews')
 export class ItineraryReviewsController {
+  private readonly logger = new Logger(ItineraryReviewsController.name);
+
   constructor(private readonly service: ItineraryReviewsService) {}
+
+  private logApiError(
+    route: string,
+    error: unknown,
+    context: Record<string, unknown>,
+  ) {
+    const message = error instanceof Error ? error.message : String(error);
+    const stack = error instanceof Error ? error.stack : undefined;
+
+    this.logger.error(
+      `${route} failed: ${message} | context=${JSON.stringify(context)}`,
+      stack,
+    );
+  }
 
   @Get('popup')
   @ApiOperation({
@@ -33,22 +57,38 @@ export class ItineraryReviewsController {
   @ApiQuery({ name: 'tourist_id', required: true, type: String })
   @ApiQuery({ name: 'itinerary_id', required: true, type: String })
   @ApiOkResponse({ type: ItineraryReviewPopupResponseDto })
-  getPopup(
+  async getPopup(
     @Query('tourist_id') touristId: string,
     @Query('itinerary_id') itineraryId: string,
   ): Promise<ItineraryReviewPopupResponseDto> {
-    return this.service.getPopup(touristId, itineraryId);
+    try {
+      return await this.service.getPopup(touristId, itineraryId);
+    } catch (error) {
+      this.logApiError('GET /itinerary-reviews/popup', error, {
+        touristId,
+        itineraryId,
+      });
+      throw error;
+    }
   }
 
   @Get(':itineraryId/detail')
   @ApiOperation({ summary: 'Get detailed itinerary review screen data' })
   @ApiQuery({ name: 'tourist_id', required: true, type: String })
   @ApiOkResponse({ type: ItineraryReviewDetailResponseDto })
-  getDetail(
+  async getDetail(
     @Param('itineraryId') itineraryId: string,
     @Query('tourist_id') touristId: string,
   ): Promise<ItineraryReviewDetailResponseDto> {
-    return this.service.getDetail(touristId, itineraryId);
+    try {
+      return await this.service.getDetail(touristId, itineraryId);
+    } catch (error) {
+      this.logApiError('GET /itinerary-reviews/:itineraryId/detail', error, {
+        touristId,
+        itineraryId,
+      });
+      throw error;
+    }
   }
 
   @Post(':itineraryId/submit')
@@ -64,10 +104,29 @@ export class ItineraryReviewsController {
       },
     },
   })
-  submitReview(
+  async submitReview(
     @Param('itineraryId') itineraryId: string,
     @Body() body: SubmitItineraryReviewDto,
   ): Promise<SubmitReviewResponse> {
-    return this.service.submitReview(body.tourist_id, itineraryId, body);
+    try {
+      return await this.service.submitReview(
+        body.tourist_id,
+        itineraryId,
+        body,
+      );
+    } catch (error) {
+      this.logApiError('POST /itinerary-reviews/:itineraryId/submit', error, {
+        touristId: body.tourist_id,
+        itineraryId,
+        itineraryMediaCount: body.media?.length ?? 0,
+        placeReviewCount: body.place_reviews?.length ?? 0,
+        placeMediaCount:
+          body.place_reviews?.reduce(
+            (total, item) => total + (item.media?.length ?? 0),
+            0,
+          ) ?? 0,
+      });
+      throw error;
+    }
   }
 }
