@@ -92,6 +92,16 @@ export class SubmitItineraryReviewDto {
   @IsString()
   overall_content?: string | null;
 
+  @ApiProperty({
+    type: [String],
+    required: false,
+    description: 'Quick tags selected for the overall itinerary review',
+  })
+  @IsOptional()
+  @IsArray()
+  @IsString({ each: true })
+  tags?: string[] | null;
+
   @ApiProperty({ required: false, default: false })
   @IsOptional()
   @IsBoolean()

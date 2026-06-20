@@ -74,13 +74,13 @@ export class ItineraryReviewsController {
     }
   }
 
-  @Get(':itineraryId/submitted-review')
+  @Get(':itineraryId/review-detail')
   @ApiOperation({
-    summary: 'Get full submitted review data for read-only display',
+    summary: 'Get itinerary review detail for read-only display',
   })
   @ApiQuery({ name: 'tourist_id', required: true, type: String })
   @ApiOkResponse({ type: ItinerarySubmittedReviewResponseDto })
-  async getSubmittedReview(
+  async getReviewDetail(
     @Param('itineraryId') itineraryId: string,
     @Query('tourist_id') touristId: string,
   ): Promise<ItinerarySubmittedReviewResponseDto> {
@@ -88,17 +88,20 @@ export class ItineraryReviewsController {
       return await this.service.getSubmittedReview(touristId, itineraryId);
     } catch (error) {
       this.logApiError(
-        'GET /itinerary-reviews/:itineraryId/submitted-review',
+        'GET /itinerary-reviews/:itineraryId/review-detail',
         error,
-        { touristId, itineraryId },
+        {
+          touristId,
+          itineraryId,
+        },
       );
       throw error;
     }
   }
-
   @Get(':itineraryId/summary')
   @ApiOperation({
-    summary: 'Get itinerary review summary (rating + content) for popup mode check',
+    summary:
+      'Get itinerary review summary (rating + content) for popup mode check',
   })
   @ApiQuery({ name: 'tourist_id', required: true, type: String })
   @ApiOkResponse({ type: ItineraryReviewSummaryResponseDto })
