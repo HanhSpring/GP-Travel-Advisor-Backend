@@ -6,6 +6,7 @@ import {
   IsBoolean,
   Equals,
   IsString,
+  Matches,
 } from 'class-validator';
 
 export class RegisterBusinessDto {
@@ -19,10 +20,11 @@ export class RegisterBusinessDto {
 
   @ApiProperty({
     example: '0912345678',
-    description: 'Số điện thoại liên hệ',
+    description: 'Số điện thoại liên hệ (10 chữ số, bắt đầu bằng 0)',
   })
   @IsNotEmpty({ message: 'Vui lòng nhập số điện thoại' })
   @IsString()
+  @Matches(/^0[0-9]{9}$/, { message: 'Số điện thoại phải có đúng 10 chữ số và bắt đầu bằng 0' })
   phone: string;
 
   @ApiProperty({
@@ -34,11 +36,14 @@ export class RegisterBusinessDto {
   email: string;
 
   @ApiProperty({
-    example: '123456',
-    description: 'Mật khẩu bảo mật',
+    example: 'Password@123',
+    description: 'Mật khẩu: tối thiểu 8 ký tự, có chữ hoa, chữ thường, chữ số và ký tự đặc biệt (@$!%*?&.#)',
   })
   @IsNotEmpty({ message: 'Vui lòng nhập mật khẩu' })
-  @MinLength(6, { message: 'Mật khẩu phải có ít nhất 6 ký tự' })
+  @MinLength(8, { message: 'Mật khẩu phải có ít nhất 8 ký tự' })
+  @Matches(/^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[@$!%*?&.#])[A-Za-z\d@$!%*?&.#]{8,}$/, {
+    message: 'Mật khẩu phải chứa ít nhất 1 chữ hoa, 1 chữ thường, 1 chữ số và 1 ký tự đặc biệt (@$!%*?&.#)',
+  })
   password: string;
 
   @ApiProperty({
