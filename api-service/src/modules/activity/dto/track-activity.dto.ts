@@ -15,9 +15,14 @@ export const FRONTEND_ACTIONS = [
 export type FrontendActionType = (typeof FRONTEND_ACTIONS)[number];
 
 export class TrackActivityDto {
-  @ApiProperty({ description: 'ID của tourist' })
+  @ApiPropertyOptional({
+    description:
+      'Deprecated: tourist ID is derived from the bearer token and this value is ignored',
+    deprecated: true,
+  })
+  @IsOptional()
   @IsUUID()
-  tourist_id!: string;
+  tourist_id?: string;
 
   @ApiProperty({
     enum: FRONTEND_ACTIONS,

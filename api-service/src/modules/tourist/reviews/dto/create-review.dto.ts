@@ -1,5 +1,5 @@
 /* eslint-disable @typescript-eslint/no-unsafe-call */
-import { ApiProperty } from '@nestjs/swagger';
+import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsUUID,
   IsNumber,
@@ -11,12 +11,15 @@ import {
 } from 'class-validator';
 
 export class CreateReviewDto {
-  @ApiProperty({
+  @ApiPropertyOptional({
     example: '2c2caf9e-1fc9-4065-a280-45d8508458c7',
-    description: 'UUID of the tourist/user writing the review',
+    description:
+      'Deprecated: tourist ID is derived from the bearer token and this value is ignored',
+    deprecated: true,
   })
+  @IsOptional()
   @IsUUID('4')
-  tourist_id: string;
+  tourist_id?: string;
 
   @ApiProperty({
     example: '16579947-051d-47ec-856c-a8f5159ab7ba',

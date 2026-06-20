@@ -10,7 +10,7 @@ Bảng `activity_logs`:
 | `tourist_id` | uuid | ID tourist thực hiện hành động |
 | `action_type` | varchar | Loại hành động |
 | `place_id` | uuid | Địa điểm liên quan (nullable) |
-| `created_at` | timestamp | Thời điểm xảy ra |
+| `created_at` | timestamp | Giờ Việt Nam (UTC+7) |
 
 ---
 
@@ -162,22 +162,13 @@ listener: (context, state) {
 
 Timer bị hủy trong `dispose()` — nếu user rời trước 2s thì không log.
 
-**Card trong danh sách cuộn** dùng `VisiblePlaceTracker`:
+Backend chỉ chấp nhận `view` nếu tourist đã có log `click` cho đúng `place_id`
+ít nhất 2 giây trước đó (và không quá 30 phút). Vì vậy card chỉ xuất hiện trong
+danh sách hoặc được nhìn thấy khi cuộn sẽ không tạo log `view`.
 
-```dart
-VisiblePlaceTracker(
-  placeId: item.id,
-  child: GestureDetector(
-    onTap: () { ... },
-    child: RestaurantCard(item: item),
-  ),
-)
-```
-
-`VisiblePlaceTracker` dùng `VisibilityDetector`:
-- `visibleFraction >= 0.5` → bắt đầu timer 2s
-- `visibleFraction < 0.5` (user scroll qua) → hủy timer
-- Timer fire → `trackView(placeId)`, đặt flag `_tracked = true` (chỉ log 1 lần)
+Frontend phải hủy timer khi user rời trang, đổi địa điểm hoặc app mất trạng thái
+đang xem. Backend xác minh click + khoảng thời gian tối thiểu; trạng thái “liên
+tục” trong 2 giây vẫn do lifecycle của màn hình frontend chịu trách nhiệm.
 
 ---
 
@@ -207,11 +198,25 @@ onFavorite: () {
 _debounce = Timer(const Duration(milliseconds: 300), () async {
   final results = await _searchLocations(query);
   emit(SearchState.searchResults(results));
-  _activityService.trackSearch(); // log sau khi có kết quả
+  _activityService.trackSearch(); // tạo log search với place_id = null
 });
 ```
 
 Không log khi: query rỗng, search lỗi, hoặc load recent searches.
+
+Khi user click một địa điểm trong kết quả, frontend tiếp tục gửi action `click`
+với `place_id`. Backend tự động gắn địa điểm đó vào log `search` gần nhất còn
+`place_id = null` của chính tourist. Không có thời gian chờ hoặc giới hạn
+30 phút: update xảy ra ngay khi request `click` đến backend. Điều kiện cập nhật
+`place_id is null` bảo đảm các click tiếp theo không ghi đè địa điểm đầu tiên.
+Việc cập nhật log `search` được thực hiện và kiểm tra thành công trước khi backend
+ghi thêm log `click`. Search cũ hơn click gần nhất không được phép nhận địa điểm,
+nên click thứ hai không thể lấp một dòng search cũ còn `NULL`.
+
+Màn kết quả phải phát action `click` khi user thực sự chọn một địa điểm. `view`
+không được dùng thay cho click. Các action `search` liên tiếp trong vòng 5 giây
+khi người dùng đang gõ được gom thành một log để tránh nhiều dòng
+`place_id = null`.
 
 ---
 

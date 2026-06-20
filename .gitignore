@@ -186,6 +186,9 @@ secrets/
 
 # Database dumps
 *.sql
+!api-service/supabase/
+!api-service/supabase/migrations/
+!api-service/supabase/migrations/*.sql
 *.sqlite
 *.db
 
