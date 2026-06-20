@@ -286,4 +286,43 @@ export class NotificationsService {
       updated_count: updatedRows?.length ?? 0,
     };
   }
+
+  async sendNotification(
+    touristId: string,
+    title: string,
+    content: string,
+    type: string,
+  ): Promise<void> {
+    const { data: notification, error: notifError } = await supabase
+      .schema('public')
+      .from('notifications')
+      .insert({
+        title,
+        content,
+        type,
+        is_global: false,
+      })
+      .select('id')
+      .single();
+
+    if (notifError || !notification) {
+      throw new InternalServerErrorException(
+        notifError?.message ?? 'Failed to create notification',
+      );
+    }
+
+    const { error: userNotifError } = await supabase
+      .schema('public')
+      .from('users_notifications')
+      .insert({
+        notification_id: notification.id,
+        user_id: touristId,
+        is_read: false,
+        sent_at: new Date().toISOString(),
+      });
+
+    if (userNotifError) {
+      throw new InternalServerErrorException(userNotifError.message);
+    }
+  }
 }

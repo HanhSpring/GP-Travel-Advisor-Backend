@@ -42,6 +42,7 @@ const CORE_PARAM_MAP = {
   fetchBufferMultiplier: 'fetch_buffer_multiplier',
   enableAttractionTravelTypeFilter: 'enable_attraction_travel_type_filter',
   enableDiversityBudget: 'enable_diversity_budget',
+  moderationBatchIntervalMinutes: 'moderation_batch_interval_minutes',
 } as const;
 
 const BOOLEAN_PARAMS = new Set<string>([
@@ -53,6 +54,7 @@ const INTEGER_PARAMS = new Set<string>([
   CORE_PARAM_MAP.defaultTopK,
   CORE_PARAM_MAP.maxTopK,
   CORE_PARAM_MAP.maxIntents,
+  CORE_PARAM_MAP.moderationBatchIntervalMinutes,
 ]);
 
 const DEFAULT_PARAM_DEFINITIONS: Record<
@@ -100,6 +102,13 @@ const DEFAULT_PARAM_DEFINITIONS: Record<
     minValue: 0,
     maxValue: 1,
     description: 'Enable quota-aware diversity budget selection',
+  },
+  moderation_batch_interval_minutes: {
+    defaultValue: 10,
+    currentValue: 10,
+    minValue: 1,
+    maxValue: 1440,
+    description: 'Interval in minutes between periodic review moderation batch runs',
   },
 };
 
@@ -453,6 +462,9 @@ export class AdminAlgorithmSettingsService {
           CORE_PARAM_MAP.enableAttractionTravelTypeFilter,
         ),
         enableDiversityBudget: meta(CORE_PARAM_MAP.enableDiversityBudget),
+        moderationBatchIntervalMinutes: meta(
+          CORE_PARAM_MAP.moderationBatchIntervalMinutes,
+        ),
       },
       quotas,
     };

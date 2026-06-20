@@ -110,6 +110,11 @@ export class UpdateTwoTowerSettingsDto {
   @IsBoolean()
   enableDiversityBudget?: boolean;
 
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsNumber()
+  moderationBatchIntervalMinutes?: number;
+
   @ApiPropertyOptional({ type: QuotaValuesDto })
   @IsOptional()
   @IsObject()
