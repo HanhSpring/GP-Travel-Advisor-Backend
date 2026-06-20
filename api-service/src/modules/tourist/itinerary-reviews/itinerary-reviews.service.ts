@@ -42,6 +42,25 @@ interface ItineraryReviewRow {
   tourist_id: string;
 }
 
+interface ItineraryFullReviewRow {
+  id: string;
+  rating: number | null;
+  content: string | null;
+  url_image: string[] | null;
+}
+
+interface PlaceReviewRow {
+  id: string;
+  place_id: string;
+  rating: number | null;
+  url_image: string[] | null;
+}
+
+interface ReviewContentRow {
+  review_id: string;
+  content: string | null;
+}
+
 @Injectable()
 export class ItineraryReviewsService {
   constructor(private readonly configService: ConfigService) {}
@@ -611,6 +630,137 @@ export class ItineraryReviewsService {
     return {
       dayByDate,
       dayFilters,
+    };
+  }
+
+  private async getItineraryFullReview(
+    touristId: string,
+    itineraryId: string,
+  ): Promise<ItineraryFullReviewRow | null> {
+    for (const byTourist of [true, false]) {
+      let query = supabase
+        .schema('review_ai')
+        .from('itinerary_reviews')
+        .select('id, rating, content, url_image')
+        .eq('itinerary_id', itineraryId)
+        .order('created_at', { ascending: false })
+        .limit(1);
+
+      if (byTourist) {
+        query = (query as typeof query).eq('tourist_id', touristId);
+      }
+
+      const { data, error } = await query.maybeSingle<ItineraryFullReviewRow>();
+
+      if (error) {
+        if (
+          error.code === 'PGRST205' ||
+          error.code === '42703' ||
+          (error.message || '').includes('does not exist')
+        ) {
+          continue;
+        }
+        throw new InternalServerErrorException(error.message);
+      }
+
+      if (data) return data;
+    }
+    return null;
+  }
+
+  private async getPlaceReviewsForItinerary(
+    touristId: string,
+    itineraryId: string,
+  ): Promise<
+    Map<string, { rating: number | null; content: string | null; mediaUrls: string[] }>
+  > {
+    const { data: reviews, error } = await supabase
+      .schema('review_ai')
+      .from('reviews')
+      .select('id, place_id, rating, url_image')
+      .eq('tourist_id', touristId)
+      .eq('itinerary_id', itineraryId)
+      .returns<PlaceReviewRow[]>();
+
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!reviews || reviews.length === 0) {
+      return new Map();
+    }
+
+    const reviewIds = reviews.map((r) => r.id);
+    const { data: contents } = await supabase
+      .schema('review_ai')
+      .from('review_contents')
+      .select('review_id, content')
+      .in('review_id', reviewIds)
+      .returns<ReviewContentRow[]>();
+
+    const contentByReviewId = new Map<string, string | null>(
+      (contents ?? []).map((c) => [c.review_id, c.content]),
+    );
+
+    const byPlaceId = new Map<
+      string,
+      { rating: number | null; content: string | null; mediaUrls: string[] }
+    >();
+    for (const r of reviews) {
+      byPlaceId.set(r.place_id, {
+        rating: r.rating,
+        content: contentByReviewId.get(r.id) ?? null,
+        mediaUrls: Array.isArray(r.url_image) ? r.url_image : [],
+      });
+    }
+    return byPlaceId;
+  }
+
+  async getSubmittedReview(touristId: string, itineraryId: string) {
+    if (!touristId || !itineraryId) {
+      throw new BadRequestException('tourist_id and itinerary_id are required');
+    }
+
+    const [itinerary, details, overallReview, placeReviewsMap] =
+      await Promise.all([
+        this.getItineraryOrThrow(touristId, itineraryId),
+        this.getItineraryDetails(itineraryId),
+        this.getItineraryFullReview(touristId, itineraryId),
+        this.getPlaceReviewsForItinerary(touristId, itineraryId),
+      ]);
+
+    const placeIds = [...new Set(details.map((d) => d.place_id))];
+    const places = await this.getPlaces(placeIds);
+    const placeMap = new Map(places.map((p) => [p.id, p]));
+    const { dayByDate } = this.buildDayInfo(details);
+
+    return {
+      itinerary: {
+        id: itinerary.id,
+        title: itinerary.destination ?? 'Lịch trình của bạn',
+        start_date: itinerary.start_date ?? '',
+        end_date: itinerary.end_date ?? '',
+        cover_image: this.getFirstPlaceImageUrl(places[0]),
+      },
+      overall: {
+        rating: overallReview?.rating ?? null,
+        content: overallReview?.content ?? null,
+        media_urls: Array.isArray(overallReview?.url_image)
+          ? overallReview.url_image
+          : [],
+      },
+      places: details.map((detail) => {
+        const place = placeMap.get(detail.place_id);
+        const placeReview = placeReviewsMap.get(detail.place_id);
+        return {
+          itinerary_detail_id: detail.id,
+          day_label: detail.visit_date
+            ? (dayByDate.get(detail.visit_date) ?? 'DAY')
+            : 'DAY',
+          place_name: place?.name ?? 'Địa điểm',
+          place_image_url: this.getFirstPlaceImageUrl(place),
+          rating: placeReview?.rating ?? null,
+          content: placeReview?.content ?? null,
+          media_urls: placeReview?.mediaUrls ?? [],
+        };
+      }),
     };
   }
 
