@@ -7,6 +7,7 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import { randomUUID } from 'crypto';
 import { supabase } from '../../../config/supabase';
 import { ACTIVITY_LOG_EVENT } from '../../activity/activity.listener';
+import { getReviewActivityAction } from './review-activity';
 
 interface CreateReviewPayload {
   tourist_id: string;
@@ -94,7 +95,7 @@ export class ReviewsService {
 
     this.eventEmitter.emit(ACTIVITY_LOG_EVENT, {
       tourist_id: payload.tourist_id,
-      action_type: 'write_review',
+      action_type: getReviewActivityAction(payload.content),
       place_id: payload.place_id,
     });
 
