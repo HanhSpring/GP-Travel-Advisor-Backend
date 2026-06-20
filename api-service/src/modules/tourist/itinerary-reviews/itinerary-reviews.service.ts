@@ -29,7 +29,7 @@ interface ItineraryDetailRow {
 interface PlaceRow {
   id: string;
   name: string;
-  image_url: string | null;
+  image_url: string | string[] | null;
 }
 
 interface ItineraryReviewRow {
@@ -40,6 +40,17 @@ interface ItineraryReviewRow {
 
 @Injectable()
 export class ItineraryReviewsService {
+  private getPlaceImage(value: string | string[] | null): string | null {
+    const raw = Array.isArray(value) ? value[0] : value;
+    if (!raw?.trim()) return null;
+    if (/^https?:/i.test(raw)) return raw;
+    const publicUrl = (process.env.CLOUDFLARE_R2_PUBLIC_URL ?? '').replace(
+      /\/$/,
+      '',
+    );
+    return publicUrl ? `${publicUrl}/${raw.replace(/^\//, '')}` : raw;
+  }
+
   private normalizeOptionalText(value: unknown): string | null {
     if (typeof value !== 'string') {
       return null;
@@ -440,11 +451,16 @@ export class ItineraryReviewsService {
     );
     const placeIds = Array.from(new Set(details.map((item) => item.place_id)));
     const places = await this.getPlaces(placeIds);
-    const coverImage = places[0]?.image_url ?? null;
-    const isCompleted = (itinerary.status ?? '').toLowerCase() === 'completed';
-
-    const showPopup = isCompleted;
-    const reason = isCompleted ? 'eligible' : 'itinerary_not_completed';
+    const coverImage = this.getPlaceImage(places[0]?.image_url ?? null);
+    const status = (itinerary.status ?? '').toLowerCase();
+    const todayVi = new Date(Date.now() + 7 * 60 * 60 * 1000)
+      .toISOString()
+      .slice(0, 10);
+    const hasEnded = Boolean(
+      itinerary.end_date && itinerary.end_date.slice(0, 10) < todayVi,
+    );
+    const showPopup = hasEnded && ['completed', 'uncompleted'].includes(status);
+    const reason = showPopup ? 'eligible' : 'itinerary_not_ended';
 
     return {
       show_popup: showPopup,
@@ -494,7 +510,7 @@ export class ItineraryReviewsService {
         start_date: itinerary.start_date ?? '',
         end_date: itinerary.end_date ?? '',
         status: itinerary.status,
-        cover_image: places[0]?.image_url ?? null,
+        cover_image: this.getPlaceImage(places[0]?.image_url ?? null),
         total_places: details.length,
       },
       general_review: {
@@ -514,7 +530,7 @@ export class ItineraryReviewsService {
           visit_date: item.visit_date ?? '',
           place_id: item.place_id,
           place_name: place?.name ?? 'Địa điểm',
-          place_image_url: place?.image_url ?? null,
+          place_image_url: this.getPlaceImage(place?.image_url ?? null),
           rating: null,
           content: null,
         };

@@ -364,6 +364,93 @@ export class ItineraryTrackingService {
     }
   }
 
+  private isOptionalNotificationColumnError(error: {
+    code?: string;
+    message?: string;
+  }): boolean {
+    return (
+      error.code === '42703' ||
+      error.code === 'PGRST204' ||
+      /column|schema cache/i.test(error.message ?? '')
+    );
+  }
+
+  /** Tao thong bao moi nguoi dung danh gia dia diem sau khi da ghe. */
+  private async createPlaceReviewNotification(args: {
+    touristId: string;
+    itineraryId: string | null;
+    itineraryDetailId: string;
+    placeId: string | null;
+    placeName: string;
+  }): Promise<string | null> {
+    const message = `Hãy chia sẻ cảm nhận của bạn về ${args.placeName}.`;
+
+    try {
+      const notificationId = randomUUID();
+      const nowIso = new Date().toISOString();
+      const notificationPayload = {
+        id: notificationId,
+        title: 'Đánh giá địa điểm',
+        content: message,
+        type: 'review',
+        is_global: false,
+        action_type: 'review_place',
+        action_label: 'Đánh giá địa điểm',
+        target_type: 'place_review',
+        metadata: {
+          action_label: 'Danh gia dia diem',
+          place_id: args.placeId,
+          itinerary_id: args.itineraryId,
+          itinerary_detail_id: args.itineraryDetailId,
+        },
+        created_at: nowIso,
+      };
+      delete (notificationPayload as Record<string, unknown>).action_label;
+
+      let { error: nErr } = await supabase
+        .schema('public')
+        .from('notifications')
+        .insert(notificationPayload);
+
+      if (nErr && this.isOptionalNotificationColumnError(nErr)) {
+        const { error } = await supabase
+          .schema('public')
+          .from('notifications')
+          .insert({
+            id: notificationPayload.id,
+            title: notificationPayload.title,
+            content: notificationPayload.content,
+            type: notificationPayload.type,
+            is_global: notificationPayload.is_global,
+            created_at: notificationPayload.created_at,
+          });
+        nErr = error;
+      }
+
+      if (nErr) throw nErr;
+
+      const { error: uErr } = await supabase
+        .schema('public')
+        .from('users_notifications')
+        .insert({
+          id: randomUUID(),
+          user_id: args.touristId,
+          notification_id: notificationId,
+          is_read: false,
+          sent_at: nowIso,
+        });
+      if (uErr) throw uErr;
+
+      return message;
+    } catch (e) {
+      console.warn(
+        '[ItineraryTracking] Tạo thông báo đánh giá thất bại:',
+        (e as Error).message,
+      );
+      return null;
+    }
+  }
+
   private nextDayInfo(nextDayDate: string | null) {
     return {
       nextDayDate,
@@ -656,7 +743,9 @@ export class ItineraryTrackingService {
   async handleEvent(dto: GeofenceEventDto) {
     const row = await this.resolveVisitRow(dto);
     if (row.tourist_id && row.tourist_id !== dto.touristId) {
-      throw new BadRequestException('touristId không khớp với bản ghi theo dõi');
+      throw new BadRequestException(
+        'touristId không khớp với bản ghi theo dõi',
+      );
     }
 
     const occurredAt = dto.occurredAt ?? new Date().toISOString();
@@ -723,6 +812,13 @@ export class ItineraryTrackingService {
         dto.touristId,
         name,
       );
+      await this.createPlaceReviewNotification({
+        touristId: dto.touristId,
+        itineraryId: row.itinerary_id,
+        itineraryDetailId: row.itinerary_detail_id,
+        placeId: row.geofences?.place_id ?? null,
+        placeName: name,
+      });
       this.emitVisited(dto.touristId, row.geofences?.place_id ?? null);
       return this.eventResponse(
         updated,
@@ -750,7 +846,9 @@ export class ItineraryTrackingService {
   async checkIn(dto: CheckInDto) {
     const row = await this.resolveVisitRow(dto);
     if (row.tourist_id && row.tourist_id !== dto.touristId) {
-      throw new BadRequestException('touristId không khớp với bản ghi theo dõi');
+      throw new BadRequestException(
+        'touristId không khớp với bản ghi theo dõi',
+      );
     }
     const name = await this.placeName(row.geofences?.place_id ?? '');
 
@@ -780,6 +878,13 @@ export class ItineraryTrackingService {
       dto.touristId,
       name,
     );
+    await this.createPlaceReviewNotification({
+      touristId: dto.touristId,
+      itineraryId: row.itinerary_id,
+      itineraryDetailId: row.itinerary_detail_id,
+      placeId: row.geofences?.place_id ?? null,
+      placeName: name,
+    });
     this.emitVisited(dto.touristId, row.geofences?.place_id ?? null);
 
     return this.eventResponse(
