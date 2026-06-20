@@ -58,6 +58,17 @@ export class ItineraryReviewDetailPlaceItemDto {
   content: string | null;
 }
 
+export class ItineraryReviewSummaryResponseDto {
+  @ApiProperty()
+  has_review: boolean;
+
+  @ApiProperty({ nullable: true, type: Number })
+  rating: number | null;
+
+  @ApiProperty({ nullable: true, type: String })
+  content: string | null;
+}
+
 export class ItineraryReviewDetailResponseDto {
   @ApiProperty({ type: Object })
   itinerary: {
