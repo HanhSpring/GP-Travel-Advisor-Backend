@@ -18,6 +18,7 @@ import {
   ItineraryReviewDetailResponseDto,
   ItineraryReviewPopupResponseDto,
   ItineraryReviewSummaryResponseDto,
+  ItinerarySubmittedReviewResponseDto,
 } from './dto/itinerary-review-response.dto';
 import { SubmitItineraryReviewDto } from './dto/submit-itinerary-review.dto';
 import { ItineraryReviewsService } from './itinerary-reviews.service';
@@ -69,6 +70,28 @@ export class ItineraryReviewsController {
         touristId,
         itineraryId,
       });
+      throw error;
+    }
+  }
+
+  @Get(':itineraryId/submitted-review')
+  @ApiOperation({
+    summary: 'Get full submitted review data for read-only display',
+  })
+  @ApiQuery({ name: 'tourist_id', required: true, type: String })
+  @ApiOkResponse({ type: ItinerarySubmittedReviewResponseDto })
+  async getSubmittedReview(
+    @Param('itineraryId') itineraryId: string,
+    @Query('tourist_id') touristId: string,
+  ): Promise<ItinerarySubmittedReviewResponseDto> {
+    try {
+      return await this.service.getSubmittedReview(touristId, itineraryId);
+    } catch (error) {
+      this.logApiError(
+        'GET /itinerary-reviews/:itineraryId/submitted-review',
+        error,
+        { touristId, itineraryId },
+      );
       throw error;
     }
   }

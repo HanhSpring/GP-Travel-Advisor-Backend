@@ -58,6 +58,50 @@ export class ItineraryReviewDetailPlaceItemDto {
   content: string | null;
 }
 
+export class SubmittedPlaceReviewDto {
+  @ApiProperty()
+  itinerary_detail_id: string;
+
+  @ApiProperty()
+  day_label: string;
+
+  @ApiProperty()
+  place_name: string;
+
+  @ApiProperty({ nullable: true, type: String })
+  place_image_url: string | null;
+
+  @ApiProperty({ nullable: true, type: Number })
+  rating: number | null;
+
+  @ApiProperty({ nullable: true, type: String })
+  content: string | null;
+
+  @ApiProperty({ type: [String] })
+  media_urls: string[];
+}
+
+export class ItinerarySubmittedReviewResponseDto {
+  @ApiProperty({ type: Object })
+  itinerary: {
+    id: string;
+    title: string;
+    start_date: string;
+    end_date: string;
+    cover_image: string | null;
+  };
+
+  @ApiProperty({ type: Object })
+  overall: {
+    rating: number | null;
+    content: string | null;
+    media_urls: string[];
+  };
+
+  @ApiProperty({ type: [SubmittedPlaceReviewDto] })
+  places: SubmittedPlaceReviewDto[];
+}
+
 export class ItineraryReviewSummaryResponseDto {
   @ApiProperty()
   has_review: boolean;
