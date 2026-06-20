@@ -11,8 +11,10 @@ export class ItineraryReviewPopupResponseDto {
   itinerary: {
     id: string;
     title: string;
+    destination: string | null;
     start_date: string;
     end_date: string;
+    status: string | null;
     cover_image: string | null;
   };
 
@@ -78,7 +80,13 @@ export class SubmittedPlaceReviewDto {
   content: string | null;
 
   @ApiProperty({ type: [String] })
+  tags: string[];
+
+  @ApiProperty({ type: [String] })
   media_urls: string[];
+
+  @ApiProperty({ nullable: true, type: String })
+  reviewed_at: string | null;
 }
 
 export class ItinerarySubmittedReviewResponseDto {
@@ -86,8 +94,10 @@ export class ItinerarySubmittedReviewResponseDto {
   itinerary: {
     id: string;
     title: string;
+    destination: string | null;
     start_date: string;
     end_date: string;
+    status: string | null;
     cover_image: string | null;
   };
 
@@ -95,7 +105,9 @@ export class ItinerarySubmittedReviewResponseDto {
   overall: {
     rating: number | null;
     content: string | null;
+    tags: string[];
     media_urls: string[];
+    reviewed_at: string | null;
   };
 
   @ApiProperty({ type: [SubmittedPlaceReviewDto] })
