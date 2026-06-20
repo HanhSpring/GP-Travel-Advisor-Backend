@@ -17,6 +17,7 @@ import {
 import {
   ItineraryReviewDetailResponseDto,
   ItineraryReviewPopupResponseDto,
+  ItineraryReviewSummaryResponseDto,
 } from './dto/itinerary-review-response.dto';
 import { SubmitItineraryReviewDto } from './dto/submit-itinerary-review.dto';
 import { ItineraryReviewsService } from './itinerary-reviews.service';
@@ -65,6 +66,27 @@ export class ItineraryReviewsController {
       return await this.service.getPopup(touristId, itineraryId);
     } catch (error) {
       this.logApiError('GET /itinerary-reviews/popup', error, {
+        touristId,
+        itineraryId,
+      });
+      throw error;
+    }
+  }
+
+  @Get(':itineraryId/summary')
+  @ApiOperation({
+    summary: 'Get itinerary review summary (rating + content) for popup mode check',
+  })
+  @ApiQuery({ name: 'tourist_id', required: true, type: String })
+  @ApiOkResponse({ type: ItineraryReviewSummaryResponseDto })
+  async getSummary(
+    @Param('itineraryId') itineraryId: string,
+    @Query('tourist_id') touristId: string,
+  ): Promise<ItineraryReviewSummaryResponseDto> {
+    try {
+      return await this.service.getSummary(touristId, itineraryId);
+    } catch (error) {
+      this.logApiError('GET /itinerary-reviews/:itineraryId/summary', error, {
         touristId,
         itineraryId,
       });

@@ -614,6 +614,23 @@ export class ItineraryReviewsService {
     };
   }
 
+  async getSummary(touristId: string, itineraryId: string) {
+    if (!touristId || !itineraryId) {
+      throw new BadRequestException('tourist_id and itinerary_id are required');
+    }
+
+    const summaryReview = await this.getItinerarySummaryReview(
+      touristId,
+      itineraryId,
+    );
+
+    return {
+      has_review: summaryReview.overall_rating !== null,
+      rating: summaryReview.overall_rating,
+      content: summaryReview.overall_content,
+    };
+  }
+
   async getPopup(touristId: string, itineraryId: string) {
     if (!touristId || !itineraryId) {
       throw new BadRequestException('tourist_id and itinerary_id are required');
