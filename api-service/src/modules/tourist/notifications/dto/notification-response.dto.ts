@@ -37,6 +37,45 @@ export class TouristNotificationItemDto {
     description: 'Whether this notification should show unread dot',
   })
   is_unread: boolean;
+
+  @ApiProperty({ nullable: true, required: false })
+  action_type?: string | null;
+
+  @ApiProperty({ nullable: true, required: false })
+  action_label?: string | null;
+
+  @ApiProperty({ nullable: true, required: false })
+  target_type?: string | null;
+
+  @ApiProperty({ nullable: true, required: false })
+  place_id?: string | null;
+
+  @ApiProperty({ nullable: true, required: false })
+  itinerary_id?: string | null;
+
+  @ApiProperty({ nullable: true, required: false })
+  itinerary_detail_id?: string | null;
+
+  @ApiProperty({
+    required: false,
+    description: 'Whether the tourist already wrote a review for this place',
+  })
+  has_place_review?: boolean;
+
+  @ApiProperty({
+    required: false,
+    description:
+      'Whether the tourist already wrote a review for this itinerary',
+  })
+  has_itinerary_review?: boolean;
+
+  @ApiProperty({
+    nullable: true,
+    required: false,
+    description:
+      'Flexible action payload, for example place_id or itinerary_id',
+  })
+  metadata?: Record<string, unknown> | null;
 }
 
 export class TouristNotificationsResponseDto {
