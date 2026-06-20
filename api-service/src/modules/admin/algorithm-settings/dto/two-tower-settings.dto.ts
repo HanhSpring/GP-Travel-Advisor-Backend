@@ -70,6 +70,9 @@ export class TwoTowerCoreSettingsDto {
 
   @ApiProperty({ type: ParameterMetaDto })
   enableDiversityBudget: ParameterMetaDto;
+
+  @ApiProperty({ type: ParameterMetaDto })
+  moderationBatchIntervalMinutes: ParameterMetaDto;
 }
 
 export class AlgorithmLogDto {

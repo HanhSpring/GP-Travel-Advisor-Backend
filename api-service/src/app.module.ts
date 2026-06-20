@@ -23,6 +23,7 @@ import { OrdersModule } from './modules/tourist/orders/orders.module';
 import { MoreInfoModule } from './modules/tourist/more-info/more-info.module';
 import { ItineraryReviewsModule } from './modules/tourist/itinerary-reviews/itinerary-reviews.module';
 import { NotificationsModule } from './modules/tourist/notifications/notifications.module';
+import { ModerationModule } from './modules/moderation/moderation.module';
 
 /*
 Admin modules
@@ -79,6 +80,7 @@ import { RecommendationModule } from './modules/recommendation/recommendation.mo
     MoreInfoModule,
     ItineraryReviewsModule,
     NotificationsModule,
+    ModerationModule,
 
     /*
     Admin

@@ -169,23 +169,39 @@ export class PlacesService {
       }
     }
 
-    const { data: ratingRows, error: ratingRowsError } = await supabase
+    let ratingQuery = supabase
       .schema('review_ai')
       .from('reviews')
       .select('rating')
       .eq('place_id', placeId);
 
+    if (touristId) {
+      ratingQuery = ratingQuery.or(`status.eq.approved,and(tourist_id.eq.${touristId},status.eq.pending)`);
+    } else {
+      ratingQuery = ratingQuery.eq('status', 'approved');
+    }
+
+    const { data: ratingRows, error: ratingRowsError } = await ratingQuery;
+
     if (ratingRowsError) {
       throw new InternalServerErrorException(ratingRowsError.message);
     }
 
-    const { data: reviews, error: reviewsError } = await supabase
+    let reviewsQuery = supabase
       .schema('review_ai')
       .from('reviews')
       .select('id, tourist_id, rating, created_at')
       .eq('place_id', placeId)
       .order('created_at', { ascending: false })
       .limit(10);
+
+    if (touristId) {
+      reviewsQuery = reviewsQuery.or(`status.eq.approved,and(tourist_id.eq.${touristId},status.eq.pending)`);
+    } else {
+      reviewsQuery = reviewsQuery.eq('status', 'approved');
+    }
+
+    const { data: reviews, error: reviewsError } = await reviewsQuery;
 
     if (reviewsError) {
       throw new InternalServerErrorException(reviewsError.message);

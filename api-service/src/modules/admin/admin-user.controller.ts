@@ -10,7 +10,7 @@ import {
   Body,
   Post,
   UseGuards,
- 
+  Request,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -40,6 +40,14 @@ import { CreateUserByAdminDto } from './dto/create-user-by-admin.dto';
 // @Roles(Role.Admin)
 export class AdminUserController {
   constructor(private readonly adminService: AdminService) {}
+
+  @Patch('profile/me')
+  @ApiOperation({ summary: 'Admin cập nhật thông tin cá nhân' })
+  @ApiResponse({ status: 200, description: 'Cập nhật thành công' })
+  async updateAdminProfile(@Request() req, @Body() updateDto: any) {
+    return this.adminService.updateAdminProfile(req.user.userId, updateDto);
+  }
+
   @Get('stats')
   @ApiOperation({ summary: 'Lấy 3 con số thống kê tổng quan của người dùng' })
   @ApiResponse({ status: 200, description: 'Trả về thống kê thành công' })
