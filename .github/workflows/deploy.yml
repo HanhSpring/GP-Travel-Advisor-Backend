@@ -6,8 +6,9 @@ on:
       - develop
 
 env:
-  REGISTRY: registry.digitalocean.com/graduation
-  IMAGE_NAME: backend-api
+  REGISTRY: registry.digitalocean.com/graduation-travel
+  API_IMAGE_NAME: backend-api
+  AI_IMAGE_NAME: ai-service
 
 jobs:
   build-and-deploy:
@@ -23,11 +24,11 @@ jobs:
         with:
           node-version: "20"
 
-      - name: Install dependencies
+      - name: Install API dependencies
         working-directory: ./api-service
         run: npm install
 
-      - name: Build NestJS app
+      - name: Build API app
         working-directory: ./api-service
         run: npm run build
 
@@ -38,14 +39,23 @@ jobs:
           username: ${{ secrets.DO_REGISTRY_TOKEN }}
           password: ${{ secrets.DO_REGISTRY_TOKEN }}
 
-      - name: Build Docker Image
+      - name: Build API Docker Image
         working-directory: ./api-service
         run: |
-          docker build -t $REGISTRY/$IMAGE_NAME:latest .
+          docker build -t $REGISTRY/$API_IMAGE_NAME:latest .
 
-      - name: Push Image
+      - name: Push API Image
         run: |
-          docker push $REGISTRY/$IMAGE_NAME:latest
+          docker push $REGISTRY/$API_IMAGE_NAME:latest
+
+      - name: Build AI Docker Image
+        working-directory: ./ai-service
+        run: |
+          docker build -t $REGISTRY/$AI_IMAGE_NAME:latest .
+
+      - name: Push AI Image
+        run: |
+          docker push $REGISTRY/$AI_IMAGE_NAME:latest
 
       - name: Deploy to Droplet
         uses: appleboy/ssh-action@v1.0.3
@@ -61,7 +71,7 @@ jobs:
             else
               DC="docker-compose"
             fi
-            $DC pull backend-api
-            $DC rm -f backend-api
-            $DC up -d --no-deps backend-api
+            $DC pull backend-api ai-service
+            $DC rm -f backend-api ai-service
+            $DC up -d --no-deps backend-api ai-service
             $DC ps
