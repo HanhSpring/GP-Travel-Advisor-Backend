@@ -8,6 +8,8 @@ from typing import Any
 MIN_POOL_PER_DAY = 4
 MAX_LOAD_RATIO = 1.0
 LUNCH_BLOCK_MINUTES = 80
+POI_TARGET_TIME_SLICE_MINUTES = 90
+POI_TARGET_MAX_PER_DAY = 10
 
 
 @dataclass
@@ -26,6 +28,20 @@ class AssignmentConfig:
     @property
     def daily_effective(self) -> int:
         return max(0, self.daily_available - LUNCH_BLOCK_MINUTES)
+
+    @property
+    def max_nonmeal_per_day(self) -> int:
+        if self.daily_effective <= 0:
+            return self.target_nonmeal_per_day
+        by_time = max(
+            self.target_nonmeal_per_day,
+            self.daily_effective // POI_TARGET_TIME_SLICE_MINUTES,
+        )
+        return max(1, min(POI_TARGET_MAX_PER_DAY, int(by_time)))
+
+    @property
+    def max_nonmeal_total(self) -> int:
+        return max(0, self.num_days * self.max_nonmeal_per_day)
 
 
 @dataclass
@@ -61,8 +77,19 @@ class AssignmentModule:
             )
 
         self._rebalance(day_pools)
+        trimmed_count = self._trim_overloaded_days(day_pools)
         day_loads = [self._day_load(pool) for pool in day_pools]
         warnings = self._warnings(day_pools, day_loads)
+        warnings.insert(
+            0,
+            (
+                "assignment_v2 "
+                f"max_nonmeal_per_day={self.config.max_nonmeal_per_day} "
+                f"max_nonmeal_total={self.config.max_nonmeal_total} "
+                f"daily_effective={self.config.daily_effective} "
+                f"trimmed={trimmed_count}"
+            ),
+        )
         return AssignmentResult(day_pools=day_pools, day_loads=day_loads, warnings=warnings)
 
     def _new_day_pool(self) -> list[dict[str, list[Any]]]:
@@ -101,26 +128,43 @@ class AssignmentModule:
                 place.candidate_rank,
             ),
         )
-        targets = self._balanced_count_targets(len(ordered))
-        cursor = 0
-        for day_idx, target in enumerate(targets):
-            for _ in range(target):
-                if cursor >= len(ordered):
-                    break
-                day_pools[day_idx]["attractions"].append(ordered[cursor])
-                cursor += 1
-
-        while cursor < len(ordered):
-            place = ordered[cursor]
-            cursor += 1
+        current_total = sum(len(pool["attractions"]) for pool in day_pools)
+        remaining_slots = max(0, self.config.max_nonmeal_total - current_total)
+        for place in ordered[:remaining_slots]:
+            place_load = self._poi_load(place)
+            candidates = [
+                idx
+                for idx, pool in enumerate(day_pools)
+                if len(pool["attractions"]) < self.config.max_nonmeal_per_day
+                and self._day_load(pool) + place_load
+                <= self.config.daily_effective * MAX_LOAD_RATIO
+            ]
+            if not candidates:
+                candidates = [
+                    idx
+                    for idx, pool in enumerate(day_pools)
+                    if len(pool["attractions"])
+                    < min(
+                        MIN_POOL_PER_DAY,
+                        self.config.target_nonmeal_per_day,
+                        self.config.max_nonmeal_per_day,
+                    )
+                ]
+            if not candidates:
+                break
             target_idx = min(
-                range(self.config.num_days),
+                candidates,
                 key=lambda idx: (
-                    len(day_pools[idx]["attractions"]),
+                    self._sector_distance(place, idx),
                     self._day_load(day_pools[idx]),
+                    len(day_pools[idx]["attractions"]),
                 ),
             )
             day_pools[target_idx]["attractions"].append(place)
+
+        # Do not force every remaining candidate into the daily GA pools.
+        # Two-Tower may return many backups; daily GA should only receive the
+        # amount a user can realistically visit in the selected time window.
 
     def _rebalance(self, day_pools: list[dict[str, list[Any]]]) -> None:
         if self.config.num_days <= 1:
@@ -130,6 +174,8 @@ class AssignmentModule:
             while len(pool["attractions"]) < self.config.target_nonmeal_per_day:
                 donor_idx = self._richest_donor(day_pools)
                 if donor_idx is None or donor_idx == idx:
+                    break
+                if len(pool["attractions"]) >= self.config.max_nonmeal_per_day:
                     break
                 donor = day_pools[donor_idx]["attractions"]
                 if len(donor) <= 1:
@@ -152,8 +198,14 @@ class AssignmentModule:
                 movable = [
                     p
                     for p in pool["attractions"]
-                    if len(day_pools[target_idx]["attractions"]) < self.config.target_nonmeal_per_day
-                    or self._day_load(day_pools[target_idx]) < self.config.daily_effective
+                    if len(day_pools[target_idx]["attractions"])
+                    < self.config.max_nonmeal_per_day
+                    and (
+                        len(day_pools[target_idx]["attractions"])
+                        < self.config.target_nonmeal_per_day
+                        or self._day_load(day_pools[target_idx])
+                        < self.config.daily_effective
+                    )
                 ]
                 if not movable:
                     continue
@@ -161,6 +213,24 @@ class AssignmentModule:
                 pool["attractions"].remove(moved)
                 day_pools[target_idx]["attractions"].append(moved)
                 changed = True
+
+    def _trim_overloaded_days(self, day_pools: list[dict[str, list[Any]]]) -> int:
+        max_load = self.config.daily_effective * MAX_LOAD_RATIO
+        if max_load <= 0:
+            return 0
+        trimmed_count = 0
+        for pool in day_pools:
+            while len(pool["attractions"]) > 1 and self._day_load(pool) > max_load:
+                removed = max(
+                    pool["attractions"],
+                    key=lambda place: (
+                        self._poi_load(place),
+                        place.candidate_rank,
+                    ),
+                )
+                pool["attractions"].remove(removed)
+                trimmed_count += 1
+        return trimmed_count
 
     def _warnings(
         self,
