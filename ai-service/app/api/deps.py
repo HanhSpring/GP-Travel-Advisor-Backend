@@ -77,8 +77,9 @@ def _download_two_tower_weights(vocab_path: str, weights_path: str) -> None:
             (vocab_path, settings.two_tower_vocab_r2_key),
             (weights_path, settings.two_tower_weights_r2_key),
         ]:
-            # if os.path.exists(local_path):
-            #     continue
+            if os.path.exists(local_path):
+                logger.info("  ✓ Dùng cache local: %s", local_path)
+                continue
             os.makedirs(os.path.dirname(local_path) or ".", exist_ok=True)
             logger.info("⬇ Downloading r2://%s/%s → %s", bucket, r2_key, local_path)
             client.download_file(bucket, r2_key, local_path)

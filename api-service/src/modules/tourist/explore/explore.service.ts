@@ -431,21 +431,22 @@ export class ExploreService implements OnModuleInit {
   }
 
   private mapActivityEntityCategory(categoryNames: string[]): string {
+    // categoryNames are already normalizeText()-ed (no diacritics, & → space)
     const joinedCategoryNames = categoryNames.join(' ');
 
-    if (joinedCategoryNames.includes('tham quan & khám phá')) {
+    if (joinedCategoryNames.includes('tham quan kham pha')) {
       return 'attractions';
     }
 
-    if (joinedCategoryNames.includes('văn hoá & di sản')) {
+    if (joinedCategoryNames.includes('van hoa di san')) {
       return 'culturalHistory';
     }
 
-    if (joinedCategoryNames.includes('giải trí & vui chơi')) {
+    if (joinedCategoryNames.includes('giai tri vui choi')) {
       return 'entertainment';
     }
 
-    if (joinedCategoryNames.includes('thư giãn & thể thao')) {
+    if (joinedCategoryNames.includes('thu gian the thao')) {
       return 'nature';
     }
 
@@ -640,6 +641,7 @@ export class ExploreService implements OnModuleInit {
       };
     }
 
+    // Only match itineraries starting TODAY so the home card never shows stale past trips.
     const { data: upcoming, error: upcomingError } = await supabase
       .schema('travel')
       .from('itineraries')
@@ -648,7 +650,7 @@ export class ExploreService implements OnModuleInit {
       )
       .eq('creator_id', touristId)
       .in('status', ['pending', 'ongoing', 'uncompleted', 'completed'])
-      .gte('start_date', today)
+      .eq('start_date', today)
       .order('start_date', { ascending: true })
       .limit(1)
       .maybeSingle<ItineraryRow>();
@@ -673,38 +675,8 @@ export class ExploreService implements OnModuleInit {
       };
     }
 
-    const { data: recent, error: recentError } = await supabase
-      .schema('travel')
-      .from('itineraries')
-      .select(
-        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public',
-      )
-      .eq('creator_id', touristId)
-      .order('start_date', { ascending: false })
-      .limit(1)
-      .maybeSingle<ItineraryRow>();
-
-    if (recentError) {
-      throw new InternalServerErrorException(recentError.message);
-    }
-
-    if (!recent) {
-      return null;
-    }
-
-    return {
-      id: recent.id,
-      title:
-        (recent.description && recent.description.trim()) ||
-        recent.destination ||
-        'Lịch trình của bạn',
-      date_range: `${recent.start_date ?? ''} - ${recent.end_date ?? ''}`,
-      time_range: await this.getTimeRange(recent.id),
-      participant_count: this.toParticipantCount(recent),
-      status: recent.status,
-      can_start: false,
-      start_target: null,
-    };
+    // No ongoing and no today-starting itinerary → hide the home card.
+    return null;
   }
 
   async startItinerary(touristId: string, itineraryId: string) {
@@ -1253,12 +1225,13 @@ export class ExploreService implements OnModuleInit {
     const activities: Array<Record<string, unknown>> = [];
     const restaurants: Array<Record<string, unknown>> = [];
     const hotels: Array<Record<string, unknown>> = [];
+    // Must match normalizeText() output: diacritics stripped, & → space
     const activityCategoryNames = [
-      'giải trí & vui chơi',
-      'tham quan & khám phá',
-      'thư giãn & thể thao',
-      'văn hoá & di sản',
-      'mua sắm & dịch vụ',
+      'giai tri vui choi',
+      'tham quan kham pha',
+      'thu gian the thao',
+      'van hoa di san',
+      'mua sam dich vu',
     ];
 
     for (const item of places ?? []) {

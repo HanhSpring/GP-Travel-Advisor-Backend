@@ -30,42 +30,61 @@ export class SearchService {
    */
   async autocomplete(query: string): Promise<AutocompleteItem[]> {
     const q = (query ?? '').trim();
-    if (q.length === 0) {
-      return [];
+    if (q.length === 0) return [];
+
+    // Race the RPC against a 2.5s hard timeout so the fallback runs quickly
+    // when the GIN index isn't in place yet.
+    const rpcResult = await Promise.race([
+      supabase.schema('travel').rpc('search_autocomplete', { p_query: q }).returns<SearchRow[]>(),
+      new Promise<{ data: null; error: Error }>((resolve) =>
+        setTimeout(() => resolve({ data: null, error: new Error('rpc_timeout') }), 2500),
+      ),
+    ]) as { data: SearchRow[] | null; error: any };
+
+    if (rpcResult.error || !rpcResult.data) {
+      console.error('Autocomplete primary failed, falling back:', rpcResult.error?.message ?? rpcResult.error);
+      return this.autocompleteFallback(q);
     }
 
-    // Chỉ truyền p_query để tương thích cả function cũ (1 tham số) lẫn mới (p_limit có default).
-    const { data, error } = await supabase
-      .schema('travel')
-      .rpc('search_autocomplete', { p_query: q })
-      .returns<SearchRow[]>();
-
-    if (error) {
-      // Không ném 500: lỗi tạm thời (vd timeout) → trả rỗng để FE hiện "không có kết quả"
-      // thay vì banner đỏ "failed to search locations".
-      console.error('Autocomplete error:', error);
-      return [];
-    }
-
-    const rows = Array.isArray(data) ? data : [];
+    const rows = Array.isArray(rpcResult.data) ? rpcResult.data : [];
     return rows.map((row) => {
       const type =
         this.asString(row['type']).trim().toLowerCase() === 'city'
           ? 'city'
           : 'place';
       const image = this.asString(row['image']).trim();
-
       return {
         id: this.asString(row['id']),
         name: this.asString(row['name']),
         type,
-        // Place không có ảnh → dùng ảnh mặc định; city để rỗng (FE hiện icon).
         image: type === 'place' ? image || this.defaultPlaceImageUrl : image,
         city: this.asString(row['city']),
         rating: Number(row['rating']) || 0,
         score: Number(row['score']) || 0,
       };
     });
+  }
+
+  private async autocompleteFallback(q: string): Promise<AutocompleteItem[]> {
+    const { data } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, name, image_url, average_rating')
+      .eq('is_approved', true)
+      .eq('is_active', true)
+      .ilike('name', `${q}%`)
+      .order('average_rating', { ascending: false })
+      .limit(15);
+
+    return ((data ?? []) as any[]).map((p) => ({
+      id: String(p.id ?? ''),
+      name: String(p.name ?? ''),
+      type: 'place' as const,
+      image: this.resolveSearchImage(p.image_url),
+      city: '',
+      rating: Number(p.average_rating) || 0,
+      score: 0,
+    }));
   }
 
   async searchAdvanced(query: string): Promise<SearchRow[]> {
@@ -128,6 +147,211 @@ export class SearchService {
     const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
     return R * c;
   }
+
+  // ── Multi-type search ──────────────────────────────────────────────────────
+
+  private classifyPlaceType(place: any): 'activity' | 'restaurant' | 'hotel' {
+    const typeData = Array.isArray(place.types) ? place.types[0] : place.types;
+    if (!typeData) return 'activity';
+    const cats = Array.isArray(typeData.categories) ? typeData.categories : [typeData.categories].filter(Boolean);
+    const names: string[] = cats.map((c: any) => (c?.name ?? '').toLowerCase());
+    if (names.some(n =>
+      n.includes('lưu trú') || n.includes('khách sạn') || n.includes('homestay') || n.includes('resort') ||
+      n.includes('nhà nghỉ') || n.includes('nhà trọ') || n.includes('biệt thự') ||
+      n.includes('căn hộ') || n.includes('nghỉ dưỡng') || n.includes('bungalow')
+    )) return 'hotel';
+    if (names.some(n =>
+      n.includes('ẩm thực') || n.includes('nhà hàng') || n.includes('quán ăn') ||
+      n.includes('cà phê') || n.includes('cafe') || n.includes('quán cà phê') ||
+      n.includes('trà sữa') || n.includes('giải khát') || n.includes('buffet')
+    )) return 'restaurant';
+    return 'activity';
+  }
+
+  private resolveSearchImage(imageUrl: unknown): string {
+    if (Array.isArray(imageUrl)) {
+      const first = (imageUrl as unknown[]).find(i => typeof i === 'string' && (i as string).trim());
+      if (first) return first as string;
+    }
+    if (typeof imageUrl === 'string' && imageUrl.trim()) return imageUrl.trim();
+    return this.defaultPlaceImageUrl;
+  }
+
+  private mapPlaceItem(place: any, cityMap: Map<string, string> = new Map()): Record<string, unknown> {
+    const type = this.classifyPlaceType(place);
+    const base = {
+      id: String(place.id ?? ''),
+      name: String(place.name ?? ''),
+      imageUrl: this.resolveSearchImage(place.image_url),
+      rating: Number(place.average_rating) || 0,
+      reviewCount: Number(place.review_count) || 0,
+      address: String(place.address ?? ''),
+      city: cityMap.get(String(place.city_id ?? '')) ?? '',
+      placeType: type,
+    };
+    if (type === 'hotel') {
+      return { ...base, price: 'Liên hệ', starRating: 4, priceValue: 0, accommodationType: 'hotel', amenities: [] };
+    }
+    if (type === 'restaurant') {
+      return { ...base, status: 'Đang mở cửa', cuisine: 'vietnamese', priceLevel: 'mid_range', amenities: [] };
+    }
+    const typeData = Array.isArray(place.types) ? place.types[0] : place.types;
+    const cats = typeData?.categories ? (Array.isArray(typeData.categories) ? typeData.categories : [typeData.categories]) : [];
+    const catName = (cats[0] as any)?.name ?? '';
+    return { ...base, status: 'Đang mở cửa', category: catName, priceType: 'free', district: '' };
+  }
+
+  private async fetchCreatorNames(ids: string[]): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    const deduped = [...new Set(ids.filter(Boolean))];
+    if (!deduped.length) return map;
+    const { data } = await supabase.from('users').select('id, full_name').in('id', deduped);
+    for (const u of (data ?? []) as any[]) {
+      if (u.full_name) map.set(u.id, u.full_name);
+    }
+    return map;
+  }
+
+  private async fetchItineraryImages(ids: string[]): Promise<Map<string, string>> {
+    const map = new Map<string, string>();
+    if (!ids.length) return map;
+    const { data } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select('itinerary_id, places:place_id(image_url)')
+      .in('itinerary_id', ids)
+      .limit(ids.length * 6);
+    for (const row of (data ?? []) as any[]) {
+      if (map.has(row.itinerary_id)) continue;
+      const img = this.resolveSearchImage((row.places as any)?.image_url);
+      if (img !== this.defaultPlaceImageUrl) map.set(row.itinerary_id, img);
+    }
+    return map;
+  }
+
+  private calcDays(start: string | null, end: string | null): number {
+    if (!start || !end) return 1;
+    const ms = new Date(end).getTime() - new Date(start).getTime();
+    return Math.max(1, Math.round(ms / 86400000) + 1);
+  }
+
+  private async queryItineraries(q: string, page: number, limit: number) {
+    const offset = (page - 1) * limit;
+    const { data, error, count } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, creator_id, description, start_date, end_date, destination, created_at', { count: 'exact' })
+      .eq('is_public', true)
+      .eq('status', 'completed')
+      .or(`description.ilike.%${q}%,destination.ilike.%${q}%`)
+      .order('created_at', { ascending: false })
+      .range(offset, offset + limit - 1)
+      .returns<any[]>();
+    if (error) return { data: [], total: 0 };
+    const rows = (data ?? []) as any[];
+    const creatorIds = rows.map(r => r.creator_id).filter(Boolean);
+    const itinIds = rows.map(r => r.id);
+    const [creatorMap, imgMap] = await Promise.all([
+      this.fetchCreatorNames(creatorIds),
+      this.fetchItineraryImages(itinIds),
+    ]);
+    const mapped = rows.map(r => ({
+      id: r.id,
+      title: (r.description && String(r.description).trim()) || r.destination || 'Lịch trình',
+      authorName: creatorMap.get(r.creator_id) ?? 'Traveler',
+      authorAvatar: `https://i.pravatar.cc/150?u=${r.creator_id}`,
+      imageUrl: imgMap.get(r.id) ?? this.defaultPlaceImageUrl,
+      duration: `${this.calcDays(r.start_date, r.end_date)} NGÀY`,
+      destination: String(r.destination ?? ''),
+      views: '0',
+      likes: '0',
+    }));
+    return { data: mapped, total: count ?? 0 };
+  }
+
+  private readonly placesSelect =
+    'id, name, address, average_rating, review_count, image_url, city_id, types(id, category_id, categories(id, name))';
+
+  // Infix search — requires GIN trigram index for speed on large tables.
+  private async queryPlaces(q: string, maxRows = 2000): Promise<any[]> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('places')
+      .select(this.placesSelect)
+      .eq('is_approved', true)
+      .eq('is_active', true)
+      .ilike('name', `%${q}%`)
+      .order('average_rating', { ascending: false })
+      .limit(maxRows);
+    if (error) console.error('queryPlaces (infix) error:', error.message);
+    return error ? [] : (data ?? []);
+  }
+
+  // Prefix-only fallback — works with a standard B-tree index.
+  private async queryPlacesPrefix(q: string, maxRows = 500): Promise<any[]> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('places')
+      .select(this.placesSelect)
+      .eq('is_approved', true)
+      .eq('is_active', true)
+      .ilike('name', `${q}%`)
+      .order('average_rating', { ascending: false })
+      .limit(maxRows);
+    if (error) console.error('queryPlacesPrefix error:', error.message);
+    return error ? [] : (data ?? []);
+  }
+
+  private async buildCityMap(rawPlaces: any[]): Promise<Map<string, string>> {
+    const cityIds = [...new Set(rawPlaces.map((p: any) => String(p.city_id ?? '')).filter(Boolean))];
+    if (!cityIds.length) return new Map();
+    const { data } = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name')
+      .in('id', cityIds);
+    const map = new Map<string, string>();
+    for (const c of (data ?? []) as any[]) map.set(String(c.id), String(c.name ?? ''));
+    return map;
+  }
+
+  async searchAll(query: string) {
+    const q = (query ?? '').trim();
+    if (!q) return { itineraries: { data: [], total: 0 }, activities: { data: [], total: 0 }, restaurants: { data: [], total: 0 }, hotels: { data: [], total: 0 } };
+    let [itinResult, rawPlaces] = await Promise.all([
+      this.queryItineraries(q, 1, 50),
+      this.queryPlaces(q, 2000),
+    ]);
+    // Infix timed out (no GIN index) → fall back to prefix search.
+    if (!rawPlaces.length) rawPlaces = await this.queryPlacesPrefix(q, 500);
+    const cityMap = await this.buildCityMap(rawPlaces);
+    const classified = rawPlaces.map(p => this.mapPlaceItem(p, cityMap));
+    const activities = classified.filter(p => p['placeType'] === 'activity');
+    const restaurants = classified.filter(p => p['placeType'] === 'restaurant');
+    const hotels = classified.filter(p => p['placeType'] === 'hotel');
+    return {
+      itineraries: itinResult,
+      activities: { data: activities, total: activities.length },
+      restaurants: { data: restaurants, total: restaurants.length },
+      hotels: { data: hotels, total: hotels.length },
+    };
+  }
+
+  async searchByType(query: string, type: string, page: number, limit: number) {
+    const q = (query ?? '').trim();
+    const safePage = Math.max(1, page);
+    const safeLimit = Math.max(1, limit);
+    if (type === 'itinerary') return this.queryItineraries(q, safePage, safeLimit);
+    let raw = await this.queryPlaces(q, 2000);
+    if (!raw.length) raw = await this.queryPlacesPrefix(q, 500);
+    const cityMap = await this.buildCityMap(raw);
+    const filtered = raw.map(p => this.mapPlaceItem(p, cityMap)).filter(p => p['placeType'] === type);
+    const total = filtered.length;
+    const offset = (safePage - 1) * safeLimit;
+    return { data: filtered.slice(offset, offset + safeLimit), total, page: safePage, pages: Math.ceil(total / safeLimit) };
+  }
+
+  // ── Nearby places ─────────────────────────────────────────────────────────
 
   async getNearbyPlaces(
     lat: number,
