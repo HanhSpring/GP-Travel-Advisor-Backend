@@ -77,9 +77,19 @@ class AssignmentModule:
             )
 
         self._rebalance(day_pools)
-        self._trim_overloaded_days(day_pools)
+        trimmed_count = self._trim_overloaded_days(day_pools)
         day_loads = [self._day_load(pool) for pool in day_pools]
         warnings = self._warnings(day_pools, day_loads)
+        warnings.insert(
+            0,
+            (
+                "assignment_v2 "
+                f"max_nonmeal_per_day={self.config.max_nonmeal_per_day} "
+                f"max_nonmeal_total={self.config.max_nonmeal_total} "
+                f"daily_effective={self.config.daily_effective} "
+                f"trimmed={trimmed_count}"
+            ),
+        )
         return AssignmentResult(day_pools=day_pools, day_loads=day_loads, warnings=warnings)
 
     def _new_day_pool(self) -> list[dict[str, list[Any]]]:
@@ -204,10 +214,11 @@ class AssignmentModule:
                 day_pools[target_idx]["attractions"].append(moved)
                 changed = True
 
-    def _trim_overloaded_days(self, day_pools: list[dict[str, list[Any]]]) -> None:
+    def _trim_overloaded_days(self, day_pools: list[dict[str, list[Any]]]) -> int:
         max_load = self.config.daily_effective * MAX_LOAD_RATIO
         if max_load <= 0:
-            return
+            return 0
+        trimmed_count = 0
         for pool in day_pools:
             while len(pool["attractions"]) > 1 and self._day_load(pool) > max_load:
                 removed = max(
@@ -218,6 +229,8 @@ class AssignmentModule:
                     ),
                 )
                 pool["attractions"].remove(removed)
+                trimmed_count += 1
+        return trimmed_count
 
     def _warnings(
         self,
