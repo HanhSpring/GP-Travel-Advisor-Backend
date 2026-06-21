@@ -3,7 +3,7 @@ name: CD - Backend Deploy
 on:
   push:
     branches:
-      - feature/deploy-updates
+      - develop
 
 env:
   REGISTRY: registry.digitalocean.com/graduation-travel
