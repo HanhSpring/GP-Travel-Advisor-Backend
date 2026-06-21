@@ -27,6 +27,23 @@ export class SearchController {
     )
   }
 
+  @Get('all')
+  @ApiOperation({ summary: 'Search all types (itinerary, activity, restaurant, hotel) — top 10 each' })
+  searchAll(@Query('q') q: string) {
+    return this.service.searchAll(q ?? '');
+  }
+
+  @Get('results')
+  @ApiOperation({ summary: 'Paginated search for one type' })
+  searchByType(
+    @Query('q') q: string,
+    @Query('type') type: string,
+    @Query('page') page?: string,
+    @Query('limit') limit?: string,
+  ) {
+    return this.service.searchByType(q ?? '', type ?? 'activity', page ? parseInt(page, 10) : 1, limit ? parseInt(limit, 10) : 10);
+  }
+
   @Get('nearby')
   @ApiOperation({ summary: 'Get nearby places based on lat, lng' })
   getNearbyPlaces(

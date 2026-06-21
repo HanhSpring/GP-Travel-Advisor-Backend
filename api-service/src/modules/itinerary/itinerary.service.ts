@@ -1043,6 +1043,29 @@ export class ItineraryService {
       }
     }
 
+    // Lấy trạng thái visit thực tế từ geofence_visits cho itinerary này.
+    // Priority: visited > skipped > not_visited (default chuaDi)
+    const visitStatusByDetailId = new Map<string, string>();
+    try {
+      const { data: geoVisits } = await supabase
+        .schema('tracking')
+        .from('geofence_visits')
+        .select('itinerary_detail_id, status')
+        .eq('itinerary_id', id);
+
+      for (const v of geoVisits || []) {
+        const detailId: string = v.itinerary_detail_id;
+        const current = visitStatusByDetailId.get(detailId);
+        if (v.status === 'visited') {
+          visitStatusByDetailId.set(detailId, 'daDi');
+        } else if (v.status === 'skipped' && current !== 'daDi') {
+          visitStatusByDetailId.set(detailId, 'diQua');
+        }
+      }
+    } catch (_) {
+      // Nếu query tracking thất bại thì vẫn trả về dữ liệu bình thường với status mặc định.
+    }
+
     const daysMap = new Map<string, any[]>();
     for (const detail of details || []) {
       const dateStr = detail.visit_date;
@@ -1128,7 +1151,7 @@ export class ItineraryService {
           longitude: place?.longitude,
           rating: place?.average_rating || 4.5,
           reviewCount: place?.review_count || 100,
-          status: 'chuaDi',
+          status: visitStatusByDetailId.get(act.id) ?? 'chuaDi',
         };
       });
 
