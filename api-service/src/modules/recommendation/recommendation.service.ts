@@ -342,8 +342,11 @@ export class RecommendationService {
       adult_count: dto.adultCount,
       child_count: dto.childCount ?? 0,
       budget_per_person: dto.budget ?? 0,
-      use_goong: true,
-      require_goong: true,
+      // GOONG: Bật use_goong=true khi đã có GOONG_API_KEY trong ai-service/.env.
+      // QUAN TRọNG: require_goong phải =false nếu không có key.
+      // require_goong=true + không có key → GA skip toàn bộ địa điểm → visited_count=0!
+      use_goong: false,
+      require_goong: false,
       travel_vehicle: this.resolveGoongVehicle(dto.transportMode),
       population_size: 50,
       generations: 120,
