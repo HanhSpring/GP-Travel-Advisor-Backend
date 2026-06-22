@@ -6,7 +6,7 @@ type SearchRow = Record<string, unknown>;
 export interface AutocompleteItem {
   id: string;
   name: string;
-  type: 'place' | 'city';
+  type: 'place' | 'city' | 'itinerary';
   image: string;
   city: string;
   rating: number;
@@ -32,37 +32,73 @@ export class SearchService {
     const q = (query ?? '').trim();
     if (q.length === 0) return [];
 
-    // Race the RPC against a 2.5s hard timeout so the fallback runs quickly
-    // when the GIN index isn't in place yet.
-    const rpcResult = await Promise.race([
+    const TIMEOUT_MS = 5000;
+
+    // Run RPC (with 5s timeout fallback) and itinerary query in parallel
+    const rpcPromise = Promise.race([
       supabase.schema('travel').rpc('search_autocomplete', { p_query: q }).returns<SearchRow[]>(),
       new Promise<{ data: null; error: Error }>((resolve) =>
-        setTimeout(() => resolve({ data: null, error: new Error('rpc_timeout') }), 2500),
+        setTimeout(() => resolve({ data: null, error: new Error('rpc_timeout') }), TIMEOUT_MS),
       ),
-    ]) as { data: SearchRow[] | null; error: any };
+    ]) as Promise<{ data: SearchRow[] | null; error: any }>;
 
+    // Prefix-only (destination.ilike.q%) — dùng B-tree index, nhanh hơn nhiều so với %q%
+    // description chỉ prefix để tránh full-table scan; destination là trường chính để match
+    const itinQuery = supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, description, destination')
+      .eq('is_public', true)
+      .eq('status', 'completed')
+      .or(`destination.ilike.${q}%,description.ilike.${q}%`)
+      .order('created_at', { ascending: false })
+      .limit(5);
+
+    // Cũng giới hạn timeout cho itinerary query
+    const itinPromise = Promise.race([
+      itinQuery,
+      new Promise<{ data: null; error: Error }>((resolve) =>
+        setTimeout(() => resolve({ data: null, error: new Error('itin_timeout') }), TIMEOUT_MS),
+      ),
+    ]);
+
+    const [rpcResult, itinResult] = await Promise.all([rpcPromise, itinPromise]);
+
+    // Map places/cities (RPC or fallback)
+    let placeItems: AutocompleteItem[];
     if (rpcResult.error || !rpcResult.data) {
       console.error('Autocomplete primary failed, falling back:', rpcResult.error?.message ?? rpcResult.error);
-      return this.autocompleteFallback(q);
+      placeItems = await this.autocompleteFallback(q);
+    } else {
+      const rows = Array.isArray(rpcResult.data) ? rpcResult.data : [];
+      placeItems = rows.map((row) => {
+        const type =
+          this.asString(row['type']).trim().toLowerCase() === 'city' ? 'city' : 'place';
+        const image = this.asString(row['image']).trim();
+        return {
+          id: this.asString(row['id']),
+          name: this.asString(row['name']),
+          type,
+          image: type === 'place' ? image || this.defaultPlaceImageUrl : image,
+          city: this.asString(row['city']),
+          rating: Number(row['rating']) || 0,
+          score: Number(row['score']) || 0,
+        };
+      });
     }
 
-    const rows = Array.isArray(rpcResult.data) ? rpcResult.data : [];
-    return rows.map((row) => {
-      const type =
-        this.asString(row['type']).trim().toLowerCase() === 'city'
-          ? 'city'
-          : 'place';
-      const image = this.asString(row['image']).trim();
-      return {
-        id: this.asString(row['id']),
-        name: this.asString(row['name']),
-        type,
-        image: type === 'place' ? image || this.defaultPlaceImageUrl : image,
-        city: this.asString(row['city']),
-        rating: Number(row['rating']) || 0,
-        score: Number(row['score']) || 0,
-      };
-    });
+    // Map itinerary results (append after places)
+    const itinItems: AutocompleteItem[] = ((itinResult.data ?? []) as any[]).map((r) => ({
+      id: String(r.id),
+      name: (r.description && String(r.description).trim()) || String(r.destination ?? '') || 'Lịch trình',
+      type: 'itinerary' as const,
+      image: '',
+      city: String(r.destination ?? ''),
+      rating: 0,
+      score: 0,
+    }));
+
+    return [...placeItems, ...itinItems];
   }
 
   private async autocompleteFallback(q: string): Promise<AutocompleteItem[]> {
@@ -220,7 +256,7 @@ export class SearchService {
       .from('itinerary_details')
       .select('itinerary_id, places:place_id(image_url)')
       .in('itinerary_id', ids)
-      .limit(ids.length * 6);
+      .limit(ids.length * 2); // giảm từ *6 xuống *2: 1 ảnh/lịch trình là đủ
     for (const row of (data ?? []) as any[]) {
       if (map.has(row.itinerary_id)) continue;
       const img = this.resolveSearchImage((row.places as any)?.image_url);
@@ -322,7 +358,6 @@ export class SearchService {
       this.queryItineraries(q, 1, 50),
       this.queryPlaces(q, 2000),
     ]);
-    // Infix timed out (no GIN index) → fall back to prefix search.
     if (!rawPlaces.length) rawPlaces = await this.queryPlacesPrefix(q, 500);
     const cityMap = await this.buildCityMap(rawPlaces);
     const classified = rawPlaces.map(p => this.mapPlaceItem(p, cityMap));

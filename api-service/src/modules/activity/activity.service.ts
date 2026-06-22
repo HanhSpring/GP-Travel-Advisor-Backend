@@ -184,8 +184,75 @@ export class ActivityService {
     }
   }
 
+  private resolveImage(imageUrl: unknown): string {
+    if (Array.isArray(imageUrl)) {
+      const first = (imageUrl as unknown[]).find(
+        (i) => typeof i === 'string' && (i as string).trim(),
+      );
+      if (first) return first as string;
+    }
+    if (typeof imageUrl === 'string' && imageUrl.trim()) return imageUrl.trim();
+    return '';
+  }
+
   private activityError(operation: string, message: string): never {
     this.logger.error(`Failed to ${operation}: ${message}`);
     throw new InternalServerErrorException('Failed to record activity');
   }
+
+  async getRecentSearchPlaces(touristId: string): Promise<RecentSearchPlace[]> {
+    const { data: logs } = await supabase
+      .schema('travel')
+      .from('activity_logs')
+      .select('place_id, created_at')
+      .eq('tourist_id', touristId)
+      .eq('action_type', 'search')
+      .not('place_id', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(50);
+
+    if (!logs?.length) return [];
+
+    const seen = new Set<string>();
+    const uniqueIds: string[] = [];
+    for (const log of logs) {
+      const pid = log.place_id as string | null;
+      if (pid && !seen.has(pid)) {
+        seen.add(pid);
+        uniqueIds.push(pid);
+        if (uniqueIds.length >= 10) break;
+      }
+    }
+
+    if (!uniqueIds.length) return [];
+
+    const { data: places } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, name, image_url')
+      .in('id', uniqueIds);
+
+    if (!places?.length) return [];
+
+    const placeMap = new Map(places.map((p) => [p.id as string, p]));
+    return uniqueIds
+      .map((id) => {
+        const p = placeMap.get(id);
+        if (!p) return null;
+        return {
+          id: p.id as string,
+          name: p.name as string,
+          image: this.resolveImage(p.image_url),
+          type: 'place' as const,
+        };
+      })
+      .filter((x): x is RecentSearchPlace => x !== null);
+  }
+}
+
+export interface RecentSearchPlace {
+  id: string;
+  name: string;
+  image: string;
+  type: 'place';
 }
