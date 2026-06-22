@@ -71,7 +71,67 @@ export class ItineraryService {
       console.error('[ItineraryService] getMyItineraries error:', error);
       throw error;
     }
-    return data;
+    return this.withEstimatedListCosts(data);
+  }
+
+  private async withEstimatedListCosts(payload: any) {
+    const itineraries = Array.isArray(payload?.itineraries)
+      ? payload.itineraries
+      : [];
+    const itineraryIds = itineraries
+      .map((item: any) => item?.id)
+      .filter((id: any): id is string => typeof id === 'string' && id.length > 0);
+
+    if (itineraryIds.length === 0) {
+      return payload;
+    }
+
+    const { data: detailRows, error } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select('itinerary_id, estimated_cost, transport_cost')
+      .in('itinerary_id', itineraryIds);
+
+    if (error) {
+      this.logger.warn(
+        `Cannot enrich itinerary list estimated costs: ${error.message}`,
+      );
+      return payload;
+    }
+
+    const estimatedByItinerary = new Map<string, number>();
+    for (const row of detailRows ?? []) {
+      const itineraryId = row.itinerary_id;
+      if (!itineraryId) continue;
+      const current = estimatedByItinerary.get(itineraryId) ?? 0;
+      estimatedByItinerary.set(
+        itineraryId,
+        current +
+          Number(row.estimated_cost ?? 0) +
+          Number(row.transport_cost ?? 0),
+      );
+    }
+
+    return {
+      ...payload,
+      itineraries: itineraries.map((item: any) => {
+        const calculatedEstimatedCost = estimatedByItinerary.get(item.id) ?? 0;
+        const userBudget = Number(item.estimated_cost ?? 0);
+        return {
+          ...item,
+          estimated_cost:
+            calculatedEstimatedCost > 0
+              ? Math.round(calculatedEstimatedCost)
+              : item.estimated_cost,
+          estimatedCost:
+            calculatedEstimatedCost > 0
+              ? Math.round(calculatedEstimatedCost)
+              : item.estimated_cost,
+          user_budget: userBudget,
+          userBudget,
+        };
+      }),
+    };
   }
 
   async createGeneratedItinerary(
