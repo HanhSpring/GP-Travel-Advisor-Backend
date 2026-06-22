@@ -1,6 +1,7 @@
 import {
   Body,
   Controller,
+  Get,
   HttpCode,
   Post,
   Req,
@@ -16,7 +17,7 @@ import { Roles } from '../../common/decorators/roles.decorator';
 import { Role } from '../../common/enum/role.enum';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { JwtAuthGuard } from '../auth/jwt-auth.guard';
-import { ActivityService } from './activity.service';
+import { ActivityService, RecentSearchPlace } from './activity.service';
 import { TrackActivityDto } from './dto/track-activity.dto';
 
 @ApiTags('Activity')
@@ -41,5 +42,13 @@ export class ActivityController {
       action_type: dto.action_type,
       place_id: dto.place_id ?? null,
     });
+  }
+
+  @Get('recent-searches')
+  @ApiOperation({
+    summary: 'Lấy danh sách địa điểm đã tìm kiếm gần đây của tourist',
+  })
+  async recentSearches(@Req() req: any): Promise<RecentSearchPlace[]> {
+    return this.activityService.getRecentSearchPlaces(req.user.userId);
   }
 }
