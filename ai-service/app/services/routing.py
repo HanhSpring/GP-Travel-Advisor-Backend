@@ -1,3 +1,14 @@
+"""
+DEPRECATED — Không dùng trong production.
+
+File này là dead code từ giai đoạn prototype ban đầu (được import bởi ai-service/main.py
+đã bị xóa). TSP routing hiện tại được xử lý bởi:
+  - app/services/itinerary/planner.py  — GA-based multi-day planner (production)
+  - app/services/itinerary_optimizer.py — Greedy TSPTW day optimizer
+
+File này có thể bị xóa trong phiên bản tiếp theo.
+"""
+
 import math
 from typing import List, Dict, Any
 

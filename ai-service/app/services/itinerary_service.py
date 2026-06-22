@@ -2,10 +2,10 @@ from __future__ import annotations
 
 import datetime
 import logging
-import os
 import time
 from typing import Any
 
+from app.core.config import settings
 from app.schemas.itinerary import (
     ItineraryDayResponse,
     ItineraryPlanRequest,
@@ -43,19 +43,32 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
 
     coords = {place.id: (place.longitude, place.latitude) for place in places}
     travel_cache = req.travel_cache_path or planner.TRAVEL_CACHE_PATH
-    goong_key = req.goong_api_key or os.getenv("GOONG_API_KEY", "")
+
+    # Fallback to settings if not provided in request
+    goong_key = req.goong_api_key or settings.goong_api_key
     if not req.use_goong:
         goong_key = ""
 
+    if not goong_key and req.require_goong:
+        logger.warning("[Planner] require_goong=True but no GOONG_API_KEY. Using Haversine fallback.")
+    elif goong_key:
+        logger.info("[Planner] Using Goong Distance Matrix API (vehicle=%s)", req.travel_vehicle)
+    else:
+        logger.info("[Planner] No Goong config. Using Haversine fallback (speed=%.1f km/h)", req.speed_kmh)
+
     matrix_started_at = time.perf_counter()
-    travel_times, travel_distances, travel_sources, travel_reliability = planner.build_travel_matrix(
-        coords,
-        api_key=goong_key,
-        vehicle=req.travel_vehicle,
-        cache_path=travel_cache,
-        speed_kmh=req.speed_kmh,
-        require_goong=req.require_goong,
-    )
+    try:
+        travel_times, travel_distances, travel_sources, travel_reliability = planner.build_travel_matrix(
+            coords,
+            api_key=goong_key,
+            vehicle=req.travel_vehicle,
+            cache_path=travel_cache,
+            speed_kmh=req.speed_kmh,
+            require_goong=req.require_goong,
+        )
+    except Exception as e:
+        logger.exception("[Planner] Lỗi khi tính toán travel matrix (Goong API/Haversine)")
+        raise RuntimeError(f"Travel matrix calculation failed: {str(e)}") from e
 
     engine = planner.MultiDayTripPlanner(
         places=places,
@@ -80,7 +93,11 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
     )
     matrix_ms = round((time.perf_counter() - matrix_started_at) * 1000)
     ga_started_at = time.perf_counter()
-    result = engine.run(seed=req.seed)
+    try:
+        result = engine.run(seed=req.seed)
+    except Exception as e:
+        logger.exception("[Planner] Lỗi khi chạy Genetic Algorithm (TSP-TW GA)")
+        raise RuntimeError(f"Genetic Algorithm planning failed: {str(e)}") from e
     places_map = {place.id: place for place in places}
     for day_idx in range(req.num_days):
         weekday_idx = (trip_start_date.weekday() + day_idx) % 7
