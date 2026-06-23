@@ -34,6 +34,9 @@ class ItineraryItemDto {
 
   @ApiProperty({ type: [String], description: 'Ảnh địa điểm (tối đa 5, từ places.image_url[1])' })
   place_images: string[]
+
+  @ApiProperty({ description: 'Điểm đánh giá tổng thể (null nếu chưa đánh giá)', nullable: true, required: false })
+  rating: number | null
 }
 
 class StatsDto {
