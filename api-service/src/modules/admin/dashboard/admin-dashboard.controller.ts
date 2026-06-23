@@ -21,17 +21,34 @@ import { Role } from 'src/common/enum/role.enum';
 export class DashboardController {
   constructor(private readonly dashboardService: DashboardService) {}
 
+  @Get('stats')
+  @Header('Cache-Control', 'private, max-age=120')
+  @ApiOperation({ summary: 'Lấy tổng hợp thống kê dashboard (1 call thay cho 4 calls riêng lẻ)' })
+  async getDashboardStats() {
+    const data = await this.dashboardService.getDashboardStats();
+    return {
+      statusCode: 200,
+      message: 'Lấy thống kê dashboard thành công',
+      data,
+    };
+  }
+
   @Get('popular-places')
-  @Header('Cache-Control', 'private, max-age=600')
-  @ApiOperation({ summary: 'Lấy thống kê Top địa điểm phổ biến' })
+  @Header('Cache-Control', 'private, max-age=3600')
+  @ApiOperation({ summary: 'Lấy thống kê Top/Flop địa điểm phổ biến' })
   async getPopularPlaces(
     @Query('limit', new ParseIntPipe({ optional: true })) limit?: number,
+    @Query('mode') mode?: string,
   ) {
-    const stats = await this.dashboardService.getPopularPlacesChart(limit);
+    const validMode: 'top' | 'flop' = mode === 'flop' ? 'flop' : 'top';
+    const stats = await this.dashboardService.getPopularPlacesChart(
+      limit ?? 20,
+      validMode,
+    );
 
     return {
       statusCode: 200,
-      message: 'Lấy thống kê Top địa điểm thành công',
+      message: 'Lấy thống kê địa điểm thành công',
       data: stats,
     };
   }
