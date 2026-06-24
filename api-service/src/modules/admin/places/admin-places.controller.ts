@@ -107,16 +107,6 @@ export class AdminPlacesController {
     return this.service.getPlaceDetail(id);
   }
 
-  @Delete(':id')
-  @ApiOperation({
-    summary: 'Delete a place',
-    description: 'Permanently delete a place from the database',
-  })
-  @ApiResponse({ status: 200, description: 'Place deleted successfully' })
-  @ApiResponse({ status: 404, description: 'Place not found' })
-  async deletePlace(@Param('id') id: string) {
-    return this.service.deletePlace(id);
-  }
 
   @Patch(':id/approve')
   @ApiOperation({
