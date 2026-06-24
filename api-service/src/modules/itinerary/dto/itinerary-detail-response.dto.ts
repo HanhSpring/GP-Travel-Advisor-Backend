@@ -25,6 +25,9 @@ class ItineraryActivityDto {
   @ApiProperty({ example: 'act-123', description: 'ID của hoạt động' })
   id: string;
 
+  @ApiPropertyOptional({ example: 'place-123', description: 'ID của địa điểm' })
+  placeId?: string;
+
   @ApiProperty({ example: '08:00', description: 'Giờ bắt đầu' })
   startTime: string;
 
