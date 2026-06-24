@@ -16,11 +16,11 @@ export class JwtStrategy extends PassportStrategy(Strategy) {
         cache: true,
         rateLimit: true,
         jwksRequestsPerMinute: 5,
-        jwksUri: `https://marqtgjhtospwriwndar.supabase.co/auth/v1/.well-known/jwks.json`,
+        jwksUri: `${process.env.SUPABASE_URL}/auth/v1/.well-known/jwks.json`,
       }),
       algorithms: ['ES256'],
       audience: 'authenticated',
-      issuer: `https://marqtgjhtospwriwndar.supabase.co/auth/v1`,
+      issuer: `${process.env.SUPABASE_URL}/auth/v1`,
     });
   }
 

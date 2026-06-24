@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, Param, Patch, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Query } from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { AdminPlacesService } from './admin-places.service';
 import { AdminPlaceListDto } from './dto/admin-place-list.dto';
@@ -31,6 +31,11 @@ export class AdminPlacesController {
     description: 'Filter by category name',
   })
   @ApiQuery({
+    name: 'vendor_id',
+    required: false,
+    description: 'Filter by vendor user ID',
+  })
+  @ApiQuery({
     name: 'page',
     required: false,
     description: 'Page number (default: 1)',
@@ -51,6 +56,7 @@ export class AdminPlacesController {
     @Query('limit') limit?: string,
     @Query('search') search?: string,
     @Query('category_name') categoryName?: string,
+    @Query('vendor_id') vendorId?: string,
   ) {
     const pageNum = page ? parseInt(page, 10) : 1;
     const limitNum = limit ? parseInt(limit, 10) : 10;
@@ -60,6 +66,7 @@ export class AdminPlacesController {
       limitNum,
       search,
       categoryName,
+      vendorId,
     );
   }
 
@@ -100,16 +107,6 @@ export class AdminPlacesController {
     return this.service.getPlaceDetail(id);
   }
 
-  @Delete(':id')
-  @ApiOperation({
-    summary: 'Delete a place',
-    description: 'Permanently delete a place from the database',
-  })
-  @ApiResponse({ status: 200, description: 'Place deleted successfully' })
-  @ApiResponse({ status: 404, description: 'Place not found' })
-  async deletePlace(@Param('id') id: string) {
-    return this.service.deletePlace(id);
-  }
 
   @Patch(':id/approve')
   @ApiOperation({
@@ -147,5 +144,17 @@ export class AdminPlacesController {
     @Body() body: AdminPlaceRejectRequestDto,
   ) {
     return this.service.rejectPlace(id, body?.note);
+  }
+
+  @Delete(':id')
+  @HttpCode(204)
+  @ApiOperation({
+    summary: 'Delete a place',
+    description: 'Permanently delete a place by ID',
+  })
+  @ApiResponse({ status: 204, description: 'Place deleted successfully' })
+  @ApiResponse({ status: 404, description: 'Place not found' })
+  async deletePlace(@Param('id') id: string) {
+    return this.service.deletePlace(id);
   }
 }

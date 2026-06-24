@@ -373,6 +373,7 @@ export class AdminPlacesService {
     limit: number = 10,
     search?: string,
     categoryName?: string,
+    vendorId?: string,
   ) {
     const safePage = Number.isFinite(page) && page > 0 ? Math.floor(page) : 1;
     const requestedLimit =
@@ -426,6 +427,10 @@ export class AdminPlacesService {
       }
 
       query = query.in('type_id', typeIdsByCategoryName);
+    }
+
+    if (vendorId) {
+      query = query.eq('vendor_id', vendorId);
     }
 
     const normalizedSearch = this.normalizeForSearch(search);
@@ -638,7 +643,6 @@ export class AdminPlacesService {
         `Failed to delete place: ${error.message}`,
       );
     }
-
     return { id, message: 'Place deleted successfully' };
   }
 
