@@ -373,6 +373,7 @@ export class AdminPlacesService {
     limit: number = 10,
     search?: string,
     categoryName?: string,
+    vendorId?: string,
   ) {
     const safePage = Number.isFinite(page) && page > 0 ? Math.floor(page) : 1;
     const requestedLimit =
@@ -426,6 +427,10 @@ export class AdminPlacesService {
       }
 
       query = query.in('type_id', typeIdsByCategoryName);
+    }
+
+    if (vendorId) {
+      query = query.eq('vendor_id', vendorId);
     }
 
     const normalizedSearch = this.normalizeForSearch(search);
@@ -624,6 +629,20 @@ export class AdminPlacesService {
       status: 'approved',
       message: 'Place approved successfully',
     };
+  }
+
+  async deletePlace(id: string) {
+    const { error } = await supabase
+      .schema('travel')
+      .from('places')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      throw new InternalServerErrorException(
+        `Failed to delete place: ${error.message}`,
+      );
+    }
   }
 
   async rejectPlace(id: string, note?: string) {
