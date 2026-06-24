@@ -626,6 +626,22 @@ export class AdminPlacesService {
     };
   }
 
+  async deletePlace(id: string) {
+    const { error } = await supabase
+      .schema('travel')
+      .from('places')
+      .delete()
+      .eq('id', id);
+
+    if (error) {
+      throw new InternalServerErrorException(
+        `Failed to delete place: ${error.message}`,
+      );
+    }
+
+    return { id, message: 'Place deleted successfully' };
+  }
+
   async rejectPlace(id: string, note?: string) {
     const { data, error } = await supabase
       .schema('travel')

@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Param, Patch, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, Param, Patch, Query } from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { AdminPlacesService } from './admin-places.service';
 import { AdminPlaceListDto } from './dto/admin-place-list.dto';
@@ -98,6 +98,17 @@ export class AdminPlacesController {
   })
   async getPlaceDetail(@Param('id') id: string) {
     return this.service.getPlaceDetail(id);
+  }
+
+  @Delete(':id')
+  @ApiOperation({
+    summary: 'Delete a place',
+    description: 'Permanently delete a place from the database',
+  })
+  @ApiResponse({ status: 200, description: 'Place deleted successfully' })
+  @ApiResponse({ status: 404, description: 'Place not found' })
+  async deletePlace(@Param('id') id: string) {
+    return this.service.deletePlace(id);
   }
 
   @Patch(':id/approve')
