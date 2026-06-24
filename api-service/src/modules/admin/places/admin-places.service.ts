@@ -643,6 +643,7 @@ export class AdminPlacesService {
         `Failed to delete place: ${error.message}`,
       );
     }
+    return { id, message: 'Place deleted successfully' };
   }
 
   async rejectPlace(id: string, note?: string) {
