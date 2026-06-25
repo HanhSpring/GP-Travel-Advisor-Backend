@@ -9,6 +9,7 @@ import { randomUUID } from 'crypto';
 import { supabase } from '../../../config/supabase';
 import { ACTIVITY_LOG_EVENT } from '../../activity/activity.listener';
 import { getReviewActivityAction } from './review-activity';
+import { ModerationService } from '../../moderation/moderation.service';
 
 interface CreateReviewPayload {
   tourist_id: string;
@@ -34,7 +35,10 @@ export interface ReviewResponse {
 
 @Injectable()
 export class ReviewsService {
-  constructor(private readonly eventEmitter: EventEmitter2) {}
+  constructor(
+    private readonly eventEmitter: EventEmitter2,
+    private readonly moderationService: ModerationService,
+  ) {}
 
   private normalizeMediaUrls(value: unknown): string[] {
     let values: unknown[] = [];
@@ -380,6 +384,19 @@ export class ReviewsService {
       payload.rating > 5
     ) {
       throw new BadRequestException('rating must be a number between 1 and 5');
+    }
+
+    if (payload.content) {
+      const modResult = await this.moderationService.moderateReview(
+        payload.content,
+        payload.images || [],
+      );
+
+      if (modResult.status === 'violation') {
+        throw new BadRequestException(
+          `Đánh giá của bạn vi phạm tiêu chuẩn cộng đồng (${modResult.violations.join(', ')}). Vui lòng chỉnh sửa lại.`,
+        );
+      }
     }
 
     const reviewId = randomUUID();

@@ -11,6 +11,7 @@ import {
   SubmitItineraryReviewDto,
   SubmitReviewMediaDto,
 } from './dto/submit-itinerary-review.dto';
+import { ModerationService } from '../../moderation/moderation.service';
 
 interface ItineraryRow {
   id: string;
@@ -73,7 +74,10 @@ interface ReviewContentRow {
 
 @Injectable()
 export class ItineraryReviewsService {
-  constructor(private readonly configService: ConfigService) {}
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly moderationService: ModerationService,
+  ) {}
 
   private getPlaceImage(value: string | string[] | null): string | null {
     const raw = Array.isArray(value) ? value[0] : value;
@@ -247,6 +251,15 @@ export class ItineraryReviewsService {
       (error.message || '').includes('Could not find the') ||
       ((error.message || '').includes('column') &&
         (error.message || '').includes('does not exist'));
+
+    if (overallContent) {
+      const modResult = await this.moderationService.moderateReview(overallContent);
+      if (modResult.status === 'violation') {
+        throw new BadRequestException(
+          `Đánh giá lịch trình của bạn vi phạm tiêu chuẩn cộng đồng (${modResult.violations.join(', ')}). Vui lòng chỉnh sửa lại.`,
+        );
+      }
+    }
 
     const hasTags = Boolean(tags?.length);
     const hasSummary =
@@ -1096,11 +1109,22 @@ export class ItineraryReviewsService {
     });
     const allMediaUrls = [...itineraryMediaUrls];
 
+    for (const pr of finalPlaceRatings) {
+      if (pr.content) {
+        const modResult = await this.moderationService.moderateReview(pr.content);
+        if (modResult.status === 'violation') {
+          throw new BadRequestException(
+            `Đánh giá địa điểm vi phạm tiêu chuẩn cộng đồng (${modResult.violations.join(', ')}). Vui lòng chỉnh sửa lại.`,
+          );
+        }
+      }
+    }
+
     const reviewsWithTags = finalPlaceRatings.map((item) => {
       const matchingPlaceReview = payload.place_reviews?.find(
         (placeReview) =>
           placeReview.itinerary_detail_id === item.itinerary_detail_id,
-      );
+      ) as { tags?: string[] | null; media?: any[] } | undefined;
 
       const tags: string[] | null = Array.isArray(matchingPlaceReview?.tags)
         ? [...matchingPlaceReview.tags]

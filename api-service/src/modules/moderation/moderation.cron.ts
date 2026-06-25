@@ -24,15 +24,21 @@ export class ModerationCron {
     try {
       this.isProcessing = true;
 
-      // 1. Fetch configured interval from DB settings
-      const settings = await this.adminSettingsService.getTwoTowerSettings();
-      // Default to 10 minutes if not set or invalid
       let intervalMinutes = 10;
-      if (
-        settings.core &&
-        typeof settings.core.moderationBatchIntervalMinutes?.currentValue === 'number'
-      ) {
-        intervalMinutes = settings.core.moderationBatchIntervalMinutes.currentValue;
+      try {
+        const settings = await this.adminSettingsService.getTwoTowerSettings();
+        if (
+          settings.core &&
+          typeof settings.core.moderationBatchIntervalMinutes?.currentValue === 'number'
+        ) {
+          intervalMinutes = settings.core.moderationBatchIntervalMinutes.currentValue;
+        }
+      } catch (err: any) {
+        if (err.status === 404 || err.name === 'NotFoundException' || (err.message && err.message.includes('seeded'))) {
+          // Ignore unseeded config and use default
+        } else {
+          throw err;
+        }
       }
       
       const intervalMs = intervalMinutes * 60 * 1000;
