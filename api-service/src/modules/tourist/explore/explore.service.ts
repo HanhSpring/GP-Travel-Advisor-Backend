@@ -19,11 +19,16 @@ interface ItineraryRow {
   destination: string | null;
   created_at: string;
   is_public: boolean | null;
+  trip_intent: string | null;
 }
 
 interface ItineraryTimeRow {
   arrival_time: string | null;
   departure_time: string | null;
+}
+
+interface ItineraryWithDetailsRow extends ItineraryRow {
+  itinerary_details: ItineraryTimeRow[] | null;
 }
 
 interface ItineraryDetailPlaceRow {
@@ -132,6 +137,10 @@ export interface ExplorePublicItineraryItem {
   image: string;
   image_gallery: string[];
   is_favorite?: boolean;
+  favorite_count: number;
+  average_rating: number;
+  travel_type: string;
+  trip_intent: string;
 }
 
 export interface ExplorePublicItinerariesResponse {
@@ -198,6 +207,10 @@ export class ExploreService implements OnModuleInit {
       this.getAllCategories(),
       this.getPlacesByCategory(restaurantKey, 1, 10),
       this.getPlacesByCategory(hotelKey, 1, 10),
+      this.getFeaturedCities(1, 10),
+      // Pre-warm the shared itinerary cache (no touristId) so the first user
+      // request only needs the lightweight favorites query, not the full fetch.
+      this.getPublicItineraries(1, 10),
     ]);
   }
 
@@ -423,6 +436,16 @@ export class ExploreService implements OnModuleInit {
     return bestIndex;
   }
 
+  private computeTimeRange(details: ItineraryTimeRow[] | null): string {
+    if (!details || details.length === 0) return 'N/A';
+    const sorted = [...details].sort((a, b) =>
+      (a.arrival_time ?? '').localeCompare(b.arrival_time ?? ''),
+    );
+    const first = sorted[0];
+    const last = sorted[sorted.length - 1];
+    return `${first.arrival_time ?? '??'} - ${last.departure_time ?? '??'}`;
+  }
+
   private pickRandomItem<T>(items: T[]): T | null {
     if (items.length === 0) {
       return null;
@@ -495,6 +518,13 @@ export class ExploreService implements OnModuleInit {
       throw new BadRequestException('tourist_id is required');
     }
 
+    // Top-level cache — 60 s TTL so repeated home visits (tab switch, back nav)
+    // return instantly. Pull-to-refresh bypasses this via forceRefresh.
+    const homeCacheKey = `explore:home:${touristId}`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const cachedHome = this.getFromCache<any>(homeCacheKey);
+    if (cachedHome) return cachedHome;
+
     // Use limit=10 so the sub-method caches are warmed for the "Xem tất cả"
     // first page (which also requests page=1 limit=10). The frontend trims to 5
     // for the home carousel, but the cached result is reused instantly for
@@ -513,6 +543,15 @@ export class ExploreService implements OnModuleInit {
       pagination: { page: 1, limit: PAGE_SIZE, total: 0, pages: 0 },
     });
 
+    // If featured cities are already cached, start getCityOverview in parallel
+    // so the fallback branch has zero sequential wait when it runs.
+    const cachedFeatured = this.getFromCache<ExplorePlacesResponse>(featuredKey);
+    const speculativeCityId = cachedFeatured?.data[0]?.id ?? null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const cityOverviewPromise: Promise<any> = speculativeCityId
+      ? this.getCityOverview(speculativeCityId).catch(() => null)
+      : Promise.resolve(null);
+
     const [
       publicItinerariesResult,
       featuredPlacesResult,
@@ -520,12 +559,9 @@ export class ExploreService implements OnModuleInit {
       hotelsResult,
       currentItineraryResult,
     ] = await Promise.all([
-      Promise.resolve(
-        (touristId
-          ? null
-          : this.getFromCache<ExplorePublicItinerariesResponse>(publicKey)) ??
-          this.getPublicItineraries(1, PAGE_SIZE, touristId),
-      ).catch(() => emptyItineraries),
+      this.getPublicItineraries(1, PAGE_SIZE, touristId).catch(
+        () => emptyItineraries,
+      ),
       Promise.resolve(
         this.getFromCache<ExplorePlacesResponse>(featuredKey) ??
           this.getFeaturedCities(1, PAGE_SIZE),
@@ -546,7 +582,13 @@ export class ExploreService implements OnModuleInit {
       const fallbackCity = featuredPlacesResult.data[0];
       if (fallbackCity) {
         try {
-          const cityOverview = await this.getCityOverview(fallbackCity.id);
+          // Reuse the speculative fetch if it targeted the same city
+          const cityOverview =
+            fallbackCity.id === speculativeCityId
+              ? await cityOverviewPromise
+              : await this.getCityOverview(fallbackCity.id);
+
+          if (!cityOverview) throw new Error('no overview');
 
           if (restaurants.length === 0) {
             const fallbackRestaurants = (cityOverview.restaurants ?? []).slice(
@@ -587,7 +629,7 @@ export class ExploreService implements OnModuleInit {
       }
     }
 
-    return {
+    const homeResult = {
       actions: {
         more_info_target: `/more-info?tourist_id=${touristId}`,
         notifications_target: `/notifications?tourist_id=${touristId}`,
@@ -606,81 +648,46 @@ export class ExploreService implements OnModuleInit {
         hotels: '/explore/places?category=lưu trú&page=1&limit=50',
       },
     };
+
+    // Cache without current_itinerary so the Flutter client always falls back
+    // to the parallel /explore/current call for a fresh itinerary status.
+    // The suggestions / places / restaurant sections are safe to cache (5 min).
+    this.setCache(homeCacheKey, { ...homeResult, current_itinerary: null });
+    return homeResult;
   }
 
   async getCurrentItinerary(touristId: string) {
-    const today = new Date().toISOString().split('T')[0];
-
-    const { data: ongoing, error: ongoingError } = await supabase
+    const { data: ongoing, error } = await supabase
       .schema('travel')
       .from('itineraries')
       .select(
-        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public',
+        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public, itinerary_details(arrival_time, departure_time)',
       )
       .eq('creator_id', touristId)
       .eq('status', 'ongoing')
-      .lte('start_date', today)
-      .gte('end_date', today)
-      .order('start_date', { ascending: true })
+      .order('created_at', { ascending: false })
       .limit(1)
-      .maybeSingle<ItineraryRow>();
+      .maybeSingle<ItineraryWithDetailsRow>();
 
-    if (ongoingError) {
-      throw new InternalServerErrorException(ongoingError.message);
+    if (error) {
+      throw new InternalServerErrorException(error.message);
     }
 
-    if (ongoing) {
-      return {
-        id: ongoing.id,
-        title:
-          (ongoing.description && ongoing.description.trim()) ||
-          ongoing.destination ||
-          'Lịch trình của bạn',
-        date_range: `${ongoing.start_date ?? ''} - ${ongoing.end_date ?? ''}`,
-        time_range: await this.getTimeRange(ongoing.id),
-        participant_count: this.toParticipantCount(ongoing),
-        status: ongoing.status,
-        can_start: false,
-        start_target: null,
-      };
-    }
+    if (!ongoing) return null;
 
-    // Only match itineraries starting TODAY so the home card never shows stale past trips.
-    const { data: upcoming, error: upcomingError } = await supabase
-      .schema('travel')
-      .from('itineraries')
-      .select(
-        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public',
-      )
-      .eq('creator_id', touristId)
-      .in('status', ['pending', 'ongoing', 'uncompleted', 'completed'])
-      .eq('start_date', today)
-      .order('start_date', { ascending: true })
-      .limit(1)
-      .maybeSingle<ItineraryRow>();
-
-    if (upcomingError) {
-      throw new InternalServerErrorException(upcomingError.message);
-    }
-
-    if (upcoming) {
-      return {
-        id: upcoming.id,
-        title:
-          (upcoming.description && upcoming.description.trim()) ||
-          upcoming.destination ||
-          'Lịch trình của bạn',
-        date_range: `${upcoming.start_date ?? ''} - ${upcoming.end_date ?? ''}`,
-        time_range: await this.getTimeRange(upcoming.id),
-        participant_count: this.toParticipantCount(upcoming),
-        status: upcoming.status,
-        can_start: true,
-        start_target: `/explore/itineraries/${upcoming.id}/start?tourist_id=${touristId}`,
-      };
-    }
-
-    // No ongoing and no today-starting itinerary → hide the home card.
-    return null;
+    return {
+      id: ongoing.id,
+      title:
+        (ongoing.description && ongoing.description.trim()) ||
+        ongoing.destination ||
+        'Lịch trình của bạn',
+      date_range: `${ongoing.start_date ?? ''} - ${ongoing.end_date ?? ''}`,
+      time_range: this.computeTimeRange(ongoing.itinerary_details),
+      participant_count: this.toParticipantCount(ongoing),
+      status: ongoing.status,
+      can_start: false,
+      start_target: null,
+    };
   }
 
   async startItinerary(touristId: string, itineraryId: string) {
@@ -733,80 +740,104 @@ export class ExploreService implements OnModuleInit {
     limit = 5,
     touristId?: string,
   ): Promise<ExplorePublicItinerariesResponse> {
-    const cacheKey = `explore:public_itineraries:${page}:${limit}`;
-    const useCache = !touristId;
-    const cached = useCache
-      ? this.getFromCache<ExplorePublicItinerariesResponse>(cacheKey)
-      : null;
-    if (cached) return cached;
-    const safePage = page > 0 ? page : 1;
-    const safeLimit = limit > 0 ? limit : 5;
-    const offset = (safePage - 1) * safeLimit;
+    // Per-user cache (includes is_favorite) — instant on repeat visits.
+    const userCacheKey = `explore:public_itineraries:${page}:${limit}:${touristId ?? 'anon'}`;
+    const userCached = this.getFromCache<ExplorePublicItinerariesResponse>(userCacheKey);
+    if (userCached) return userCached;
 
-    const { data, error, count } = await supabase
-      .schema('travel')
-      .from('itineraries')
-      .select(
-        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public',
-        { count: 'exact' },
-      )
-      .eq('is_public', true)
-      .order('created_at', { ascending: false })
-      .range(offset, offset + safeLimit - 1)
-      .returns<ItineraryRow[]>();
+    // Shared cache (no is_favorite) — reused across all users so the expensive
+    // sub-queries (image join, ratings, creator names) only run once per page.
+    const sharedCacheKey = `explore:public_itineraries_shared:${page}:${limit}`;
+    type SharedItem = Omit<ExplorePublicItineraryItem, 'is_favorite'>;
+    type SharedResponse = { data: SharedItem[]; pagination: ExplorePagination };
+    let sharedData = this.getFromCache<SharedResponse>(sharedCacheKey);
 
-    if (error) {
-      throw new InternalServerErrorException(error.message);
+    if (!sharedData) {
+      const safePage = page > 0 ? page : 1;
+      const safeLimit = limit > 0 ? limit : 5;
+      const offset = (safePage - 1) * safeLimit;
+
+      const { data, error, count } = await supabase
+        .schema('travel')
+        .from('itineraries')
+        .select(
+          'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public, trip_intent',
+          { count: 'exact' },
+        )
+        .eq('is_public', true)
+        .order('created_at', { ascending: false })
+        .range(offset, offset + safeLimit - 1)
+        .returns<ItineraryRow[]>();
+
+      if (error) {
+        throw new InternalServerErrorException(error.message);
+      }
+
+      const itineraryIds = (data ?? []).map((item) => item.id);
+      const creatorIds = (data ?? []).map((item) => item.creator_id);
+
+      // Run all non-user-specific sub-queries in parallel.
+      const [creatorNameMap, itineraryImages, favoriteCountMap, ratingMap] =
+        await Promise.all([
+          this.getCreatorNameMap(creatorIds),
+          this.getItineraryImageMap(itineraryIds),
+          this.getFavoriteCountMap(itineraryIds),
+          this.getItineraryRatingMap(itineraryIds),
+        ]);
+
+      const mapped: SharedItem[] = (data ?? []).map((item) => {
+        const gallery = itineraryImages.get(item.id) ?? [];
+        const imageGallery =
+          gallery.length > 0 ? gallery.slice(0, 3) : [this.defaultImageUrl];
+
+        return {
+          id: item.id,
+          title:
+            (item.description && item.description.trim()) ||
+            item.destination ||
+            'Lịch trình công khai',
+          location: item.destination ?? 'Không xác định',
+          description: item.description,
+          start_date: item.start_date,
+          end_date: item.end_date,
+          days: this.getDays(item.start_date, item.end_date),
+          participant_count: this.toParticipantCount(item),
+          creator_id: item.creator_id,
+          creator_name: creatorNameMap.get(item.creator_id) ?? 'Traveler',
+          image: imageGallery[0],
+          image_gallery: imageGallery,
+          favorite_count: favoriteCountMap.get(item.id) ?? 0,
+          average_rating: ratingMap.get(item.id) ?? 0,
+          travel_type: this.deriveTravelType(item.destination),
+          trip_intent: item.trip_intent ?? '',
+        };
+      });
+
+      sharedData = {
+        data: mapped,
+        pagination: {
+          page: safePage,
+          limit: safeLimit,
+          total: count ?? 0,
+          pages: Math.ceil((count ?? 0) / safeLimit),
+        },
+      };
+      this.setCache(sharedCacheKey, sharedData);
     }
 
-    const itineraryIds = (data ?? []).map((item) => item.id);
-    const creatorIds = (data ?? []).map((item) => item.creator_id);
+    // Layer in user-specific favorites — a single lightweight query.
+    const itineraryIds = sharedData.data.map((item) => item.id);
+    const favoriteItineraryIds = await this.getFavoriteItinerarySet(touristId, itineraryIds);
 
-    const [creatorNameMap, itineraryImages, favoriteItineraryIds] =
-      await Promise.all([
-      this.getCreatorNameMap(creatorIds),
-      this.getItineraryImageMap(itineraryIds),
-      this.getFavoriteItinerarySet(touristId, itineraryIds),
-    ]);
-
-    const mapped = (data ?? []).map((item) => {
-      const gallery = itineraryImages.get(item.id) ?? [];
-      const imageGallery =
-        gallery.length > 0 ? gallery.slice(0, 3) : [this.defaultImageUrl];
-
-      return {
-        id: item.id,
-        title:
-          (item.description && item.description.trim()) ||
-          item.destination ||
-          'Lịch trình công khai',
-        location: item.destination ?? 'Không xác định',
-        description: item.description,
-        start_date: item.start_date,
-        end_date: item.end_date,
-        days: this.getDays(item.start_date, item.end_date),
-        participant_count: this.toParticipantCount(item),
-        creator_id: item.creator_id,
-        creator_name: creatorNameMap.get(item.creator_id) ?? 'Traveler',
-        image: imageGallery[0],
-        image_gallery: imageGallery,
+    const result: ExplorePublicItinerariesResponse = {
+      ...sharedData,
+      data: sharedData.data.map((item) => ({
+        ...item,
         is_favorite: favoriteItineraryIds.has(item.id),
-      };
-    });
-
-    const result = {
-      data: mapped,
-      pagination: {
-        page: safePage,
-        limit: safeLimit,
-        total: count ?? 0,
-        pages: Math.ceil((count ?? 0) / safeLimit),
-      },
+      })),
     };
 
-    if (useCache) {
-      this.setCache(cacheKey, result);
-    }
+    this.setCache(userCacheKey, result);
     return result;
   }
 
@@ -903,11 +934,11 @@ export class ExploreService implements OnModuleInit {
       supabase
         .schema('travel')
         .from('places')
-        .select('id, city_id')
+        .select('id, city_id, average_rating, review_count')
         .eq('is_approved', true)
         .eq('is_active', true)
         .limit(3000)
-        .returns<{ id: string; city_id: string | null }[]>(),
+        .returns<{ id: string; city_id: string | null; average_rating: number | null; review_count: number | null }[]>(),
       supabase
         .schema('travel')
         .from('favorite_places')
@@ -946,6 +977,7 @@ export class ExploreService implements OnModuleInit {
     }
 
     const favoriteCountByCity = new Map<string, number>();
+    const ratingByCity = new Map<string, { sumRating: number; ratedCount: number; sumReviews: number }>();
 
     for (const item of placeCityRows ?? []) {
       if (!item.city_id) {
@@ -957,6 +989,16 @@ export class ExploreService implements OnModuleInit {
         item.city_id,
         (favoriteCountByCity.get(item.city_id) ?? 0) + placeFavoriteCount,
       );
+
+      const entry = ratingByCity.get(item.city_id) ?? { sumRating: 0, ratedCount: 0, sumReviews: 0 };
+      const rating = Number(item.average_rating) || 0;
+      const reviews = Number(item.review_count) || 0;
+      if (rating > 0) {
+        entry.sumRating += rating;
+        entry.ratedCount += 1;
+      }
+      entry.sumReviews += reviews;
+      ratingByCity.set(item.city_id, entry);
     }
 
     const sortedCities = (cities ?? []).slice().sort((left, right) => {
@@ -1049,15 +1091,22 @@ export class ExploreService implements OnModuleInit {
       }
     }
 
-    const mapped = pagedCities.map((item) => ({
-      id: item.id,
-      name: item.name,
-      image: cityImageMap.get(item.id) ?? this.defaultImageUrl,
-      rating: 0,
-      review_count: 0,
-      city: item.name,
-      category: null,
-    }));
+    const mapped = pagedCities.map((item) => {
+      const ratingEntry = ratingByCity.get(item.id);
+      const avgRating = ratingEntry && ratingEntry.ratedCount > 0
+        ? Math.round((ratingEntry.sumRating / ratingEntry.ratedCount) * 100) / 100
+        : 0;
+      const totalReviews = ratingEntry?.sumReviews ?? 0;
+      return {
+        id: item.id,
+        name: item.name,
+        image: cityImageMap.get(item.id) ?? this.defaultImageUrl,
+        rating: avgRating,
+        review_count: totalReviews,
+        city: item.name,
+        category: null,
+      };
+    });
 
     const result = {
       category: null,
@@ -1078,6 +1127,11 @@ export class ExploreService implements OnModuleInit {
     if (!cityId || !cityId.trim()) {
       throw new BadRequestException('city_id is required');
     }
+
+    const ovCacheKey = `explore:city_overview:${cityId}`;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const cachedOverview = this.getFromCache<any>(ovCacheKey);
+    if (cachedOverview) return cachedOverview;
 
     const { data: city, error: cityError } = await supabase
       .schema('travel')
@@ -1313,7 +1367,7 @@ export class ExploreService implements OnModuleInit {
       });
     }
 
-    return {
+    const ovResult = {
       city: {
         id: city.id,
         name: city.name,
@@ -1323,6 +1377,9 @@ export class ExploreService implements OnModuleInit {
       restaurants,
       hotels,
     };
+
+    this.setCache(ovCacheKey, ovResult);
+    return ovResult;
   }
 
   async getPlacesByCategory(
@@ -1362,11 +1419,8 @@ export class ExploreService implements OnModuleInit {
 
     const cacheKey = `explore:places:${categoryName}:${safePage}:${safeLimit}:${Array.from(
       resolvedCategoryIds,
-    ).join(',')}`;
-    const useCache = !touristId;
-    const cached = useCache
-      ? this.getFromCache<ExplorePlacesResponse>(cacheKey)
-      : null;
+    ).join(',')}:${touristId ?? 'anon'}`;
+    const cached = this.getFromCache<ExplorePlacesResponse>(cacheKey);
     if (cached) return cached;
 
     if (categoryFilter) {
@@ -1459,9 +1513,7 @@ export class ExploreService implements OnModuleInit {
             },
           };
 
-          if (useCache) {
-            this.setCache(cacheKey, result);
-          }
+          this.setCache(cacheKey, result);
           return result;
         }
       }
@@ -1548,9 +1600,7 @@ export class ExploreService implements OnModuleInit {
         },
       };
 
-      if (useCache) {
-        this.setCache(cacheKey, result);
-      }
+      this.setCache(cacheKey, result);
       return result;
     }
 
@@ -1610,9 +1660,7 @@ export class ExploreService implements OnModuleInit {
       },
     };
 
-    if (useCache) {
-      this.setCache(cacheKey, result);
-    }
+    this.setCache(cacheKey, result);
     return result;
   }
 
@@ -1637,6 +1685,62 @@ export class ExploreService implements OnModuleInit {
     }
 
     return new Set((data ?? []).map((item) => item.place_id));
+  }
+
+  private deriveTravelType(destination: string | null): string {
+    if (!destination) return 'Khác';
+    const d = destination.toLowerCase();
+    const beach = ['đà nẵng', 'nha trang', 'phú quốc', 'quy nhơn', 'bình định', 'vũng tàu', 'bà rịa', 'côn đảo', 'cát bà', 'mũi né', 'bình thuận', 'hội an', 'quảng nam', 'khánh hòa', 'phan thiết', 'phan rang'];
+    const mountain = ['sapa', 'lào cai', 'đà lạt', 'lâm đồng', 'hà giang', 'mộc châu', 'sơn la', 'lai châu', 'điện biên', 'yên tử', 'quảng ninh'];
+    const heritage = ['huế', 'thừa thiên', 'ninh bình', 'tràng an', 'hoa lư', 'hội an'];
+    const mekong = ['cần thơ', 'tiền giang', 'đồng tháp', 'an giang', 'vĩnh long', 'bến tre', 'hậu giang', 'sóc trăng'];
+    if (beach.some((k) => d.includes(k))) return 'Biển đảo';
+    if (mountain.some((k) => d.includes(k))) return 'Núi rừng';
+    if (heritage.some((k) => d.includes(k))) return 'Di tích văn hóa';
+    if (mekong.some((k) => d.includes(k))) return 'Miền sông nước';
+    return 'Thành thị';
+  }
+
+  private async getFavoriteCountMap(
+    itineraryIds: string[],
+  ): Promise<Map<string, number>> {
+    if (itineraryIds.length === 0) return new Map();
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('favorite_itineraries')
+      .select('itinerary_id')
+      .in('itinerary_id', itineraryIds)
+      .returns<Array<{ itinerary_id: string }>>();
+    if (error) return new Map();
+    const countMap = new Map<string, number>();
+    for (const row of data ?? []) {
+      countMap.set(row.itinerary_id, (countMap.get(row.itinerary_id) ?? 0) + 1);
+    }
+    return countMap;
+  }
+
+  private async getItineraryRatingMap(
+    itineraryIds: string[],
+  ): Promise<Map<string, number>> {
+    if (itineraryIds.length === 0) return new Map();
+    const { data, error } = await supabase
+      .schema('review_ai')
+      .from('itinerary_reviews')
+      .select('itinerary_id, rating')
+      .in('itinerary_id', itineraryIds)
+      .returns<Array<{ itinerary_id: string; rating: number }>>();
+    if (error) return new Map();
+    const sumMap = new Map<string, number>();
+    const cntMap = new Map<string, number>();
+    for (const row of data ?? []) {
+      sumMap.set(row.itinerary_id, (sumMap.get(row.itinerary_id) ?? 0) + row.rating);
+      cntMap.set(row.itinerary_id, (cntMap.get(row.itinerary_id) ?? 0) + 1);
+    }
+    const avgMap = new Map<string, number>();
+    for (const [id, sum] of sumMap) {
+      avgMap.set(id, Math.round((sum / (cntMap.get(id) ?? 1)) * 10) / 10);
+    }
+    return avgMap;
   }
 
   private async getFavoriteItinerarySet(

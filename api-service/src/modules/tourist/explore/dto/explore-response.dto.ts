@@ -64,6 +64,9 @@ export class FeaturedItineraryDto {
 
   @ApiProperty({ type: [String] })
   image_gallery: string[];
+
+  @ApiProperty()
+  trip_intent: string;
 }
 
 export class ExplorePlaceDto {
