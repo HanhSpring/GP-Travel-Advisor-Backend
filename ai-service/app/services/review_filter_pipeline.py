@@ -1692,9 +1692,10 @@ def fetch_pending_reviews(client, limit: Optional[int] = None) -> List[Dict[str,
         .from_("review_contents")
         .select(
             "id, content, processing_status, review_id, "
-            "reviews(id, place_id, created_at, rating)"
+            "reviews!inner(id, place_id, created_at, rating, status)"
         )
         .eq("processing_status", "pending")
+        .eq("reviews.status", "approved")
     )
     if limit:
         query = query.limit(limit)

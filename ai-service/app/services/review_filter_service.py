@@ -12,6 +12,7 @@ from typing import Any, Dict
 
 from app.core.config import settings
 from app.core.logger import get_logger
+from app.core.r2_downloader import ensure_r2_prefix
 from app.schemas.review_pipeline import PipelineRunRequest
 from app.services.review_filter_pipeline import (
     DEFAULT_EMBEDDING_MODEL,
@@ -28,6 +29,34 @@ from app.services.review_filter_pipeline import (
 )
 
 logger = get_logger(__name__)
+
+
+def _resolve_phobert_time_model_path() -> str | None:
+    """Return a local filesystem path for the PhoBERT time-label model."""
+    r2_prefix = (settings.phobert_time_model_r2_prefix or "").strip()
+    if r2_prefix:
+        cache_dir = Path(settings.phobert_time_model_cache_dir)
+        logger.info(
+            "[pipeline] Sync PhoBERT time model from R2 prefix '%s' to '%s'",
+            r2_prefix,
+            cache_dir,
+        )
+        try:
+            return str(ensure_r2_prefix(settings, r2_prefix, cache_dir))
+        except Exception as exc:
+            logger.warning(
+                "[pipeline] Cannot sync PhoBERT model from R2: %s. Fallback to local path.",
+                exc,
+            )
+
+    local_path = (settings.phobert_time_model_path or "").strip()
+    if not local_path:
+        return None
+
+    path = Path(local_path)
+    if not path.exists():
+        logger.warning("[pipeline] PhoBERT local model path does not exist: %s", path)
+    return str(path)
 
 
 def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
@@ -63,6 +92,8 @@ def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         logger.info("[pipeline] Không có review pending. Kết thúc.")
         return empty_result
 
+    phobert_time_model_path = _resolve_phobert_time_model_path()
+
     config = PipelineConfig(
         input_label=batch_label,
         output_dir=batch_output_dir,
@@ -80,7 +111,7 @@ def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         top_k=5,
         old_lookback_multiplier=6,
         promotion_mode=request.promotion_mode,
-        phobert_time_model_path=settings.phobert_time_model_path,
+        phobert_time_model_path=phobert_time_model_path,
     )
 
     pipeline = ReviewFilteringPipeline(config)

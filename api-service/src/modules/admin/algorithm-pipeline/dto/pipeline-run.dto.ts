@@ -55,6 +55,11 @@ export interface PipelineRunResponseDto {
 
 export interface PipelineHistoryItemDto {
   run_id: string;
+  algorithm_id?: string | null;
+  algorithm_name?: string;
+  status?: string;
+  action?: string;
+  details?: Record<string, any> | null;
   started_at: string;
   completed_at: string;
   total_reviews: number;
@@ -64,6 +69,7 @@ export interface PipelineHistoryItemDto {
   duration_seconds: number;
   success: boolean;
   error: string | null;
+  created_at?: string;
 }
 
 export interface PipelineHistoryResponseDto {
