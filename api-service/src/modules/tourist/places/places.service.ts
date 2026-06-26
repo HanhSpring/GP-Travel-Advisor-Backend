@@ -136,37 +136,57 @@ export class PlacesService {
   }
 
   async getPlaceDetail(placeId: string, touristId?: string) {
-    const { data: place, error: placeError } = await supabase
-      .schema('travel')
-      .from('places')
-      .select(
-        '*, cities(name), type_id, types(id, category_id, categories(id, name))',
-      )
-      .eq('id', placeId)
-      .eq('is_approved', true)
-      .eq('is_active', true)
-      .maybeSingle<PlaceRow>();
+    const numericUserId =
+      touristId && /^\d+$/.test(touristId) ? Number(touristId) : null;
 
-    if (placeError) {
-      throw new InternalServerErrorException(placeError.message);
+    // ── Group 1: fire all independent queries in parallel ────────────────────
+    const [
+      placeResult,
+      ratingRowsResult,
+      reviewsResult,
+      recommended,
+      isFavorite,
+    ] = await Promise.all([
+      supabase
+        .schema('travel')
+        .from('places')
+        .select('*, cities(name), type_id, types(id, category_id, categories(id, name))')
+        .eq('id', placeId)
+        .eq('is_approved', true)
+        .eq('is_active', true)
+        .maybeSingle<PlaceRow>(),
+      supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('rating')
+        .eq('place_id', placeId),
+      supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('id, tourist_id, rating, created_at')
+        .eq('place_id', placeId)
+        .order('created_at', { ascending: false })
+        .limit(10),
+      this.recommendations.getRecommendedPlaceIds(placeId, {
+        userId: numericUserId,
+        k: 10,
+      }),
+      touristId
+        ? this.checkFavorite(touristId, placeId)
+        : Promise.resolve(false),
+    ]);
+
+    if (placeResult.error) {
+      throw new InternalServerErrorException(placeResult.error.message);
     }
-
-    if (!place) {
+    if (!placeResult.data) {
       throw new NotFoundException('Place not found');
     }
-
-    // Extract category from type relationship
-    let categoryList: string[] = [];
-    const typeData = Array.isArray(place.types)
-      ? place.types?.[0]
-      : place.types;
-    if (typeData) {
-      const categoryData = Array.isArray(typeData.categories)
-        ? typeData.categories?.[0]
-        : typeData.categories;
-      if (categoryData?.name) {
-        categoryList = [categoryData.name];
-      }
+    if (ratingRowsResult.error) {
+      throw new InternalServerErrorException(ratingRowsResult.error.message);
+    }
+    if (reviewsResult.error) {
+      throw new InternalServerErrorException(reviewsResult.error.message);
     }
 
     let ratingQuery = supabase
@@ -207,48 +227,57 @@ export class PlacesService {
       throw new InternalServerErrorException(reviewsError.message);
     }
 
-    const typedReviews = reviews as ReviewRow[] | null;
-    const userIds =
-      typedReviews?.map((item) => item.tourist_id).filter(Boolean) ?? [];
-    const reviewIds = typedReviews?.map((item) => item.id) ?? [];
+    const place = placeResult.data;
+    const typedReviews = (reviews ?? []) as ReviewRow[];
+    const userIds = typedReviews.map((item) => item.tourist_id).filter(Boolean);
+    const reviewIds = typedReviews.map((item) => item.id);
 
-    const usersPromise = userIds.length
-      ? supabase
-          .schema('public')
-          .from('users')
-          .select('id, full_name')
-          .in('id', userIds)
-      : Promise.resolve({ data: this.emptyUsers, error: null });
-
-    const contentsPromise = reviewIds.length
-      ? supabase
-          .schema('review_ai')
-          .from('review_contents')
-          .select('review_id, content')
-          .in('review_id', reviewIds)
-      : Promise.resolve({ data: this.emptyContents, error: null });
-
-    const [usersResult, contentsResult] = await Promise.all([
-      usersPromise,
-      contentsPromise,
-    ]);
+    // ── Group 2: queries that depend on group-1 results ──────────────────────
+    const [usersResult, contentsResult, vendorResult, relatedPlaces] =
+      await Promise.all([
+        userIds.length
+          ? supabase
+              .schema('public')
+              .from('users')
+              .select('id, full_name')
+              .in('id', userIds)
+          : Promise.resolve({ data: this.emptyUsers, error: null }),
+        reviewIds.length
+          ? supabase
+              .schema('review_ai')
+              .from('review_contents')
+              .select('review_id, content')
+              .in('review_id', reviewIds)
+          : Promise.resolve({ data: this.emptyContents, error: null }),
+        place.vendor_id
+          ? supabase
+              .schema('public')
+              .from('users')
+              .select('phone_number')
+              .eq('id', place.vendor_id)
+              .maybeSingle<UserRow>()
+          : Promise.resolve({ data: null, error: null }),
+        this.enrichRelatedPlaces(recommended, placeId, place.city_id),
+      ]);
 
     if (usersResult.error) {
       throw new InternalServerErrorException(usersResult.error.message);
     }
-
     if (contentsResult.error) {
       throw new InternalServerErrorException(contentsResult.error.message);
+    }
+    if (vendorResult.error) {
+      throw new InternalServerErrorException(vendorResult.error.message);
     }
 
     const users = (usersResult.data ?? this.emptyUsers) as UserRow[];
     const contents = (contentsResult.data ??
       this.emptyContents) as ReviewContentRow[];
+    const vendor = vendorResult.data as UserRow | null;
 
-    const reviewList = (typedReviews ?? []).map((review) => {
+    const reviewList = typedReviews.map((review) => {
       const user = users.find((item) => item.id === review.tourist_id);
       const content = contents.find((item) => item.review_id === review.id);
-
       return {
         id: review.id,
         user_name: user?.full_name ?? 'Ẩn danh',
@@ -258,45 +287,23 @@ export class PlacesService {
       };
     });
 
-    const breakdown: Record<number, number> = {
-      1: 0,
-      2: 0,
-      3: 0,
-      4: 0,
-      5: 0,
-    };
-
+    const breakdown: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
     ((ratingRows as RatingRow[] | null) ?? []).forEach((item) => {
-      if (item.rating >= 1 && item.rating <= 5) {
-        breakdown[item.rating] += 1;
-      }
+      if (item.rating >= 1 && item.rating <= 5) breakdown[item.rating] += 1;
     });
 
-    const { data: vendor, error: vendorError } = place.vendor_id
-      ? await supabase
-          .schema('public')
-          .from('users')
-          .select('phone_number')
-          .eq('id', place.vendor_id)
-          .maybeSingle<UserRow>()
-      : { data: null, error: null };
-
-    if (vendorError) {
-      throw new InternalServerErrorException(vendorError.message);
+    // Extract category from type relationship
+    let categoryList: string[] = [];
+    const typeData = Array.isArray(place.types) ? place.types?.[0] : place.types;
+    if (typeData) {
+      const categoryData = Array.isArray(typeData.categories)
+        ? typeData.categories?.[0]
+        : typeData.categories;
+      if (categoryData?.name) categoryList = [categoryData.name];
     }
-
-    const relatedPlaces = await this.buildRelatedPlaces(
-      placeId,
-      place.city_id,
-      touristId,
-    );
 
     const cityName = this.extractCityName(place.cities);
     const vibes = this.extractVibes(place.vibes);
-
-    const isFavorite = touristId
-      ? await this.checkFavorite(touristId, placeId)
-      : false;
 
     return {
       id: place.id,
@@ -342,24 +349,15 @@ export class PlacesService {
   }
 
   /**
-   * Mục "Có thể bạn sẽ thích": ưu tiên gợi ý từ AI Service (Hybrid CB + CF + khoảng cách).
-   * AI Service chỉ trả place id đã xếp hạng → ở đây enrich lại bằng Supabase để có
-   * ảnh/rating đúng với app. Nếu AI Service không sẵn sàng/không có gợi ý → fallback
-   * danh sách cùng thành phố xếp theo rating (hành vi cũ).
+   * Enrich AI-recommended place IDs with full Supabase data and preserve model ranking.
+   * Called after getRecommendedPlaceIds already ran in parallel group 1.
+   * Falls back to same-city places if AI returned no results or Supabase enrichment is empty.
    */
-  private async buildRelatedPlaces(
+  private async enrichRelatedPlaces(
+    recommended: import('./recommendations.service').RecommendationItem[],
     placeId: string,
     cityId: string | null,
-    touristId?: string,
   ) {
-    const numericUserId =
-      touristId && /^\d+$/.test(touristId) ? Number(touristId) : null;
-
-    const recommended = await this.recommendations.getRecommendedPlaceIds(
-      placeId,
-      { userId: numericUserId, k: 10 },
-    );
-
     const recommendedIds = recommended.map((item) => item.id);
     if (recommendedIds.length > 0) {
       const { data, error } = await supabase
@@ -373,23 +371,16 @@ export class PlacesService {
         .in('id', recommendedIds)
         .returns<PlaceRow[]>();
 
-      if (error) {
-        throw new InternalServerErrorException(error.message);
-      }
-
-      const byId = new Map<string, PlaceRow>(
-        ((data as PlaceRow[] | null) ?? []).map((row) => [row.id, row]),
-      );
-
-      // Giữ đúng thứ tự xếp hạng của model, bỏ id không còn approved/active.
-      const ordered = recommendedIds
-        .map((id) => byId.get(id))
-        .filter((row): row is PlaceRow => Boolean(row))
-        .slice(0, 10)
-        .map((row) => this.mapRelatedRow(row));
-
-      if (ordered.length > 0) {
-        return ordered;
+      if (!error) {
+        const byId = new Map<string, PlaceRow>(
+          ((data as PlaceRow[] | null) ?? []).map((row) => [row.id, row]),
+        );
+        const ordered = recommendedIds
+          .map((id) => byId.get(id))
+          .filter((row): row is PlaceRow => Boolean(row))
+          .slice(0, 10)
+          .map((row) => this.mapRelatedRow(row));
+        if (ordered.length > 0) return ordered;
       }
     }
 
