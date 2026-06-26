@@ -6,6 +6,7 @@ import {
 } from '@nestjs/common';
 import { randomUUID } from 'crypto';
 import { supabase } from '../../../config/supabase';
+import { PushNotificationService } from './push-notification.service';
 
 interface UserNotificationRow {
   id: string;
@@ -70,6 +71,7 @@ const NOTIFICATION_SELECT_BASE =
 
 @Injectable()
 export class NotificationsService {
+  constructor(private readonly pushService: PushNotificationService) {}
   private mapIconKey(notificationType: string | null): string {
     const type = (notificationType ?? '').toLowerCase();
 
@@ -835,5 +837,75 @@ export class NotificationsService {
       tourist_id: touristId,
       updated_count: updatedRows?.length ?? 0,
     };
+  }
+
+  async registerFcmToken(touristId: string, fcmToken: string): Promise<void> {
+    if (!touristId || !fcmToken) {
+      throw new BadRequestException('tourist_id and fcm_token are required');
+    }
+
+    const { error } = await supabase
+      .schema('public')
+      .from('users')
+      .update({ fcm_token: fcmToken })
+      .eq('id', touristId);
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+  }
+
+  async sendNotification(
+    touristId: string,
+    title: string,
+    content: string,
+    type: string,
+  ): Promise<void> {
+    const { data: notification, error: notifError } = await supabase
+      .schema('public')
+      .from('notifications')
+      .insert({
+        title,
+        content,
+        type,
+        is_global: false,
+      })
+      .select('id')
+      .single();
+
+    if (notifError || !notification) {
+      throw new InternalServerErrorException(
+        notifError?.message ?? 'Failed to create notification',
+      );
+    }
+
+    const { error: userNotifError } = await supabase
+      .schema('public')
+      .from('users_notifications')
+      .insert({
+        notification_id: notification.id,
+        user_id: touristId,
+        is_read: false,
+        sent_at: new Date().toISOString(),
+      });
+
+    if (userNotifError) {
+      throw new InternalServerErrorException(userNotifError.message);
+    }
+
+    // Send FCM push notification (best-effort, non-blocking)
+    const { data: userRow } = await supabase
+      .schema('public')
+      .from('users')
+      .select('fcm_token')
+      .eq('id', touristId)
+      .maybeSingle();
+
+    if (userRow?.fcm_token) {
+      void this.pushService.sendPush(userRow.fcm_token, title, content, {
+        notification_id: notification.id,
+        type,
+      });
+    }
   }
 }

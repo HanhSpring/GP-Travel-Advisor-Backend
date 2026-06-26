@@ -15,6 +15,7 @@ interface ReviewRow {
   created_at: string;
   review_type: string;
   status: 'pending' | 'approved' | 'violation';
+  violation_reason?: string | null;
 }
 
 interface PlaceData {
@@ -404,7 +405,7 @@ export class AdminReviewsService {
       const queryResult = await supabase
         .schema('review_ai')
         .from('reviews')
-        .select('id, tourist_id, place_id, rating, created_at, status')
+        .select('id, tourist_id, place_id, rating, created_at, status, violation_reason')
         .eq('id', reviewId)
         .single();
 
@@ -478,6 +479,7 @@ export class AdminReviewsService {
         review_content: reviewContent,
         images: [],
         status: review.status,
+        violation_reason: review.violation_reason ?? null,
         created_at: review.created_at,
       };
     } catch (error) {

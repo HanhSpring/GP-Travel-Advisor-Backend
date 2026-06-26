@@ -5,5 +5,6 @@ import { AdminAlgorithmSettingsService } from './admin-algorithm-settings.servic
 @Module({
   controllers: [AdminAlgorithmSettingsController],
   providers: [AdminAlgorithmSettingsService],
+  exports: [AdminAlgorithmSettingsService],
 })
 export class AdminAlgorithmSettingsModule {}

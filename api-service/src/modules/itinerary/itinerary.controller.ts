@@ -459,11 +459,22 @@ export class ItineraryController {
     summary:
       'Tối ưu hoá các hoạt động trong một ngày bằng AI Service (OR-Tools)',
   })
-  async optimizeDay(@Body() body: { activities: any[] }) {
+  async optimizeDay(
+    @Body()
+    body: {
+      activities: any[];
+      dailyStartTime?: string;
+      dailyEndTime?: string;
+    },
+  ) {
     if (!body.activities || body.activities.length === 0) {
       return { optimized: [] };
     }
-    const optimized = await this.service.optimizeDayRoute(body.activities);
+    const optimized = await this.service.optimizeDayRoute(
+      body.activities,
+      body.dailyStartTime,
+      body.dailyEndTime,
+    );
     return { optimized };
   }
 

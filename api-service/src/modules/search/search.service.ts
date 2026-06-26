@@ -395,6 +395,7 @@ export class SearchService {
     excludeIds: string[] = [],
     preferCategory: string = '',
     radius: number = 10,
+    q?: string,
   ): Promise<any[]> {
     // Pre-filter with bounding box to avoid fetching the entire table.
     const latDelta = radius / 111.32;
@@ -415,6 +416,10 @@ export class SearchService {
 
     if (excludeIds.length > 0) {
       query = query.not('id', 'in', `(${excludeIds.join(',')})`);
+    }
+
+    if (q && q.trim().length > 0) {
+      query = query.ilike('name', `%${q.trim()}%`);
     }
 
     const { data, error } = await query;
@@ -470,6 +475,15 @@ export class SearchService {
     // Bounding box over-approximates — do a precise Haversine filter as the final step.
     const inRadius = placesWithDistance
       .filter((p) => p.distanceKm !== null && p.distanceKm <= radius)
+      .filter((p) => {
+        if (normalizedPrefer === 'tham quan' || normalizedPrefer === '') {
+          const cat = p.category.toLowerCase();
+          if (cat.includes('nhà hàng') || cat.includes('khách sạn') || cat.includes('quán ăn') || cat.includes('lưu trú') || cat.includes('ẩm thực') || cat.includes('quán cà phê') || cat.includes('cafe')) {
+            return false;
+          }
+        }
+        return true;
+      })
       .sort((a, b) => (a.distanceKm as number) - (b.distanceKm as number));
 
     // Same-category places first (sorted by distance), then the rest.
