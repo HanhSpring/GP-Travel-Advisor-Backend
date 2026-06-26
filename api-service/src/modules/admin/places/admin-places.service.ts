@@ -140,6 +140,39 @@ export class AdminPlacesService {
       .trim();
   }
 
+  private sanitizeSupabaseOrValue(value: string): string {
+    return value.replace(/[(),]/g, ' ').trim();
+  }
+
+  private async getVendorIdsBySearch(search: string): Promise<string[]> {
+    const keyword = this.sanitizeSupabaseOrValue(search);
+
+    if (!keyword) {
+      return [];
+    }
+
+    const { data, error } = await supabase
+      .schema('public')
+      .from('users')
+      .select('id')
+      .or(
+        `full_name.ilike.%${keyword}%,email.ilike.%${keyword}%,phone_number.ilike.%${keyword}%`,
+      )
+      .limit(200);
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return Array.from(
+      new Set(
+        ((data ?? []) as Array<{ id: string | null }>)
+          .map((item) => item.id)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
+  }
+
   private extractCityName(cityData: CityRow | CityRow[] | null): string {
     if (!cityData) {
       return '';
@@ -738,7 +771,20 @@ export class AdminPlacesService {
     if (normalizedSearch) {
       const simpleSearch = search?.trim() ?? '';
       if (simpleSearch) {
-        query = query.ilike('name', `%${simpleSearch}%`);
+        const keyword = this.sanitizeSupabaseOrValue(simpleSearch);
+        if (!keyword) {
+          query = query.ilike('name', `%${simpleSearch}%`);
+        } else {
+        const matchingVendorIds = await this.getVendorIdsBySearch(keyword);
+
+        if (matchingVendorIds.length > 0) {
+          query = query.or(
+            `name.ilike.%${keyword}%,vendor_id.in.(${matchingVendorIds.join(',')})`,
+          );
+        } else {
+          query = query.ilike('name', `%${keyword}%`);
+        }
+        }
       }
     }
 
@@ -841,25 +887,34 @@ export class AdminPlacesService {
       throw new NotFoundException(`Place with id ${id} not found`);
     }
 
-    const vendor = place.vendor_id
-      ? (
-          await supabase
+    const [vendorResult, vendorPlaceCount] = await Promise.all([
+      place.vendor_id
+        ? supabase
             .schema('public')
             .from('users')
             .select('id, full_name, email, phone_number, created_at')
             .eq('id', place.vendor_id)
             .maybeSingle<UserRow>()
-        ).data
-      : null;
+        : Promise.resolve({ data: null, error: null }),
+      place.vendor_id
+        ? supabase
+            .schema('travel')
+            .from('places')
+            .select('id', { count: 'estimated', head: true })
+            .eq('vendor_id', place.vendor_id)
+            .or('is_active.is.null,is_active.eq.true')
+        : Promise.resolve({ count: 0, error: null }),
+    ]);
 
-    const vendorPlaceCount = place.vendor_id
-      ? await supabase
-          .schema('travel')
-          .from('places')
-          .select('id', { count: 'exact', head: true })
-          .eq('vendor_id', place.vendor_id)
-          .or('is_active.is.null,is_active.eq.true')
-      : null;
+    if (vendorResult.error) {
+      throw new InternalServerErrorException(vendorResult.error.message);
+    }
+
+    if (vendorPlaceCount.error) {
+      throw new InternalServerErrorException(vendorPlaceCount.error.message);
+    }
+
+    const vendor = vendorResult.data;
 
     const category = this.extractCategoryFromType(place.types);
     const cityName = this.extractCityName(place.cities);
@@ -933,18 +988,75 @@ export class AdminPlacesService {
     };
   }
 
-  async deletePlace(id: string) {
-    const { error } = await supabase
+  async updatePlaceCoordinates(
+    id: string,
+    latitude: number,
+    longitude: number,
+  ) {
+    const lat = Number(latitude);
+    const lng = Number(longitude);
+
+    if (!Number.isFinite(lat) || lat < -90 || lat > 90) {
+      throw new BadRequestException('Latitude must be a number from -90 to 90');
+    }
+
+    if (!Number.isFinite(lng) || lng < -180 || lng > 180) {
+      throw new BadRequestException(
+        'Longitude must be a number from -180 to 180',
+      );
+    }
+
+    const { data, error } = await supabase
       .schema('travel')
       .from('places')
-      .delete()
-      .eq('id', id);
+      .update({
+        latitude: lat,
+        longitude: lng,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', id)
+      .or('is_active.is.null,is_active.eq.true')
+      .select('id, latitude, longitude')
+      .maybeSingle<{ id: string; latitude: number; longitude: number }>();
+
+    if (error) {
+      throw new InternalServerErrorException(
+        `Failed to update place coordinates: ${error.message}`,
+      );
+    }
+
+    if (!data) {
+      throw new NotFoundException(`Place with id ${id} not found`);
+    }
+
+    return {
+      id: data.id,
+      latitude: data.latitude,
+      longitude: data.longitude,
+      message: 'Place coordinates updated successfully',
+    };
+  }
+
+  async deletePlace(id: string) {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('places')
+      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .eq('id', id)
+      .or('is_active.is.null,is_active.eq.true')
+      .select('id')
+      .maybeSingle<{ id: string }>();
 
     if (error) {
       throw new InternalServerErrorException(
         `Failed to delete place: ${error.message}`,
       );
     }
+
+    if (!data) {
+      throw new NotFoundException(`Place with id ${id} not found`);
+    }
+
     return { id, message: 'Place deleted successfully' };
   }
 
