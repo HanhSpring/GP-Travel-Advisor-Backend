@@ -10,11 +10,174 @@ import { BusinessProfileDto } from './dto/business-profile.dto';
 import { supabase } from '../../config/supabase';
 import * as XLSX from 'xlsx';
 import { GetOrdersDto } from './dto/get-orders.dto';
+import { randomUUID } from 'crypto';
 
 @Injectable()
 export class BusinessService {
   private supabaseUrl = process.env.SUPABASE_URL || '';
   private supabaseAnonKey = process.env.SUPABASE_KEY || '';
+
+  private async resolvePlaceType(input: {
+    typeId?: string;
+    typeName?: string;
+    categories?: string[];
+  }): Promise<{ typeId?: string; categoryNames: string[] }> {
+    const typeId = input.typeId?.trim();
+    const typeName = input.typeName?.trim();
+    const categories = Array.isArray(input.categories) ? input.categories : [];
+
+    let query = supabase
+      .schema('travel')
+      .from('types')
+      .select('id, name, categories(id, name)')
+      .limit(1);
+
+    if (typeId) {
+      query = query.eq('id', typeId);
+    } else if (typeName) {
+      query = query.ilike('name', typeName);
+    } else if (categories.length > 0) {
+      query = query.ilike('name', categories[0]);
+    } else {
+      return { categoryNames: [] };
+    }
+
+    const { data, error } = await query.maybeSingle();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    if (!data) {
+      return { categoryNames: categories };
+    }
+
+    const categoryData = (data as any).categories;
+    const categoryNames = Array.isArray(categoryData)
+      ? categoryData.map((category: any) => category?.name).filter(Boolean)
+      : categoryData?.name
+        ? [categoryData.name]
+        : categories;
+
+    return {
+      typeId: (data as any).id,
+      categoryNames,
+    };
+  }
+
+  private extractCreatedPlaceId(data: any): string | null {
+    if (!data) return null;
+    if (typeof data === 'string') return data;
+    if (Array.isArray(data)) return this.extractCreatedPlaceId(data[0]);
+    return data.place_id || data.placeId || data.id || null;
+  }
+
+  private async resolveCityId(cityName: string): Promise<string> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name')
+      .ilike('name', cityName.trim())
+      .maybeSingle();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    if (!data?.id) {
+      throw new BadRequestException(`Tinh/thanh khong hop le: ${cityName}`);
+    }
+
+    return data.id;
+  }
+
+  private async addPlaceServices(
+    placeId: string,
+    services: Array<{ name: string; description?: string }>,
+  ) {
+    for (const service of services) {
+      const serviceName = service.name?.trim();
+      if (!serviceName) continue;
+
+      let serviceId: string | null = null;
+
+      const { data: existingService, error: findError } = await supabase
+        .schema('travel')
+        .from('services')
+        .select('id')
+        .ilike('name', serviceName)
+        .maybeSingle();
+
+      if (findError) {
+        throw new InternalServerErrorException(findError.message);
+      }
+
+      serviceId = existingService?.id ?? null;
+
+      if (!serviceId) {
+        const { data: createdService, error: createServiceError } = await supabase
+          .schema('travel')
+          .from('services')
+          .insert({ id: randomUUID(), name: serviceName, price: null })
+          .select('id')
+          .single();
+
+        if (createServiceError) {
+          throw new BadRequestException(createServiceError.message);
+        }
+
+        serviceId = createdService?.id ?? null;
+      }
+
+      if (!serviceId) continue;
+
+      const { error: linkError } = await supabase
+        .schema('travel')
+        .from('place_services')
+        .upsert(
+          { place_id: placeId, service_id: serviceId },
+          { onConflict: 'place_id,service_id' },
+        );
+
+      if (linkError) {
+        throw new BadRequestException(linkError.message);
+      }
+    }
+  }
+
+  private async addMenuItems(
+    placeId: string,
+    menu: Array<{ name: string; description?: string; price: number; image_url?: string; img?: string }>,
+  ) {
+    if (menu.length === 0) return;
+
+    const rows = menu
+      .filter((item) => item.name?.trim())
+      .map((item) => ({
+        id: randomUUID(),
+        place_id: placeId,
+        name: item.name.trim(),
+        description: item.description || null,
+        price: Number(item.price),
+        image_url: this.normalizeFoodImageUrls(item.image_url || item.img),
+      }));
+
+    if (rows.length === 0) return;
+
+    const { error } = await supabase
+      .schema('order_sys')
+      .from('food_items')
+      .insert(rows);
+
+    if (error) {
+      throw new BadRequestException(error.message);
+    }
+  }
+
+  private normalizeFoodImageUrls(imageUrl?: string) {
+    const trimmedUrl = imageUrl?.trim();
+    return trimmedUrl ? [trimmedUrl] : [];
+  }
 
   async getVendorPlaces(vendorId: string) {
     const { data, error } = await supabase
@@ -26,21 +189,133 @@ export class BusinessService {
   }
 
   async getPlaceDetail(placeId: string) {
-    const [{ data, error }, { data: imagesData }] = await Promise.all([
-      supabase.schema('travel').rpc('get_place_detail', { p_place_id: placeId }),
-      supabase.schema('travel').from('place_images').select('image_url').eq('place_id', placeId).order('created_at', { ascending: true }),
-    ]);
+    const { data: place, error } = await supabase
+      .schema('travel')
+      .from('places')
+      .select(
+        'id, name, description, address, city_id, cities(name), latitude, longitude, open_time, close_time, image_url, is_approved, is_active, average_rating, review_count, type_id, types(id, name, categories(id, name))',
+      )
+      .eq('id', placeId)
+      .maybeSingle();
 
     if (error) throw new InternalServerErrorException(error.message);
+    if (!place) throw new BadRequestException('Không tìm thấy địa điểm');
 
-    const images = (imagesData ?? []).map((r: any) => r.image_url);
-    if (Array.isArray(data) && data.length > 0) {
-      return { ...data[0], images };
+    const record = place as any;
+    const cityData = Array.isArray(record.cities)
+      ? record.cities[0]
+      : record.cities;
+    const typeData = Array.isArray(record.types) ? record.types[0] : record.types;
+    const categoryData = Array.isArray(typeData?.categories)
+      ? typeData.categories[0]
+      : typeData?.categories;
+    const placeImages = Array.isArray(record.image_url)
+      ? record.image_url
+      : record.image_url
+        ? [record.image_url]
+        : [];
+    return {
+      ...record,
+      city: cityData?.name ?? '',
+      type: typeData?.name ?? categoryData?.name ?? '',
+      category: typeData?.name ?? categoryData?.name ?? '',
+      images: placeImages,
+    };
+  }
+
+  async updatePlaceDetail(placeId: string, vendorId: string, dto: any) {
+    const normalizedPlaceId = placeId?.trim();
+    const normalizedVendorId = vendorId?.trim();
+
+    if (!normalizedPlaceId) {
+      throw new BadRequestException('Thiếu dữ liệu: Place ID');
     }
-    if (data && typeof data === 'object') {
-      return { ...data, images };
+
+    if (!normalizedVendorId) {
+      throw new BadRequestException('Thiếu dữ liệu: Vendor ID');
     }
-    return data;
+
+    const updatePayload: Record<string, unknown> = {
+      updated_at: new Date().toISOString(),
+    };
+
+    if (typeof dto.name === 'string') updatePayload.name = dto.name.trim();
+    if (typeof dto.address === 'string') updatePayload.address = dto.address.trim();
+    if (typeof dto.description === 'string') updatePayload.description = dto.description;
+    if (typeof dto.openTime === 'string') updatePayload.open_time = dto.openTime;
+    if (typeof dto.closeTime === 'string') updatePayload.close_time = dto.closeTime;
+    if (typeof dto.open_time === 'string') updatePayload.open_time = dto.open_time;
+    if (typeof dto.close_time === 'string') updatePayload.close_time = dto.close_time;
+
+    const latitude = dto.latitude ?? dto.lat;
+    const longitude = dto.longitude ?? dto.lng;
+    if (latitude !== undefined && latitude !== '') updatePayload.latitude = Number(latitude);
+    if (longitude !== undefined && longitude !== '') updatePayload.longitude = Number(longitude);
+
+    if (typeof dto.isActive === 'boolean') updatePayload.is_active = dto.isActive;
+    if (typeof dto.is_active === 'boolean') updatePayload.is_active = dto.is_active;
+
+    const imageUrls = dto.imageUrls ?? dto.image_url ?? dto.images;
+    if (Array.isArray(imageUrls)) {
+      updatePayload.image_url = imageUrls.filter(
+        (url): url is string => typeof url === 'string' && url.trim().length > 0,
+      );
+    }
+
+    const cityName = typeof dto.city === 'string' ? dto.city.trim() : '';
+    if (cityName) {
+      updatePayload.city_id = await this.resolveCityId(cityName);
+    }
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('places')
+      .update(updatePayload)
+      .eq('id', normalizedPlaceId)
+      .eq('vendor_id', normalizedVendorId)
+      .select('id')
+      .maybeSingle();
+
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!data) throw new NotFoundException('Không tìm thấy địa điểm thuộc đối tác này');
+
+    return {
+      message: 'Cập nhật địa điểm thành công',
+      placeId: data.id,
+    };
+  }
+
+  async deletePlaceDetail(placeId: string, vendorId: string) {
+    const normalizedPlaceId = placeId?.trim();
+    const normalizedVendorId = vendorId?.trim();
+
+    if (!normalizedPlaceId) {
+      throw new BadRequestException('Thiếu dữ liệu: Place ID');
+    }
+
+    if (!normalizedVendorId) {
+      throw new BadRequestException('Thiếu dữ liệu: Vendor ID');
+    }
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('places')
+      .update({
+        is_active: false,
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', normalizedPlaceId)
+      .eq('vendor_id', normalizedVendorId)
+      .select('id')
+      .maybeSingle();
+
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!data) throw new NotFoundException('Không tìm thấy địa điểm thuộc đối tác này');
+
+    return {
+      message: 'Xóa địa điểm thành công',
+      placeId: data.id,
+    };
   }
 
   async getOrdersByPlace(placeId: string) {
@@ -208,12 +483,23 @@ export class BusinessService {
     const city = dto.p_city || dto.city;
     const categories = dto.p_categories || dto.categories;
     const vendorId = dto.p_vendor_id || dto.vendorId;
+    const email = (dto.p_email || dto.email || '').trim();
+    const resolvedType = await this.resolvePlaceType({
+      typeId: dto.p_type_id || dto.typeId,
+      typeName: dto.p_type_name || dto.typeName,
+      categories: Array.isArray(categories) ? categories : [],
+    });
+    const categoryNames = resolvedType.categoryNames;
 
     if (!name) throw new BadRequestException('Thiếu dữ liệu: Tên địa điểm');
     if (!address) throw new BadRequestException('Thiếu dữ liệu: Địa chỉ');
     if (!city) throw new BadRequestException('Thiếu dữ liệu: Tỉnh/Thành phố');
     if (!categories || categories.length === 0) throw new BadRequestException('Thiếu dữ liệu: Danh mục');
     if (!vendorId) throw new BadRequestException('Thiếu dữ liệu: Vendor ID');
+    if (!email) throw new BadRequestException('Thieu du lieu: Email lien he');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new BadRequestException('Email lien he khong dung dinh dang');
+    }
 
     let menu: any[] = [];
     // Lấy menu từ form (p_menu)
@@ -238,6 +524,59 @@ export class BusinessService {
     }
 
     // 2. GỌI RPC VỚI ĐẦY ĐỦ 13 THAM SỐ
+    if (!resolvedType.typeId) {
+      throw new BadRequestException('Loai hinh kinh doanh khong hop le');
+    }
+
+    const cityId = await this.resolveCityId(city);
+    const images = Array.isArray(dto.p_images || dto.images) ? (dto.p_images || dto.images) : [];
+    const services = Array.isArray(dto.p_services || dto.services) ? (dto.p_services || dto.services) : [];
+
+    const { data: createdPlace, error: createPlaceError } = await supabase
+      .schema('travel')
+      .from('places')
+      .insert({
+        id: randomUUID(),
+        name,
+        address,
+        email,
+        city_id: cityId,
+        latitude: Number(dto.p_lat || dto.latitude),
+        longitude: Number(dto.p_lng || dto.longitude),
+        vendor_id: vendorId,
+        type_id: resolvedType.typeId,
+        open_time: dto.p_open_time || '08:00',
+        close_time: dto.p_close_time || '22:00',
+        description: dto.p_description || '',
+        image_url: images,
+        is_approved: null,
+        is_active: true,
+        average_rating: 0,
+        review_count: 0,
+        registered_date: new Date().toISOString().slice(0, 10),
+        source: 'business',
+      })
+      .select('id')
+      .single();
+
+    if (createPlaceError) {
+      console.error('Supabase create place error:', createPlaceError);
+      throw new BadRequestException(createPlaceError.message || 'Loi khi tao dia diem');
+    }
+
+    const createdPlaceId = createdPlace?.id;
+    if (!createdPlaceId) {
+      throw new BadRequestException('Khong lay duoc ID dia diem sau khi tao');
+    }
+
+    await this.addPlaceServices(createdPlaceId, services);
+    await this.addMenuItems(createdPlaceId, menu);
+
+    return {
+      message: 'Tao thanh cong',
+      placeId: createdPlaceId,
+    };
+
     const { data, error } = await supabase
       .schema('travel')
       .rpc('create_full_place_v2', {
@@ -247,7 +586,7 @@ export class BusinessService {
         p_lat: Number(dto.p_lat || dto.latitude),
         p_lng: Number(dto.p_lng || dto.longitude),
         p_vendor_id: vendorId,
-        p_categories: Array.isArray(categories) ? categories : [],
+        p_categories: categoryNames,
         p_services: Array.isArray(dto.p_services || dto.services) ? (dto.p_services || dto.services) : [],
         p_menu: menu,
         // BỔ SUNG CÁC THAM SỐ CÒN THIẾU Ở ĐÂY:
@@ -259,12 +598,26 @@ export class BusinessService {
 
     if (error) {
       console.error('Supabase RPC Error:', error);
-      throw new BadRequestException(error.message || 'Lỗi khi tạo địa điểm');
+      throw new BadRequestException(error?.message || 'Loi khi tao dia diem');
+    }
+
+    const placeId = this.extractCreatedPlaceId(data);
+    if (placeId && resolvedType.typeId) {
+      const { error: updateTypeError } = await supabase
+        .schema('travel')
+        .from('places')
+        .update({ type_id: resolvedType.typeId })
+        .eq('id', placeId);
+
+      if (updateTypeError) {
+        console.error('Supabase update type_id error:', updateTypeError);
+        throw new BadRequestException(updateTypeError?.message || 'Loi khi cap nhat loai hinh dia diem');
+      }
     }
 
     return {
       message: 'Tạo thành công',
-      placeId: data,
+      placeId: placeId ?? data,
     };
   }
 

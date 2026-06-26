@@ -1,4 +1,4 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Query } from '@nestjs/common';
+import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { AdminPlacesService } from './admin-places.service';
 import { AdminPlaceListDto } from './dto/admin-place-list.dto';
@@ -86,6 +86,25 @@ export class AdminPlacesController {
   })
   async getPlaceStats() {
     return this.service.getPlaceStats();
+  }
+
+  @Get('vendors')
+  @ApiOperation({
+    summary: 'Get business users for admin place creation',
+    description: 'Return active business users that can own an admin-created place',
+  })
+  async getBusinessVendors() {
+    return this.service.getBusinessVendors();
+  }
+
+  @Post('full')
+  @ApiOperation({
+    summary: 'Create a full place from admin',
+    description:
+      'Create place with services and menu. Supports system places and places owned by a vendor.',
+  })
+  async createFullPlace(@Body() body: any) {
+    return this.service.createFullPlace(body);
   }
 
   @Get(':id')

@@ -1,5 +1,6 @@
 import {
   Controller,
+  Delete,
   Get,
   Post,
   Put,
@@ -61,6 +62,23 @@ export class BusinessController {
     return this.businessService.getPlaceDetail(query.placeId);
   }
 
+  @Put('place-detail')
+  updatePlaceDetail(@Body() body: any) {
+    return this.businessService.updatePlaceDetail(
+      body.placeId || body.id,
+      body.vendorId || body.vendor_id,
+      body,
+    );
+  }
+
+  @Delete('place-detail')
+  deletePlaceDetail(@Body() body: any, @Query() query: any) {
+    return this.businessService.deletePlaceDetail(
+      body.placeId || body.id || query.placeId || query.id,
+      body.vendorId || body.vendor_id || query.vendorId || query.vendor_id,
+    );
+  }
+
   @Get('orders')
   @ApiResponse({ type: [OrderItemDto] })
   getOrders(@Query() query: PlaceDto) {
@@ -114,6 +132,9 @@ async createFull(
     latitude: Number(latitude),
     longitude: Number(longitude),
     vendorId: body.p_vendor_id || body.vendorId || '',
+    email: body.p_email || body.email || '',
+    typeId: body.p_type_id || body.typeId || '',
+    typeName: body.p_type_name || body.typeName || '',
     categories: this.parseFlexible(body.p_categories || body.categories),
     services: this.parseFlexible(body.p_services || body.services),
     menu: this.parseFlexible(body.p_menu || body.menu),

@@ -52,6 +52,7 @@ import { AiTestModule } from './modules/ai-test/ai-test.module';
 
 // City module
 import { CitiesModule } from './modules/city/city.module';
+import { PlaceTypesModule } from './modules/place-type/place-type.module';
 import { RecommendationModule } from './modules/recommendation/recommendation.module';
 
 @Module({
@@ -109,6 +110,7 @@ import { RecommendationModule } from './modules/recommendation/recommendation.mo
 
     // City module
     CitiesModule,
+    PlaceTypesModule,
   ],
 })
 export class AppModule {}

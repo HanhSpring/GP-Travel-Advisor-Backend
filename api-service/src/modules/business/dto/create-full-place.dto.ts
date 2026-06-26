@@ -55,6 +55,15 @@ export class CreateFullPlaceDto {
   @ApiProperty({ required: false })
   p_categories?: string[]
 
+  @ApiProperty({ example: 'partner@example.com', required: false })
+  p_email?: string
+
+  @ApiProperty({ required: false })
+  p_type_id?: string
+
+  @ApiProperty({ required: false })
+  p_type_name?: string
+
   @ApiProperty({ required: false })
   p_services?: Array<{ name: string; description?: string }>
   @ApiProperty({ example: '10:00', required: false })

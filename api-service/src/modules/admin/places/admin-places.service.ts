@@ -4,6 +4,7 @@ import {
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
+import { randomUUID } from 'crypto';
 import { supabase } from '../../../config/supabase';
 
 interface CategoryRow {
@@ -62,6 +63,11 @@ interface CategoryFilterRow {
 
 interface TypeFilterRow {
   id: string;
+}
+
+interface ResolvedPlaceType {
+  typeId: string | null;
+  categoryNames: string[];
 }
 
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
@@ -228,6 +234,177 @@ export class AdminPlacesService {
     return 'pending';
   }
 
+  private onlyVisiblePlaces<T>(query: T): T {
+    return (query as any).or('is_active.is.null,is_active.eq.true') as T;
+  }
+
+  private normalizeFoodImageUrls(imageUrl?: string) {
+    const trimmedUrl = imageUrl?.trim();
+    return trimmedUrl ? [trimmedUrl] : [];
+  }
+
+  private async resolveCityIdForCreate(cityName: string): Promise<string> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name')
+      .ilike('name', cityName.trim())
+      .maybeSingle();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    if (!data?.id) {
+      throw new BadRequestException(`Tinh/thanh khong hop le: ${cityName}`);
+    }
+
+    return data.id;
+  }
+
+  private async resolvePlaceTypeForCreate(input: {
+    typeId?: string;
+    typeName?: string;
+    categories?: string[];
+  }): Promise<ResolvedPlaceType> {
+    const typeId = input.typeId?.trim();
+
+    if (typeId) {
+      const { data, error } = await supabase
+        .schema('travel')
+        .from('types')
+        .select('id, name, categories(id, name)')
+        .eq('id', typeId)
+        .maybeSingle<TypeRow>();
+
+      if (error) {
+        throw new InternalServerErrorException(error.message);
+      }
+
+      if (data?.id) {
+        return {
+          typeId: data.id,
+          categoryNames: this.extractCategoryFromType(data)
+            ? [this.extractCategoryFromType(data)]
+            : input.categories ?? [],
+        };
+      }
+    }
+
+    const typeName = input.typeName?.trim() || input.categories?.[0]?.trim();
+    if (!typeName) {
+      return { typeId: null, categoryNames: [] };
+    }
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('types')
+      .select('id, name, categories(id, name)')
+      .ilike('name', typeName)
+      .maybeSingle<TypeRow>();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    if (!data?.id) {
+      return { typeId: null, categoryNames: [] };
+    }
+
+    return {
+      typeId: data.id,
+      categoryNames: this.extractCategoryFromType(data)
+        ? [this.extractCategoryFromType(data)]
+        : input.categories ?? [],
+    };
+  }
+
+  private async addPlaceServices(
+    placeId: string,
+    services: Array<{ name: string; description?: string }>,
+  ) {
+    for (const service of services) {
+      const serviceName = service.name?.trim();
+      if (!serviceName) continue;
+
+      const { data: existingService, error: findError } = await supabase
+        .schema('travel')
+        .from('services')
+        .select('id')
+        .ilike('name', serviceName)
+        .maybeSingle<{ id: string }>();
+
+      if (findError) {
+        throw new InternalServerErrorException(findError.message);
+      }
+
+      let serviceId = existingService?.id ?? null;
+
+      if (!serviceId) {
+        const { data: createdService, error: createServiceError } =
+          await supabase
+            .schema('travel')
+            .from('services')
+            .insert({ id: randomUUID(), name: serviceName, price: null })
+            .select('id')
+            .single<{ id: string }>();
+
+        if (createServiceError) {
+          throw new BadRequestException(createServiceError.message);
+        }
+
+        serviceId = createdService?.id ?? null;
+      }
+
+      if (!serviceId) continue;
+
+      const { error: linkError } = await supabase
+        .schema('travel')
+        .from('place_services')
+        .upsert(
+          { place_id: placeId, service_id: serviceId },
+          { onConflict: 'place_id,service_id' },
+        );
+
+      if (linkError) {
+        throw new BadRequestException(linkError.message);
+      }
+    }
+  }
+
+  private async addMenuItems(
+    placeId: string,
+    menu: Array<{
+      name: string;
+      description?: string;
+      price: number;
+      image_url?: string;
+      img?: string;
+    }>,
+  ) {
+    const rows = menu
+      .filter((item) => item.name?.trim())
+      .map((item) => ({
+        id: randomUUID(),
+        place_id: placeId,
+        name: item.name.trim(),
+        description: item.description || null,
+        price: Number(item.price),
+        image_url: this.normalizeFoodImageUrls(item.image_url || item.img),
+      }));
+
+    if (rows.length === 0) return;
+
+    const { error } = await supabase
+      .schema('order_sys')
+      .from('food_items')
+      .insert(rows);
+
+    if (error) {
+      throw new BadRequestException(error.message);
+    }
+  }
+
   private async countPlaces(
     status: PlaceStatus = 'all',
     registeredFrom?: string,
@@ -244,6 +421,8 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select('id', { count: countAlgorithm, head: true });
+
+    query = this.onlyVisiblePlaces(query);
 
     if (status === 'pending') {
       query = query.is('is_approved', null);
@@ -283,6 +462,125 @@ export class AdminPlacesService {
       totalLocations,
       pendingApproval,
       newThisMonth,
+    };
+  }
+
+  async getBusinessVendors() {
+    const { data, error } = await supabase
+      .schema('public')
+      .from('users')
+      .select('id, full_name, email, phone_number')
+      .eq('role', 'BUSINESS')
+      .order('full_name', { ascending: true });
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return {
+      data: ((data ?? []) as UserRow[]).map((user) => ({
+        id: user.id,
+        name: user.full_name || user.email || user.id,
+        email: user.email || '',
+        phone: user.phone_number || '',
+      })),
+    };
+  }
+
+  async createFullPlace(dto: any) {
+    const sourceMode = dto.sourceMode || dto.source_mode || 'system';
+    const name = dto.p_name || dto.name;
+    const address = dto.p_address || dto.address;
+    const city = dto.p_city || dto.city;
+    const email = (dto.p_email || dto.email || '').trim();
+    const vendorId = (dto.p_vendor_id || dto.vendorId || dto.vendor_id || '').trim();
+    const categories = Array.isArray(dto.p_categories || dto.categories)
+      ? dto.p_categories || dto.categories
+      : [];
+    const services = Array.isArray(dto.p_services || dto.services)
+      ? dto.p_services || dto.services
+      : [];
+    const menu = Array.isArray(dto.p_menu || dto.menu) ? dto.p_menu || dto.menu : [];
+    const images = Array.isArray(dto.p_images || dto.images)
+      ? dto.p_images || dto.images
+      : [];
+
+    if (!['system', 'vendor'].includes(sourceMode)) {
+      throw new BadRequestException('Loai nguon dia diem khong hop le');
+    }
+
+    if (!name) throw new BadRequestException('Thieu du lieu: Ten dia diem');
+    if (!address) throw new BadRequestException('Thieu du lieu: Dia chi');
+    if (!city) throw new BadRequestException('Thieu du lieu: Tinh/Thanh pho');
+    if (!email) throw new BadRequestException('Thieu du lieu: Email lien he');
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      throw new BadRequestException('Email lien he khong dung dinh dang');
+    }
+    if (sourceMode === 'vendor' && !vendorId) {
+      throw new BadRequestException('Vui long chon doi tac quan ly dia diem');
+    }
+
+    if (menu.length > 0) {
+      for (const item of menu) {
+        if (!item.name) throw new BadRequestException('Thieu ten mon');
+        if (!item.price || Number(item.price) <= 0) {
+          throw new BadRequestException(`Gia sai: ${item.name}`);
+        }
+      }
+    }
+
+    const resolvedType = await this.resolvePlaceTypeForCreate({
+      typeId: dto.p_type_id || dto.typeId,
+      typeName: dto.p_type_name || dto.typeName,
+      categories,
+    });
+
+    if (!resolvedType.typeId) {
+      throw new BadRequestException('Loai hinh kinh doanh khong hop le');
+    }
+
+    const cityId = await this.resolveCityIdForCreate(city);
+    const createdPlaceId = randomUUID();
+    const now = new Date();
+
+    const { data: createdPlace, error: createPlaceError } = await supabase
+      .schema('travel')
+      .from('places')
+      .insert({
+        id: createdPlaceId,
+        name,
+        address,
+        email,
+        city_id: cityId,
+        latitude: Number(dto.p_lat ?? dto.latitude),
+        longitude: Number(dto.p_lng ?? dto.longitude),
+        vendor_id: sourceMode === 'vendor' ? vendorId : null,
+        type_id: resolvedType.typeId,
+        open_time: dto.p_open_time || dto.openTime || '08:00',
+        close_time: dto.p_close_time || dto.closeTime || '22:00',
+        description: dto.p_description || dto.description || '',
+        image_url: images,
+        is_approved: true,
+        is_active: true,
+        average_rating: 0,
+        review_count: 0,
+        registered_date: now.toISOString().slice(0, 10),
+        source: sourceMode === 'vendor' ? 'admin_created_for_business' : 'admin',
+      })
+      .select('id')
+      .single<{ id: string }>();
+
+    if (createPlaceError) {
+      throw new BadRequestException(createPlaceError.message || 'Loi khi tao dia diem');
+    }
+
+    await this.addPlaceServices(createdPlace.id, services);
+    await this.addMenuItems(createdPlace.id, menu);
+
+    return {
+      message: 'Tao dia diem thanh cong',
+      placeId: createdPlace.id,
+      sourceMode,
     };
   }
 
@@ -412,6 +710,8 @@ export class AdminPlacesService {
         { count: 'estimated' },
       );
 
+    query = this.onlyVisiblePlaces(query);
+
     if (status === 'pending') {
       query = query.is('is_approved', null);
     } else if (status === 'approved') {
@@ -534,6 +834,7 @@ export class AdminPlacesService {
         'id, image_url, name, description, address, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, types(id, name, categories(id, name))',
       )
       .eq('id', id)
+      .or('is_active.is.null,is_active.eq.true')
       .maybeSingle<PlaceDetailRow>();
 
     if (placeError || !place) {
@@ -557,6 +858,7 @@ export class AdminPlacesService {
           .from('places')
           .select('id', { count: 'exact', head: true })
           .eq('vendor_id', place.vendor_id)
+          .or('is_active.is.null,is_active.eq.true')
       : null;
 
     const category = this.extractCategoryFromType(place.types);
