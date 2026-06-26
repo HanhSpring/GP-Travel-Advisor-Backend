@@ -13,6 +13,7 @@ from app.schemas.itinerary import (
     ScheduleEntryResponse,
 )
 from app.services.itinerary import planner
+from app.services.itinerary.scheduler_v2 import SchedulerV2Config, SchedulerV2Planner
 from app.services.itinerary.validator import FeasibilityValidator, ValidationResult
 
 logger = logging.getLogger(__name__)
@@ -67,9 +68,94 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
             require_goong=req.require_goong,
         )
     except Exception as e:
-        logger.exception("[Planner] Lỗi khi tính toán travel matrix (Goong API/Haversine)")
+        logger.exception("[Planner] Travel matrix calculation failed (Goong API/Haversine)")
         raise RuntimeError(f"Travel matrix calculation failed: {str(e)}") from e
 
+    matrix_ms = round((time.perf_counter() - matrix_started_at) * 1000)
+    engine_name = (req.planner_engine or "ga_v1").strip().lower()
+    if engine_name not in {"ga_v1", "scheduler_v2", "compare"}:
+        raise ValueError("planner_engine must be one of: ga_v1, scheduler_v2, compare.")
+
+    comparison = None
+    if engine_name == "compare":
+        ga_result, ga_ms, ga_validation = _run_ga_engine(
+            req, places, travel_times, travel_distances, travel_sources, travel_reliability
+        )
+        scheduler_result, scheduler_ms, scheduler_validation = _run_scheduler_v2_engine(
+            req, places, travel_times, travel_distances, travel_sources, travel_reliability
+        )
+        ga_result.validation_result = ga_validation
+        scheduler_result.validation_result = scheduler_validation
+        comparison = {
+            "engines": {
+                "ga_v1": _summarize_result(ga_result, ga_ms, ga_validation),
+                "scheduler_v2": _summarize_result(scheduler_result, scheduler_ms, scheduler_validation),
+            },
+            "winner_hint": _winner_hint(ga_result, scheduler_result),
+        }
+        _log_result("GA_V1", ga_result, ga_ms)
+        _log_result("SCHEDULER_V2", scheduler_result, scheduler_ms)
+        try:
+            _print_comparison(ga_result, scheduler_result, comparison)
+        except UnicodeEncodeError as exc:
+            logger.warning("[Planner] skipped comparison console print due to encoding: %s", exc)
+        result = scheduler_result
+        validation = scheduler_validation
+        response_engine = "compare:scheduler_v2"
+    elif engine_name == "scheduler_v2":
+        result, scheduler_ms, validation = _run_scheduler_v2_engine(
+            req, places, travel_times, travel_distances, travel_sources, travel_reliability
+        )
+        result.validation_result = validation
+        ga_ms = 0
+        response_engine = "scheduler_v2"
+        _log_result("SCHEDULER_V2", result, scheduler_ms)
+    else:
+        result, ga_ms, validation = _run_ga_engine(
+            req, places, travel_times, travel_distances, travel_sources, travel_reliability
+        )
+        result.validation_result = validation
+        scheduler_ms = ga_ms
+        response_engine = "ga_v1"
+        _log_result("GA_V1", result, ga_ms)
+    total_ms = round((time.perf_counter() - started_at) * 1000)
+
+    logger.info(
+        "[Planner] completed engine=%s total=%sms matrix=%sms ga=%sms solver=%sms hotel=%s (%s)",
+        response_engine,
+        total_ms,
+        matrix_ms,
+        ga_ms,
+        scheduler_ms,
+        result.hotel.name,
+        result.hotel.id,
+    )
+    try:
+        planner.print_multi_day_schedule(result)
+    except UnicodeEncodeError as exc:
+        logger.warning("[Planner] skipped console schedule print due to encoding: %s", exc)
+    return _serialize_result(
+        result,
+        input_places=len(req.places),
+        total_ms=total_ms,
+        matrix_ms=matrix_ms,
+        ga_ms=ga_ms,
+        planner_engine=response_engine,
+        solver_ms=scheduler_ms,
+        validation=validation,
+        comparison=comparison,
+    )
+
+
+def _run_ga_engine(
+    req: ItineraryPlanRequest,
+    places: list[planner.Place],
+    travel_times: dict,
+    travel_distances: dict,
+    travel_sources: dict,
+    travel_reliability: dict,
+) -> tuple[planner.MultiDayResult, int, ValidationResult]:
+    started_at = time.perf_counter()
     engine = planner.MultiDayTripPlanner(
         places=places,
         num_days=req.num_days,
@@ -91,35 +177,144 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
         travel_vehicle=req.travel_vehicle,
         trip_start_date=req.trip_start_date,
     )
-    matrix_ms = round((time.perf_counter() - matrix_started_at) * 1000)
-    ga_started_at = time.perf_counter()
     try:
         result = engine.run(seed=req.seed)
     except Exception as e:
-        logger.exception("[Planner] Lỗi khi chạy Genetic Algorithm (TSP-TW GA)")
-        raise RuntimeError(f"Genetic Algorithm planning failed: {str(e)}") from e
-    places_map = {place.id: place for place in places}
-    for day_idx in range(req.num_days):
+        logger.exception("[Planner] GA v1 failed")
+        raise RuntimeError(f"GA v1 planning failed: {str(e)}") from e
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+    validation = FeasibilityValidator().validate(
+        result,
+        _build_places_map(places, req.num_days, _parse_trip_start_date(req.trip_start_date)),
+    )
+    return result, elapsed_ms, validation
+
+
+def _run_scheduler_v2_engine(
+    req: ItineraryPlanRequest,
+    places: list[planner.Place],
+    travel_times: dict,
+    travel_distances: dict,
+    travel_sources: dict,
+    travel_reliability: dict,
+) -> tuple[planner.MultiDayResult, int, ValidationResult]:
+    started_at = time.perf_counter()
+    engine = SchedulerV2Planner(
+        SchedulerV2Config(
+            places=places,
+            num_days=req.num_days,
+            travel_times=travel_times,
+            travel_distances=travel_distances,
+            travel_sources=travel_sources,
+            travel_reliability=travel_reliability,
+            selected_hotel_id=req.selected_hotel_id,
+            day_start_time=planner.time_to_minutes(req.daily_start_time),
+            day_end_time=planner.time_to_minutes(req.daily_end_time),
+            return_to_hotel=req.return_to_hotel,
+            require_goong_edges=req.require_goong,
+            budget_per_person=req.budget_per_person,
+            adult_count=req.adult_count,
+            child_count=req.child_count,
+            travel_vehicle=req.travel_vehicle,
+            trip_start_date=req.trip_start_date,
+        )
+    )
+    try:
+        result = engine.run(seed=req.seed)
+    except Exception as e:
+        logger.exception("[Planner] scheduler_v2 failed")
+        raise RuntimeError(f"scheduler_v2 planning failed: {str(e)}") from e
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+    validation = FeasibilityValidator().validate(
+        result,
+        _build_places_map(places, req.num_days, _parse_trip_start_date(req.trip_start_date)),
+    )
+    return result, elapsed_ms, validation
+
+
+def _build_places_map(
+    places: list[planner.Place],
+    num_days: int,
+    trip_start_date: datetime.date,
+) -> dict:
+    places_map: dict = {place.id: place for place in places}
+    for day_idx in range(num_days):
         weekday_idx = (trip_start_date.weekday() + day_idx) % 7
         for place in places:
             places_map[(day_idx + 1, place.id)] = place.to_poi_for_day(weekday_idx)
-    validation = FeasibilityValidator().validate(result, places_map)
-    result.validation_result = validation
-    ga_ms = round((time.perf_counter() - ga_started_at) * 1000)
-    total_ms = round((time.perf_counter() - started_at) * 1000)
+    return places_map
 
+
+def _summarize_result(
+    result: planner.MultiDayResult,
+    elapsed_ms: int,
+    validation: ValidationResult | None,
+) -> dict[str, Any]:
+    days = []
+    for day in result.days:
+        ga = day.ga_result
+        days.append(
+            {
+                "day": day.day,
+                "candidates": len(day.pois),
+                "visited": len(day.visited_pois),
+                "restaurants": ga.restaurant_count,
+                "travel_minutes": ga.total_travel_time,
+                "wait_minutes": ga.total_wait_time,
+                "visit_minutes": ga.total_visit_time,
+                "idle_minutes": ga.idle_time,
+                "distance_km": round(ga.total_distance_km, 2),
+                "fitness": round(ga.fitness, 4),
+                "day_cost": round(ga.total_day_cost),
+                "budget_overage": round(ga.budget_overage),
+                "stopped_reason": ga.stopped_reason,
+            }
+        )
+    validation_dict = (
+        validation.to_dict()
+        if validation is not None and hasattr(validation, "to_dict")
+        else {"is_feasible": True, "violations": [], "warnings": []}
+    )
+    return {
+        "elapsed_ms": elapsed_ms,
+        "hotel_id": result.hotel.id,
+        "hotel_name": result.hotel.name,
+        "total_visited": sum(len(day.visited_pois) for day in result.days),
+        "total_travel_minutes": sum(day.ga_result.total_travel_time for day in result.days),
+        "total_wait_minutes": sum(day.ga_result.total_wait_time for day in result.days),
+        "total_distance_km": round(sum(day.ga_result.total_distance_km for day in result.days), 2),
+        "total_cost": round(sum(day.ga_result.total_day_cost for day in result.days)),
+        "validation": validation_dict,
+        "days": days,
+    }
+
+
+def _winner_hint(ga_result: planner.MultiDayResult, scheduler_result: planner.MultiDayResult) -> str:
+    ga_visited = sum(len(day.visited_pois) for day in ga_result.days)
+    v2_visited = sum(len(day.visited_pois) for day in scheduler_result.days)
+    if v2_visited > ga_visited:
+        return "scheduler_v2_more_visited"
+    if ga_visited > v2_visited:
+        return "ga_v1_more_visited"
+    ga_travel = sum(day.ga_result.total_travel_time for day in ga_result.days)
+    v2_travel = sum(day.ga_result.total_travel_time for day in scheduler_result.days)
+    return "scheduler_v2_less_travel" if v2_travel <= ga_travel else "ga_v1_less_travel"
+
+
+def _log_result(label: str, result: planner.MultiDayResult, elapsed_ms: int) -> None:
     logger.info(
-        "[Planner] completed total=%sms matrix=%sms ga=%sms hotel=%s (%s)",
-        total_ms,
-        matrix_ms,
-        ga_ms,
+        "[%s] elapsed=%sms hotel=%s days=%s total_visited=%s",
+        label,
+        elapsed_ms,
         result.hotel.name,
-        result.hotel.id,
+        result.num_days,
+        sum(len(day.visited_pois) for day in result.days),
     )
     for day in result.days:
         ga = day.ga_result
         logger.info(
-            "[GA][Day %s] fitness=%.4f candidates=%s visited=%s skipped=%s travel=%s wait=%s idle=%s visit=%s restaurant=%s stopped=%s@%s",
+            "[%s][Day %s] fitness=%.4f candidates=%s visited=%s skipped=%s travel=%s wait=%s idle=%s visit=%s restaurant=%s cost=%s stopped=%s@%s",
+            label,
             day.day,
             ga.fitness,
             len(day.pois),
@@ -130,21 +325,38 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
             ga.idle_time,
             ga.total_visit_time,
             ga.restaurant_count,
+            round(ga.total_day_cost),
             ga.stopped_reason,
             ga.generations_run,
         )
-    try:
-        planner.print_multi_day_schedule(result)
-    except UnicodeEncodeError as exc:
-        logger.warning("[Planner] skipped console schedule print due to encoding: %s", exc)
-    return _serialize_result(
-        result,
-        input_places=len(req.places),
-        total_ms=total_ms,
-        matrix_ms=matrix_ms,
-        ga_ms=ga_ms,
-        validation=validation,
-    )
+
+
+def _print_comparison(
+    ga_result: planner.MultiDayResult,
+    scheduler_result: planner.MultiDayResult,
+    comparison: dict[str, Any],
+) -> None:
+    print("\n========== ITINERARY ENGINE COMPARISON ==========")
+    for label, result in (("GA_V1", ga_result), ("SCHEDULER_V2", scheduler_result)):
+        print(f"\n--- {label} ---")
+        for day in result.days:
+            ga = day.ga_result
+            print(
+                f"Day {day.day}: visited={len(day.visited_pois)}/{len(day.pois)} "
+                f"restaurant={ga.restaurant_count} travel={ga.total_travel_time}m "
+                f"wait={ga.total_wait_time}m idle={ga.idle_time}m "
+                f"cost={round(ga.total_day_cost)} fitness={ga.fitness:.2f} "
+                f"stop={ga.stopped_reason}"
+            )
+            for seq, entry in enumerate([e for e in ga.schedule if not e.is_return_to_hotel], start=1):
+                print(
+                    f"  {seq:02d}. {entry.service_start_str}-{entry.departure_str} "
+                    f"[{entry.place_type}] {entry.location_name} "
+                    f"move={entry.travel_minutes}m wait={entry.wait_time}m "
+                    f"cost={round(entry.estimated_cost)}"
+                )
+    print(f"\nWinner hint: {comparison.get('winner_hint')}")
+    print("=================================================\n")
 
 
 def _to_planner_place(
@@ -245,7 +457,10 @@ def _serialize_result(
     total_ms: int = 0,
     matrix_ms: int = 0,
     ga_ms: int = 0,
+    planner_engine: str = "ga_v1",
+    solver_ms: int = 0,
     validation: ValidationResult | None = None,
+    comparison: dict[str, Any] | None = None,
 ) -> ItineraryPlanResponse:
     days = [_serialize_day(day) for day in result.days]
     assignment_warnings = (
@@ -273,11 +488,14 @@ def _serialize_result(
         total_ms=total_ms,
         matrix_ms=matrix_ms,
         ga_ms=ga_ms,
+        planner_engine=planner_engine,
+        solver_ms=solver_ms,
         assignment_day_loads=assignment_day_loads,
         assignment_warnings=assignment_warnings,
         validation_is_feasible=bool(validation_dict["is_feasible"]),
         validation_violations=validation_dict["violations"],
         validation_warnings=validation_dict["warnings"],
+        comparison=comparison,
         days=days,
     )
 
@@ -357,3 +575,4 @@ def _serialize_entry(entry: planner.ScheduleEntry) -> ScheduleEntryResponse:
         unknown_hours=entry.unknown_hours,
         is_return_to_hotel=entry.is_return_to_hotel,
     )
+

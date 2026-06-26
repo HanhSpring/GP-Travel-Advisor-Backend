@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -53,6 +55,10 @@ class ItineraryPlanRequest(BaseModel):
     generations: int = Field(default=200, ge=1)
     mutation_rate: float = Field(default=0.30, ge=0, le=1)
     seed: int | None = 42
+    planner_engine: str = Field(
+        default="ga_v1",
+        description="ga_v1 | scheduler_v2 | compare. compare is intended for preview/debug only.",
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -179,9 +185,12 @@ class ItineraryPlanResponse(BaseModel):
     total_ms: int = 0
     matrix_ms: int = 0
     ga_ms: int = 0
+    planner_engine: str = "ga_v1"
+    solver_ms: int = 0
     assignment_day_loads: list[int] = Field(default_factory=list)
     assignment_warnings: list[str] = Field(default_factory=list)
     validation_is_feasible: bool = True
     validation_violations: list[dict] = Field(default_factory=list)
     validation_warnings: list[str] = Field(default_factory=list)
+    comparison: dict[str, Any] | None = None
     days: list[ItineraryDayResponse]

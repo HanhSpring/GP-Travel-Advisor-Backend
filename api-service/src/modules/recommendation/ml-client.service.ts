@@ -57,6 +57,7 @@ export interface ItineraryPlanPayload {
   generations?: number;
   mutation_rate?: number;
   seed?: number;
+  planner_engine?: 'ga_v1' | 'scheduler_v2' | 'compare';
 }
 
 @Injectable()

@@ -198,6 +198,7 @@ export class ItineraryController {
   async previewPlan(
     @Body() body: CreateItineraryDto,
     @Query('top_k') topK?: string,
+    @Query('engine') engine?: string,
   ) {
     const startedAt = Date.now();
     const requestedDays = this.calcRequestedDays(body.startDate, body.endDate);
@@ -205,13 +206,19 @@ export class ItineraryController {
       ? Math.min(parseInt(topK, 10) || 60, 200)
       : this.calcRetrievalTopK(requestedDays);
 
-    const plan = await this.recommendationService.planItinerary(body, k);
+    const plannerEngine = this.resolvePreviewEngine(engine);
+    const plan = await this.recommendationService.planItinerary(
+      body,
+      k,
+      plannerEngine,
+    );
     const executionTimeMs = Date.now() - startedAt;
     this.logPlanSummary(plan as any);
+    this.logComparisonSummary(plan as any);
 
     this.logger.warn(
       `POST /itinerary/plan/preview completed in ${executionTimeMs}ms ` +
-        `(persist=skipped, days=${requestedDays}, topK=${k})`,
+        `(persist=skipped, days=${requestedDays}, topK=${k}, engine=${plannerEngine})`,
     );
 
     return {
@@ -223,6 +230,7 @@ export class ItineraryController {
         topK: k,
         requestedDays,
         totalMs: executionTimeMs,
+        engine: plannerEngine,
       },
       plan,
     };
@@ -570,6 +578,16 @@ export class ItineraryController {
     return Math.min(200, Math.max(60, numDays * 20));
   }
 
+  private resolvePreviewEngine(
+    engine?: string,
+  ): 'ga_v1' | 'scheduler_v2' | 'compare' {
+    const normalized = (engine ?? 'ga_v1').trim().toLowerCase();
+    if (normalized === 'scheduler_v2' || normalized === 'compare') {
+      return normalized;
+    }
+    return 'ga_v1';
+  }
+
   private logPlanSummary(plan: any): void {
     const days = Array.isArray(plan?.days) ? plan.days : [];
     this.logger.warn(
@@ -583,6 +601,24 @@ export class ItineraryController {
           `visited=${day.visited_count}, travel=${day.total_travel_minutes}m, ` +
           `wait=${day.total_wait_minutes}m, visit=${day.total_visit_minutes}m, ` +
           `restaurant=${day.restaurant_count}, stopped=${day.stopped_reason}`,
+      );
+    }
+  }
+
+  private logComparisonSummary(plan: any): void {
+    const comparison = plan?.comparison;
+    if (!comparison?.engines) {
+      return;
+    }
+    this.logger.warn(
+      `Planner compare winner=${comparison.winner_hint ?? 'unknown'}`,
+    );
+    for (const [engine, summary] of Object.entries<any>(comparison.engines)) {
+      this.logger.warn(
+        `Compare ${engine}: elapsed=${summary.elapsed_ms}ms ` +
+          `visited=${summary.total_visited}, travel=${summary.total_travel_minutes}m, ` +
+          `wait=${summary.total_wait_minutes}m, distance=${summary.total_distance_km}km, ` +
+          `cost=${summary.total_cost}, feasible=${summary.validation?.is_feasible}`,
       );
     }
   }

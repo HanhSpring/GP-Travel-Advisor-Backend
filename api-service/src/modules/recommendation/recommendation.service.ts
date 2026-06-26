@@ -283,7 +283,11 @@ export class RecommendationService {
     return pool;
   }
 
-  async planItinerary(dto: CreateItineraryDto, topK = 60): Promise<unknown> {
+  async planItinerary(
+    dto: CreateItineraryDto,
+    topK = 60,
+    plannerEngine: 'ga_v1' | 'scheduler_v2' | 'compare' = 'ga_v1',
+  ): Promise<unknown> {
     const numDays = this.calcNumDays(dto.startDate, dto.endDate);
     const runStartedAt = Date.now();
     const fetchPlan = getStratifiedFetchPlan(
@@ -364,6 +368,7 @@ export class RecommendationService {
       generations: 120,
       mutation_rate: 0.3,
       seed: 42,
+      planner_engine: plannerEngine,
     };
 
     try {

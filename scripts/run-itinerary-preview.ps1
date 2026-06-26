@@ -10,12 +10,14 @@ param(
   [string]$EndDate = "2026-06-15",
   [string]$DailyStartTime = "07:00",
   [string]$DailyEndTime = "22:00",
-  [string]$TripIntent = "Văn hóa & Lịch sử",
+  [string]$TripIntent = "Kham pha tong hop",
   [int]$AdultCount = 2,
   [int]$ChildCount = 0,
   [int]$Budget = 5000000,
   [string]$OutDir = ".\tmp-run-logs",
   [int]$CandidatePreviewLimit = 20,
+  [ValidateSet("ga_v1", "scheduler_v2", "compare")]
+  [string]$Engine = "ga_v1",
   [switch]$ShowDetails
 )
 
@@ -69,12 +71,12 @@ $bodyObject = [ordered]@{
 }
 
 $body = $bodyObject | ConvertTo-Json -Depth 10
-$uri = "$ApiUrl/itinerary/plan/preview?top_k=$TopK"
+$uri = "$ApiUrl/itinerary/plan/preview?top_k=$TopK&engine=$Engine"
 
 Write-Host ""
 Write-Host "Running itinerary preview..."
 Write-Host "POST $uri"
-Write-Host "Intent: $TripIntent | Dates: $StartDate -> $EndDate | Time: $DailyStartTime-$DailyEndTime"
+Write-Host "Intent: $TripIntent | Dates: $StartDate -> $EndDate | Time: $DailyStartTime-$DailyEndTime | Engine: $Engine"
 
 $stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
 $response = Invoke-RestMethod `
@@ -98,6 +100,53 @@ if (Test-Path $debugPath) {
 $plan = $response.plan
 if ($null -eq $plan -and $null -ne $response.days) {
   $plan = $response
+}
+
+if ($plan.comparison -and $plan.comparison.engines) {
+  Write-Host ""
+  Write-Host "=== ENGINE COMPARISON ==="
+  $plan.comparison.engines.PSObject.Properties |
+    Sort-Object Name |
+    ForEach-Object {
+      $summary = $_.Value
+      [pscustomobject]@{
+        Engine = $_.Name
+        Time = Format-Milliseconds $summary.elapsed_ms
+        Visited = $summary.total_visited
+        Travel = Format-Minutes $summary.total_travel_minutes
+        Wait = Format-Minutes $summary.total_wait_minutes
+        Km = $summary.total_distance_km
+        Cost = $summary.total_cost
+        Feasible = $summary.validation.is_feasible
+      }
+    } |
+    Format-Table -AutoSize
+  Write-Host "Winner hint: $($plan.comparison.winner_hint)"
+
+  foreach ($engineName in @("ga_v1", "scheduler_v2")) {
+    $engineSummary = $plan.comparison.engines.$engineName
+    if ($null -eq $engineSummary) { continue }
+    Write-Host ""
+    Write-Host "=== $engineName DAY COMPARISON ==="
+    @($engineSummary.days) |
+      ForEach-Object {
+        [pscustomobject]@{
+          Day = $_.day
+          Candidates = $_.candidates
+          Visited = $_.visited
+          Restaurant = $_.restaurants
+          Travel = Format-Minutes $_.travel_minutes
+          Visit = Format-Minutes $_.visit_minutes
+          Wait = Format-Minutes $_.wait_minutes
+          Idle = Format-Minutes $_.idle_minutes
+          Km = $_.distance_km
+          Cost = $_.day_cost
+          Fitness = $_.fitness
+          Stop = $_.stopped_reason
+        }
+      } |
+      Format-Table -AutoSize
+  }
 }
 
 Write-Host ""
