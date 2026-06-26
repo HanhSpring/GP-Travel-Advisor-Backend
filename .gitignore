@@ -196,7 +196,7 @@ secrets/
 !api-service/supabase/migrations/*.sql
 *.sqlite
 *.db
-
+.temp/
 
 .claude/
 ai-service/data/Places.csv

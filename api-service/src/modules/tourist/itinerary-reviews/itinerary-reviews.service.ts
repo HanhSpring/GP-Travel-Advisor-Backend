@@ -71,6 +71,10 @@ interface ReviewContentRow {
   content: string | null;
 }
 
+interface GeofenceVisitRow {
+  itinerary_detail_id: string;
+}
+
 @Injectable()
 export class ItineraryReviewsService {
   constructor(private readonly configService: ConfigService) {}
@@ -662,6 +666,38 @@ export class ItineraryReviewsService {
     return byPlaceId;
   }
 
+  private async getReviewedPlaceIdsForItinerary(
+    touristId: string,
+    itineraryId: string,
+  ): Promise<Set<string>> {
+    const { data, error } = await supabase
+      .schema('review_ai')
+      .from('reviews')
+      .select('place_id')
+      .eq('tourist_id', touristId)
+      .eq('itinerary_id', itineraryId)
+      .returns<Array<{ place_id: string }>>();
+
+    if (error) throw new InternalServerErrorException(error.message);
+    return new Set((data ?? []).map((item) => item.place_id));
+  }
+
+  private async getVisitStatusForItinerary(
+    touristId: string,
+    itineraryId: string,
+  ): Promise<Set<string>> {
+    const { data } = await supabase
+      .schema('tracking')
+      .from('geofence_visits')
+      .select('itinerary_detail_id')
+      .eq('itinerary_id', itineraryId)
+      .eq('tourist_id', touristId)
+      .or('status.eq.visited,checked_in_at.not.is.null')
+      .returns<GeofenceVisitRow[]>();
+
+    return new Set((data ?? []).map((r) => r.itinerary_detail_id));
+  }
+
   async getSubmittedReview(touristId: string, itineraryId: string) {
     if (!touristId || !itineraryId) {
       throw new BadRequestException('tourist_id and itinerary_id are required');
@@ -809,12 +845,18 @@ export class ItineraryReviewsService {
       throw new BadRequestException('tourist_id and itinerary_id are required');
     }
 
+    // Auth check first — throws 404 if itinerary doesn't belong to tourist
     const itinerary = await this.getItineraryOrThrow(touristId, itineraryId);
-    const details = await this.getItineraryDetails(itineraryId);
-    const summaryReview = await this.getItinerarySummaryReview(
-      touristId,
-      itineraryId,
-    );
+
+    // Run remaining independent queries in parallel to reduce latency
+    const [details, summaryReview, placeReviewsMap, visitSet] =
+      await Promise.all([
+        this.getItineraryDetails(itineraryId),
+        this.getItinerarySummaryReview(touristId, itineraryId),
+        this.getPlaceReviewsForItinerary(touristId, itineraryId),
+        this.getVisitStatusForItinerary(touristId, itineraryId),
+      ]);
+
     const placeIds = Array.from(new Set(details.map((item) => item.place_id)));
     const places = await this.getPlaces(placeIds);
     const placeMap = new Map(places.map((item) => [item.id, item]));
@@ -839,6 +881,7 @@ export class ItineraryReviewsService {
       day_filters: dayFilters,
       places: details.map((item) => {
         const place = placeMap.get(item.place_id);
+        const review = placeReviewsMap.get(item.place_id);
 
         return {
           itinerary_detail_id: item.id,
@@ -849,8 +892,10 @@ export class ItineraryReviewsService {
           place_id: item.place_id,
           place_name: place?.name ?? 'Địa điểm',
           place_image_url: this.getPlaceImage(place?.image_url ?? null),
-          rating: null,
-          content: null,
+          rating: review?.rating ?? null,
+          content: review?.content ?? null,
+          has_review: placeReviewsMap.has(item.place_id),
+          is_visited: visitSet.has(item.id),
         };
       }),
       media_urls: [],
@@ -902,7 +947,10 @@ export class ItineraryReviewsService {
     }
 
     await this.getItineraryOrThrow(touristId, itineraryId);
-    const details = await this.getItineraryDetails(itineraryId);
+    const [details, existingPlaceIds] = await Promise.all([
+      this.getItineraryDetails(itineraryId),
+      this.getReviewedPlaceIdsForItinerary(touristId, itineraryId),
+    ]);
 
     if (details.length === 0) {
       throw new BadRequestException('Itinerary has no place details to review');
@@ -937,6 +985,9 @@ export class ItineraryReviewsService {
 
     if (payload.apply_all_places && hasOverallRating) {
       for (const item of details) {
+        if (existingPlaceIds.has(item.place_id)) {
+          continue;
+        }
         ratingByDetailId.set(item.id, {
           itinerary_detail_id: item.id,
           place_id: item.place_id,
@@ -954,6 +1005,9 @@ export class ItineraryReviewsService {
         throw new BadRequestException(
           `itinerary_detail_id ${placeReview.itinerary_detail_id} does not belong to itinerary ${itineraryId}`,
         );
+      }
+      if (existingPlaceIds.has(detail.place_id)) {
+        continue;
       }
 
       ratingByDetailId.set(placeReview.itinerary_detail_id, {
@@ -1011,9 +1065,7 @@ export class ItineraryReviewsService {
       const { error: insertReviewsError } = await supabase
         .schema('review_ai')
         .from('reviews')
-        .insert(
-          reviewsWithTags,
-        );
+        .insert(reviewsWithTags);
 
       if (insertReviewsError) {
         throw new InternalServerErrorException(insertReviewsError.message);
