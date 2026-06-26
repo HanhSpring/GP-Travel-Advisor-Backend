@@ -1,13 +1,13 @@
 import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { supabase } from '../../config/supabase';
-import { City } from './entity/city.entity';
+import { PlaceType } from './entity/place-type.entity';
 
 @Injectable()
-export class CitiesService {
-  async findAll(searchKeyword?: string): Promise<City[]> {
+export class PlaceTypesService {
+  async findAll(searchKeyword?: string): Promise<PlaceType[]> {
     let query = supabase
       .schema('travel')
-      .from('cities')
+      .from('types')
       .select('id, name')
       .order('name', { ascending: true });
 
@@ -19,10 +19,10 @@ export class CitiesService {
 
     if (error) {
       throw new InternalServerErrorException(
-        `Lỗi khi lấy danh sách thành phố: ${error.message}`,
+        `Lỗi khi lấy danh sách loại hình kinh doanh: ${error.message}`,
       );
     }
 
-    return data as City[];
+    return data as PlaceType[];
   }
 }

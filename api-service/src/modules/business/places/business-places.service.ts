@@ -5,30 +5,25 @@ import {
 } from '@nestjs/common';
 import { supabase } from '../../../config/supabase';
 
-interface CategoryRow {
-  id: string;
-  name: string;
-}
-
-interface PlaceCategoryJoinRow {
-  category_id: string;
-  categories: CategoryRow | CategoryRow[] | null;
-}
-
 interface PlaceRow {
   id: string;
-  image_url: string | null;
+  image_url: string[] | string | null;
   name: string;
   address: string | null;
   is_approved: boolean | null;
   average_rating: number | null;
   review_count: number | null;
   registered_date: string | null;
-  place_categories: PlaceCategoryJoinRow[] | null;
+  type_id: string | null;
 }
 
 interface BusinessRow {
   id: string;
+}
+
+interface TypeRow {
+  id: string;
+  name: string;
 }
 
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
@@ -89,36 +84,6 @@ export class BusinessPlacesService {
     return 'pending';
   }
 
-  private extractCategoryNames(
-    placeCategories: PlaceCategoryJoinRow[] | null,
-  ): string[] {
-    if (!placeCategories || placeCategories.length === 0) {
-      return [];
-    }
-
-    const names: string[] = [];
-
-    for (const item of placeCategories) {
-      const categoryData = item.categories;
-
-      if (!categoryData) {
-        continue;
-      }
-
-      if (Array.isArray(categoryData)) {
-        for (const category of categoryData) {
-          if (category?.name) {
-            names.push(category.name);
-          }
-        }
-      } else if (categoryData.name) {
-        names.push(categoryData.name);
-      }
-    }
-
-    return names;
-  }
-
   async getPlaces(
     vendorId: string,
     page: number = 1,
@@ -147,10 +112,11 @@ export class BusinessPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, address, image_url, is_approved, average_rating, review_count, registered_date, place_categories(category_id, categories(id, name))',
+        'id, name, address, image_url, is_approved, average_rating, review_count, registered_date, type_id',
         { count: 'exact' },
       )
-      .eq('vendor_id', resolvedVendorId);
+      .eq('vendor_id', resolvedVendorId)
+      .or('is_active.is.null,is_active.eq.true');
 
     if (status === 'pending') {
       query = query.is('is_approved', null);
@@ -181,12 +147,38 @@ export class BusinessPlacesService {
       throw new InternalServerErrorException(error.message);
     }
 
-    const places = ((data ?? []) as PlaceRow[]).map((item) => ({
+    const placeRows = (data ?? []) as PlaceRow[];
+    const typeIds = [
+      ...new Set(
+        placeRows
+          .map((item) => item.type_id)
+          .filter((value): value is string => Boolean(value)),
+      ),
+    ];
+    const typeNameById = new Map<string, string>();
+
+    if (typeIds.length > 0) {
+      const { data: typesData, error: typesError } = await supabase
+        .schema('travel')
+        .from('types')
+        .select('id, name')
+        .in('id', typeIds);
+
+      if (typesError) {
+        throw new InternalServerErrorException(typesError.message);
+      }
+
+      for (const type of (typesData ?? []) as TypeRow[]) {
+        typeNameById.set(type.id, type.name);
+      }
+    }
+
+    const places = placeRows.map((item) => ({
       id: item.id,
       name: item.name,
       address: item.address ?? '',
       image_url: item.image_url ?? null,
-      categories: this.extractCategoryNames(item.place_categories),
+      categories: item.type_id ? [typeNameById.get(item.type_id) ?? 'Khác'] : [],
       rating: Number(item.average_rating) || 0,
       review_count: item.review_count || 0,
       status: this.mapStatus(item.is_approved),

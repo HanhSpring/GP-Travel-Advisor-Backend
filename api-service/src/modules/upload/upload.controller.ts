@@ -120,6 +120,7 @@ export class UploadController {
   }
 
   // 3. LUỒNG UPLOAD ẢNH ĐỊA ĐIỂM (Chủ cơ sở)
+  @Post('place-image')
   @Post('place')
   @UseInterceptors(FileInterceptor('file'))
   async uploadPlace(
@@ -153,5 +154,21 @@ export class UploadController {
     @Body('foodId') foodId: string,
   ) {
     return this.uploadService.uploadFoodImage(file, foodId);
+  }
+
+  @Post('food-draft')
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadFoodDraft(
+    @UploadedFile(
+      new ParseFilePipe({
+        validators: [
+          new MaxFileSizeValidator({ maxSize: 5 * 1024 * 1024 }),
+          new FileTypeValidator({ fileType: 'image/*' }),
+        ],
+      }),
+    )
+    file: Express.Multer.File,
+  ) {
+    return this.uploadService.uploadFoodDraftImage(file);
   }
 }

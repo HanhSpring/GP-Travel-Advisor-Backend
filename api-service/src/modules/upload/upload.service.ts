@@ -309,14 +309,9 @@ export class UploadService {
         .toBuffer();
 
       const fileName = `places/place-${placeId}-${Date.now()}.webp`;
-      const url = await this.pushToR2(optimizedBuffer, fileName);
+      const url = await this.uploadPlaceImageBuffer(optimizedBuffer, fileName);
 
       // Lưu URL vào bảng travel.place_images
-      await this.supabase
-        .schema('travel')
-        .from('place_images')
-        .insert({ place_id: placeId, image_url: url });
-
       return { url };
     } catch (error) {
       throw new InternalServerErrorException('Lỗi upload ảnh địa điểm');
@@ -334,11 +329,12 @@ export class UploadService {
         .toBuffer();
 
       const fileName = `foods/food-${foodId}-${Date.now()}.webp`;
-      const url = await this.pushToR2(optimizedBuffer, fileName);
+      const url = await this.uploadFoodImageBuffer(optimizedBuffer, fileName);
 
       await this.supabase
+        .schema('order_sys')
         .from('food_items')
-        .update({ image_url: url })
+        .update({ image_url: [url] })
         .eq('id', foodId);
 
       return { success: true, url };
@@ -349,7 +345,128 @@ export class UploadService {
   }
 
   // Hàm bổ trợ để đẩy lên R2
+  async uploadFoodDraftImage(file: Express.Multer.File) {
+    try {
+      const optimizedBuffer = await sharp(file.buffer)
+        .resize(800, 600, {
+          fit: 'cover',
+          position: 'centre',
+        })
+        .webp({ quality: 85 })
+        .toBuffer();
+
+      const fileName = `foods/draft-${Date.now()}-${Math.random().toString(36).slice(2)}.webp`;
+      const url = await this.uploadFoodImageBuffer(optimizedBuffer, fileName);
+
+      return { success: true, url };
+    } catch (error) {
+      console.error('Food draft upload error:', error);
+      throw new InternalServerErrorException(
+        error?.message || 'Loi upload anh mon an',
+      );
+    }
+  }
+
+  private async uploadPlaceImageBuffer(
+    buffer: Buffer,
+    key: string,
+  ): Promise<string> {
+    if (this.hasR2Config()) {
+      return this.pushToR2(buffer, key);
+    }
+
+    return this.pushToSupabaseStorage(buffer, key);
+  }
+
+  private async uploadFoodImageBuffer(
+    buffer: Buffer,
+    key: string,
+  ): Promise<string> {
+    if (this.hasR2Config()) {
+      return this.pushToR2(buffer, key);
+    }
+
+    return this.pushToSupabaseStorage(buffer, key);
+  }
+
+  private hasR2Config(): boolean {
+    return [
+      'CLOUDFLARE_R2_ENDPOINT',
+      'CLOUDFLARE_R2_ACCESS_KEY_ID',
+      'CLOUDFLARE_R2_SECRET_ACCESS_KEY',
+      'CLOUDFLARE_R2_BUCKET_NAME',
+      'CLOUDFLARE_R2_PUBLIC_URL',
+    ].every((key) => Boolean(this.configService.get<string>(key)?.trim()));
+  }
+
+  private async pushToSupabaseStorage(
+    buffer: Buffer,
+    key: string,
+  ): Promise<string> {
+    const bucketName =
+      this.configService.get<string>('SUPABASE_FOOD_IMAGE_BUCKET')?.trim() ||
+      'food-images';
+
+    await this.ensureSupabasePublicBucket(bucketName);
+
+    const { error: uploadError } = await this.supabase.storage
+      .from(bucketName)
+      .upload(key, buffer, {
+        contentType: 'image/webp',
+        upsert: true,
+      });
+
+    if (uploadError) {
+      throw new Error(
+        `Khong the upload anh mon an len Supabase Storage: ${uploadError.message}`,
+      );
+    }
+
+    const { data } = this.supabase.storage.from(bucketName).getPublicUrl(key);
+    if (!data.publicUrl) {
+      throw new Error('Khong the tao public URL cho anh mon an');
+    }
+
+    return data.publicUrl;
+  }
+
+  private async ensureSupabasePublicBucket(bucketName: string) {
+    const { data: buckets, error: listError } =
+      await this.supabase.storage.listBuckets();
+
+    if (listError) {
+      throw new Error(
+        `Khong the kiem tra Supabase Storage bucket: ${listError.message}`,
+      );
+    }
+
+    if (buckets?.some((bucket) => bucket.name === bucketName)) {
+      return;
+    }
+
+    const { error: createError } = await this.supabase.storage.createBucket(
+      bucketName,
+      {
+        public: true,
+        fileSizeLimit: 5 * 1024 * 1024,
+        allowedMimeTypes: ['image/webp'],
+      },
+    );
+
+    if (createError && !createError.message?.toLowerCase().includes('exists')) {
+      throw new Error(
+        `Backend chua cau hinh R2 va khong the tao Supabase Storage bucket "${bucketName}": ${createError.message}`,
+      );
+    }
+  }
+
   private async pushToR2(buffer: Buffer, key: string): Promise<string> {
+    if (!this.hasR2Config()) {
+      throw new Error(
+        'Missing Cloudflare R2 configuration for image upload',
+      );
+    }
+
     await this.s3Client.send(
       new PutObjectCommand({
         Bucket: this.configService.get('CLOUDFLARE_R2_BUCKET_NAME'),
