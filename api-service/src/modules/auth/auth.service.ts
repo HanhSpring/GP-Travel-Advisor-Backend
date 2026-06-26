@@ -18,6 +18,7 @@ import axios from 'axios';
 export class AuthService {
   private supabase: SupabaseClient;
   private supabaseAdmin: SupabaseClient;
+  private readonly invalidLoginMessage = 'Tài khoản hoặc mật khẩu không đúng.';
 
   constructor() {
     const supabaseUrl = process.env.SUPABASE_URL?.trim();
@@ -135,9 +136,7 @@ export class AuthService {
         .single();
 
       if (dbError || !userData) {
-        throw new UnauthorizedException(
-          'Không tìm thấy tài khoản với số điện thoại này',
-        );
+        throw new UnauthorizedException(this.invalidLoginMessage);
       }
 
       finalEmail = userData.email;
@@ -156,7 +155,7 @@ export class AuthService {
       await this.supabase.auth.signInWithPassword(credentials);
 
     if (error) {
-      throw new UnauthorizedException(`Đăng nhập thất bại: ${error.message}`);
+      throw new UnauthorizedException(this.invalidLoginMessage);
     }
 
     if (!data.session) {
