@@ -118,7 +118,7 @@ class SchedulerV2Planner:
         )
         self.rooms = max(1, math.ceil(self.full_people / planner.ROOM_CAPACITY))
         self.budget_per_person = max(0.0, float(config.budget_per_person or 0))
-        self.trip_budget = self.budget_per_person * self.full_people
+        self.trip_budget = (self.budget_per_person * self.full_people) * 0.9
 
         if config.selected_hotel_id:
             hotel_place = next(
