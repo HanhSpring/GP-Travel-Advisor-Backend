@@ -31,6 +31,8 @@ class Settings(BaseSettings):
 
     # PhoBERT path (optional)
     phobert_time_model_path: Optional[str] = None
+    phobert_time_model_r2_prefix: Optional[str] = None
+    phobert_time_model_cache_dir: str = "/tmp/ai_cache/phobert_timelabel/checkpoint-60"
 
     # Recommender local paths
     reco_artifact_dir: str = "recommender_artifacts"

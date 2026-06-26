@@ -40,11 +40,45 @@ def ensure_artifacts(settings) -> tuple[Path, Path]:
     bucket = settings.r2_bucket_name
 
     logger.info("🔄 Đồng bộ artifact từ R2 bucket '%s'...", bucket)
-    _sync_prefix(client, bucket, "recommender_artifacts/", artifact_dir)
-    _sync_prefix(client, bucket, "data/", data_dir)
+    _sync_prefix(
+        client,
+        bucket,
+        "recommender_artifacts/",
+        artifact_dir,
+        skip_suffixes=_SKIP_SUFFIXES,
+        skip_dirs=_SKIP_DIRS,
+    )
+    _sync_prefix(
+        client,
+        bucket,
+        "data/",
+        data_dir,
+        skip_suffixes=_SKIP_SUFFIXES,
+        skip_dirs=_SKIP_DIRS,
+    )
     logger.info("✅ Artifact đã sẵn sàng tại %s", cache)
 
     return artifact_dir, data_dir
+
+
+def ensure_r2_prefix(settings, prefix: str, local_dir: Path) -> Path:
+    """Ensure all objects under an R2 prefix exist in a local cache directory.
+
+    This is useful for model directories such as HuggingFace checkpoints, where
+    transformers expects a normal filesystem path containing config/model files.
+    """
+    if not prefix:
+        raise ValueError("R2 prefix must not be empty")
+    if not _r2_configured(settings):
+        raise ValueError("R2 is not configured")
+
+    normalized_prefix = prefix.strip("/")
+    local_dir.mkdir(parents=True, exist_ok=True)
+
+    client = _make_client(settings)
+    bucket = settings.r2_bucket_name
+    _sync_prefix(client, bucket, f"{normalized_prefix}/", local_dir)
+    return local_dir
 
 
 # ─────────────────────────── internal ────────────────────────────────────────
@@ -72,7 +106,14 @@ def _make_client(settings):
     )
 
 
-def _sync_prefix(client, bucket: str, prefix: str, local_dir: Path) -> None:
+def _sync_prefix(
+    client,
+    bucket: str,
+    prefix: str,
+    local_dir: Path,
+    skip_suffixes: set[str] | None = None,
+    skip_dirs: set[str] | None = None,
+) -> None:
     """Download tất cả object dưới prefix; bỏ qua nếu local size đã khớp."""
     paginator = client.get_paginator("list_objects_v2")
     total, skipped, downloaded = 0, 0, 0
@@ -87,11 +128,11 @@ def _sync_prefix(client, bucket: str, prefix: str, local_dir: Path) -> None:
 
             # Bỏ qua subdirectory không cần thiết
             parts = rel.split("/")
-            if len(parts) > 1 and parts[0] in _SKIP_DIRS:
+            if skip_dirs and len(parts) > 1 and parts[0] in skip_dirs:
                 continue
 
             # Bỏ qua file tài liệu
-            if Path(rel).suffix.lower() in _SKIP_SUFFIXES:
+            if skip_suffixes and Path(rel).suffix.lower() in skip_suffixes:
                 continue
 
             total += 1
