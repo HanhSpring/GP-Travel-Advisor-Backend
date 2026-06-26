@@ -140,6 +140,39 @@ export class AdminPlacesService {
       .trim();
   }
 
+  private sanitizeSupabaseOrValue(value: string): string {
+    return value.replace(/[(),]/g, ' ').trim();
+  }
+
+  private async getVendorIdsBySearch(search: string): Promise<string[]> {
+    const keyword = this.sanitizeSupabaseOrValue(search);
+
+    if (!keyword) {
+      return [];
+    }
+
+    const { data, error } = await supabase
+      .schema('public')
+      .from('users')
+      .select('id')
+      .or(
+        `full_name.ilike.%${keyword}%,email.ilike.%${keyword}%,phone_number.ilike.%${keyword}%`,
+      )
+      .limit(200);
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return Array.from(
+      new Set(
+        ((data ?? []) as Array<{ id: string | null }>)
+          .map((item) => item.id)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
+  }
+
   private extractCityName(cityData: CityRow | CityRow[] | null): string {
     if (!cityData) {
       return '';
@@ -738,7 +771,20 @@ export class AdminPlacesService {
     if (normalizedSearch) {
       const simpleSearch = search?.trim() ?? '';
       if (simpleSearch) {
-        query = query.ilike('name', `%${simpleSearch}%`);
+        const keyword = this.sanitizeSupabaseOrValue(simpleSearch);
+        if (!keyword) {
+          query = query.ilike('name', `%${simpleSearch}%`);
+        } else {
+        const matchingVendorIds = await this.getVendorIdsBySearch(keyword);
+
+        if (matchingVendorIds.length > 0) {
+          query = query.or(
+            `name.ilike.%${keyword}%,vendor_id.in.(${matchingVendorIds.join(',')})`,
+          );
+        } else {
+          query = query.ilike('name', `%${keyword}%`);
+        }
+        }
       }
     }
 
