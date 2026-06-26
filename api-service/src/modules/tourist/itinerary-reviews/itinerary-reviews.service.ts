@@ -11,7 +11,6 @@ import {
   SubmitItineraryReviewDto,
   SubmitReviewMediaDto,
 } from './dto/submit-itinerary-review.dto';
-import { ModerationService } from '../../moderation/moderation.service';
 
 interface ItineraryRow {
   id: string;
@@ -74,10 +73,7 @@ interface ReviewContentRow {
 
 @Injectable()
 export class ItineraryReviewsService {
-  constructor(
-    private readonly configService: ConfigService,
-    private readonly moderationService: ModerationService,
-  ) {}
+  constructor(private readonly configService: ConfigService) {}
 
   private getPlaceImage(value: string | string[] | null): string | null {
     const raw = Array.isArray(value) ? value[0] : value;
@@ -243,24 +239,8 @@ export class ItineraryReviewsService {
     overallContent: string | null,
     applyAllPlaces: boolean,
     tags: string[] | null,
+    mediaUrls: string[],
   ): Promise<string | null> {
-    const isUnknownColumnError = (error: { code?: string; message?: string }) =>
-      error.code === '42703' ||
-      error.code === 'PGRST204' ||
-      error.code === 'PGRST205' ||
-      (error.message || '').includes('Could not find the') ||
-      ((error.message || '').includes('column') &&
-        (error.message || '').includes('does not exist'));
-
-    if (overallContent) {
-      const modResult = await this.moderationService.moderateReview(overallContent);
-      if (modResult.status === 'violation') {
-        throw new BadRequestException(
-          `Đánh giá lịch trình của bạn vi phạm tiêu chuẩn cộng đồng (${modResult.violations.join(', ')}). Vui lòng chỉnh sửa lại.`,
-        );
-      }
-    }
-
     const hasTags = Boolean(tags?.length);
     const hasSummary =
       overallRating !== null || Boolean(overallContent) || hasTags;
@@ -269,9 +249,9 @@ export class ItineraryReviewsService {
     }
 
     const existing = await this.getReviewDraft(touristId, itineraryId);
-    let fallbackExistingId: string | null = null;
+    let targetId = existing?.id;
 
-    if (!existing) {
+    if (!targetId) {
       const { data: latestByItinerary } = await supabase
         .schema('review_ai')
         .from('itinerary_reviews')
@@ -281,168 +261,42 @@ export class ItineraryReviewsService {
         .limit(1)
         .maybeSingle<{ id: string }>();
 
-      fallbackExistingId = latestByItinerary?.id ?? null;
+      targetId = latestByItinerary?.id;
     }
 
-    const updateCandidates: Array<Record<string, unknown>> = [
-      {
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        overall_rating: overallRating,
-        overall_content: overallContent,
-        apply_all_places: applyAllPlaces,
-        tags,
-        is_approved: null,
-      },
-      {
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        overall_rating: overallRating,
-        overall_content: overallContent,
-        apply_all_places: applyAllPlaces,
-        is_approved: null,
-      },
-      {
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        rating: overallRating,
-        content: overallContent,
-        apply_all_places: applyAllPlaces,
-        is_approved: null,
-      },
-      {
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        rating: overallRating,
-        content: overallContent,
-        status: 'pending',
-      },
-      {
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        rating: overallRating,
-        content: overallContent,
-      },
-      {
-        rating: overallRating,
-        content: overallContent,
-        status: 'pending',
-      },
-      {
-        rating: overallRating,
-        content: overallContent,
-      },
-      {
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        rating: overallRating,
-        content: overallContent,
-        is_approved: null,
-      },
-      {
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        score: overallRating,
-        comment: overallContent,
-        is_approved: null,
-      },
-    ];
+    const payloadToSave = {
+      tourist_id: touristId,
+      itinerary_id: itineraryId,
+      rating: overallRating,
+      content: overallContent,
+      url_image: mediaUrls,
+      tags,
+      status: 'pending',
+    };
 
-    if (existing || fallbackExistingId != null) {
-      const targetId = existing?.id ?? (fallbackExistingId as string);
-      for (const candidate of updateCandidates) {
-        const { error } = await supabase
-          .schema('review_ai')
-          .from('itinerary_reviews')
-          .update(candidate)
-          .eq('id', targetId);
+    if (targetId) {
+      const { error } = await supabase
+        .schema('review_ai')
+        .from('itinerary_reviews')
+        .update(payloadToSave)
+        .eq('id', targetId);
 
-        if (!error) {
-          return targetId;
-        }
-
-        const isUnknownColumn = isUnknownColumnError(error);
-        if (!isUnknownColumn) {
-          throw new InternalServerErrorException(error.message);
-        }
+      if (error) {
+        throw new InternalServerErrorException(error.message);
       }
-
       return targetId;
-    }
+    } else {
+      const newId = randomUUID();
+      const { error } = await supabase
+        .schema('review_ai')
+        .from('itinerary_reviews')
+        .insert([{ id: newId, ...payloadToSave }]);
 
-    const baseCandidates: Array<Record<string, unknown>> = [
-      {
-        id: randomUUID(),
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        status: 'pending',
-      },
-      {
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        status: 'pending',
-      },
-      {
-        id: randomUUID(),
-        itinerary_id: itineraryId,
-        status: 'pending',
-      },
-      {
-        itinerary_id: itineraryId,
-        status: 'pending',
-      },
-      {
-        id: randomUUID(),
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        is_approved: null,
-      },
-      {
-        tourist_id: touristId,
-        itinerary_id: itineraryId,
-        is_approved: null,
-      },
-      {
-        id: randomUUID(),
-        itinerary_id: itineraryId,
-        is_approved: null,
-      },
-      {
-        itinerary_id: itineraryId,
-        is_approved: null,
-      },
-    ];
-
-    for (const base of baseCandidates) {
-      for (const update of updateCandidates) {
-        const candidate = {
-          ...base,
-          ...update,
-        };
-
-        const { data, error } = await supabase
-          .schema('review_ai')
-          .from('itinerary_reviews')
-          .insert([candidate])
-          .select('id')
-          .maybeSingle<{ id: string }>();
-
-        if (!error) {
-          return data?.id ?? null;
-        }
-
-        const isUnknownColumn = isUnknownColumnError(error);
-        const isFkTouristError = (error.message || '').includes(
-          'itinerary_reviews_tourist_id_fkey',
-        );
-
-        if (!isUnknownColumn && !isFkTouristError) {
-          throw new InternalServerErrorException(error.message);
-        }
+      if (error) {
+        throw new InternalServerErrorException(error.message);
       }
+      return newId;
     }
-
-    return null;
   }
 
   private async getItinerarySummaryReview(
@@ -1015,6 +869,11 @@ export class ItineraryReviewsService {
       throw new BadRequestException('tourist_id and itinerary_id are required');
     }
 
+    const r2PublicUrl = process.env.CLOUDFLARE_R2_PUBLIC_URL || '';
+    const overallMediaUrls = (payload.media || [])
+      .sort((a, b) => a.sort_order - b.sort_order)
+      .map((m) => `${r2PublicUrl}/${m.object_key}`);
+
     const normalizedOverallContent = this.normalizeOptionalText(
       payload.overall_content,
     );
@@ -1056,6 +915,7 @@ export class ItineraryReviewsService {
       normalizedOverallContent,
       payload.apply_all_places ?? false,
       normalizedOverallTags,
+      overallMediaUrls,
     );
 
     if (!itineraryReviewId) {
@@ -1071,6 +931,7 @@ export class ItineraryReviewsService {
         place_id: string;
         rating: number;
         content: string | null;
+        mediaUrls: string[];
       }
     >();
 
@@ -1081,6 +942,7 @@ export class ItineraryReviewsService {
           place_id: item.place_id,
           rating: payload.overall_rating as number,
           content: null,
+          mediaUrls: [],
         });
       }
     }
@@ -1099,6 +961,9 @@ export class ItineraryReviewsService {
         place_id: detail.place_id,
         rating: placeReview.rating,
         content: this.normalizeOptionalText(placeReview.content),
+        mediaUrls: (placeReview.media || [])
+          .sort((a, b) => a.sort_order - b.sort_order)
+          .map((m) => `${r2PublicUrl}/${m.object_key}`),
       });
     }
 
@@ -1109,33 +974,17 @@ export class ItineraryReviewsService {
     });
     const allMediaUrls = [...itineraryMediaUrls];
 
-    for (const pr of finalPlaceRatings) {
-      if (pr.content) {
-        const modResult = await this.moderationService.moderateReview(pr.content);
-        if (modResult.status === 'violation') {
-          throw new BadRequestException(
-            `Đánh giá địa điểm vi phạm tiêu chuẩn cộng đồng (${modResult.violations.join(', ')}). Vui lòng chỉnh sửa lại.`,
-          );
-        }
-      }
-    }
-
     const reviewsWithTags = finalPlaceRatings.map((item) => {
       const matchingPlaceReview = payload.place_reviews?.find(
         (placeReview) =>
           placeReview.itinerary_detail_id === item.itinerary_detail_id,
-      ) as { tags?: string[] | null; media?: any[] } | undefined;
+      ) as { tags?: string[] | null } | undefined;
 
       const tags: string[] | null = Array.isArray(matchingPlaceReview?.tags)
         ? [...matchingPlaceReview.tags]
         : null;
 
       return {
-        source_itinerary_detail_id: item.itinerary_detail_id,
-        url_image: this.buildReviewMediaUrls({
-          expectedPrefix: `reviews/itinerary-details/${item.itinerary_detail_id}/`,
-          media: matchingPlaceReview?.media ?? [],
-        }),
         id: randomUUID(),
         tourist_id: touristId,
         itinerary_id: itineraryId,
@@ -1143,6 +992,8 @@ export class ItineraryReviewsService {
         rating: item.rating,
         review_type: item.content ? 'with_content' : 'without_content',
         tags,
+        url_image: item.mediaUrls,
+        status: 'pending',
       };
     });
 
@@ -1161,9 +1012,7 @@ export class ItineraryReviewsService {
         .schema('review_ai')
         .from('reviews')
         .insert(
-          reviewsWithTags.map(({ source_itinerary_detail_id, ...review }) => ({
-            ...review,
-          })),
+          reviewsWithTags,
         );
 
       if (insertReviewsError) {

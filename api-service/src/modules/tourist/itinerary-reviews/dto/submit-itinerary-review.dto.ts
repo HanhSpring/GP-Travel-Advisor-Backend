@@ -122,13 +122,4 @@ export class SubmitItineraryReviewDto {
   @Type(() => SubmitReviewMediaDto)
   media?: SubmitReviewMediaDto[];
 
-  @ApiProperty({
-    type: [String],
-    required: false,
-    description: 'Image/video urls for general itinerary feedback',
-  })
-  @IsOptional()
-  @IsArray()
-  @IsString({ each: true })
-  media_urls?: string[];
 }

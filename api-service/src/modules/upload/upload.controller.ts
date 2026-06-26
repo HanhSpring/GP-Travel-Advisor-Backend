@@ -10,6 +10,8 @@ import {
   ParseFilePipe,
   MaxFileSizeValidator,
   FileTypeValidator,
+  HttpCode,
+  HttpStatus,
 } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { UploadService } from './upload.service';
@@ -102,6 +104,7 @@ export class UploadController {
     }
   }
 
+  // 3. LUỒNG UPLOAD ẢNH REVIEW (Khách du lịch - multipart fallback)
   @Post('review')
   @UseInterceptors(FileInterceptor('file'))
   async uploadReview(

@@ -348,6 +348,67 @@ export class UploadService {
     }
   }
 
+  // Tạo presigned PUT URL cho mobile upload trực tiếp lên R2
+  async createReviewPresignedUrls(payload: {
+    scope: string;
+    itinerary_id: string;
+    itinerary_detail_id?: string;
+    files: Array<{
+      file_name: string;
+      content_type: string;
+      size: number;
+      sort_order: number;
+    }>;
+  }) {
+    const { scope, itinerary_id, itinerary_detail_id, files } = payload;
+
+    if (!files || files.length === 0) {
+      throw new BadRequestException('files array is required and must not be empty');
+    }
+
+    if (files.length > 10) {
+      throw new BadRequestException('Maximum 10 files per request');
+    }
+
+    const bucket = this.configService.get<string>('CLOUDFLARE_R2_BUCKET_NAME');
+    const publicUrl = this.configService.get<string>('CLOUDFLARE_R2_PUBLIC_URL');
+    const expiresInSeconds = 3600;
+
+    const items = await Promise.all(
+      files.map(async (file) => {
+        const isVideo = file.content_type.startsWith('video/');
+        const mediaType = isVideo ? 'video' : 'image';
+
+        const ext = file.file_name.split('.').pop()?.toLowerCase() || (isVideo ? 'mp4' : 'jpg');
+        const folderScope = scope === 'itinerary_review' ? 'itinerary' : 'place';
+        const subFolder = itinerary_detail_id
+          ? `${itinerary_id}/${itinerary_detail_id}`
+          : itinerary_id;
+        const objectKey = `reviews/${folderScope}/${subFolder}/${Date.now()}-${file.sort_order}.${ext}`;
+
+        const command = new PutObjectCommand({
+          Bucket: bucket,
+          Key: objectKey,
+          ContentType: file.content_type,
+          ContentLength: file.size,
+        });
+
+        const uploadUrl = await getSignedUrl(this.s3Client, command, { expiresIn: expiresInSeconds });
+
+        return {
+          upload_url: uploadUrl,
+          object_key: objectKey,
+          public_url: `${publicUrl}/${objectKey}`,
+          media_type: mediaType,
+          sort_order: file.sort_order,
+          expires_in_seconds: expiresInSeconds,
+        };
+      }),
+    );
+
+    return { items };
+  }
+
   // Hàm bổ trợ để đẩy lên R2
   private async pushToR2(buffer: Buffer, key: string): Promise<string> {
     await this.s3Client.send(

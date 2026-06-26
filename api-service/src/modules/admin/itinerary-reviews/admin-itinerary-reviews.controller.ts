@@ -58,6 +58,13 @@ export class AdminItineraryReviewsController {
     );
   }
 
+  @Get(':id')
+  @ApiOperation({ summary: 'Get itinerary review detail by ID' })
+  @ApiResponse({ status: 200, description: 'Itinerary review detail retrieved successfully' })
+  async getReviewById(@Param('id') id: string) {
+    return this.service.getReviewById(id);
+  }
+
   @Put(':id/approve')
   @ApiOperation({ summary: 'Approve itinerary review' })
   @ApiResponse({ status: 200, description: 'Itinerary review approved successfully' })

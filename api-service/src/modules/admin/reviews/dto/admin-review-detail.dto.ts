@@ -58,6 +58,9 @@ export class AdminReviewDetailDto {
   @ApiProperty({ enum: ['pending', 'approved', 'violation'] })
   status: 'pending' | 'approved' | 'violation';
 
+  @ApiProperty({ nullable: true, type: String })
+  violation_reason: string | null;
+
   @ApiProperty()
   created_at: string;
 }

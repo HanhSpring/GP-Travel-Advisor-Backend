@@ -1,6 +1,8 @@
 import { Injectable, Logger } from '@nestjs/common';
 import OpenAI from 'openai';
 
+import { extractFrameFromVideo } from './video-extractor';
+
 export type ModerationResult = {
   status: 'approved' | 'violation';
   violations: string[];
@@ -17,20 +19,27 @@ export class ModerationService {
     });
   }
 
+  private isVideo(url: string): boolean {
+    const lowerUrl = url.toLowerCase();
+    return lowerUrl.endsWith('.mp4') || lowerUrl.endsWith('.mov') || lowerUrl.endsWith('.avi');
+  }
+
   async moderateReview(
     content: string | null,
     images: string[] = [],
     videos: string[] = [],
   ): Promise<ModerationResult> {
     const textToAnalyze = content || '';
-    const internalViolations = this.checkInternalRules(textToAnalyze);
+    const allMediaUrls = [...images, ...videos];
 
-    // If internal rules flagged something that causes immediate rejection
-    if (internalViolations.some(v => v.includes('Số điện thoại') || v.includes('URL'))) {
+    // --- STEP 1: Internal rules (business-specific, fast, no API cost) ---
+    const internalViolations = this.checkInternalRules(textToAnalyze);
+    if (internalViolations.length > 0) {
       return { status: 'violation', violations: internalViolations };
     }
 
-    // OpenAI Moderation
+    // --- STEP 2: OpenAI omni-moderation-latest (primary AI check, supports Vietnamese) ---
+    let openaiApiOk = false;
     let openaiViolations: string[] = [];
     try {
       const inputs: any[] = [];
@@ -38,12 +47,19 @@ export class ModerationService {
         inputs.push({ type: 'text', text: textToAnalyze });
       }
 
-      // OpenAI omni-moderation-latest supports image_url
-      images.forEach((url) => {
-        if (url) {
+      for (const url of allMediaUrls) {
+        if (!url) continue;
+        if (this.isVideo(url)) {
+          try {
+            const frameBase64 = await extractFrameFromVideo(url);
+            inputs.push({ type: 'image_url', image_url: { url: frameBase64 } });
+          } catch (err) {
+            this.logger.warn(`Could not extract frame from video: ${url}`, err);
+          }
+        } else {
           inputs.push({ type: 'image_url', image_url: { url } });
         }
-      });
+      }
 
       if (inputs.length > 0) {
         const response = await this.openai.moderations.create({
@@ -51,27 +67,36 @@ export class ModerationService {
           input: inputs,
         });
 
-        const result = response.results[0];
-        if (result.flagged) {
-          const flaggedCategories = Object.entries(result.categories)
-            .filter(([_, isFlagged]) => isFlagged)
-            .map(([category]) => category);
-          openaiViolations = flaggedCategories;
+        openaiApiOk = true;
+
+        // Each input item returns its own result — check ALL of them
+        for (const result of response.results) {
+          if (result.flagged) {
+            const flagged = Object.entries(result.categories)
+              .filter(([, isFlagged]) => isFlagged)
+              .map(([category]) => category);
+            openaiViolations.push(...flagged);
+          }
         }
+      } else {
+        // Nothing to check — treat as clean
+        openaiApiOk = true;
       }
     } catch (error) {
-      this.logger.error('OpenAI Moderation API error', error);
-      // Fallback: Proceed without OpenAI if it fails, rely on internal rules
+      this.logger.error('OpenAI Moderation API error — will keep review as pending', error);
     }
-
-    const allViolations = [...internalViolations, ...openaiViolations];
 
     if (openaiViolations.length > 0) {
-      return { status: 'violation', violations: allViolations };
+      return { status: 'violation', violations: openaiViolations };
     }
 
-    if (internalViolations.length > 0) {
-      return { status: 'violation', violations: allViolations };
+    // If OpenAI API failed (network/quota/etc.), return violation to trigger manual review
+    // rather than silently approving potentially bad content
+    if (!openaiApiOk && (textToAnalyze.trim() || allMediaUrls.length > 0)) {
+      return {
+        status: 'violation',
+        violations: ['OpenAI API không phản hồi — cần kiểm duyệt thủ công'],
+      };
     }
 
     return { status: 'approved', violations: [] };
@@ -100,14 +125,67 @@ export class ModerationService {
     }
 
     // 4. Spam Detection (Repeated characters)
-    const spamRegex = /(.)\1{4,}/g; // 5 identical characters in a row
+    const spamRegex = /(.)\1{4,}/g;
     if (spamRegex.test(lowerText)) {
       violations.push('Spam');
     }
 
-    // 5. Fake Review (Too short but 5 stars - since we don't pass stars here, just check if it's "Lorem ipsum")
+    // 5. Fake Review
     if (lowerText.includes('lorem ipsum')) {
       violations.push('Fake Review (Lorem ipsum)');
+    }
+
+    // 6. Vietnamese Profanity / Hate Speech
+    // Normalize text: remove diacritics for variant matching (e.g. "lon" = "lồn")
+    const normalizeVi = (s: string) =>
+      s.normalize('NFD')
+       .replace(/[̀-ͯ]/g, '')  // strip combining diacritics
+       .replace(/đ/g, 'd')
+       .replace(/Đ/g, 'd');
+
+    const normalizedText = normalizeVi(lowerText);
+
+    // Exact profanity words (normalized, no diacritics)
+    const profanityWords = [
+      'lon',       // lồn
+      'cac',       // cặc
+      'dit',       // địt
+      'du ma',     // đụ mẹ
+      'du me',
+      'du ba',
+      'du bo',
+      'vl',        // viết tắt vãi lồn
+      'vcl',
+      'vkl',
+      'clm',       // con lồn mẹ (phổ biến trong chat)
+      'dm',        // đụ mẹ (viết tắt)
+      'dkm',
+      'dmm',
+      'dmc',
+      'đmm',
+      'đkm',
+      'fuck',
+      'shit',
+      'bitch',
+      'asshole',
+      'con cho',   // con chó
+      'do cho',    // đồ chó
+      'thang cho',
+      'con dieu',  // con điếm
+      'dieu',      // điếm
+      'mai dam',   // mại dâm
+      'chim chuot',
+      'dau buoi',  // đầu buồi
+      'buoi',      // buồi
+    ];
+
+    // Check each profanity word — match as whole word or substring
+    const foundProfanity = profanityWords.filter((word) =>
+      normalizedText.includes(word),
+    );
+
+    if (foundProfanity.length > 0) {
+      violations.push(`Ngôn ngữ thô tục (Profanity): ${foundProfanity.join(', ')}`);
     }
 
     return violations;
