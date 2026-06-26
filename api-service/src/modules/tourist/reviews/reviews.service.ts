@@ -34,7 +34,9 @@ export interface ReviewResponse {
 
 @Injectable()
 export class ReviewsService {
-  constructor(private readonly eventEmitter: EventEmitter2) {}
+  constructor(
+    private readonly eventEmitter: EventEmitter2,
+  ) {}
 
   private normalizeMediaUrls(value: unknown): string[] {
     let values: unknown[] = [];
@@ -398,6 +400,7 @@ export class ReviewsService {
           rating: payload.rating,
           review_type: reviewType,
           tags: payload.tags ?? null,
+          status: 'pending',
         },
       ]);
 

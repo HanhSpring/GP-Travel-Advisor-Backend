@@ -201,3 +201,6 @@ secrets/
 .claude/
 ai-service/data/Places.csv
 ai-service/recommender_artifacts/*.npy
+
+# Firebase service account
+api-service/firebase-service-account.json

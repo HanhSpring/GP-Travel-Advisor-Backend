@@ -293,4 +293,43 @@ export class AdminService {
       totalAdmins: Number(stats.total_admins),
     };
   }
+
+  async updateAdminProfile(userId: string, updateDto: any) {
+    const supabaseAdmin = createClient(
+      process.env.SUPABASE_URL as string,
+      process.env.SUPABASE_KEY as string,
+    );
+
+    const { data, error } = await supabaseAdmin
+      .from('users')
+      .update({
+        full_name: updateDto.fullName,
+        phone_number: updateDto.phone,
+        avatar_url: updateDto.avatarUrl,
+      })
+      .eq('id', userId)
+      .select();
+
+    if (error) {
+      throw new InternalServerErrorException(
+        `Lỗi khi cập nhật DB: ${error.message}`,
+      );
+    }
+
+    const { error: authError } = await supabaseAdmin.auth.admin.updateUserById(userId, {
+      user_metadata: {
+        full_name: updateDto.fullName,
+        phone_number: updateDto.phone,
+        avatar_url: updateDto.avatarUrl,
+      }
+    });
+
+    if (authError) {
+      throw new InternalServerErrorException(
+        `Lỗi khi cập nhật Auth Metadata: ${authError.message}`,
+      );
+    }
+
+    return { success: true, user: data[0] };
+  }
 }

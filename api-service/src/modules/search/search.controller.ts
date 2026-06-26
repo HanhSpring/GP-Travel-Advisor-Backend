@@ -53,6 +53,7 @@ export class SearchController {
     @Query('excludeIds') excludeIds?: string,
     @Query('preferCategory') preferCategory?: string,
     @Query('radius') radius?: number,
+    @Query('q') q?: string,
   ) {
     const ids = excludeIds ? excludeIds.split(',').filter(Boolean) : [];
     return this.service.getNearbyPlaces(
@@ -62,6 +63,7 @@ export class SearchController {
       ids,
       preferCategory ?? '',
       radius ? Number(radius) : 10,
+      q,
     );
   }
 }

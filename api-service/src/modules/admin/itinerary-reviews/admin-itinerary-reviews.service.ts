@@ -14,7 +14,8 @@ interface ItineraryReviewRow {
   content: string | null;
   url_image: string[] | string | null;
   created_at: string;
-  is_approved: boolean | null;
+  status: 'pending' | 'approved' | 'violation' | null;
+  violation_reason?: string | null;
 }
 
 interface ItineraryRow {
@@ -61,15 +62,8 @@ export class AdminItineraryReviewsService {
     return [];
   }
 
-  private mapStatus(isApproved: boolean | null): 'pending' | 'approved' | 'violation' {
-    if (isApproved === true) {
-      return 'approved';
-    }
-
-    if (isApproved === false) {
-      return 'violation';
-    }
-
+  private resolveStatus(status: string | null): 'pending' | 'approved' | 'violation' {
+    if (status === 'approved' || status === 'violation') return status;
     return 'pending';
   }
 
@@ -84,11 +78,11 @@ export class AdminItineraryReviewsService {
       .select('id', { count: 'exact', head: true });
 
     if (status === 'pending') {
-      query = query.is('is_approved', null);
+      query = query.not('status', 'in', '("approved","violation")');
     } else if (status === 'approved') {
-      query = query.eq('is_approved', true);
+      query = query.eq('status', 'approved');
     } else if (status === 'violation') {
-      query = query.eq('is_approved', false);
+      query = query.eq('status', 'violation');
     }
 
     const { count, error } = await query;
@@ -205,17 +199,15 @@ export class AdminItineraryReviewsService {
       let query = supabase
         .schema('review_ai')
         .from('itinerary_reviews')
-        .select('id, tourist_id, itinerary_id, rating, content, url_image, created_at, is_approved', {
+        .select('id, tourist_id, itinerary_id, rating, content, url_image, created_at, status, violation_reason', {
           count: 'exact',
         });
 
       if (status && ['pending', 'approved', 'violation'].includes(status)) {
         if (status === 'pending') {
-          query = query.is('is_approved', null);
-        } else if (status === 'approved') {
-          query = query.eq('is_approved', true);
+          query = query.not('status', 'in', '("approved","violation")');
         } else {
-          query = query.eq('is_approved', false);
+          query = query.eq('status', status);
         }
       }
 
@@ -342,7 +334,7 @@ export class AdminItineraryReviewsService {
         reviewRows.map(async (review) => {
           const [reviewCountResult, reportCountResult] = await Promise.all([
             supabase.schema('review_ai').from('itinerary_reviews').select('id', { count: 'exact', head: true }).eq('tourist_id', review.tourist_id),
-            supabase.schema('review_ai').from('itinerary_reviews').select('id', { count: 'exact', head: true }).eq('tourist_id', review.tourist_id).eq('is_approved', false),
+            supabase.schema('review_ai').from('itinerary_reviews').select('id', { count: 'exact', head: true }).eq('tourist_id', review.tourist_id).eq('status', 'violation'),
           ]);
 
           const user = userMap.get(review.tourist_id);
@@ -360,7 +352,7 @@ export class AdminItineraryReviewsService {
             itinerary_end_date: itinerary?.end_date ?? null,
             rating: review.rating,
             review_content: review.content,
-            status: this.mapStatus(review.is_approved),
+            status: this.resolveStatus(review.status),
             created_at: review.created_at,
             has_images: this.normalizeImageUrls(review.url_image).length > 0,
           };
@@ -382,15 +374,18 @@ export class AdminItineraryReviewsService {
   }
 
   async updateReviewStatus(id: string, status: 'approved' | 'violation', reason?: string) {
-    const nextStatus = status === 'approved';
+    const updatePayload: Record<string, unknown> = { status };
+    if (status === 'violation' && reason) {
+      updatePayload.violation_reason = reason;
+    }
 
     const { data, error } = await supabase
       .schema('review_ai')
       .from('itinerary_reviews')
-      .update({ is_approved: nextStatus })
+      .update(updatePayload)
       .eq('id', id)
-      .select('id, is_approved')
-      .maybeSingle<{ id: string; is_approved: boolean | null }>();
+      .select('id, status')
+      .maybeSingle<{ id: string; status: string }>();
 
     if (error) {
       throw new InternalServerErrorException(error.message);
@@ -405,7 +400,7 @@ export class AdminItineraryReviewsService {
       status,
       message: status === 'approved' ? 'Itinerary review approved successfully' : 'Itinerary review rejected successfully',
       note: reason ?? null,
-      note_saved: false,
+      note_saved: status === 'violation' && !!reason,
     };
   }
 
@@ -415,5 +410,49 @@ export class AdminItineraryReviewsService {
 
   async rejectReview(id: string, reason?: string) {
     return this.updateReviewStatus(id, 'violation', reason);
+  }
+
+  async getReviewById(id: string) {
+    const { data: review, error } = await supabase
+      .schema('review_ai')
+      .from('itinerary_reviews')
+      .select('id, tourist_id, itinerary_id, rating, content, url_image, created_at, status, violation_reason')
+      .eq('id', id)
+      .single<ItineraryReviewRow>();
+
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!review) throw new InternalServerErrorException('Itinerary review not found');
+
+    const [userResult, itineraryResult, reviewCountResult, reportCountResult] = await Promise.all([
+      supabase.schema('public').from('users').select('id, full_name').eq('id', review.tourist_id).single<UserRow>(),
+      supabase.schema('travel').from('itineraries').select('id, destination, start_date, end_date').eq('id', review.itinerary_id).single<ItineraryRow>(),
+      supabase.schema('review_ai').from('itinerary_reviews').select('id', { count: 'exact', head: true }).eq('tourist_id', review.tourist_id),
+      supabase.schema('review_ai').from('itinerary_reviews').select('id', { count: 'exact', head: true }).eq('tourist_id', review.tourist_id).eq('status', 'violation'),
+    ]);
+
+    const imageUrls = this.normalizeImageUrls(review.url_image).map((url) => ({ url }));
+    const resolvedStatus = this.resolveStatus(review.status);
+
+    return {
+      id: review.id,
+      reviewer: {
+        id: review.tourist_id,
+        name: userResult.data?.full_name ?? 'Người dùng ẩn danh',
+        review_count: reviewCountResult.count ?? 0,
+        report_count: reportCountResult.count ?? 0,
+      },
+      itinerary: {
+        id: review.itinerary_id,
+        name: itineraryResult.data?.destination ?? 'Lịch trình',
+        start_date: itineraryResult.data?.start_date ?? null,
+        end_date: itineraryResult.data?.end_date ?? null,
+      },
+      rating: review.rating,
+      review_content: review.content,
+      images: imageUrls,
+      status: resolvedStatus,
+      violation_reason: review.violation_reason ?? null,
+      created_at: review.created_at,
+    };
   }
 }

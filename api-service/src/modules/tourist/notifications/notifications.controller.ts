@@ -1,5 +1,6 @@
-import { Controller, Get, Param, Patch, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Query } from '@nestjs/common';
 import {
+  ApiBody,
   ApiOkResponse,
   ApiOperation,
   ApiQuery,
@@ -15,6 +16,22 @@ import {
 @Controller('notifications')
 export class NotificationsController {
   constructor(private readonly service: NotificationsService) {}
+
+  @Post('fcm-token')
+  @ApiOperation({ summary: 'Register or update FCM push token for a user' })
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        tourist_id: { type: 'string' },
+        fcm_token: { type: 'string' },
+      },
+      required: ['tourist_id', 'fcm_token'],
+    },
+  })
+  registerFcmToken(@Body() body: { tourist_id: string; fcm_token: string }) {
+    return this.service.registerFcmToken(body.tourist_id, body.fcm_token);
+  }
 
   @Get()
   @ApiOperation({

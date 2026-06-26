@@ -515,7 +515,7 @@ export class ItineraryService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, address, image_url, average_rating, estimated_cost, category_id',
+        'id, name, address, image_url, average_rating, estimated_cost, category_id, categories(name)',
       )
       .eq('id', dto.placeId)
       .single();
@@ -539,9 +539,29 @@ export class ItineraryService {
 
     const nextSequence = maxSeqData ? (maxSeqData.sequence_order ?? 0) + 1 : 1;
 
-    // ─── Bước 5: Xác định thời gian và ghim giờ (nếu user có yêu cầu) ─
+    // ─── Bước 5: Xác định thời gian và ghim giờ (nếu user có yêu cầu hoặc auto-assign) ─
     const durationMinutes = dto.durationMinutes ?? 60; // Mặc định 60 phút
-    const isLocked = !!dto.preferredTime;
+    let preferredTime = dto.preferredTime;
+    let isLocked = !!dto.preferredTime;
+    
+    // Tự động gán giờ cho các loại địa điểm đặc thù nếu người dùng chưa chọn giờ
+    if (!preferredTime && place.categories && (place.categories as any).name) {
+      const catName = ((place.categories as any).name as string).toLowerCase();
+      if (catName.includes('bãi biển') || catName.includes('bãi tắm')) {
+        // Gán giờ sáng hoặc chiều mát. Ưu tiên 15:30 chiều.
+        preferredTime = '15:30:00';
+      } else if (catName.includes('chợ đêm') || catName.includes('phố đi bộ')) {
+        preferredTime = '19:00:00';
+      } else if (catName.includes('khu du lịch sinh thái')) {
+        preferredTime = '08:00:00';
+      } else if (catName.includes('chùa') || catName.includes('đền')) {
+        preferredTime = '08:30:00';
+      }
+      
+      if (preferredTime) {
+        isLocked = true;
+      }
+    }
 
     // ─── Bước 6: Chèn bản ghi mới vào itinerary_details ─────────
     const { data: inserted, error: insertErr } = await supabase
@@ -555,8 +575,8 @@ export class ItineraryService {
         sequence_order: nextSequence,
         estimated_cost: place.estimated_cost ?? 0,
         is_locked: isLocked,
-        locked_arrive_time: dto.preferredTime ?? null,
-        arrival_time: dto.preferredTime ?? null, // Sẽ được optimizer ghi đè nếu không ghim
+        locked_arrive_time: preferredTime ?? null,
+        arrival_time: preferredTime ?? null, // Sẽ được optimizer ghi đè nếu không ghim
         added_by: 'user', // Đánh dấu user tự thêm (khác với 'ai' do hệ thống tạo)
       })
       .select()
@@ -762,6 +782,17 @@ export class ItineraryService {
    * @param visitDate   - Ngày cần tối ưu ('YYYY-MM-DD')
    */
   private async _reOptimizeDay(itineraryId: string, visitDate: string) {
+    // ─── Lấy thời gian hoạt động của lịch trình ───────────────────
+    const { data: itinerary } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('daily_start_time, daily_end_time')
+      .eq('id', itineraryId)
+      .single();
+
+    const dailyStartTime = itinerary?.daily_start_time || '08:00';
+    const dailyEndTime = itinerary?.daily_end_time || '21:00';
+
     // ─── Lấy toàn bộ hoạt động trong ngày (JOIN với places) ──────
     const { data: activities, error: fetchErr } = await supabase
       .schema('travel')
@@ -823,9 +854,8 @@ export class ItineraryService {
             close_time: a.places?.close_time ?? '22:00',
             estimated_cost: a.estimated_cost ?? 0,
           })),
-        // Mặc định ngày bắt đầu lúc 08:00, kết thúc lúc 21:00
-        day_start_time: '08:00',
-        day_end_time: '21:00',
+        day_start_time: dailyStartTime,
+        day_end_time: dailyEndTime,
       };
 
       const response = await axios.post(
@@ -989,38 +1019,116 @@ export class ItineraryService {
   }
 
   async updateActivities(id: string, days: any[]) {
-    // Gom tất cả activities từ mọi ngày thành một mảng phẳng
+    const { data: itinerary } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('start_date')
+      .eq('id', id)
+      .single();
+
+    if (!itinerary) throw new Error('Itinerary not found');
+
     const allActivities: Array<{
       id: string;
+      placeId?: string;
+      dayNumber: number;
       startTime: string;
       endTime: string;
+      sequenceOrder: number;
     }> = [];
+
     for (const day of days) {
       if (day.activities && Array.isArray(day.activities)) {
-        for (const act of day.activities) {
-          allActivities.push(act);
-        }
+        day.activities.forEach((act, index) => {
+          allActivities.push({
+            id: act.id,
+            placeId: act.placeId,
+            dayNumber: day.dayNumber,
+            startTime: act.startTime,
+            endTime: act.endTime,
+            sequenceOrder: index + 1,
+          });
+        });
       }
     }
 
-    // Chạy tất cả lệnh UPDATE song song thay vì tuần tự
-    // Trước: 24 activities × ~150ms = ~3.6s
-    // Sau:   Promise.all → ~150ms (chỉ 1 vòng chờ duy nhất)
+    const { data: currentActs } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select('id')
+      .eq('itinerary_id', id);
+
+    const incomingIds = allActivities.map((a) => a.id);
+    const toDelete = (currentActs || []).filter((a) => !incomingIds.includes(a.id));
+
+    if (toDelete.length > 0) {
+      await supabase
+        .schema('travel')
+        .from('itinerary_details')
+        .delete()
+        .in(
+          'id',
+          toDelete.map((a) => a.id),
+        );
+    }
+
     await Promise.all(
       allActivities.map(async (act) => {
-        const { error } = await supabase
-          .schema('travel')
-          .from('itinerary_details')
-          .update({
+        const isUUID =
+          /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
+            act.id,
+          );
+
+        if (isUUID) {
+          const startDate = new Date(itinerary.start_date);
+          startDate.setDate(startDate.getDate() + (act.dayNumber - 1));
+          const visitDate = startDate.toISOString().split('T')[0];
+
+          const updatePayload: any = {
             arrival_time: act.startTime,
             departure_time: act.endTime,
-          })
-          .eq('id', act.id);
+            visit_date: visitDate,
+            sequence_order: act.sequenceOrder,
+          };
+          if (act.placeId) {
+            updatePayload.place_id = act.placeId;
+          }
 
-        if (error) {
-          console.warn(
-            `[Supabase] Không thể cập nhật activity ${act.id}: ${error.message}`,
-          );
+          const { error } = await supabase
+            .schema('travel')
+            .from('itinerary_details')
+            .update(updatePayload)
+            .eq('id', act.id);
+
+          if (error) {
+            console.warn(
+              `[Supabase] Không thể cập nhật activity ${act.id}: ${error.message}`,
+            );
+          }
+        } else {
+          if (!act.placeId) return;
+
+          const startDate = new Date(itinerary.start_date);
+          startDate.setDate(startDate.getDate() + (act.dayNumber - 1));
+          const visitDate = startDate.toISOString().split('T')[0];
+
+          const { error } = await supabase
+            .schema('travel')
+            .from('itinerary_details')
+            .insert({
+              itinerary_id: id,
+              place_id: act.placeId,
+              visit_date: visitDate,
+              arrival_time: act.startTime,
+              departure_time: act.endTime,
+              sequence_order: act.sequenceOrder,
+            });
+
+          if (error) {
+            console.warn(
+              `[Supabase] Không thể thêm mới activity ${act.id}: ${error.message}`,
+            );
+          }
         }
       }),
     );
@@ -1432,7 +1540,11 @@ export class ItineraryService {
       return null;
     }
   }
-  async optimizeDayRoute(activities: any[]) {
+  async optimizeDayRoute(
+    activities: any[],
+    dailyStartTime?: string,
+    dailyEndTime?: string,
+  ) {
     if (activities.length <= 2) return activities;
 
     try {
@@ -1440,8 +1552,8 @@ export class ItineraryService {
       const payload = {
         itinerary_id: 'client-optimize', // placeholder — không cần lưu DB
         visit_date: new Date().toISOString().split('T')[0],
-        day_start_time: '08:00',
-        day_end_time: '21:00',
+        day_start_time: dailyStartTime || '08:00',
+        day_end_time: dailyEndTime || '21:00',
         activities: activities.map((a: any) => {
           // Tính duration từ startTime/endTime nếu không có sẵn
           const startMin = this.toMinutes(a.startTime || '08:00');
