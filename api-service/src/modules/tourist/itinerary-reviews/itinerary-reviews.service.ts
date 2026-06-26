@@ -871,7 +871,7 @@ export class ItineraryReviewsService {
 
     const r2PublicUrl = process.env.CLOUDFLARE_R2_PUBLIC_URL || '';
     const overallMediaUrls = (payload.media || [])
-      .sort((a, b) => a.sort_order - b.sort_order)
+      .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))
       .map((m) => `${r2PublicUrl}/${m.object_key}`);
 
     const normalizedOverallContent = this.normalizeOptionalText(
@@ -962,7 +962,7 @@ export class ItineraryReviewsService {
         rating: placeReview.rating,
         content: this.normalizeOptionalText(placeReview.content),
         mediaUrls: (placeReview.media || [])
-          .sort((a, b) => a.sort_order - b.sort_order)
+          .sort((a, b) => (a.sort_order ?? 0) - (b.sort_order ?? 0))
           .map((m) => `${r2PublicUrl}/${m.object_key}`),
       });
     }
