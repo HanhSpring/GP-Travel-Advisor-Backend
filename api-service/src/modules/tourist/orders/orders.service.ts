@@ -31,6 +31,9 @@ interface FoodItemRow {
   description: string | null;
   price: number | null;
   place_id: string;
+  image_url?: string[] | string | null;
+  category?: string | null;
+  is_active?: boolean | null;
 }
 
 interface CreateOrderFoodItemRow {
@@ -53,14 +56,23 @@ interface ItineraryDetailRow {
   arrival_time: string | null;
 }
 
-interface PlaceCategoryRow {
-  place_id: string;
-  category_id: string;
+interface TypeCategoryRow {
+  id: string;
+  name: string | null;
 }
 
-interface CategoryRow {
+interface PlaceTypeRow {
+  id: string;
+  name: string | null;
+  category_id: string | null;
+  categories: TypeCategoryRow | TypeCategoryRow[] | null;
+}
+
+interface OrderPlaceRow {
   id: string;
   name: string;
+  type_id: string | null;
+  types: PlaceTypeRow | PlaceTypeRow[] | null;
 }
 
 interface OrderRow {
@@ -85,11 +97,42 @@ export class OrdersService {
   private isOrderEligibleCategory(category: string): boolean {
     const normalized = this.normalizeText(category);
     return (
+      normalized.includes('am thuc') ||
       normalized.includes('cafe') ||
       normalized.includes('ca phe') ||
       normalized.includes('restaurant') ||
       normalized.includes('nha hang')
     );
+  }
+
+  private extractSingle<T>(data: T | T[] | null): T | null {
+    if (!data) {
+      return null;
+    }
+
+    return Array.isArray(data) ? (data[0] ?? null) : data;
+  }
+
+  private isOrderEligibleType(
+    typeName: string | null,
+    categoryName: string | null,
+  ): boolean {
+    if (categoryName && this.isOrderEligibleCategory(categoryName)) {
+      return true;
+    }
+
+    const normalizedType = this.normalizeText(typeName ?? '');
+    const eligibleTypeNames = [
+      'pub/bar',
+      'nha hang',
+      'cafe & do uong',
+      'tiem banh & trang mieng',
+      'quan chay',
+      'quan an',
+      'buffet & khu am thuc',
+    ];
+
+    return eligibleTypeNames.includes(normalizedType);
   }
 
   private extractCityName(
@@ -114,7 +157,7 @@ export class OrdersService {
   }
 
   private mapFoodCategory(name: string | null): 'main' | 'drink' {
-    const value = (name ?? '').toLowerCase();
+    const value = this.normalizeText(name ?? '');
     const drinkKeywords = [
       'ca phe',
       'cafe',
@@ -138,7 +181,52 @@ export class OrdersService {
     return 'main';
   }
 
-  private buildFoodImage(seed: string): string {
+  private normalizeFoodCategory(
+    category: string | null | undefined,
+    name: string | null,
+  ): 'main' | 'drink' {
+    const normalized = this.normalizeText(category ?? '');
+
+    if (
+      normalized === 'drink' ||
+      normalized.includes('do uong') ||
+      normalized.includes('thuc uong') ||
+      normalized.includes('nuoc') ||
+      normalized.includes('cafe') ||
+      normalized.includes('ca phe')
+    ) {
+      return 'drink';
+    }
+
+    if (
+      normalized === 'main' ||
+      normalized.includes('mon chinh') ||
+      normalized.includes('mon an') ||
+      normalized.includes('food')
+    ) {
+      return 'main';
+    }
+
+    return this.mapFoodCategory(name);
+  }
+
+  private extractFoodImageUrl(
+    imageUrl: string[] | string | null | undefined,
+    seed: string,
+  ): string {
+    if (Array.isArray(imageUrl)) {
+      const firstUrl = imageUrl.find(
+        (url) => typeof url === 'string' && url.trim().length > 0,
+      );
+      if (firstUrl) {
+        return firstUrl.trim();
+      }
+    }
+
+    if (typeof imageUrl === 'string' && imageUrl.trim().length > 0) {
+      return imageUrl.trim();
+    }
+
     return `https://picsum.photos/seed/${seed}-food/320/240`;
   }
 
@@ -242,9 +330,11 @@ export class OrdersService {
     const { data: placeRows, error: placeError } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, name')
+      .select(
+        'id, name, type_id, types(id, name, category_id, categories(id, name))',
+      )
       .in('id', orderedUniquePlaceIds)
-      .returns<Array<{ id: string; name: string }>>();
+      .returns<OrderPlaceRow[]>();
 
     if (placeError) {
       throw new InternalServerErrorException(placeError.message);
@@ -253,58 +343,21 @@ export class OrdersService {
     const placeMap = new Map(
       (placeRows ?? []).map((item) => [item.id, item.name]),
     );
-
-    const { data: placeCategoryRows, error: placeCategoryError } =
-      await supabase
-        .schema('travel')
-        .from('place_categories')
-        .select('place_id, category_id')
-        .in('place_id', orderedUniquePlaceIds)
-        .returns<PlaceCategoryRow[]>();
-
-    if (placeCategoryError) {
-      throw new InternalServerErrorException(placeCategoryError.message);
-    }
-
-    const categoryIds = Array.from(
-      new Set((placeCategoryRows ?? []).map((item) => item.category_id)),
+    const placeTypeMap = new Map(
+      (placeRows ?? []).map((item) => [item.id, item]),
     );
-
-    const categoryMap = new Map<string, string>();
-    if (categoryIds.length > 0) {
-      const { data: categories, error: categoryError } = await supabase
-        .schema('travel')
-        .from('categories')
-        .select('id, name')
-        .in('id', categoryIds)
-        .returns<CategoryRow[]>();
-
-      if (categoryError) {
-        throw new InternalServerErrorException(categoryError.message);
-      }
-
-      for (const item of categories ?? []) {
-        categoryMap.set(item.id, item.name);
-      }
-    }
-
-    const categoriesByPlace = new Map<string, string[]>();
-    for (const row of placeCategoryRows ?? []) {
-      const categoryName = categoryMap.get(row.category_id);
-      if (!categoryName) {
-        continue;
-      }
-      const list = categoriesByPlace.get(row.place_id) ?? [];
-      list.push(categoryName);
-      categoriesByPlace.set(row.place_id, list);
-    }
 
     const filtered = orderedUniquePlaceIds
       .map((placeId) => {
-        const categories = categoriesByPlace.get(placeId) ?? [];
-        const eligible = categories.some((name) =>
-          this.isOrderEligibleCategory(name),
+        const place = placeTypeMap.get(placeId);
+        const type = this.extractSingle(place?.types ?? null);
+        const category = this.extractSingle(type?.categories ?? null);
+        const typeName = type?.name ?? null;
+        const categoryName = category?.name ?? null;
+        const categories = [categoryName, typeName].filter(
+          (value): value is string => !!value,
         );
+        const eligible = this.isOrderEligibleType(typeName, categoryName);
 
         if (!eligible) {
           return null;
@@ -562,8 +615,14 @@ export class OrdersService {
     let query = supabase
       .schema('order_sys')
       .from('food_items')
-      .select('id, name, description, price, place_id', { count: 'exact' })
+      .select(
+        'id, name, description, price, place_id, image_url, category, is_active',
+        {
+          count: 'exact',
+        },
+      )
       .eq('place_id', placeId)
+      .or('is_active.is.null,is_active.eq.true')
       .order('name', { ascending: true });
 
     if (search) {
@@ -585,8 +644,8 @@ export class OrdersService {
       name: item.name ?? '',
       description: item.description ?? '',
       price: Number(item.price) || 0,
-      category: this.mapFoodCategory(item.name),
-      image_url: this.buildFoodImage(item.id),
+      category: this.normalizeFoodCategory(item.category, item.name),
+      image_url: this.extractFoodImageUrl(item.image_url, item.id),
     }));
 
     if (category !== 'all') {
