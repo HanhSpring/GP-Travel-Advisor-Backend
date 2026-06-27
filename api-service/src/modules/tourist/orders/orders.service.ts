@@ -4,7 +4,8 @@ import {
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
-import { randomUUID } from 'crypto';
+import axios from 'axios';
+import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import { supabase } from '../../../config/supabase';
 import { CreateOrderDto } from './dto/create-order.dto';
 
@@ -74,6 +75,13 @@ type FoodCategory = 'all' | 'main' | 'drink';
 export class OrdersService {
   constructor() {}
 
+  private readonly validOrderStatuses = [
+    'pending',
+    'processing',
+    'completed',
+    'cancelled',
+  ] as const;
+
   private normalizeText(value: string): string {
     return value
       .normalize('NFD')
@@ -90,6 +98,220 @@ export class OrdersService {
       normalized.includes('restaurant') ||
       normalized.includes('nha hang')
     );
+  }
+
+  private getOrderActionSecret(): string {
+    return (
+      process.env.ORDER_ACTION_SECRET ||
+      process.env.SUPABASE_KEY ||
+      'dev-order-action-secret'
+    );
+  }
+
+  private base64UrlEncode(value: string): string {
+    return Buffer.from(value, 'utf8').toString('base64url');
+  }
+
+  private base64UrlDecode(value: string): string {
+    return Buffer.from(value, 'base64url').toString('utf8');
+  }
+
+  private signOrderActionPayload(payload: string): string {
+    return createHmac('sha256', this.getOrderActionSecret())
+      .update(payload)
+      .digest('base64url');
+  }
+
+  private createOrderActionToken(orderId: string): string {
+    const expiresAt = Date.now() + 1000 * 60 * 60 * 24 * 3;
+    const payload = this.base64UrlEncode(JSON.stringify({ orderId, expiresAt }));
+    return `${payload}.${this.signOrderActionPayload(payload)}`;
+  }
+
+  private verifyOrderActionToken(token: string): { orderId: string } {
+    const [payload, signature] = token.split('.');
+    if (!payload || !signature) {
+      throw new BadRequestException('Token xử lý đơn không hợp lệ');
+    }
+
+    const expectedSignature = this.signOrderActionPayload(payload);
+    const signatureBuffer = Buffer.from(signature);
+    const expectedBuffer = Buffer.from(expectedSignature);
+
+    if (
+      signatureBuffer.length !== expectedBuffer.length ||
+      !timingSafeEqual(signatureBuffer, expectedBuffer)
+    ) {
+      throw new BadRequestException('Token xử lý đơn không hợp lệ');
+    }
+
+    const data = JSON.parse(this.base64UrlDecode(payload)) as {
+      orderId?: string;
+      expiresAt?: number;
+    };
+
+    if (!data.orderId || !data.expiresAt || Date.now() > data.expiresAt) {
+      throw new BadRequestException('Token xử lý đơn đã hết hạn');
+    }
+
+    return { orderId: data.orderId };
+  }
+
+  private getApiBaseUrl(): string {
+    const port = process.env.API_SERVICE_PORT || '3000';
+    return (
+      process.env.API_PUBLIC_URL ||
+      process.env.BACKEND_URL ||
+      `http://localhost:${port}`
+    ).replace(/\/$/, '');
+  }
+
+  private getActionUrl(token: string, action: 'confirm' | 'complete' | 'cancel'): string {
+    return `${this.getApiBaseUrl()}/order-actions/${token}?action=${action}`;
+  }
+
+  private getOrderActionEmailHtml(params: {
+    orderId: string;
+    placeName: string;
+    totalAmount: number;
+    items: Array<{ name: string; quantity: number; total_price: number }>;
+    confirmUrl: string;
+    completeUrl: string;
+    cancelUrl: string;
+  }): string {
+    const formatCurrency = (value: number) =>
+      `${Math.max(0, value).toLocaleString('vi-VN')}đ`;
+    const itemsHtml = params.items
+      .map(
+        (item) =>
+          `<li>${item.name} x${item.quantity} - ${formatCurrency(item.total_price)}</li>`,
+      )
+      .join('');
+
+    return `
+      <div style="font-family:Arial,sans-serif;color:#0f172a;line-height:1.5">
+        <h2>Đơn đặt món mới</h2>
+        <p><strong>Mã đơn:</strong> ${params.orderId}</p>
+        <p><strong>Nhà hàng:</strong> ${params.placeName}</p>
+        <p><strong>Tổng tiền:</strong> ${formatCurrency(params.totalAmount)}</p>
+        <p><strong>Món đã đặt:</strong></p>
+        <ul>${itemsHtml}</ul>
+        <p>Vui lòng chọn thao tác xử lý đơn:</p>
+        <p>
+          <a href="${params.confirmUrl}" style="display:inline-block;background:#2563eb;color:white;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:700">Xác nhận đơn</a>
+          <a href="${params.completeUrl}" style="display:inline-block;background:#10b981;color:white;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:700;margin-left:8px">Hoàn thành</a>
+          <a href="${params.cancelUrl}" style="display:inline-block;background:#ef4444;color:white;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:700;margin-left:8px">Hủy đơn</a>
+        </p>
+        <p style="color:#64748b;font-size:13px">Link có hiệu lực trong 3 ngày. Trang quản lý đối tác chỉ hiển thị trạng thái sau khi nhà hàng thao tác qua email.</p>
+      </div>
+    `;
+  }
+
+  private async sendOrderActionEmail(params: {
+    orderId: string;
+    placeName: string;
+    totalAmount: number;
+    items: Array<{ name: string; quantity: number; total_price: number }>;
+  }): Promise<boolean> {
+    const apiKey = process.env.RESEND_API_KEY;
+    const to = process.env.ORDER_NOTIFICATION_EMAIL || 'trip.datn2026@gmail.com';
+    const from = process.env.RESEND_FROM || 'Travel Advisor <onboarding@resend.dev>';
+
+    if (!apiKey) {
+      console.warn('RESEND_API_KEY is missing. Skipped order email notification.');
+      return false;
+    }
+
+    const token = this.createOrderActionToken(params.orderId);
+
+    await axios.post(
+      'https://api.resend.com/emails',
+      {
+        from,
+        to,
+        subject: `Đơn đặt món mới tại ${params.placeName}`,
+        html: this.getOrderActionEmailHtml({
+          ...params,
+          confirmUrl: this.getActionUrl(token, 'confirm'),
+          completeUrl: this.getActionUrl(token, 'complete'),
+          cancelUrl: this.getActionUrl(token, 'cancel'),
+        }),
+      },
+      {
+        headers: {
+          Authorization: `Bearer ${apiKey}`,
+          'Content-Type': 'application/json',
+        },
+      },
+    );
+
+    return true;
+  }
+
+  private getTargetStatus(action: string): 'processing' | 'completed' | 'cancelled' {
+    if (action === 'confirm') return 'processing';
+    if (action === 'complete') return 'completed';
+    if (action === 'cancel') return 'cancelled';
+    throw new BadRequestException('Thao tác xử lý đơn không hợp lệ');
+  }
+
+  private canTransitionOrderStatus(currentStatus: string, targetStatus: string): boolean {
+    const transitions: Record<string, string[]> = {
+      pending: ['processing', 'cancelled'],
+      processing: ['completed', 'cancelled'],
+      completed: [],
+      cancelled: [],
+    };
+
+    return transitions[currentStatus]?.includes(targetStatus) ?? false;
+  }
+
+  async handleOrderEmailAction(token: string, action: string) {
+    const { orderId } = this.verifyOrderActionToken(token);
+    const targetStatus = this.getTargetStatus(action);
+
+    const { data: order, error: orderError } = await supabase
+      .schema('order_sys')
+      .from('orders')
+      .select('id, status')
+      .eq('id', orderId)
+      .maybeSingle<{ id: string; status: string }>();
+
+    if (orderError) {
+      throw new InternalServerErrorException(orderError.message);
+    }
+    if (!order) {
+      throw new NotFoundException('Không tìm thấy đơn hàng');
+    }
+
+    if (!this.canTransitionOrderStatus(order.status, targetStatus)) {
+      return {
+        success: false,
+        order_id: order.id,
+        current_status: order.status,
+        requested_status: targetStatus,
+        message: 'Trạng thái đơn hiện tại không cho phép thao tác này',
+      };
+    }
+
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .from('orders')
+      .update({ status: targetStatus })
+      .eq('id', order.id)
+      .select('id, status')
+      .single<{ id: string; status: string }>();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return {
+      success: true,
+      order_id: data.id,
+      status: data.status,
+      message: 'Cập nhật trạng thái đơn hàng thành công',
+    };
   }
 
   private extractCityName(
@@ -397,6 +619,7 @@ export class OrdersService {
 
       return {
         food_item_id: item.food_item_id,
+        name: menu.name || 'Món ăn',
         quantity,
         unit_price: unitPrice,
         total_price: totalPrice,
@@ -411,14 +634,12 @@ export class OrdersService {
     const orderedAt = new Date().toISOString();
 
     const orderId = randomUUID();
-    const statusCandidates = ['pending', 'processing', 'confirmed', 'created'];
-
-    const orderInsertVariants = statusCandidates.flatMap((status) => [
+    const orderInsertVariants = [
       {
         id: orderId,
         ordered_at: orderedAt,
         total_amount: totalAmount,
-        status,
+        status: 'pending',
         notes: payload.notes ?? null,
         tourist_id: payload.tourist_id,
         itinerary_detail_id: payload.itinerary_detail_id ?? null,
@@ -427,16 +648,16 @@ export class OrdersService {
         id: orderId,
         ordered_at: orderedAt,
         total_amount: totalAmount,
-        status,
+        status: 'pending',
         tourist_id: payload.tourist_id,
       },
       {
         id: orderId,
         ordered_at: orderedAt,
-        status,
+        status: 'pending',
         tourist_id: payload.tourist_id,
       },
-    ]);
+    ];
 
     let orderInsertError: { code?: string; message?: string } | null = null;
     for (const variant of orderInsertVariants) {
@@ -522,11 +743,28 @@ export class OrdersService {
       }
     }
 
+    let emailSent = false;
+    try {
+      emailSent = await this.sendOrderActionEmail({
+        orderId,
+        placeName: place.name,
+        totalAmount,
+        items: normalizedItems.map((item) => ({
+          name: item.name,
+          quantity: item.quantity,
+          total_price: item.total_price,
+        })),
+      });
+    } catch (emailError) {
+      console.error('Failed to send order action email:', emailError);
+    }
+
     return {
       success: true,
       order_id: orderId,
       total_amount: totalAmount,
       items: normalizedItems,
+      email_sent: emailSent,
       message: 'Đặt món thành công',
     };
   }

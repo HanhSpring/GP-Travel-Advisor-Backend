@@ -1,4 +1,4 @@
-import {
+﻿import {
   BadRequestException,
   Injectable,
   InternalServerErrorException,
@@ -15,6 +15,15 @@ interface PlaceRow {
   review_count: number | null;
   registered_date: string | null;
   type_id: string | null;
+  city_id: string | null;
+  cities:
+    | {
+        name: string | null;
+      }
+    | {
+        name: string | null;
+      }[]
+    | null;
 }
 
 interface BusinessRow {
@@ -112,7 +121,7 @@ export class BusinessPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, address, image_url, is_approved, average_rating, review_count, registered_date, type_id',
+        'id, name, address, image_url, is_approved, average_rating, review_count, registered_date, type_id, city_id, cities(name)',
         { count: 'exact' },
       )
       .eq('vendor_id', resolvedVendorId)
@@ -173,17 +182,49 @@ export class BusinessPlacesService {
       }
     }
 
-    const places = placeRows.map((item) => ({
-      id: item.id,
-      name: item.name,
-      address: item.address ?? '',
-      image_url: item.image_url ?? null,
-      categories: item.type_id ? [typeNameById.get(item.type_id) ?? 'Khác'] : [],
-      rating: Number(item.average_rating) || 0,
-      review_count: item.review_count || 0,
-      status: this.mapStatus(item.is_approved),
-      registered_date: item.registered_date ?? '',
-    }));
+    // Compute real-time ratings from review_ai.reviews (places.average_rating is not auto-updated)
+    const placeIds = placeRows.map((item) => item.id);
+    const liveRatingByPlaceId = new Map<string, { average: number; count: number }>();
+    if (placeIds.length > 0) {
+      const { data: reviewRows } = await supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('place_id, rating')
+        .in('place_id', placeIds);
+
+      if (reviewRows && reviewRows.length > 0) {
+        const groups: Record<string, number[]> = {};
+        for (const row of reviewRows as { place_id: string; rating: number }[]) {
+          if (!groups[row.place_id]) groups[row.place_id] = [];
+          groups[row.place_id].push(row.rating);
+        }
+        for (const [placeId, ratings] of Object.entries(groups)) {
+          const count = ratings.length;
+          const avg = count > 0 ? Number((ratings.reduce((a, b) => a + b, 0) / count).toFixed(1)) : 0;
+          liveRatingByPlaceId.set(placeId, { average: avg, count });
+        }
+      }
+    }
+
+    const places = placeRows.map((item) => {
+      const city = Array.isArray(item.cities)
+        ? item.cities[0]?.name
+        : item.cities?.name;
+
+      const liveRating = liveRatingByPlaceId.get(item.id);
+      return {
+        id: item.id,
+        name: item.name,
+        address: item.address ?? '',
+        city: city ?? '',
+        image_url: item.image_url ?? null,
+        categories: item.type_id ? [typeNameById.get(item.type_id) ?? 'Khác'] : [],
+        rating: liveRating?.average ?? Number(item.average_rating) ?? 0,
+        review_count: liveRating?.count ?? item.review_count ?? 0,
+        status: this.mapStatus(item.is_approved),
+        registered_date: item.registered_date ?? '',
+      };
+    });
 
     return {
       data: places,
