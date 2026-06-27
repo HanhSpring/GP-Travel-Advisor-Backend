@@ -25,7 +25,7 @@ import { ItineraryReviewsService } from './itinerary-reviews.service';
 
 type SubmitReviewResponse = {
   success: boolean;
-  itinerary_review_id: string;
+  itinerary_review_id: string | null;
   saved_place_reviews: number;
   saved_media_count: number;
   message: string;
