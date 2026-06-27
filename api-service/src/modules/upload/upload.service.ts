@@ -258,7 +258,7 @@ export class UploadService {
         .toBuffer();
 
       const fileName = `avatars/${userId}-${Date.now()}.webp`;
-      const url = await this.pushToR2(optimizedBuffer, fileName);
+      const url = await this.uploadAvatarBuffer(optimizedBuffer, fileName);
 
       await this.supabase.rpc('update_user_avatar', {
         p_user_id: userId,
@@ -367,6 +367,17 @@ export class UploadService {
     }
   }
 
+  private async uploadAvatarBuffer(
+    buffer: Buffer,
+    key: string,
+  ): Promise<string> {
+    if (this.hasR2Config()) {
+      return this.pushToR2(buffer, key);
+    }
+
+    return this.pushToSupabaseStorage(buffer, key, 'avatars');
+  }
+
   private async uploadPlaceImageBuffer(
     buffer: Buffer,
     key: string,
@@ -402,8 +413,10 @@ export class UploadService {
   private async pushToSupabaseStorage(
     buffer: Buffer,
     key: string,
+    bucketName?: string,
   ): Promise<string> {
-    const bucketName =
+    bucketName =
+      bucketName ||
       this.configService.get<string>('SUPABASE_FOOD_IMAGE_BUCKET')?.trim() ||
       'food-images';
 

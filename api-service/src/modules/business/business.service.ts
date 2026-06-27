@@ -368,7 +368,7 @@ export class BusinessService {
       const { data: foodItems, error: foodError } = await supabase
         .schema('order_sys')
         .from('food_items')
-        .select('id, name, price, description')
+        .select('id, name, price, description, image_url')
         .eq('place_id', placeId)
 
       console.log('🍽️  Food items query - error:', foodError)
@@ -424,7 +424,8 @@ export class BusinessService {
             id: item.id,
             name: item.name,
             description: item.description,
-            price: typeof item.price === 'string' ? parseFloat(item.price) : item.price
+            price: typeof item.price === 'string' ? parseFloat(item.price) : item.price,
+            image_url: Array.isArray(item.image_url) ? item.image_url[0] : (item.image_url ?? null),
           })
         })
       }
@@ -619,6 +620,108 @@ export class BusinessService {
       message: 'Tạo thành công',
       placeId: placeId ?? data,
     };
+  }
+
+  // ── Single service / menu-item CRUD ──────────────────────────────────────────
+
+  async addSingleMenuItem(placeId: string, name: string, description: string | null, price: number) {
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .from('food_items')
+      .insert({ id: randomUUID(), place_id: placeId, name: name.trim(), description: description || null, price: Number(price), image_url: [] })
+      .select('id, name, description, price')
+      .single();
+
+    if (error) throw new BadRequestException(error.message);
+    return { message: 'Thêm dịch vụ thành công', item: data };
+  }
+
+  async updateSingleMenuItem(itemId: string, placeId: string, name: string, description: string | null, price: number) {
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .from('food_items')
+      .update({ name: name.trim(), description: description || null, price: Number(price) })
+      .eq('id', itemId)
+      .eq('place_id', placeId)
+      .select('id')
+      .maybeSingle();
+
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new NotFoundException('Không tìm thấy dịch vụ');
+    return { message: 'Cập nhật dịch vụ thành công' };
+  }
+
+  async deleteSingleMenuItem(itemId: string, placeId: string) {
+    const { error } = await supabase
+      .schema('order_sys')
+      .from('food_items')
+      .delete()
+      .eq('id', itemId)
+      .eq('place_id', placeId);
+
+    if (error) throw new BadRequestException(error.message);
+    return { message: 'Xóa dịch vụ thành công' };
+  }
+
+  async addSingleFreeService(placeId: string, name: string) {
+    const serviceName = name.trim();
+
+    const { data: existing, error: findError } = await supabase
+      .schema('travel')
+      .from('services')
+      .select('id')
+      .ilike('name', serviceName)
+      .maybeSingle();
+
+    if (findError) throw new InternalServerErrorException(findError.message);
+
+    let serviceId: string | null = existing?.id ?? null;
+
+    if (!serviceId) {
+      const { data: created, error: createError } = await supabase
+        .schema('travel')
+        .from('services')
+        .insert({ id: randomUUID(), name: serviceName, price: null })
+        .select('id')
+        .single();
+
+      if (createError) throw new BadRequestException(createError.message);
+      serviceId = created?.id ?? null;
+    }
+
+    if (!serviceId) throw new InternalServerErrorException('Không thể tạo tiện ích');
+
+    const { error: linkError } = await supabase
+      .schema('travel')
+      .from('place_services')
+      .upsert({ place_id: placeId, service_id: serviceId }, { onConflict: 'place_id,service_id' });
+
+    if (linkError) throw new BadRequestException(linkError.message);
+    return { message: 'Thêm tiện ích thành công', id: serviceId };
+  }
+
+  async updateSingleFreeService(placeId: string, oldServiceId: string, newName: string) {
+    const { error: deleteError } = await supabase
+      .schema('travel')
+      .from('place_services')
+      .delete()
+      .eq('place_id', placeId)
+      .eq('service_id', oldServiceId);
+
+    if (deleteError) throw new BadRequestException(deleteError.message);
+    return this.addSingleFreeService(placeId, newName);
+  }
+
+  async deleteSingleFreeService(placeId: string, serviceId: string) {
+    const { error } = await supabase
+      .schema('travel')
+      .from('place_services')
+      .delete()
+      .eq('place_id', placeId)
+      .eq('service_id', serviceId);
+
+    if (error) throw new BadRequestException(error.message);
+    return { message: 'Xóa tiện ích thành công' };
   }
 
   private getSupabaseUserClient(accessToken: string) {

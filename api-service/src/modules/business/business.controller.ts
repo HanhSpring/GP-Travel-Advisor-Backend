@@ -203,4 +203,46 @@ async createFull(
   getFilteredOrders(@Query() query: GetOrdersDto) {
     return this.businessService.getFilteredOrders(query);
   }
+
+  // ── Menu item CRUD ──────────────────────────────────────────────────────────
+
+  @Post('menu-item')
+  @ApiOperation({ summary: 'Thêm dịch vụ (menu item) cho địa điểm' })
+  addMenuItem(@Body() body: any) {
+    return this.businessService.addSingleMenuItem(body.placeId, body.name, body.description ?? null, Number(body.price ?? 0));
+  }
+
+  @Put('menu-item')
+  @ApiOperation({ summary: 'Cập nhật dịch vụ (menu item)' })
+  updateMenuItem(@Body() body: any) {
+    return this.businessService.updateSingleMenuItem(body.itemId ?? body.id, body.placeId, body.name, body.description ?? null, Number(body.price ?? 0));
+  }
+
+  @Delete('menu-item')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Xóa dịch vụ (menu item)' })
+  deleteMenuItem(@Body() body: any) {
+    return this.businessService.deleteSingleMenuItem(body.itemId ?? body.id, body.placeId);
+  }
+
+  // ── Free service CRUD ───────────────────────────────────────────────────────
+
+  @Post('free-service')
+  @ApiOperation({ summary: 'Thêm tiện ích miễn phí cho địa điểm' })
+  addFreeService(@Body() body: any) {
+    return this.businessService.addSingleFreeService(body.placeId, body.name);
+  }
+
+  @Put('free-service')
+  @ApiOperation({ summary: 'Cập nhật tiện ích miễn phí' })
+  updateFreeService(@Body() body: any) {
+    return this.businessService.updateSingleFreeService(body.placeId, body.serviceId ?? body.id, body.name);
+  }
+
+  @Delete('free-service')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Xóa tiện ích miễn phí' })
+  deleteFreeService(@Body() body: any) {
+    return this.businessService.deleteSingleFreeService(body.placeId, body.serviceId ?? body.id);
+  }
 }
