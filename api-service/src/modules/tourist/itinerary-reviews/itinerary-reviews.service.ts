@@ -61,6 +61,7 @@ interface ItineraryFullReviewRow {
 
 interface PlaceReviewRow {
   id: string;
+  itinerary_id: string | null;
   place_id: string;
   rating: number | null;
   tags?: string[] | null;
@@ -618,6 +619,7 @@ export class ItineraryReviewsService {
   private async getPlaceReviewsForItinerary(
     touristId: string,
     itineraryId: string,
+    placeIds: string[] = [],
   ): Promise<
     Map<
       string,
@@ -630,16 +632,36 @@ export class ItineraryReviewsService {
       }
     >
   > {
-    const { data: reviews, error } = await supabase
+    const normalizedPlaceIds = Array.from(
+      new Set(placeIds.map((id) => id.trim()).filter(Boolean)),
+    );
+
+    let query = supabase
       .schema('review_ai')
       .from('reviews')
-      .select('id, place_id, rating, tags, url_image, created_at')
+      .select('id, itinerary_id, place_id, rating, tags, url_image, created_at')
       .eq('tourist_id', touristId)
-      .eq('itinerary_id', itineraryId)
-      .returns<PlaceReviewRow[]>();
+      .order('created_at', { ascending: false });
+
+    if (normalizedPlaceIds.length > 0) {
+      query = query.or(
+        `itinerary_id.eq.${itineraryId},place_id.in.(${normalizedPlaceIds.join(',')})`,
+      );
+    } else {
+      query = query.eq('itinerary_id', itineraryId);
+    }
+
+    const { data, error } = await query.returns<PlaceReviewRow[]>();
 
     if (error) throw new InternalServerErrorException(error.message);
-    if (!reviews || reviews.length === 0) {
+
+    const placeIdSet = new Set(normalizedPlaceIds);
+    const reviews = (data ?? []).filter(
+      (review) =>
+        review.itinerary_id === itineraryId || placeIdSet.has(review.place_id),
+    );
+
+    if (reviews.length === 0) {
       return new Map();
     }
 
@@ -665,7 +687,17 @@ export class ItineraryReviewsService {
         reviewedAt: string | null;
       }
     >();
+    const exactItineraryReviewPlaceIds = new Set<string>();
     for (const r of reviews) {
+      const isExactItineraryReview = r.itinerary_id === itineraryId;
+      if (
+        byPlaceId.has(r.place_id) &&
+        (!isExactItineraryReview ||
+          exactItineraryReviewPlaceIds.has(r.place_id))
+      ) {
+        continue;
+      }
+
       byPlaceId.set(r.place_id, {
         rating: r.rating,
         content: contentByReviewId.get(r.id) ?? null,
@@ -673,6 +705,10 @@ export class ItineraryReviewsService {
         mediaUrls: Array.isArray(r.url_image) ? r.url_image : [],
         reviewedAt: r.created_at ?? null,
       });
+
+      if (isExactItineraryReview) {
+        exactItineraryReviewPlaceIds.add(r.place_id);
+      }
     }
     return byPlaceId;
   }
@@ -680,17 +716,42 @@ export class ItineraryReviewsService {
   private async getReviewedPlaceIdsForItinerary(
     touristId: string,
     itineraryId: string,
+    placeIds: string[] = [],
   ): Promise<Set<string>> {
-    const { data, error } = await supabase
+    const normalizedPlaceIds = Array.from(
+      new Set(placeIds.map((id) => id.trim()).filter(Boolean)),
+    );
+
+    let query = supabase
       .schema('review_ai')
       .from('reviews')
-      .select('place_id')
-      .eq('tourist_id', touristId)
-      .eq('itinerary_id', itineraryId)
-      .returns<Array<{ place_id: string }>>();
+      .select('itinerary_id, place_id')
+      .eq('tourist_id', touristId);
+
+    if (normalizedPlaceIds.length > 0) {
+      query = query.or(
+        `itinerary_id.eq.${itineraryId},place_id.in.(${normalizedPlaceIds.join(',')})`,
+      );
+    } else {
+      query = query.eq('itinerary_id', itineraryId);
+    }
+
+    const { data, error } =
+      await query.returns<
+        Array<{ itinerary_id: string | null; place_id: string }>
+      >();
 
     if (error) throw new InternalServerErrorException(error.message);
-    return new Set((data ?? []).map((item) => item.place_id));
+
+    const placeIdSet = new Set(normalizedPlaceIds);
+    return new Set(
+      (data ?? [])
+        .filter(
+          (item) =>
+            item.itinerary_id === itineraryId || placeIdSet.has(item.place_id),
+        )
+        .map((item) => item.place_id),
+    );
   }
 
   private async getVisitStatusForItinerary(
@@ -714,16 +775,17 @@ export class ItineraryReviewsService {
       throw new BadRequestException('tourist_id and itinerary_id are required');
     }
 
-    const [itinerary, details, overallReview, placeReviewsMap] =
-      await Promise.all([
-        this.getItineraryOrThrow(touristId, itineraryId),
-        this.getItineraryDetails(itineraryId),
-        this.getItineraryFullReview(touristId, itineraryId),
-        this.getPlaceReviewsForItinerary(touristId, itineraryId),
-      ]);
+    const [itinerary, details, overallReview] = await Promise.all([
+      this.getItineraryOrThrow(touristId, itineraryId),
+      this.getItineraryDetails(itineraryId),
+      this.getItineraryFullReview(touristId, itineraryId),
+    ]);
 
     const placeIds = [...new Set(details.map((d) => d.place_id))];
-    const places = await this.getPlaces(placeIds);
+    const [places, placeReviewsMap] = await Promise.all([
+      this.getPlaces(placeIds),
+      this.getPlaceReviewsForItinerary(touristId, itineraryId, placeIds),
+    ]);
     const placeMap = new Map(places.map((p) => [p.id, p]));
     const { dayByDate } = this.buildDayInfo(details);
 
@@ -860,16 +922,17 @@ export class ItineraryReviewsService {
     const itinerary = await this.getItineraryOrThrow(touristId, itineraryId);
 
     // Run remaining independent queries in parallel to reduce latency
-    const [details, summaryReview, placeReviewsMap, visitSet] =
-      await Promise.all([
-        this.getItineraryDetails(itineraryId),
-        this.getItinerarySummaryReview(touristId, itineraryId),
-        this.getPlaceReviewsForItinerary(touristId, itineraryId),
-        this.getVisitStatusForItinerary(touristId, itineraryId),
-      ]);
+    const [details, summaryReview, visitSet] = await Promise.all([
+      this.getItineraryDetails(itineraryId),
+      this.getItinerarySummaryReview(touristId, itineraryId),
+      this.getVisitStatusForItinerary(touristId, itineraryId),
+    ]);
 
     const placeIds = Array.from(new Set(details.map((item) => item.place_id)));
-    const places = await this.getPlaces(placeIds);
+    const [places, placeReviewsMap] = await Promise.all([
+      this.getPlaces(placeIds),
+      this.getPlaceReviewsForItinerary(touristId, itineraryId, placeIds),
+    ]);
     const placeMap = new Map(places.map((item) => [item.id, item]));
 
     const { dayByDate, dayFilters } = this.buildDayInfo(details);
@@ -959,10 +1022,13 @@ export class ItineraryReviewsService {
     }
 
     await this.getItineraryOrThrow(touristId, itineraryId);
-    const [details, existingPlaceIds] = await Promise.all([
-      this.getItineraryDetails(itineraryId),
-      this.getReviewedPlaceIdsForItinerary(touristId, itineraryId),
-    ]);
+    const details = await this.getItineraryDetails(itineraryId);
+    const itineraryPlaceIds = details.map((detail) => detail.place_id);
+    const existingPlaceIds = await this.getReviewedPlaceIdsForItinerary(
+      touristId,
+      itineraryId,
+      itineraryPlaceIds,
+    );
 
     if (details.length === 0) {
       throw new BadRequestException('Itinerary has no place details to review');
