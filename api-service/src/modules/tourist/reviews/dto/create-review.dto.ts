@@ -18,14 +18,14 @@ export class CreateReviewDto {
     deprecated: true,
   })
   @IsOptional()
-  @IsUUID('4')
+  @IsUUID()
   tourist_id?: string;
 
   @ApiProperty({
     example: '16579947-051d-47ec-856c-a8f5159ab7ba',
     description: 'UUID of the place being reviewed',
   })
-  @IsUUID('4')
+  @IsUUID()
   place_id: string;
 
   @ApiProperty({
@@ -35,7 +35,7 @@ export class CreateReviewDto {
     nullable: true,
   })
   @IsOptional()
-  @IsUUID('4')
+  @IsUUID()
   itinerary_id?: string | null;
 
   @ApiProperty({

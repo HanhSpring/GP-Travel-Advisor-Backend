@@ -35,6 +35,8 @@ interface PlaceRow {
   id: string;
   name: string;
   image_url: string | string[] | null;
+  type_id: string | null;
+  types: { category_id: string } | { category_id: string }[] | null;
 }
 
 interface ItineraryReviewRow {
@@ -131,6 +133,15 @@ export class ItineraryReviewsService {
     return null;
   }
 
+  private getPlaceCategoryId(place: PlaceRow | undefined): string | null {
+    const types = place?.types;
+
+    if (Array.isArray(types)) {
+      return types[0]?.category_id ?? null;
+    }
+
+    return types?.category_id ?? null;
+  }
   private async getItineraryOrThrow(touristId: string, itineraryId: string) {
     const { data: itinerary, error } = await supabase
       .schema('travel')
@@ -179,7 +190,7 @@ export class ItineraryReviewsService {
     const { data: places, error } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, name, image_url')
+      .select('id, name, image_url, type_id, types(category_id)')
       .in('id', placeIds);
 
     if (error) {
@@ -892,6 +903,7 @@ export class ItineraryReviewsService {
           place_id: item.place_id,
           place_name: place?.name ?? 'Địa điểm',
           place_image_url: this.getPlaceImage(place?.image_url ?? null),
+          category_id: this.getPlaceCategoryId(place),
           rating: review?.rating ?? null,
           content: review?.content ?? null,
           has_review: placeReviewsMap.has(item.place_id),
@@ -966,7 +978,9 @@ export class ItineraryReviewsService {
       overallMediaUrls,
     );
 
-    if (!itineraryReviewId) {
+    // Only create a draft row when itinerary-level media actually needs an anchor.
+    // Submitting only place reviews should not create an empty itinerary_reviews record.
+    if (!itineraryReviewId && payload.media?.length) {
       const draft = await this.getOrCreateReviewDraft(touristId, itineraryId);
       itineraryReviewId = draft.id;
     }
@@ -1056,10 +1070,12 @@ export class ItineraryReviewsService {
     }
 
     this.assertUniqueReviewMediaUrls(allMediaUrls);
-    await this.updateItineraryReviewImages(
-      itineraryReviewId,
-      itineraryMediaUrls,
-    );
+    if (itineraryReviewId) {
+      await this.updateItineraryReviewImages(
+        itineraryReviewId,
+        itineraryMediaUrls,
+      );
+    }
 
     if (reviewsWithTags.length > 0) {
       const { error: insertReviewsError } = await supabase
