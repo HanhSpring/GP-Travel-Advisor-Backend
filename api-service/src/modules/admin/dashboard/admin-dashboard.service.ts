@@ -300,7 +300,8 @@ export class DashboardService {
           .schema('travel')
           .from('places')
           .select('id', { count: 'exact', head: true })
-          .is('is_approved', null),
+          .is('is_approved', null)
+          .or('is_active.is.null,is_active.eq.true'),
         supabase
           .schema('review_ai')
           .from('reviews')

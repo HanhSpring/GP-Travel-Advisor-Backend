@@ -33,6 +33,7 @@ interface BusinessRow {
 interface TypeRow {
   id: string;
   name: string;
+  categories: { name: string | null } | Array<{ name: string | null }> | null;
 }
 
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
@@ -164,13 +165,13 @@ export class BusinessPlacesService {
           .filter((value): value is string => Boolean(value)),
       ),
     ];
-    const typeNameById = new Map<string, string>();
+    const categoryNameByTypeId = new Map<string, string>();
 
     if (typeIds.length > 0) {
       const { data: typesData, error: typesError } = await supabase
         .schema('travel')
         .from('types')
-        .select('id, name')
+        .select('id, name, categories(name)')
         .in('id', typeIds);
 
       if (typesError) {
@@ -178,7 +179,10 @@ export class BusinessPlacesService {
       }
 
       for (const type of (typesData ?? []) as TypeRow[]) {
-        typeNameById.set(type.id, type.name);
+        const category = Array.isArray(type.categories)
+          ? type.categories[0]
+          : type.categories;
+        categoryNameByTypeId.set(type.id, category?.name || type.name);
       }
     }
 
@@ -218,7 +222,7 @@ export class BusinessPlacesService {
         address: item.address ?? '',
         city: city ?? '',
         image_url: item.image_url ?? null,
-        categories: item.type_id ? [typeNameById.get(item.type_id) ?? 'Khác'] : [],
+        categories: item.type_id ? [categoryNameByTypeId.get(item.type_id) ?? 'Khác'] : [],
         rating: liveRating?.average ?? Number(item.average_rating) ?? 0,
         review_count: liveRating?.count ?? item.review_count ?? 0,
         status: this.mapStatus(item.is_approved),

@@ -34,9 +34,7 @@ export interface ReviewResponse {
 
 @Injectable()
 export class ReviewsService {
-  constructor(
-    private readonly eventEmitter: EventEmitter2,
-  ) {}
+  constructor(private readonly eventEmitter: EventEmitter2) {}
 
   private normalizeMediaUrls(value: unknown): string[] {
     let values: unknown[] = [];
@@ -387,6 +385,9 @@ export class ReviewsService {
     const reviewId = randomUUID();
     const createdAt = new Date().toISOString();
     const reviewType = payload.content ? 'with_content' : 'without_content';
+    const imageUrls = (payload.images ?? [])
+      .map((url) => String(url ?? '').trim())
+      .filter(Boolean);
 
     const { error: reviewError } = await supabase
       .schema('review_ai')
@@ -400,6 +401,7 @@ export class ReviewsService {
           rating: payload.rating,
           review_type: reviewType,
           tags: payload.tags ?? null,
+          url_image: imageUrls.length > 0 ? imageUrls : null,
           status: 'pending',
         },
       ]);
@@ -445,7 +447,7 @@ export class ReviewsService {
       created_at: createdAt,
       content: payload.content || null,
       tags: payload.tags || null,
-      images: payload.images || null,
+      images: imageUrls.length > 0 ? imageUrls : null,
     };
   }
 }

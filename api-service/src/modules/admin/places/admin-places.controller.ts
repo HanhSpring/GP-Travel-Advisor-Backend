@@ -165,11 +165,35 @@ export class AdminPlacesController {
     return this.service.rejectPlace(id, body?.note);
   }
 
+  @Patch(':id/coordinates')
+  @ApiOperation({
+    summary: 'Update place coordinates',
+    description: 'Update latitude and longitude for a place',
+  })
+  @ApiResponse({
+    status: 200,
+    description: 'Place coordinates updated successfully',
+  })
+  @ApiResponse({
+    status: 404,
+    description: 'Place not found',
+  })
+  async updatePlaceCoordinates(
+    @Param('id') id: string,
+    @Body() body: { latitude: number; longitude: number },
+  ) {
+    return this.service.updatePlaceCoordinates(
+      id,
+      Number(body?.latitude),
+      Number(body?.longitude),
+    );
+  }
+
   @Delete(':id')
   @HttpCode(204)
   @ApiOperation({
     summary: 'Delete a place',
-    description: 'Permanently delete a place by ID',
+    description: 'Soft delete a place by ID',
   })
   @ApiResponse({ status: 204, description: 'Place deleted successfully' })
   @ApiResponse({ status: 404, description: 'Place not found' })

@@ -61,13 +61,19 @@ class TouristOrderSummaryDto {
   order_code: string;
 
   @ApiProperty()
-  item_name: string;
+  restaurant_name: string;
 
   @ApiProperty()
   status: string;
 
   @ApiProperty()
   status_label: string;
+
+  @ApiProperty({ nullable: true })
+  ordered_at: string | null;
+
+  @ApiProperty()
+  total_amount: number;
 }
 
 class OrderSectionDto {
@@ -101,4 +107,37 @@ export class TouristMoreInfoResponseDto {
 
   @ApiProperty({ type: MoreInfoActionsDto })
   actions: MoreInfoActionsDto;
+}
+
+class TouristOrderItemDto {
+  @ApiProperty()
+  id: string;
+
+  @ApiProperty()
+  food_item_id: string;
+
+  @ApiProperty()
+  name: string;
+
+  @ApiProperty()
+  quantity: number;
+
+  @ApiProperty()
+  unit_price: number;
+
+  @ApiProperty()
+  total_price: number;
+}
+
+export class TouristOrdersResponseDto {
+  @ApiProperty({ type: [TouristOrderSummaryDto] })
+  orders: TouristOrderSummaryDto[];
+}
+
+export class TouristOrderDetailResponseDto {
+  @ApiProperty({ type: TouristOrderSummaryDto })
+  order: TouristOrderSummaryDto;
+
+  @ApiProperty({ type: [TouristOrderItemDto] })
+  items: TouristOrderItemDto[];
 }

@@ -45,12 +45,18 @@ ENDPOINT_URL = os.environ.get("R2_ENDPOINT_URL", "")
 ACCESS_KEY   = os.environ.get("R2_ACCESS_KEY_ID", "")
 SECRET_KEY   = os.environ.get("R2_SECRET_ACCESS_KEY", "")
 BUCKET       = os.environ.get("R2_BUCKET_NAME", "ai-artifacts")
+TRANSFER_CONFIG = TransferConfig(
+    multipart_threshold=64 * 1024 ** 2,
+    multipart_chunksize=64 * 1024 ** 2,
+    max_concurrency=4,
+)
 
 # Thư mục nguồn (đường dẫn tương đối so với script này)
 SCRIPT_DIR   = Path(__file__).parent.parent   # gốc ai-service/
 UPLOAD_DIRS  = {
     "recommender_artifacts": SCRIPT_DIR / "recommender_artifacts",
     "data": SCRIPT_DIR / "data",
+    "phobert_timelabel/checkpoint-60": SCRIPT_DIR / "app" / "models" / "phobert_timelabel" / "checkpoint-60",
 }
 
 # File / thư mục không cần thiết cho serving (bỏ qua khi upload)
@@ -120,7 +126,7 @@ def main():
             print(f"  ⬆ Uploading {r2_key:<55} ({size_mb:.1f} MB)...", end="", flush=True)
             client.upload_file(
                 str(local_path), BUCKET, r2_key,
-                Config=TransferConfig(multipart_threshold=5 * 1024 ** 3),  # disable multipart (<5GB)
+                Config=TRANSFER_CONFIG,
             )
             print(" ✓")
             total_uploaded += 1
