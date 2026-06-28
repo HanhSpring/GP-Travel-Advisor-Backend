@@ -294,6 +294,39 @@ export class AdminService {
     };
   }
 
+  async getAdminProfile(userId: string) {
+    const supabaseAdmin = createClient(
+      process.env.SUPABASE_URL as string,
+      process.env.SUPABASE_KEY as string,
+    );
+
+    const { data, error } = await supabaseAdmin
+      .from('users')
+      .select('id, full_name, email, phone_number, date_of_birth, avatar_url')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (error) {
+      throw new InternalServerErrorException(
+        `Failed to load admin profile: ${error.message}`,
+      );
+    }
+
+    if (!data) {
+      throw new NotFoundException('Admin profile not found');
+    }
+
+    return {
+      id: data.id,
+      fullName: data.full_name,
+      email: data.email,
+      phone: data.phone_number,
+      phoneNumber: data.phone_number,
+      dateOfBirth: data.date_of_birth,
+      avatarUrl: data.avatar_url,
+    };
+  }
+
   async updateAdminProfile(userId: string, updateDto: any) {
     const supabaseAdmin = createClient(
       process.env.SUPABASE_URL as string,
@@ -305,6 +338,7 @@ export class AdminService {
       .update({
         full_name: updateDto.fullName,
         phone_number: updateDto.phone,
+        date_of_birth: updateDto.dateOfBirth || null,
         avatar_url: updateDto.avatarUrl,
       })
       .eq('id', userId)
@@ -316,13 +350,17 @@ export class AdminService {
       );
     }
 
-    const { error: authError } = await supabaseAdmin.auth.admin.updateUserById(userId, {
-      user_metadata: {
-        full_name: updateDto.fullName,
-        phone_number: updateDto.phone,
-        avatar_url: updateDto.avatarUrl,
-      }
-    });
+    const { error: authError } = await supabaseAdmin.auth.admin.updateUserById(
+      userId,
+      {
+        user_metadata: {
+          full_name: updateDto.fullName,
+          phone_number: updateDto.phone,
+          date_of_birth: updateDto.dateOfBirth || null,
+          avatar_url: updateDto.avatarUrl,
+        },
+      },
+    );
 
     if (authError) {
       throw new InternalServerErrorException(

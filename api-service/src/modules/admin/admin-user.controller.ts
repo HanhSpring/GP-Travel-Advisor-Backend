@@ -41,6 +41,13 @@ import { CreateUserByAdminDto } from './dto/create-user-by-admin.dto';
 export class AdminUserController {
   constructor(private readonly adminService: AdminService) {}
 
+  @Get('profile/me')
+  @ApiOperation({ summary: 'Admin get own profile' })
+  @ApiResponse({ status: 200, description: 'Profile loaded successfully' })
+  async getAdminProfile(@Request() req) {
+    return this.adminService.getAdminProfile(req.user.userId);
+  }
+
   @Patch('profile/me')
   @ApiOperation({ summary: 'Admin cập nhật thông tin cá nhân' })
   @ApiResponse({ status: 200, description: 'Cập nhật thành công' })
