@@ -169,7 +169,6 @@ export class PlacesService {
         .limit(10),
       this.recommendations.getRecommendedPlaceIds(placeId, {
         userId: numericUserId,
-        k: 10,
       }),
       touristId
         ? this.checkFavorite(touristId, placeId)

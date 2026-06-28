@@ -11,12 +11,17 @@ export type ModerationResult = {
 @Injectable()
 export class ModerationService {
   private readonly logger = new Logger(ModerationService.name);
-  private openai: OpenAI;
+  private _openai: OpenAI | null = null;
 
-  constructor() {
-    this.openai = new OpenAI({
-      apiKey: process.env.OPENAI_API_KEY,
-    });
+  private get openai(): OpenAI {
+    if (!this._openai) {
+      const apiKey = process.env.OPENAI_API_KEY;
+      if (!apiKey) {
+        throw new Error('OPENAI_API_KEY is not set');
+      }
+      this._openai = new OpenAI({ apiKey });
+    }
+    return this._openai;
   }
 
   private isVideo(url: string): boolean {

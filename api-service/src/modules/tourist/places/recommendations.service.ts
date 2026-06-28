@@ -40,14 +40,14 @@ export class RecommendationsService {
     placeId: string,
     options: { userId?: number | null; k?: number } = {},
   ): Promise<RecommendationItem[]> {
-    const { userId = null, k = 12 } = options;
+    const { userId = null, k } = options;
     const url = `${this.baseUrl}/recommend/places/${encodeURIComponent(placeId)}/recommendations`;
 
     try {
       const response = await firstValueFrom(
         this.http.get<RecommendationsResponse>(url, {
           params: {
-            k,
+            ...(k != null ? { k } : {}),
             ...(userId != null ? { user_id: userId } : {}),
           },
           timeout: this.timeoutMs,

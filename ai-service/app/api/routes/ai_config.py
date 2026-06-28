@@ -33,7 +33,11 @@ def get_hybrid_weights():
 )
 def update_hybrid_weights(req: UpdateDistanceWeightRequest):
     try:
-        return svc.update_distance_weight(req.distance_weight, req.actor)
+        return svc.update_hybrid_config(
+            distance_weight=req.distance_weight,
+            candidate_count=req.candidate_count,
+            actor=req.actor,
+        )
     except svc.AiConfigError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except httpx.HTTPError as e:

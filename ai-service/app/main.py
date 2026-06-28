@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from app.api.deps import load_all_models
 from app.api.routes import recommend, embedding, review, ai_config, itinerary
 from app.api.v1.api_router import api_router as v1_api_router
@@ -34,6 +35,22 @@ app = FastAPI(
 )
 
 # Routes không có prefix /api/v1 — NestJS gọi trực tiếp
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=(
+        r"https?://("
+        r"localhost|"
+        r"127\.0\.0\.1|"
+        r"192\.168\.\d{1,3}\.\d{1,3}|"
+        r"10\.\d{1,3}\.\d{1,3}\.\d{1,3}|"
+        r"172\.(1[6-9]|2\d|3[01])\.\d{1,3}\.\d{1,3}"
+        r"):\d+"
+    ),
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 app.include_router(recommend.router,   prefix="/recommend",   tags=["Recommend"])
 app.include_router(embedding.router,   prefix="/embedding",   tags=["Embedding"])
 app.include_router(review.router,      prefix="/review",      tags=["Review"])
