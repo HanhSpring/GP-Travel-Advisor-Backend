@@ -108,7 +108,8 @@ const DEFAULT_PARAM_DEFINITIONS: Record<
     currentValue: 10,
     minValue: 1,
     maxValue: 1440,
-    description: 'Interval in minutes between periodic review moderation batch runs',
+    description:
+      'Interval in minutes between periodic review moderation batch runs',
   },
 };
 

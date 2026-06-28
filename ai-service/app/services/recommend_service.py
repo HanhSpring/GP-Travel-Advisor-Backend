@@ -1,5 +1,6 @@
 from app.api.deps import get_model
 from app.core.logger import get_logger
+from app.services import ai_config_service
 
 logger = get_logger(__name__)
 
@@ -75,7 +76,7 @@ def recommend_cf(user_id: str, top_k: int) -> tuple[list[str], list[float]]:
 
 
 def recommend_for_place(
-    place_id: str, user_id: int | None, k: int
+    place_id: str, user_id: int | None, k: int | None = None
 ) -> list[dict]:
     """Gợi ý "Có thể bạn sẽ thích" cho 1 địa điểm đang xem (Hybrid CB + CF + khoảng cách)."""
     engine = get_model("hybrid_recommender")
@@ -83,4 +84,10 @@ def recommend_for_place(
         raise RuntimeError(
             "Hybrid Recommender chưa được load (thiếu artifact trong recommender_artifacts/ hoặc data/)"
         )
+    if k is None:
+        try:
+            k = int(ai_config_service.get_weights()["candidate_count"])
+        except Exception as exc:
+            logger.warning("Cannot load default hybrid k from DB, using 10: %s", exc)
+            k = 10
     return engine.recommend(user_id, place_id, k=k)

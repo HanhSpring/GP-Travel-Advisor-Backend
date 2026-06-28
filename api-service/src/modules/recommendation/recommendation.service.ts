@@ -30,11 +30,7 @@ import {
   TwoTowerRuntimeConfig,
 } from './two-tower-config.types';
 
-type PriceBasis =
-  | 'per_person'
-  | 'per_room_per_night'
-  | 'per_group'
-  | 'unknown';
+type PriceBasis = 'per_person' | 'per_room_per_night' | 'per_group' | 'unknown';
 
 interface PriceInfo {
   estimatedCost: number | null;
@@ -180,7 +176,13 @@ export class RecommendationService {
     );
     const poolChunks = await Promise.all(
       fetchPlan.map(({ slotType, limit, travelType }) =>
-        this.fetchBySlot(embedding, dto.destinationLocationId, slotType, limit, travelType),
+        this.fetchBySlot(
+          embedding,
+          dto.destinationLocationId,
+          slotType,
+          limit,
+          travelType,
+        ),
       ),
     );
 
@@ -197,11 +199,17 @@ export class RecommendationService {
     }
 
     this.logger.debug(
-      `Pool: ${pool.length} places (${fetchPlan.map(p => `${p.slotType}:${p.limit}`).join(', ')})`,
+      `Pool: ${pool.length} places (${fetchPlan.map((p) => `${p.slotType}:${p.limit}`).join(', ')})`,
     );
 
     // ── 6. Diversity-aware top-K (phase 2 fill nếu 1 slot thiếu) ─────────────
-    const diversePool = diversifyTopK(pool, numDays, dto.tripIntent, topK, fetchPlan);
+    const diversePool = diversifyTopK(
+      pool,
+      numDays,
+      dto.tripIntent,
+      topK,
+      fetchPlan,
+    );
 
     // ── 7. Map → response DTO ─────────────────────────────────────────────────
     const candidates: CandidatePlaceDto[] = diversePool.map((c) => ({
@@ -297,7 +305,9 @@ export class RecommendationService {
     const details = await this.fetchPlannerPlaceDetails(plannerCandidates);
     const detailsMs = Date.now() - detailsStartedAt;
     if (!details.length) {
-      throw new NotFoundException('No place details found for itinerary planning');
+      throw new NotFoundException(
+        'No place details found for itinerary planning',
+      );
     }
     if (!details.some((place) => place.place_type === 'hotel')) {
       throw new NotFoundException(
@@ -305,7 +315,9 @@ export class RecommendationService {
       );
     }
 
-    const attractionCount = details.filter((p) => p.place_type === 'attraction').length;
+    const attractionCount = details.filter(
+      (p) => p.place_type === 'attraction',
+    ).length;
     if (attractionCount === 0) {
       this.logger.error(
         `Zero attractions retrieved for ${retrieval.destination_name} ` +
@@ -390,8 +402,7 @@ export class RecommendationService {
   private calcNumDays(startDate: string, endDate: string): number {
     const start = new Date(startDate);
     const end = new Date(endDate);
-    const days =
-      Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
+    const days = Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
     return Math.max(1, days);
   }
 
@@ -436,23 +447,27 @@ export class RecommendationService {
 
       if (!error) {
         if (attempt > 1) {
-          this.logger.warn(`fetchBySlot [${slotType}] succeeded on attempt ${attempt}`);
+          this.logger.warn(
+            `fetchBySlot [${slotType}] succeeded on attempt ${attempt}`,
+          );
         }
         const candidates = (data ?? []) as PlaceCandidate[];
-        if (slotType === 'attraction' && travelType && candidates.length === 0) {
+        if (
+          slotType === 'attraction' &&
+          travelType &&
+          candidates.length === 0
+        ) {
           this.logger.warn(
             `fetchBySlot [${slotType}] returned 0 with travelType="${travelType}", retrying without travelType`,
           );
-          const { data: fallbackData, error: fallbackError } = await supabase.rpc(
-            'recommend_places_by_slot',
-            {
+          const { data: fallbackData, error: fallbackError } =
+            await supabase.rpc('recommend_places_by_slot', {
               query_embedding: `[${embedding.join(',')}]`,
               target_city_id: cityId,
               p_slot_type: slotType,
               p_limit: effectiveLimit,
               p_travel_type: null,
-            },
-          );
+            });
 
           if (!fallbackError) {
             return (fallbackData ?? []) as PlaceCandidate[];
@@ -550,7 +565,10 @@ export class RecommendationService {
           planner_source: 'two_tower',
         };
       })
-      .sort((a: any, b: any) => (a.candidate_rank ?? 999_999) - (b.candidate_rank ?? 999_999));
+      .sort(
+        (a: any, b: any) =>
+          (a.candidate_rank ?? 999_999) - (b.candidate_rank ?? 999_999),
+      );
   }
 
   private resolvePlannerPlaceType(
@@ -565,7 +583,11 @@ export class RecommendationService {
     if (category === 'accommodation' || category === 'hotel') {
       return 'hotel';
     }
-    if (category === 'cafe' || type.includes('cafe') || type.includes('coffee')) {
+    if (
+      category === 'cafe' ||
+      type.includes('cafe') ||
+      type.includes('coffee')
+    ) {
       return 'cafe';
     }
     if (category === 'entertainment') {
@@ -639,11 +661,7 @@ export class RecommendationService {
     ) {
       return 'Mon-Fri';
     }
-    if (
-      days.length === 2 &&
-      days[0] === 'Sat' &&
-      days[1] === 'Sun'
-    ) {
+    if (days.length === 2 && days[0] === 'Sat' && days[1] === 'Sun') {
       return 'Sat,Sun';
     }
     return days.join(',');
@@ -672,18 +690,23 @@ export class RecommendationService {
   }
 
   private formatCandidateCounts(candidates: CandidatePlaceDto[]): string {
-    const counts = candidates.reduce<Record<string, number>>((acc, candidate) => {
-      const key = candidate.category ?? 'unknown';
-      acc[key] = (acc[key] ?? 0) + 1;
-      return acc;
-    }, {});
+    const counts = candidates.reduce<Record<string, number>>(
+      (acc, candidate) => {
+        const key = candidate.category ?? 'unknown';
+        acc[key] = (acc[key] ?? 0) + 1;
+        return acc;
+      },
+      {},
+    );
     return Object.entries(counts)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([key, value]) => `${key}=${value}`)
       .join(', ');
   }
 
-  private countCandidates(candidates: CandidatePlaceDto[]): Record<string, number> {
+  private countCandidates(
+    candidates: CandidatePlaceDto[],
+  ): Record<string, number> {
     return candidates.reduce<Record<string, number>>((acc, candidate) => {
       const key = candidate.category ?? 'unknown';
       acc[key] = (acc[key] ?? 0) + 1;
@@ -707,7 +730,7 @@ export class RecommendationService {
         ? 'return_to_hotel'
         : entry.is_restaurant
           ? 'restaurant'
-          : entry.place_type ?? 'attraction';
+          : (entry.place_type ?? 'attraction');
       const bucket = acc[key] ?? {
         count: 0,
         travelMinutes: 0,
@@ -720,8 +743,12 @@ export class RecommendationService {
       bucket.travelMinutes += Number(entry.travel_minutes ?? 0);
       bucket.rawTravelMinutes += Number(entry.raw_travel_minutes ?? 0);
       bucket.waitMinutes += Number(entry.wait_minutes ?? 0);
-      bucket.activeDurationMinutes += Number(entry.active_duration_minutes ?? 0);
-      bucket.distanceKm = Number((bucket.distanceKm + Number(entry.distance_km ?? 0)).toFixed(2));
+      bucket.activeDurationMinutes += Number(
+        entry.active_duration_minutes ?? 0,
+      );
+      bucket.distanceKm = Number(
+        (bucket.distanceKm + Number(entry.distance_km ?? 0)).toFixed(2),
+      );
       acc[key] = bucket;
       return acc;
     }, {});
@@ -729,8 +756,12 @@ export class RecommendationService {
 
   private aggregateDaysByType(days: any[]): Record<string, any> {
     return days.reduce<Record<string, any>>((acc, day) => {
-      const dayTotals = this.aggregateScheduleByType(Array.isArray(day.schedule) ? day.schedule : []);
-      for (const [key, value] of Object.entries(dayTotals) as Array<[string, any]>) {
+      const dayTotals = this.aggregateScheduleByType(
+        Array.isArray(day.schedule) ? day.schedule : [],
+      );
+      for (const [key, value] of Object.entries(dayTotals) as Array<
+        [string, any]
+      >) {
         const bucket = acc[key] ?? {
           count: 0,
           travelMinutes: 0,
@@ -744,7 +775,9 @@ export class RecommendationService {
         bucket.rawTravelMinutes += value.rawTravelMinutes;
         bucket.waitMinutes += value.waitMinutes;
         bucket.activeDurationMinutes += value.activeDurationMinutes;
-        bucket.distanceKm = Number((bucket.distanceKm + value.distanceKm).toFixed(2));
+        bucket.distanceKm = Number(
+          (bucket.distanceKm + value.distanceKm).toFixed(2),
+        );
         acc[key] = bucket;
       }
       return acc;
@@ -769,7 +802,12 @@ export class RecommendationService {
   private getPriceIndex(): Map<string, PriceInfo> {
     if (this.priceIndex) return this.priceIndex;
     const index = new Map<string, PriceInfo>();
-    const csvPath = join(process.cwd(), '..', 'docs', 'places_rows_after_fill.csv');
+    const csvPath = join(
+      process.cwd(),
+      '..',
+      'docs',
+      'places_rows_after_fill.csv',
+    );
     if (!existsSync(csvPath)) {
       this.logger.warn(`Price CSV not found: ${csvPath}`);
       this.priceIndex = index;
@@ -779,7 +817,9 @@ export class RecommendationService {
     try {
       const workbook = XLSX.readFile(csvPath, { raw: false });
       const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json<Record<string, any>>(sheet, { defval: null });
+      const rows = XLSX.utils.sheet_to_json<Record<string, any>>(sheet, {
+        defval: null,
+      });
       for (const row of rows) {
         const id = String(row.id ?? '').trim();
         if (!id) continue;
@@ -787,16 +827,14 @@ export class RecommendationService {
         const placeType = slotType === 'accommodation' ? 'hotel' : slotType;
         index.set(
           id,
-          this.normalizePriceInfo(
-            row.price,
-            row.price_inferred,
-            placeType,
-          ),
+          this.normalizePriceInfo(row.price, row.price_inferred, placeType),
         );
       }
       this.logger.warn(`Loaded ${index.size} place prices from ${csvPath}`);
     } catch (err: any) {
-      this.logger.warn(`Failed to load price CSV: ${err?.message ?? String(err)}`);
+      this.logger.warn(
+        `Failed to load price CSV: ${err?.message ?? String(err)}`,
+      );
     }
 
     this.priceIndex = index;
@@ -843,7 +881,8 @@ export class RecommendationService {
 
     const billablePrices = prices.filter((price) => price > 0);
     const avg = Math.round(
-      billablePrices.reduce((sum, price) => sum + price, 0) / billablePrices.length,
+      billablePrices.reduce((sum, price) => sum + price, 0) /
+        billablePrices.length,
     );
     return {
       estimatedCost: this.percentile(billablePrices, 0.5),
@@ -857,7 +896,9 @@ export class RecommendationService {
     };
   }
 
-  private parsePriceItems(rawPrice: unknown): Array<{ name?: string; price: number }> {
+  private parsePriceItems(
+    rawPrice: unknown,
+  ): Array<{ name?: string; price: number }> {
     if (rawPrice == null || rawPrice === '') return [];
     if (Array.isArray(rawPrice)) {
       return rawPrice
@@ -870,11 +911,16 @@ export class RecommendationService {
       const parsed = JSON.parse(text);
       if (Array.isArray(parsed)) {
         return parsed
-          .map((item: any) => ({ name: item?.name, price: Number(item?.price) }))
+          .map((item: any) => ({
+            name: item?.name,
+            price: Number(item?.price),
+          }))
           .filter((item) => Number.isFinite(item.price));
       }
       if (parsed && typeof parsed === 'object' && 'price' in parsed) {
-        return [{ name: (parsed as any).name, price: Number((parsed as any).price) }];
+        return [
+          { name: (parsed as any).name, price: Number((parsed as any).price) },
+        ];
       }
     } catch {
       const matches = text.match(/\d[\d.,]*/g) ?? [];
@@ -895,8 +941,11 @@ export class RecommendationService {
   }
 
   private inferPriceBasis(placeType: string): PriceBasis {
-    if (placeType === 'hotel' || placeType === 'accommodation') return 'per_room_per_night';
-    if (['restaurant', 'cafe', 'attraction', 'entertainment'].includes(placeType)) {
+    if (placeType === 'hotel' || placeType === 'accommodation')
+      return 'per_room_per_night';
+    if (
+      ['restaurant', 'cafe', 'attraction', 'entertainment'].includes(placeType)
+    ) {
       return 'per_person';
     }
     return 'unknown';
@@ -904,7 +953,10 @@ export class RecommendationService {
 
   private percentile(values: number[], p: number): number {
     if (!values.length) return 0;
-    const idx = Math.min(values.length - 1, Math.max(0, Math.round((values.length - 1) * p)));
+    const idx = Math.min(
+      values.length - 1,
+      Math.max(0, Math.round((values.length - 1) * p)),
+    );
     return values[idx];
   }
 
@@ -932,7 +984,7 @@ export class RecommendationService {
         ? 'return_to_hotel'
         : entry.is_restaurant
           ? 'restaurant'
-          : entry.place_type ?? 'attraction';
+          : (entry.place_type ?? 'attraction');
       if (type === 'return_to_hotel') continue;
       const price = this.getPriceInfo(entry.location_id, type);
       if (price.estimatedCost == null) {
@@ -1038,11 +1090,14 @@ export class RecommendationService {
         twoTowerByCategory: this.countCandidates(args.retrieval.candidates),
         plannerInputPlaces: args.details.length,
         plannerByPlaceType: this.countPlannerPlaces(args.details),
-        plannerBySource: args.details.reduce<Record<string, number>>((acc, place) => {
-          const key = place.planner_source ?? 'two_tower';
-          acc[key] = (acc[key] ?? 0) + 1;
-          return acc;
-        }, {}),
+        plannerBySource: args.details.reduce<Record<string, number>>(
+          (acc, place) => {
+            const key = place.planner_source ?? 'two_tower';
+            acc[key] = (acc[key] ?? 0) + 1;
+            return acc;
+          },
+          {},
+        ),
         aiInputPlaces: plan.input_places ?? null,
         aiTotalVisited: plan.total_visited ?? null,
       },
@@ -1055,7 +1110,10 @@ export class RecommendationService {
         cosineScore: candidate.cosine_score,
       })),
       plannerInputPlaces: args.details.map((place, index) => ({
-        rank: place.candidate_rank != null ? Number(place.candidate_rank) + 1 : index + 1,
+        rank:
+          place.candidate_rank != null
+            ? Number(place.candidate_rank) + 1
+            : index + 1,
         placeId: place.id,
         placeName: place.name,
         plannerRole: place.place_type ?? null,
@@ -1132,7 +1190,7 @@ export class RecommendationService {
                 ? 'return_to_hotel'
                 : entry.is_restaurant
                   ? 'restaurant'
-                  : entry.place_type ?? 'attraction';
+                  : (entry.place_type ?? 'attraction');
               const price = this.getPriceInfo(entry.location_id, type);
               return {
                 sequence: index + 1,
@@ -1182,10 +1240,14 @@ export class RecommendationService {
       mkdirSync(plannerInputDir, { recursive: true });
 
       const request = report.request ?? {};
-      const generatedAt = String(report.generatedAt ?? new Date().toISOString());
+      const generatedAt = String(
+        report.generatedAt ?? new Date().toISOString(),
+      );
       const timestamp = generatedAt.replace(/[:.]/g, '-');
       const intent = this.slugifyFilePart(request.tripIntent ?? 'unknown');
-      const destination = this.slugifyFilePart(request.destinationName ?? 'unknown');
+      const destination = this.slugifyFilePart(
+        request.destinationName ?? 'unknown',
+      );
       const days = request.numDays ?? 'x';
       const topK = request.topK ?? 'x';
       const filename = `${timestamp}_${destination}_${intent}_${days}days_top${topK}.json`;
@@ -1201,7 +1263,9 @@ export class RecommendationService {
       );
       writeFileSync(
         join(plannerInputDir, `${baseName}_planner-input.csv`),
-        this.toCsv((report.plannerInputPlaces ?? []) as Array<Record<string, any>>),
+        this.toCsv(
+          (report.plannerInputPlaces ?? []) as Array<Record<string, any>>,
+        ),
         'utf8',
       );
       this.logger.warn(`ITINERARY_PLAN_DEBUG_FILE ${join(jsonDir, filename)}`);
@@ -1213,16 +1277,20 @@ export class RecommendationService {
   }
 
   private slugifyFilePart(value: unknown): string {
-    return String(value)
-      .normalize('NFD')
-      .replace(/[\u0300-\u036f]/g, '')
-      .replace(/[^a-zA-Z0-9]+/g, '-')
-      .replace(/^-+|-+$/g, '')
-      .toLowerCase()
-      .slice(0, 48) || 'unknown';
+    return (
+      String(value)
+        .normalize('NFD')
+        .replace(/[\u0300-\u036f]/g, '')
+        .replace(/[^a-zA-Z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .toLowerCase()
+        .slice(0, 48) || 'unknown'
+    );
   }
 
-  private flattenScheduleReport(report: Record<string, any>): Array<Record<string, any>> {
+  private flattenScheduleReport(
+    report: Record<string, any>,
+  ): Array<Record<string, any>> {
     const days = Array.isArray(report.days) ? report.days : [];
     return days.flatMap((day: any) =>
       (Array.isArray(day.schedule) ? day.schedule : []).map((entry: any) => ({
@@ -1275,7 +1343,8 @@ export class RecommendationService {
 
   private csvCell(value: unknown): string {
     if (value == null) return '';
-    const text = typeof value === 'object' ? JSON.stringify(value) : String(value);
+    const text =
+      typeof value === 'object' ? JSON.stringify(value) : String(value);
     if (/[",\r\n]/.test(text)) {
       return `"${text.replace(/"/g, '""')}"`;
     }

@@ -93,6 +93,7 @@ interface PlaceWithTypeRow extends PlaceRow {
 interface CityRow {
   id: string;
   name: string;
+  image_url?: string | null;
 }
 
 interface FavoritePlaceRow {
@@ -102,6 +103,7 @@ interface FavoritePlaceRow {
 interface UserRow {
   id: string;
   full_name: string | null;
+  avatar_url: string | null;
 }
 
 interface ItineraryDetailPlaceCityRow {
@@ -134,6 +136,7 @@ export interface ExplorePublicItineraryItem {
   participant_count: number;
   creator_id: string;
   creator_name: string;
+  creator_avatar: string;
   image: string;
   image_gallery: string[];
   is_favorite?: boolean;
@@ -478,10 +481,10 @@ export class ExploreService implements OnModuleInit {
     return 'attractions';
   }
 
-  private async getCreatorNameMap(
+  private async getCreatorInfoMap(
     creatorIds: string[],
-  ): Promise<Map<string, string>> {
-    const map = new Map<string, string>();
+  ): Promise<Map<string, { name: string; avatar: string }>> {
+    const map = new Map<string, { name: string; avatar: string }>();
 
     const dedupedCreatorIds = Array.from(
       new Set(creatorIds.filter((id) => id.trim().length > 0)),
@@ -493,7 +496,7 @@ export class ExploreService implements OnModuleInit {
 
     const { data: users, error } = await supabase
       .from('users')
-      .select('id, full_name')
+      .select('id, full_name, avatar_url')
       .in('id', dedupedCreatorIds)
       .returns<UserRow[]>();
 
@@ -502,15 +505,25 @@ export class ExploreService implements OnModuleInit {
     }
 
     for (const user of users ?? []) {
-      const fullName = (user.full_name ?? '').trim();
-      if (!fullName) {
-        continue;
-      }
-
-      map.set(user.id, fullName);
+      map.set(user.id, {
+        name: (user.full_name ?? '').trim(),
+        avatar: (user.avatar_url ?? '').trim(),
+      });
     }
 
     return map;
+  }
+
+  /** @deprecated use getCreatorInfoMap */
+  private async getCreatorNameMap(
+    creatorIds: string[],
+  ): Promise<Map<string, string>> {
+    const infoMap = await this.getCreatorInfoMap(creatorIds);
+    const nameMap = new Map<string, string>();
+    for (const [id, info] of infoMap) {
+      if (info.name) nameMap.set(id, info.name);
+    }
+    return nameMap;
   }
 
   async getExploreHome(touristId: string) {
@@ -777,9 +790,9 @@ export class ExploreService implements OnModuleInit {
       const creatorIds = (data ?? []).map((item) => item.creator_id);
 
       // Run all non-user-specific sub-queries in parallel.
-      const [creatorNameMap, itineraryImages, favoriteCountMap, ratingMap] =
+      const [creatorInfoMap, itineraryImages, favoriteCountMap, ratingMap] =
         await Promise.all([
-          this.getCreatorNameMap(creatorIds),
+          this.getCreatorInfoMap(creatorIds),
           this.getItineraryImageMap(itineraryIds),
           this.getFavoriteCountMap(itineraryIds),
           this.getItineraryRatingMap(itineraryIds),
@@ -789,6 +802,7 @@ export class ExploreService implements OnModuleInit {
         const gallery = itineraryImages.get(item.id) ?? [];
         const imageGallery =
           gallery.length > 0 ? gallery.slice(0, 3) : [this.defaultImageUrl];
+        const creatorInfo = creatorInfoMap.get(item.creator_id);
 
         return {
           id: item.id,
@@ -803,7 +817,8 @@ export class ExploreService implements OnModuleInit {
           days: this.getDays(item.start_date, item.end_date),
           participant_count: this.toParticipantCount(item),
           creator_id: item.creator_id,
-          creator_name: creatorNameMap.get(item.creator_id) ?? 'Traveler',
+          creator_name: creatorInfo?.name || 'Traveler',
+          creator_avatar: creatorInfo?.avatar || '',
           image: imageGallery[0],
           image_gallery: imageGallery,
           favorite_count: favoriteCountMap.get(item.id) ?? 0,
@@ -929,7 +944,7 @@ export class ExploreService implements OnModuleInit {
       supabase
         .schema('travel')
         .from('cities')
-        .select('id, name', { count: 'exact' })
+        .select('id, name, image_url', { count: 'exact' })
         .returns<CityRow[]>(),
       supabase
         .schema('travel')
@@ -1014,82 +1029,6 @@ export class ExploreService implements OnModuleInit {
     });
 
     const pagedCities = sortedCities.slice(offset, offset + safeLimit);
-    const pagedCityIds = pagedCities.map((c) => c.id);
-    const cityImageMap = new Map<string, string>();
-
-    // Only fetch places with type/category joins for the paged cities (much smaller set)
-    if (pagedCityIds.length > 0) {
-      const { data: placesWithTypes, error: placesError } = await supabase
-        .schema('travel')
-        .from('places')
-        .select(
-          'id, city_id, image_url, type_id, types(id, name, category_id, categories(id, name))',
-        )
-        .in('city_id', pagedCityIds)
-        .eq('is_approved', true)
-        .eq('is_active', true)
-        .returns<PlaceWithTypeRow[]>();
-
-      if (placesError) {
-        throw new InternalServerErrorException(placesError.message);
-      }
-
-      const placesByCity = new Map<string, PlaceWithTypeRow[]>();
-      for (const item of placesWithTypes ?? []) {
-        if (!item.city_id) {
-          continue;
-        }
-
-        const existing = placesByCity.get(item.city_id) ?? [];
-        existing.push(item);
-        placesByCity.set(item.city_id, existing);
-      }
-
-      for (const city of pagedCities) {
-        const candidates = placesByCity.get(city.id) ?? [];
-        const prioritizedGroups = new Map<number, PlaceWithTypeRow[]>();
-
-        for (const item of candidates) {
-          const typeData = Array.isArray(item.types)
-            ? item.types?.[0]
-            : item.types;
-          const typeNames = this.extractTypeNames(typeData);
-          const priorityIndex = this.getTypePriorityIndex(typeNames);
-
-          if (priorityIndex === null) {
-            continue;
-          }
-
-          const group = prioritizedGroups.get(priorityIndex) ?? [];
-          group.push(item);
-          prioritizedGroups.set(priorityIndex, group);
-        }
-
-        for (
-          let index = 0;
-          index < this.featuredPlaceTypePriority.length;
-          index += 1
-        ) {
-          const group = prioritizedGroups.get(index) ?? [];
-          if (group.length === 0) {
-            continue;
-          }
-
-          const imageReadyGroup = group.filter((place) => {
-            return this.toImageList(place.image_url).length > 0;
-          });
-
-          if (imageReadyGroup.length === 0) {
-            continue;
-          }
-
-          const picked = this.pickRandomItem(imageReadyGroup);
-          const images = this.toImageList(picked?.image_url);
-          cityImageMap.set(city.id, images[0]);
-          break;
-        }
-      }
-    }
 
     const mapped = pagedCities.map((item) => {
       const ratingEntry = ratingByCity.get(item.id);
@@ -1097,10 +1036,12 @@ export class ExploreService implements OnModuleInit {
         ? Math.round((ratingEntry.sumRating / ratingEntry.ratedCount) * 100) / 100
         : 0;
       const totalReviews = ratingEntry?.sumReviews ?? 0;
+      const image = (item.image_url ?? '').trim() || this.defaultImageUrl;
       return {
         id: item.id,
         name: item.name,
-        image: cityImageMap.get(item.id) ?? this.defaultImageUrl,
+        image_url: image,
+        image,
         rating: avgRating,
         review_count: totalReviews,
         city: item.name,
@@ -1240,7 +1181,6 @@ export class ExploreService implements OnModuleInit {
       .slice(0, 6);
 
     let cityItineraryImages = new Map<string, string[]>();
-    let cityCreatorNameMap = new Map<string, string>();
 
     try {
       cityItineraryImages = await this.getItineraryImageMap(
@@ -1256,8 +1196,9 @@ export class ExploreService implements OnModuleInit {
       );
     }
 
+    let cityCreatorInfoMap = new Map<string, { name: string; avatar: string }>();
     try {
-      cityCreatorNameMap = await this.getCreatorNameMap(
+      cityCreatorInfoMap = await this.getCreatorInfoMap(
         cityItineraries.map((item) => item.creator_id),
       );
     } catch (error) {
@@ -1272,6 +1213,7 @@ export class ExploreService implements OnModuleInit {
       const gallery = cityItineraryImages.get(item.id) ?? [];
       const imageGallery =
         gallery.length > 0 ? gallery.slice(0, 3) : [this.defaultImageUrl];
+      const creatorInfo = cityCreatorInfoMap.get(item.creator_id);
 
       return {
         id: item.id,
@@ -1279,8 +1221,8 @@ export class ExploreService implements OnModuleInit {
           (item.description && item.description.trim()) ||
           item.destination ||
           'Lịch trình công khai',
-        authorName: cityCreatorNameMap.get(item.creator_id) ?? 'Traveler',
-        authorAvatar: `https://i.pravatar.cc/150?u=${item.creator_id}`,
+        authorName: creatorInfo?.name || 'Traveler',
+        authorAvatar: creatorInfo?.avatar || '',
         imageUrl: imageGallery[0],
         duration: `${this.getDays(item.start_date, item.end_date)} NGÀY`,
         views: String(this.toParticipantCount(item)),

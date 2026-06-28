@@ -45,7 +45,7 @@ def get_recommendations(req: RecommendRequest):
 def place_recommendations(
     place_id: str,
     user_id: int | None = Query(default=None, description="UserID (số nguyên); bỏ trống nếu khách chưa đăng nhập"),
-    k: int = Query(default=10, ge=1, le=50),
+    k: int | None = Query(default=None, ge=1, le=50),
 ):
     try:
         items = recommend_service.recommend_for_place(place_id, user_id, k)
