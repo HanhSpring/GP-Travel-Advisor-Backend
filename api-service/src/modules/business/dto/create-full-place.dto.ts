@@ -58,6 +58,9 @@ export class CreateFullPlaceDto {
   @ApiProperty({ example: 'partner@example.com', required: false })
   p_email?: string
 
+  @ApiProperty({ example: '0987654321', required: false })
+  p_phone?: string
+
   @ApiProperty({ required: false })
   p_type_id?: string
 

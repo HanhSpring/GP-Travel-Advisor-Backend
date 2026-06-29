@@ -133,6 +133,7 @@ async createFull(
     longitude: Number(longitude),
     vendorId: body.p_vendor_id || body.vendorId || '',
     email: body.p_email || body.email || '',
+    phone: body.p_phone || body.phone || '',
     typeId: body.p_type_id || body.typeId || '',
     typeName: body.p_type_name || body.typeName || '',
     categories: this.parseFlexible(body.p_categories || body.categories),
