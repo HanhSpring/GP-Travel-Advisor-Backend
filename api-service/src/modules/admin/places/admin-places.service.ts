@@ -39,6 +39,8 @@ interface PlaceDetailRow {
   name: string;
   description: string | null;
   address: string | null;
+  email: string | null;
+  phone: string | null;
   city_id: string | null;
   cities: CityRow | CityRow[] | null;
   latitude: number | null;
@@ -526,6 +528,7 @@ export class AdminPlacesService {
     const address = dto.p_address || dto.address;
     const city = dto.p_city || dto.city;
     const email = (dto.p_email || dto.email || '').trim();
+    const phone = (dto.p_phone || dto.phone || '').trim();
     const vendorId = (dto.p_vendor_id || dto.vendorId || dto.vendor_id || '').trim();
     const categories = Array.isArray(dto.p_categories || dto.categories)
       ? dto.p_categories || dto.categories
@@ -548,6 +551,9 @@ export class AdminPlacesService {
     if (!email) throw new BadRequestException('Thieu du lieu: Email lien he');
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       throw new BadRequestException('Email lien he khong dung dinh dang');
+    }
+    if (phone && !/^0\d{9}$/.test(phone)) {
+      throw new BadRequestException('SDT lien he phai gom dung 10 chu so va bat dau bang so 0');
     }
     if (sourceMode === 'vendor' && !vendorId) {
       throw new BadRequestException('Vui long chon doi tac quan ly dia diem');
@@ -584,6 +590,7 @@ export class AdminPlacesService {
         name,
         address,
         email,
+        phone: phone || null,
         city_id: cityId,
         latitude: Number(dto.p_lat ?? dto.latitude),
         longitude: Number(dto.p_lng ?? dto.longitude),
@@ -877,7 +884,7 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, image_url, name, description, address, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, types(id, name, categories(id, name))',
+        'id, image_url, name, description, address, email, phone, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, types(id, name, categories(id, name))',
       )
       .eq('id', id)
       .or('is_active.is.null,is_active.eq.true')
@@ -930,8 +937,8 @@ export class AdminPlacesService {
       category,
       registered_date: place.registered_date ?? '',
       status: this.mapStatus(place.is_approved),
-      contact_phone: vendor?.phone_number ?? '',
-      contact_email: vendor?.email ?? '',
+      contact_phone: place.phone ?? vendor?.phone_number ?? '',
+      contact_email: place.email ?? vendor?.email ?? '',
       vendor: vendor
         ? {
             id: vendor.id,
