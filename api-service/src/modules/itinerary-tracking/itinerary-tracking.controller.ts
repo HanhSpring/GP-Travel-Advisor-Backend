@@ -57,6 +57,22 @@ export class ItineraryTrackingController {
     return this.service.getGeofences(query);
   }
 
+  @Get('active')
+  @ApiOperation({
+    summary:
+      'Khôi phục tracking active cho user — tạo geofence ngày hiện tại khi đăng nhập lại',
+  })
+  @ApiOkResponse({ type: StartTrackingResponseDto })
+  getActiveTracking(
+    @Query('touristId') touristId: string,
+    @Query('radiusM') radiusM?: string,
+  ) {
+    return this.service.startActiveForTourist(
+      touristId,
+      radiusM ? Number(radiusM) : undefined,
+    );
+  }
+
   @Post('event')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({

@@ -8,6 +8,7 @@ import { EventEmitter2 } from '@nestjs/event-emitter';
 import { randomUUID } from 'crypto';
 import { supabase } from '../../config/supabase';
 import { ACTIVITY_LOG_EVENT } from '../activity/activity.listener';
+import { PushNotificationService } from '../tourist/notifications/push-notification.service';
 import {
   buildCirclePolygonEWKT,
   clampGeofenceRadius,
@@ -96,7 +97,10 @@ const VISIT_COLS =
 
 @Injectable()
 export class ItineraryTrackingService {
-  constructor(private readonly eventEmitter: EventEmitter2) {}
+  constructor(
+    private readonly eventEmitter: EventEmitter2,
+    private readonly pushService: PushNotificationService,
+  ) {}
 
   // ───────────────────────── Helpers ─────────────────────────
 
@@ -105,8 +109,26 @@ export class ItineraryTrackingService {
     return new Date(Date.now() + 7 * 3600 * 1000).toISOString().slice(0, 10);
   }
 
+  private hourVN(): number {
+    return new Date(Date.now() + 7 * 3600 * 1000).getUTCHours();
+  }
+
   private resolveDate(date?: string): string {
     return date && date.trim() ? date.trim() : this.todayVN();
+  }
+
+  private addDays(date: string, days: number): string {
+    const [year, month, day] = date.split('-').map(Number);
+    const d = new Date(Date.UTC(year, month - 1, day + days));
+    return d.toISOString().slice(0, 10);
+  }
+
+  private statusAfterManualStop(
+    itinerary: ItineraryRow,
+  ): 'completed' | 'uncompleted' {
+    if (!itinerary.end_date) return 'uncompleted';
+    const endPlusOne = this.addDays(itinerary.end_date, 1);
+    return this.todayVN() >= endPlusOne ? 'completed' : 'uncompleted';
   }
 
   /** Chuẩn hoá lỗi DB; nhắc chạy migration nếu thiếu bảng/cột tracking. */
@@ -153,7 +175,9 @@ export class ItineraryTrackingService {
     if (error) this.dbError(error, 'loadItinerary');
     if (!data) throw new NotFoundException('Không tìm thấy lịch trình');
     if (touristId && data.creator_id !== touristId) {
-      throw new NotFoundException('Lịch trình không thuộc về người dùng này');
+      throw new NotFoundException(
+        'Lịch trình không thuộc về người dùng này',
+      );
     }
     return data;
   }
@@ -323,11 +347,19 @@ export class ItineraryTrackingService {
   private async createVisitNotification(
     touristId: string,
     placeName: string,
+    row: VisitRow,
   ): Promise<string | null> {
     const message = `Bạn đã đến ${placeName}`;
     try {
       const notificationId = randomUUID();
       const nowIso = new Date().toISOString();
+      const pushData = {
+        action: 'open_itinerary_day',
+        itinerary_id: row.itinerary_id ?? '',
+        itinerary_detail_id: row.itinerary_detail_id,
+        place_id: row.geofences?.place_id ?? '',
+        visit_date: row.track_date ?? '',
+      };
 
       const { error: nErr } = await supabase
         .schema('public')
@@ -338,6 +370,12 @@ export class ItineraryTrackingService {
           content: message,
           type: 'itinerary', // -> icon "map" ở màn hình thông báo
           is_global: false,
+          action_type: 'open_itinerary_day',
+          target_type: 'itinerary_day',
+          metadata: {
+            ...pushData,
+            action_label: 'Xem lịch trình',
+          },
           created_at: nowIso,
         });
       if (nErr) throw nErr;
@@ -353,6 +391,26 @@ export class ItineraryTrackingService {
           sent_at: nowIso,
         });
       if (uErr) throw uErr;
+
+      const { data: userRow } = await supabase
+        .schema('public')
+        .from('users')
+        .select('fcm_token')
+        .eq('id', touristId)
+        .maybeSingle<{ fcm_token: string | null }>();
+
+      if (userRow?.fcm_token) {
+        void this.pushService.sendPush(
+          userRow.fcm_token,
+          'Check-in lịch trình',
+          message,
+          {
+            notification_id: notificationId,
+            type: 'itinerary_checkin',
+            ...pushData,
+          },
+        );
+      }
 
       return message;
     } catch (e) {
@@ -501,6 +559,16 @@ export class ItineraryTrackingService {
 
     // Đánh dấu lịch trình đang diễn ra + bật cờ tracking_active.
     if ((itinerary.status ?? '').toLowerCase() !== 'completed') {
+      const { error: clearOtherError } = await supabase
+        .schema('travel')
+        .from('itineraries')
+        .update({ status: 'uncompleted', tracking_active: false })
+        .eq('creator_id', itinerary.creator_id)
+        .eq('status', 'ongoing')
+        .neq('id', dto.itineraryId);
+      if (clearOtherError)
+        this.dbError(clearOtherError, 'start.clearOtherOngoing');
+
       const { error } = await supabase
         .schema('travel')
         .from('itineraries')
@@ -638,6 +706,77 @@ export class ItineraryTrackingService {
   }
 
   /** Lấy danh sách geofence của 1 ngày (cho AlarmManager đăng ký lại). */
+  async startActiveForTourist(touristId: string, radiusM?: number) {
+    const today = this.todayVN();
+    if (this.hourVN() >= DAY_END_HOUR) {
+      return {
+        active: false,
+        itineraryId: null,
+        date: today,
+        geofences: [],
+        message:
+          'Đã qua 23h, không khôi phục geofence cho ngày đã kết thúc.',
+      };
+    }
+
+    const { data: itineraries, error } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, creator_id, status, start_date, end_date')
+      .eq('creator_id', touristId)
+      .eq('tracking_active', true)
+      .neq('status', 'completed')
+      .lte('start_date', today)
+      .gte('end_date', today)
+      .order('start_date', { ascending: false })
+      .limit(1)
+      .returns<ItineraryRow[]>();
+
+    if (error) this.dbError(error, 'startActiveForTourist.findItinerary');
+    const itinerary = itineraries?.[0];
+    if (!itinerary) {
+      return {
+        active: false,
+        itineraryId: null,
+        date: today,
+        geofences: [],
+        message:
+          'Không có lịch trình đang bật theo dõi cho ngày hôm nay.',
+      };
+    }
+
+    let date = today;
+    const todaysDetails = await this.loadDetailsByDay(itinerary.id, today);
+    if (todaysDetails.length === 0) {
+      const nextDay = await this.findNextDay(itinerary.id, today);
+      if (
+        !nextDay ||
+        itinerary.end_date == null ||
+        nextDay > itinerary.end_date
+      ) {
+        return {
+          active: false,
+          itineraryId: itinerary.id,
+          date: today,
+          geofences: [],
+          message:
+            'Lịch trình đang active nhưng hôm nay không có địa điểm để theo dõi.',
+        };
+      }
+      date = nextDay;
+    }
+
+    return {
+      active: true,
+      ...(await this.start({
+        itineraryId: itinerary.id,
+        touristId,
+        date,
+        radiusM,
+      })),
+    };
+  }
+
   async getGeofences(query: GeofencesQueryDto) {
     const date = this.resolveDate(query.date);
     await this.loadItinerary(query.itineraryId);
@@ -811,6 +950,7 @@ export class ItineraryTrackingService {
       const notificationMessage = await this.createVisitNotification(
         dto.touristId,
         name,
+        updated,
       );
       await this.createPlaceReviewNotification({
         touristId: dto.touristId,
@@ -877,6 +1017,7 @@ export class ItineraryTrackingService {
     const notificationMessage = await this.createVisitNotification(
       dto.touristId,
       name,
+      updated,
     );
     await this.createPlaceReviewNotification({
       touristId: dto.touristId,
@@ -963,7 +1104,16 @@ export class ItineraryTrackingService {
     let itineraryStatus = (itinerary.status ?? 'ongoing').toLowerCase();
     const isExplicitStop = dto.markPendingAsSkipped === false;
 
-    if (!nextDayDate) {
+    if (isExplicitStop) {
+      const stoppedStatus = this.statusAfterManualStop(itinerary);
+      const { error } = await supabase
+        .schema('travel')
+        .from('itineraries')
+        .update({ status: stoppedStatus, tracking_active: false })
+        .eq('id', dto.itineraryId);
+      if (error) this.dbError(error, 'endDay.stopTracking');
+      itineraryStatus = stoppedStatus;
+    } else if (!nextDayDate) {
       // Hết ngày cuối -> hoàn thành lịch trình, tắt tracking.
       const { error } = await supabase
         .schema('travel')
@@ -972,15 +1122,6 @@ export class ItineraryTrackingService {
         .eq('id', dto.itineraryId);
       if (error) this.dbError(error, 'endDay.complete');
       itineraryStatus = 'completed';
-    } else if (isExplicitStop) {
-      // User bấm Dừng → tắt tracking_active, giữ status = ongoing.
-      const { error } = await supabase
-        .schema('travel')
-        .from('itineraries')
-        .update({ tracking_active: false })
-        .eq('id', dto.itineraryId);
-      if (error) this.dbError(error, 'endDay.stopTracking');
-      itineraryStatus = 'ongoing';
     } else {
       // Hết ngày (AlarmManager), sang ngày tiếp theo → tracking vẫn active.
       itineraryStatus = 'ongoing';

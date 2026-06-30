@@ -558,7 +558,8 @@ export class ExploreService implements OnModuleInit {
 
     // If featured cities are already cached, start getCityOverview in parallel
     // so the fallback branch has zero sequential wait when it runs.
-    const cachedFeatured = this.getFromCache<ExplorePlacesResponse>(featuredKey);
+    const cachedFeatured =
+      this.getFromCache<ExplorePlacesResponse>(featuredKey);
     const speculativeCityId = cachedFeatured?.data[0]?.id ?? null;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const cityOverviewPromise: Promise<any> = speculativeCityId
@@ -729,10 +730,22 @@ export class ExploreService implements OnModuleInit {
       throw new BadRequestException('Completed itinerary cannot be started');
     }
 
+    const { error: clearOtherError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .update({ status: 'uncompleted', tracking_active: false })
+      .eq('creator_id', touristId)
+      .eq('status', 'ongoing')
+      .neq('id', itineraryId);
+
+    if (clearOtherError) {
+      throw new InternalServerErrorException(clearOtherError.message);
+    }
+
     const { error: updateError } = await supabase
       .schema('travel')
       .from('itineraries')
-      .update({ status: 'ongoing' })
+      .update({ status: 'ongoing', tracking_active: true })
       .eq('id', itineraryId)
       .eq('creator_id', touristId);
 
@@ -755,7 +768,8 @@ export class ExploreService implements OnModuleInit {
   ): Promise<ExplorePublicItinerariesResponse> {
     // Per-user cache (includes is_favorite) — instant on repeat visits.
     const userCacheKey = `explore:public_itineraries:${page}:${limit}:${touristId ?? 'anon'}`;
-    const userCached = this.getFromCache<ExplorePublicItinerariesResponse>(userCacheKey);
+    const userCached =
+      this.getFromCache<ExplorePublicItinerariesResponse>(userCacheKey);
     if (userCached) return userCached;
 
     // Shared cache (no is_favorite) — reused across all users so the expensive
@@ -842,7 +856,10 @@ export class ExploreService implements OnModuleInit {
 
     // Layer in user-specific favorites — a single lightweight query.
     const itineraryIds = sharedData.data.map((item) => item.id);
-    const favoriteItineraryIds = await this.getFavoriteItinerarySet(touristId, itineraryIds);
+    const favoriteItineraryIds = await this.getFavoriteItinerarySet(
+      touristId,
+      itineraryIds,
+    );
 
     const result: ExplorePublicItinerariesResponse = {
       ...sharedData,
@@ -953,7 +970,14 @@ export class ExploreService implements OnModuleInit {
         .eq('is_approved', true)
         .eq('is_active', true)
         .limit(3000)
-        .returns<{ id: string; city_id: string | null; average_rating: number | null; review_count: number | null }[]>(),
+        .returns<
+          {
+            id: string;
+            city_id: string | null;
+            average_rating: number | null;
+            review_count: number | null;
+          }[]
+        >(),
       supabase
         .schema('travel')
         .from('favorite_places')
@@ -992,7 +1016,10 @@ export class ExploreService implements OnModuleInit {
     }
 
     const favoriteCountByCity = new Map<string, number>();
-    const ratingByCity = new Map<string, { sumRating: number; ratedCount: number; sumReviews: number }>();
+    const ratingByCity = new Map<
+      string,
+      { sumRating: number; ratedCount: number; sumReviews: number }
+    >();
 
     for (const item of placeCityRows ?? []) {
       if (!item.city_id) {
@@ -1005,7 +1032,11 @@ export class ExploreService implements OnModuleInit {
         (favoriteCountByCity.get(item.city_id) ?? 0) + placeFavoriteCount,
       );
 
-      const entry = ratingByCity.get(item.city_id) ?? { sumRating: 0, ratedCount: 0, sumReviews: 0 };
+      const entry = ratingByCity.get(item.city_id) ?? {
+        sumRating: 0,
+        ratedCount: 0,
+        sumReviews: 0,
+      };
       const rating = Number(item.average_rating) || 0;
       const reviews = Number(item.review_count) || 0;
       if (rating > 0) {
@@ -1032,9 +1063,11 @@ export class ExploreService implements OnModuleInit {
 
     const mapped = pagedCities.map((item) => {
       const ratingEntry = ratingByCity.get(item.id);
-      const avgRating = ratingEntry && ratingEntry.ratedCount > 0
-        ? Math.round((ratingEntry.sumRating / ratingEntry.ratedCount) * 100) / 100
-        : 0;
+      const avgRating =
+        ratingEntry && ratingEntry.ratedCount > 0
+          ? Math.round((ratingEntry.sumRating / ratingEntry.ratedCount) * 100) /
+            100
+          : 0;
       const totalReviews = ratingEntry?.sumReviews ?? 0;
       const image = (item.image_url ?? '').trim() || this.defaultImageUrl;
       return {
@@ -1196,7 +1229,10 @@ export class ExploreService implements OnModuleInit {
       );
     }
 
-    let cityCreatorInfoMap = new Map<string, { name: string; avatar: string }>();
+    let cityCreatorInfoMap = new Map<
+      string,
+      { name: string; avatar: string }
+    >();
     try {
       cityCreatorInfoMap = await this.getCreatorInfoMap(
         cityItineraries.map((item) => item.creator_id),
@@ -1632,10 +1668,55 @@ export class ExploreService implements OnModuleInit {
   private deriveTravelType(destination: string | null): string {
     if (!destination) return 'Khác';
     const d = destination.toLowerCase();
-    const beach = ['đà nẵng', 'nha trang', 'phú quốc', 'quy nhơn', 'bình định', 'vũng tàu', 'bà rịa', 'côn đảo', 'cát bà', 'mũi né', 'bình thuận', 'hội an', 'quảng nam', 'khánh hòa', 'phan thiết', 'phan rang'];
-    const mountain = ['sapa', 'lào cai', 'đà lạt', 'lâm đồng', 'hà giang', 'mộc châu', 'sơn la', 'lai châu', 'điện biên', 'yên tử', 'quảng ninh'];
-    const heritage = ['huế', 'thừa thiên', 'ninh bình', 'tràng an', 'hoa lư', 'hội an'];
-    const mekong = ['cần thơ', 'tiền giang', 'đồng tháp', 'an giang', 'vĩnh long', 'bến tre', 'hậu giang', 'sóc trăng'];
+    const beach = [
+      'đà nẵng',
+      'nha trang',
+      'phú quốc',
+      'quy nhơn',
+      'bình định',
+      'vũng tàu',
+      'bà rịa',
+      'côn đảo',
+      'cát bà',
+      'mũi né',
+      'bình thuận',
+      'hội an',
+      'quảng nam',
+      'khánh hòa',
+      'phan thiết',
+      'phan rang',
+    ];
+    const mountain = [
+      'sapa',
+      'lào cai',
+      'đà lạt',
+      'lâm đồng',
+      'hà giang',
+      'mộc châu',
+      'sơn la',
+      'lai châu',
+      'điện biên',
+      'yên tử',
+      'quảng ninh',
+    ];
+    const heritage = [
+      'huế',
+      'thừa thiên',
+      'ninh bình',
+      'tràng an',
+      'hoa lư',
+      'hội an',
+    ];
+    const mekong = [
+      'cần thơ',
+      'tiền giang',
+      'đồng tháp',
+      'an giang',
+      'vĩnh long',
+      'bến tre',
+      'hậu giang',
+      'sóc trăng',
+    ];
     if (beach.some((k) => d.includes(k))) return 'Biển đảo';
     if (mountain.some((k) => d.includes(k))) return 'Núi rừng';
     if (heritage.some((k) => d.includes(k))) return 'Di tích văn hóa';
@@ -1675,7 +1756,10 @@ export class ExploreService implements OnModuleInit {
     const sumMap = new Map<string, number>();
     const cntMap = new Map<string, number>();
     for (const row of data ?? []) {
-      sumMap.set(row.itinerary_id, (sumMap.get(row.itinerary_id) ?? 0) + row.rating);
+      sumMap.set(
+        row.itinerary_id,
+        (sumMap.get(row.itinerary_id) ?? 0) + row.rating,
+      );
       cntMap.set(row.itinerary_id, (cntMap.get(row.itinerary_id) ?? 0) + 1);
     }
     const avgMap = new Map<string, number>();
