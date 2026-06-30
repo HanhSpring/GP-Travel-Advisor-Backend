@@ -41,7 +41,6 @@ import { CreateFullPlaceDto } from './dto/create-full-place.dto';
 import { FileInterceptor } from '@nestjs/platform-express';
 import { GetOrdersDto } from './dto/get-orders.dto';
 
-
 @ApiTags('Business')
 @Controller('business')
 @ApiBearerAuth('access-token')
@@ -96,9 +95,11 @@ export class BusinessController {
   }
 
   @Get('place-services-by-type')
-  @ApiOperation({ summary: 'Lấy dịch vụ của địa điểm theo loại (miễn phí/trả phí)' })
+  @ApiOperation({
+    summary: 'Lấy dịch vụ của địa điểm theo loại (miễn phí/trả phí)',
+  })
   getPlaceServicesByType(@Query() query: PlaceDto) {
-    return this.businessService.getPlaceServicesByType(query.placeId)
+    return this.businessService.getPlaceServicesByType(query.placeId);
   }
 
   @Get('dashboard')
@@ -107,48 +108,48 @@ export class BusinessController {
     return this.businessService.getDashboard(query.vendorId);
   }
 
- @Post('add-new-place')
-@ApiOperation({ summary: 'Tạo địa điểm + services + menu Excel' })
-@ApiConsumes('multipart/form-data')
-@ApiBody({
-  type: CreateFullPlaceDto,
-})
-@UseInterceptors(FileInterceptor('file'))
-async createFull(
-  @Body() body: any,
-  @UploadedFile() file?: Express.Multer.File
-) {
-  // Support both old format (name, address, etc) and new format (p_name, p_address, etc)
-  const name = body.p_name || body.name;
-  const address = body.p_address || body.address;
-  const city = body.p_city || body.city;
-  const latitude = body.p_lat !== undefined ? body.p_lat : body.latitude;
-  const longitude = body.p_lng !== undefined ? body.p_lng : body.longitude;
-  
-  const dto = {
-    name,
-    address,
-    city,
-    latitude: Number(latitude),
-    longitude: Number(longitude),
-    vendorId: body.p_vendor_id || body.vendorId || '',
-    email: body.p_email || body.email || '',
-    phone: body.p_phone || body.phone || '',
-    typeId: body.p_type_id || body.typeId || '',
-    typeName: body.p_type_name || body.typeName || '',
-    categories: this.parseFlexible(body.p_categories || body.categories),
-    services: this.parseFlexible(body.p_services || body.services),
-    menu: this.parseFlexible(body.p_menu || body.menu),
+  @Post('add-new-place')
+  @ApiOperation({ summary: 'Tạo địa điểm + services + menu Excel' })
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    type: CreateFullPlaceDto,
+  })
+  @UseInterceptors(FileInterceptor('file'))
+  async createFull(
+    @Body() body: any,
+    @UploadedFile() file?: Express.Multer.File,
+  ) {
+    // Support both old format (name, address, etc) and new format (p_name, p_address, etc)
+    const name = body.p_name || body.name;
+    const address = body.p_address || body.address;
+    const city = body.p_city || body.city;
+    const latitude = body.p_lat !== undefined ? body.p_lat : body.latitude;
+    const longitude = body.p_lng !== undefined ? body.p_lng : body.longitude;
 
-    // 👉 BỔ SUNG CÁC DÒNG DƯỚI ĐÂY ĐỂ TRUYỀN DỮ LIỆU SANG SERVICE
-    p_open_time: body.p_open_time || body.openTime,
-    p_close_time: body.p_close_time || body.closeTime,
-    p_description: body.p_description || body.description,
-    p_images: this.parseFlexible(body.p_images || body.images),
-  };
+    const dto = {
+      name,
+      address,
+      city,
+      latitude: Number(latitude),
+      longitude: Number(longitude),
+      vendorId: body.p_vendor_id || body.vendorId || '',
+      email: body.p_email || body.email || '',
+      phone: body.p_phone || body.phone || '',
+      typeId: body.p_type_id || body.typeId || '',
+      typeName: body.p_type_name || body.typeName || '',
+      categories: this.parseFlexible(body.p_categories || body.categories),
+      services: this.parseFlexible(body.p_services || body.services),
+      menu: this.parseFlexible(body.p_menu || body.menu),
 
-  return this.businessService.createFullPlace(dto, file);
-}
+      // 👉 BỔ SUNG CÁC DÒNG DƯỚI ĐÂY ĐỂ TRUYỀN DỮ LIỆU SANG SERVICE
+      p_open_time: body.p_open_time || body.openTime,
+      p_close_time: body.p_close_time || body.closeTime,
+      p_description: body.p_description || body.description,
+      p_images: this.parseFlexible(body.p_images || body.images),
+    };
+
+    return this.businessService.createFullPlace(dto, file);
+  }
   private parseFlexible(value: any) {
     if (!value) return [];
 
@@ -210,20 +211,34 @@ async createFull(
   @Post('menu-item')
   @ApiOperation({ summary: 'Thêm dịch vụ (menu item) cho địa điểm' })
   addMenuItem(@Body() body: any) {
-    return this.businessService.addSingleMenuItem(body.placeId, body.name, body.description ?? null, Number(body.price ?? 0));
+    return this.businessService.addSingleMenuItem(
+      body.placeId,
+      body.name,
+      body.description ?? null,
+      Number(body.price ?? 0),
+    );
   }
 
   @Put('menu-item')
   @ApiOperation({ summary: 'Cập nhật dịch vụ (menu item)' })
   updateMenuItem(@Body() body: any) {
-    return this.businessService.updateSingleMenuItem(body.itemId ?? body.id, body.placeId, body.name, body.description ?? null, Number(body.price ?? 0));
+    return this.businessService.updateSingleMenuItem(
+      body.itemId ?? body.id,
+      body.placeId,
+      body.name,
+      body.description ?? null,
+      Number(body.price ?? 0),
+    );
   }
 
   @Delete('menu-item')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Xóa dịch vụ (menu item)' })
   deleteMenuItem(@Body() body: any) {
-    return this.businessService.deleteSingleMenuItem(body.itemId ?? body.id, body.placeId);
+    return this.businessService.deleteSingleMenuItem(
+      body.itemId ?? body.id,
+      body.placeId,
+    );
   }
 
   // ── Free service CRUD ───────────────────────────────────────────────────────
@@ -237,13 +252,20 @@ async createFull(
   @Put('free-service')
   @ApiOperation({ summary: 'Cập nhật tiện ích miễn phí' })
   updateFreeService(@Body() body: any) {
-    return this.businessService.updateSingleFreeService(body.placeId, body.serviceId ?? body.id, body.name);
+    return this.businessService.updateSingleFreeService(
+      body.placeId,
+      body.serviceId ?? body.id,
+      body.name,
+    );
   }
 
   @Delete('free-service')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Xóa tiện ích miễn phí' })
   deleteFreeService(@Body() body: any) {
-    return this.businessService.deleteSingleFreeService(body.placeId, body.serviceId ?? body.id);
+    return this.businessService.deleteSingleFreeService(
+      body.placeId,
+      body.serviceId ?? body.id,
+    );
   }
 }

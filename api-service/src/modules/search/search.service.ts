@@ -36,9 +36,15 @@ export class SearchService {
 
     // Run RPC (with 5s timeout fallback) and itinerary query in parallel
     const rpcPromise = Promise.race([
-      supabase.schema('travel').rpc('search_autocomplete', { p_query: q }).returns<SearchRow[]>(),
+      supabase
+        .schema('travel')
+        .rpc('search_autocomplete', { p_query: q })
+        .returns<SearchRow[]>(),
       new Promise<{ data: null; error: Error }>((resolve) =>
-        setTimeout(() => resolve({ data: null, error: new Error('rpc_timeout') }), TIMEOUT_MS),
+        setTimeout(
+          () => resolve({ data: null, error: new Error('rpc_timeout') }),
+          TIMEOUT_MS,
+        ),
       ),
     ]) as Promise<{ data: SearchRow[] | null; error: any }>;
 
@@ -58,22 +64,33 @@ export class SearchService {
     const itinPromise = Promise.race([
       itinQuery,
       new Promise<{ data: null; error: Error }>((resolve) =>
-        setTimeout(() => resolve({ data: null, error: new Error('itin_timeout') }), TIMEOUT_MS),
+        setTimeout(
+          () => resolve({ data: null, error: new Error('itin_timeout') }),
+          TIMEOUT_MS,
+        ),
       ),
     ]);
 
-    const [rpcResult, itinResult] = await Promise.all([rpcPromise, itinPromise]);
+    const [rpcResult, itinResult] = await Promise.all([
+      rpcPromise,
+      itinPromise,
+    ]);
 
     // Map places/cities (RPC or fallback)
     let placeItems: AutocompleteItem[];
     if (rpcResult.error || !rpcResult.data) {
-      console.error('Autocomplete primary failed, falling back:', rpcResult.error?.message ?? rpcResult.error);
+      console.error(
+        'Autocomplete primary failed, falling back:',
+        rpcResult.error?.message ?? rpcResult.error,
+      );
       placeItems = await this.autocompleteFallback(q);
     } else {
       const rows = Array.isArray(rpcResult.data) ? rpcResult.data : [];
       placeItems = rows.map((row) => {
         const type =
-          this.asString(row['type']).trim().toLowerCase() === 'city' ? 'city' : 'place';
+          this.asString(row['type']).trim().toLowerCase() === 'city'
+            ? 'city'
+            : 'place';
         const image = this.asString(row['image']).trim();
         return {
           id: this.asString(row['id']),
@@ -88,9 +105,14 @@ export class SearchService {
     }
 
     // Map itinerary results (append after places)
-    const itinItems: AutocompleteItem[] = ((itinResult.data ?? []) as any[]).map((r) => ({
+    const itinItems: AutocompleteItem[] = (
+      (itinResult.data ?? []) as any[]
+    ).map((r) => ({
       id: String(r.id),
-      name: (r.description && String(r.description).trim()) || String(r.destination ?? '') || 'Lịch trình',
+      name:
+        (r.description && String(r.description).trim()) ||
+        String(r.destination ?? '') ||
+        'Lịch trình',
       type: 'itinerary' as const,
       image: '',
       city: String(r.destination ?? ''),
@@ -189,31 +211,59 @@ export class SearchService {
   private classifyPlaceType(place: any): 'activity' | 'restaurant' | 'hotel' {
     const typeData = Array.isArray(place.types) ? place.types[0] : place.types;
     if (!typeData) return 'activity';
-    const cats = Array.isArray(typeData.categories) ? typeData.categories : [typeData.categories].filter(Boolean);
+    const cats = Array.isArray(typeData.categories)
+      ? typeData.categories
+      : [typeData.categories].filter(Boolean);
     const names: string[] = cats.map((c: any) => (c?.name ?? '').toLowerCase());
-    if (names.some(n =>
-      n.includes('lưu trú') || n.includes('khách sạn') || n.includes('homestay') || n.includes('resort') ||
-      n.includes('nhà nghỉ') || n.includes('nhà trọ') || n.includes('biệt thự') ||
-      n.includes('căn hộ') || n.includes('nghỉ dưỡng') || n.includes('bungalow')
-    )) return 'hotel';
-    if (names.some(n =>
-      n.includes('ẩm thực') || n.includes('nhà hàng') || n.includes('quán ăn') ||
-      n.includes('cà phê') || n.includes('cafe') || n.includes('quán cà phê') ||
-      n.includes('trà sữa') || n.includes('giải khát') || n.includes('buffet')
-    )) return 'restaurant';
+    if (
+      names.some(
+        (n) =>
+          n.includes('lưu trú') ||
+          n.includes('khách sạn') ||
+          n.includes('homestay') ||
+          n.includes('resort') ||
+          n.includes('nhà nghỉ') ||
+          n.includes('nhà trọ') ||
+          n.includes('biệt thự') ||
+          n.includes('căn hộ') ||
+          n.includes('nghỉ dưỡng') ||
+          n.includes('bungalow'),
+      )
+    )
+      return 'hotel';
+    if (
+      names.some(
+        (n) =>
+          n.includes('ẩm thực') ||
+          n.includes('nhà hàng') ||
+          n.includes('quán ăn') ||
+          n.includes('cà phê') ||
+          n.includes('cafe') ||
+          n.includes('quán cà phê') ||
+          n.includes('trà sữa') ||
+          n.includes('giải khát') ||
+          n.includes('buffet'),
+      )
+    )
+      return 'restaurant';
     return 'activity';
   }
 
   private resolveSearchImage(imageUrl: unknown): string {
     if (Array.isArray(imageUrl)) {
-      const first = (imageUrl as unknown[]).find(i => typeof i === 'string' && (i as string).trim());
+      const first = (imageUrl as unknown[]).find(
+        (i) => typeof i === 'string' && i.trim(),
+      );
       if (first) return first as string;
     }
     if (typeof imageUrl === 'string' && imageUrl.trim()) return imageUrl.trim();
     return this.defaultPlaceImageUrl;
   }
 
-  private mapPlaceItem(place: any, cityMap: Map<string, string> = new Map()): Record<string, unknown> {
+  private mapPlaceItem(
+    place: any,
+    cityMap: Map<string, string> = new Map(),
+  ): Record<string, unknown> {
     const type = this.classifyPlaceType(place);
     const base = {
       id: String(place.id ?? ''),
@@ -226,29 +276,57 @@ export class SearchService {
       placeType: type,
     };
     if (type === 'hotel') {
-      return { ...base, price: 'Liên hệ', starRating: 4, priceValue: 0, accommodationType: 'hotel', amenities: [] };
+      return {
+        ...base,
+        price: 'Liên hệ',
+        starRating: 4,
+        priceValue: 0,
+        accommodationType: 'hotel',
+        amenities: [],
+      };
     }
     if (type === 'restaurant') {
-      return { ...base, status: 'Đang mở cửa', cuisine: 'vietnamese', priceLevel: 'mid_range', amenities: [] };
+      return {
+        ...base,
+        status: 'Đang mở cửa',
+        cuisine: 'vietnamese',
+        priceLevel: 'mid_range',
+        amenities: [],
+      };
     }
     const typeData = Array.isArray(place.types) ? place.types[0] : place.types;
-    const cats = typeData?.categories ? (Array.isArray(typeData.categories) ? typeData.categories : [typeData.categories]) : [];
-    const catName = (cats[0] as any)?.name ?? '';
-    return { ...base, status: 'Đang mở cửa', category: catName, priceType: 'free', district: '' };
+    const cats = typeData?.categories
+      ? Array.isArray(typeData.categories)
+        ? typeData.categories
+        : [typeData.categories]
+      : [];
+    const catName = cats[0]?.name ?? '';
+    return {
+      ...base,
+      status: 'Đang mở cửa',
+      category: catName,
+      priceType: 'free',
+      district: '',
+    };
   }
 
   private async fetchCreatorNames(ids: string[]): Promise<Map<string, string>> {
     const map = new Map<string, string>();
     const deduped = [...new Set(ids.filter(Boolean))];
     if (!deduped.length) return map;
-    const { data } = await supabase.from('users').select('id, full_name').in('id', deduped);
+    const { data } = await supabase
+      .from('users')
+      .select('id, full_name')
+      .in('id', deduped);
     for (const u of (data ?? []) as any[]) {
       if (u.full_name) map.set(u.id, u.full_name);
     }
     return map;
   }
 
-  private async fetchItineraryImages(ids: string[]): Promise<Map<string, string>> {
+  private async fetchItineraryImages(
+    ids: string[],
+  ): Promise<Map<string, string>> {
     const map = new Map<string, string>();
     if (!ids.length) return map;
     const { data } = await supabase
@@ -259,7 +337,7 @@ export class SearchService {
       .limit(ids.length * 2); // giảm từ *6 xuống *2: 1 ảnh/lịch trình là đủ
     for (const row of (data ?? []) as any[]) {
       if (map.has(row.itinerary_id)) continue;
-      const img = this.resolveSearchImage((row.places as any)?.image_url);
+      const img = this.resolveSearchImage(row.places?.image_url);
       if (img !== this.defaultPlaceImageUrl) map.set(row.itinerary_id, img);
     }
     return map;
@@ -276,7 +354,10 @@ export class SearchService {
     const { data, error, count } = await supabase
       .schema('travel')
       .from('itineraries')
-      .select('id, creator_id, description, start_date, end_date, destination, created_at', { count: 'exact' })
+      .select(
+        'id, creator_id, description, start_date, end_date, destination, created_at',
+        { count: 'exact' },
+      )
       .eq('is_public', true)
       .eq('status', 'completed')
       .or(`description.ilike.%${q}%,destination.ilike.%${q}%`)
@@ -284,16 +365,19 @@ export class SearchService {
       .range(offset, offset + limit - 1)
       .returns<any[]>();
     if (error) return { data: [], total: 0 };
-    const rows = (data ?? []) as any[];
-    const creatorIds = rows.map(r => r.creator_id).filter(Boolean);
-    const itinIds = rows.map(r => r.id);
+    const rows = data ?? [];
+    const creatorIds = rows.map((r) => r.creator_id).filter(Boolean);
+    const itinIds = rows.map((r) => r.id);
     const [creatorMap, imgMap] = await Promise.all([
       this.fetchCreatorNames(creatorIds),
       this.fetchItineraryImages(itinIds),
     ]);
-    const mapped = rows.map(r => ({
+    const mapped = rows.map((r) => ({
       id: r.id,
-      title: (r.description && String(r.description).trim()) || r.destination || 'Lịch trình',
+      title:
+        (r.description && String(r.description).trim()) ||
+        r.destination ||
+        'Lịch trình',
       authorName: creatorMap.get(r.creator_id) ?? 'Traveler',
       authorAvatar: `https://i.pravatar.cc/150?u=${r.creator_id}`,
       imageUrl: imgMap.get(r.id) ?? this.defaultPlaceImageUrl,
@@ -339,7 +423,11 @@ export class SearchService {
   }
 
   private async buildCityMap(rawPlaces: any[]): Promise<Map<string, string>> {
-    const cityIds = [...new Set(rawPlaces.map((p: any) => String(p.city_id ?? '')).filter(Boolean))];
+    const cityIds = [
+      ...new Set(
+        rawPlaces.map((p: any) => String(p.city_id ?? '')).filter(Boolean),
+      ),
+    ];
     if (!cityIds.length) return new Map();
     const { data } = await supabase
       .schema('travel')
@@ -347,23 +435,32 @@ export class SearchService {
       .select('id, name')
       .in('id', cityIds);
     const map = new Map<string, string>();
-    for (const c of (data ?? []) as any[]) map.set(String(c.id), String(c.name ?? ''));
+    for (const c of (data ?? []) as any[])
+      map.set(String(c.id), String(c.name ?? ''));
     return map;
   }
 
   async searchAll(query: string) {
     const q = (query ?? '').trim();
-    if (!q) return { itineraries: { data: [], total: 0 }, activities: { data: [], total: 0 }, restaurants: { data: [], total: 0 }, hotels: { data: [], total: 0 } };
+    if (!q)
+      return {
+        itineraries: { data: [], total: 0 },
+        activities: { data: [], total: 0 },
+        restaurants: { data: [], total: 0 },
+        hotels: { data: [], total: 0 },
+      };
     let [itinResult, rawPlaces] = await Promise.all([
       this.queryItineraries(q, 1, 50),
       this.queryPlaces(q, 2000),
     ]);
     if (!rawPlaces.length) rawPlaces = await this.queryPlacesPrefix(q, 500);
     const cityMap = await this.buildCityMap(rawPlaces);
-    const classified = rawPlaces.map(p => this.mapPlaceItem(p, cityMap));
-    const activities = classified.filter(p => p['placeType'] === 'activity');
-    const restaurants = classified.filter(p => p['placeType'] === 'restaurant');
-    const hotels = classified.filter(p => p['placeType'] === 'hotel');
+    const classified = rawPlaces.map((p) => this.mapPlaceItem(p, cityMap));
+    const activities = classified.filter((p) => p['placeType'] === 'activity');
+    const restaurants = classified.filter(
+      (p) => p['placeType'] === 'restaurant',
+    );
+    const hotels = classified.filter((p) => p['placeType'] === 'hotel');
     return {
       itineraries: itinResult,
       activities: { data: activities, total: activities.length },
@@ -376,14 +473,22 @@ export class SearchService {
     const q = (query ?? '').trim();
     const safePage = Math.max(1, page);
     const safeLimit = Math.max(1, limit);
-    if (type === 'itinerary') return this.queryItineraries(q, safePage, safeLimit);
+    if (type === 'itinerary')
+      return this.queryItineraries(q, safePage, safeLimit);
     let raw = await this.queryPlaces(q, 2000);
     if (!raw.length) raw = await this.queryPlacesPrefix(q, 500);
     const cityMap = await this.buildCityMap(raw);
-    const filtered = raw.map(p => this.mapPlaceItem(p, cityMap)).filter(p => p['placeType'] === type);
+    const filtered = raw
+      .map((p) => this.mapPlaceItem(p, cityMap))
+      .filter((p) => p['placeType'] === type);
     const total = filtered.length;
     const offset = (safePage - 1) * safeLimit;
-    return { data: filtered.slice(offset, offset + safeLimit), total, page: safePage, pages: Math.ceil(total / safeLimit) };
+    return {
+      data: filtered.slice(offset, offset + safeLimit),
+      total,
+      page: safePage,
+      pages: Math.ceil(total / safeLimit),
+    };
   }
 
   // ── Nearby places ─────────────────────────────────────────────────────────
@@ -435,20 +540,33 @@ export class SearchService {
     const placesWithDistance = places.map((place) => {
       const distance =
         place.latitude && place.longitude
-          ? this.getDistanceFromLatLonInKm(lat, lng, place.latitude, place.longitude)
+          ? this.getDistanceFromLatLonInKm(
+              lat,
+              lng,
+              place.latitude,
+              place.longitude,
+            )
           : Infinity;
 
       let category = 'Tham quan';
-      const typeData = Array.isArray(place.types) ? place.types[0] : place.types;
+      const typeData = Array.isArray(place.types)
+        ? place.types[0]
+        : place.types;
       if (typeData && typeData.categories) {
-        const catData = Array.isArray(typeData.categories) ? typeData.categories[0] : typeData.categories;
+        const catData = Array.isArray(typeData.categories)
+          ? typeData.categories[0]
+          : typeData.categories;
         if (catData && catData.name) category = catData.name;
       }
 
-      let parsedImageUrl = 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80';
+      let parsedImageUrl =
+        'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80';
       if (Array.isArray(place.image_url) && place.image_url.length > 0) {
         parsedImageUrl = place.image_url[0];
-      } else if (typeof place.image_url === 'string' && place.image_url.trim().length > 0) {
+      } else if (
+        typeof place.image_url === 'string' &&
+        place.image_url.trim().length > 0
+      ) {
         parsedImageUrl = place.image_url;
       }
 
@@ -478,7 +596,15 @@ export class SearchService {
       .filter((p) => {
         if (normalizedPrefer === 'tham quan' || normalizedPrefer === '') {
           const cat = p.category.toLowerCase();
-          if (cat.includes('nhà hàng') || cat.includes('khách sạn') || cat.includes('quán ăn') || cat.includes('lưu trú') || cat.includes('ẩm thực') || cat.includes('quán cà phê') || cat.includes('cafe')) {
+          if (
+            cat.includes('nhà hàng') ||
+            cat.includes('khách sạn') ||
+            cat.includes('quán ăn') ||
+            cat.includes('lưu trú') ||
+            cat.includes('ẩm thực') ||
+            cat.includes('quán cà phê') ||
+            cat.includes('cafe')
+          ) {
             return false;
           }
         }
@@ -493,4 +619,3 @@ export class SearchService {
     return [...sameCategory, ...others].slice(0, limit);
   }
 }
-

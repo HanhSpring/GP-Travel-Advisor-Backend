@@ -115,12 +115,13 @@ export class BusinessService {
       serviceId = existingService?.id ?? null;
 
       if (!serviceId) {
-        const { data: createdService, error: createServiceError } = await supabase
-          .schema('travel')
-          .from('services')
-          .insert({ id: randomUUID(), name: serviceName, price: null })
-          .select('id')
-          .single();
+        const { data: createdService, error: createServiceError } =
+          await supabase
+            .schema('travel')
+            .from('services')
+            .insert({ id: randomUUID(), name: serviceName, price: null })
+            .select('id')
+            .single();
 
         if (createServiceError) {
           throw new BadRequestException(createServiceError.message);
@@ -147,7 +148,13 @@ export class BusinessService {
 
   private async addMenuItems(
     placeId: string,
-    menu: Array<{ name: string; description?: string; price: number; image_url?: string; img?: string }>,
+    menu: Array<{
+      name: string;
+      description?: string;
+      price: number;
+      image_url?: string;
+      img?: string;
+    }>,
   ) {
     if (menu.length === 0) return;
 
@@ -205,7 +212,9 @@ export class BusinessService {
     const cityData = Array.isArray(record.cities)
       ? record.cities[0]
       : record.cities;
-    const typeData = Array.isArray(record.types) ? record.types[0] : record.types;
+    const typeData = Array.isArray(record.types)
+      ? record.types[0]
+      : record.types;
     const categoryData = Array.isArray(typeData?.categories)
       ? typeData.categories[0]
       : typeData?.categories;
@@ -240,29 +249,42 @@ export class BusinessService {
     };
 
     if (typeof dto.name === 'string') updatePayload.name = dto.name.trim();
-    if (typeof dto.address === 'string') updatePayload.address = dto.address.trim();
+    if (typeof dto.address === 'string')
+      updatePayload.address = dto.address.trim();
     if (typeof dto.email === 'string') updatePayload.email = dto.email.trim();
-    if (typeof dto.p_email === 'string') updatePayload.email = dto.p_email.trim();
+    if (typeof dto.p_email === 'string')
+      updatePayload.email = dto.p_email.trim();
     if (typeof dto.phone === 'string') updatePayload.phone = dto.phone.trim();
-    if (typeof dto.p_phone === 'string') updatePayload.phone = dto.p_phone.trim();
-    if (typeof dto.description === 'string') updatePayload.description = dto.description;
-    if (typeof dto.openTime === 'string') updatePayload.open_time = dto.openTime;
-    if (typeof dto.closeTime === 'string') updatePayload.close_time = dto.closeTime;
-    if (typeof dto.open_time === 'string') updatePayload.open_time = dto.open_time;
-    if (typeof dto.close_time === 'string') updatePayload.close_time = dto.close_time;
+    if (typeof dto.p_phone === 'string')
+      updatePayload.phone = dto.p_phone.trim();
+    if (typeof dto.description === 'string')
+      updatePayload.description = dto.description;
+    if (typeof dto.openTime === 'string')
+      updatePayload.open_time = dto.openTime;
+    if (typeof dto.closeTime === 'string')
+      updatePayload.close_time = dto.closeTime;
+    if (typeof dto.open_time === 'string')
+      updatePayload.open_time = dto.open_time;
+    if (typeof dto.close_time === 'string')
+      updatePayload.close_time = dto.close_time;
 
     const latitude = dto.latitude ?? dto.lat;
     const longitude = dto.longitude ?? dto.lng;
-    if (latitude !== undefined && latitude !== '') updatePayload.latitude = Number(latitude);
-    if (longitude !== undefined && longitude !== '') updatePayload.longitude = Number(longitude);
+    if (latitude !== undefined && latitude !== '')
+      updatePayload.latitude = Number(latitude);
+    if (longitude !== undefined && longitude !== '')
+      updatePayload.longitude = Number(longitude);
 
-    if (typeof dto.isActive === 'boolean') updatePayload.is_active = dto.isActive;
-    if (typeof dto.is_active === 'boolean') updatePayload.is_active = dto.is_active;
+    if (typeof dto.isActive === 'boolean')
+      updatePayload.is_active = dto.isActive;
+    if (typeof dto.is_active === 'boolean')
+      updatePayload.is_active = dto.is_active;
 
     const imageUrls = dto.imageUrls ?? dto.image_url ?? dto.images;
     if (Array.isArray(imageUrls)) {
       updatePayload.image_url = imageUrls.filter(
-        (url): url is string => typeof url === 'string' && url.trim().length > 0,
+        (url): url is string =>
+          typeof url === 'string' && url.trim().length > 0,
       );
     }
 
@@ -281,7 +303,8 @@ export class BusinessService {
       .maybeSingle();
 
     if (error) throw new InternalServerErrorException(error.message);
-    if (!data) throw new NotFoundException('Không tìm thấy địa điểm thuộc đối tác này');
+    if (!data)
+      throw new NotFoundException('Không tìm thấy địa điểm thuộc đối tác này');
 
     return {
       message: 'Cập nhật địa điểm thành công',
@@ -314,7 +337,8 @@ export class BusinessService {
       .maybeSingle();
 
     if (error) throw new InternalServerErrorException(error.message);
-    if (!data) throw new NotFoundException('Không tìm thấy địa điểm thuộc đối tác này');
+    if (!data)
+      throw new NotFoundException('Không tìm thấy địa điểm thuộc đối tác này');
 
     return {
       message: 'Xóa địa điểm thành công',
@@ -351,21 +375,23 @@ export class BusinessService {
 
   async getPlaceServicesByType(placeId: string) {
     try {
-      console.log('📍 Fetching services for placeId:', placeId)
+      console.log('📍 Fetching services for placeId:', placeId);
 
       // Step 1: Get all place_services for this place (free services)
       const { data: placeServices, error: psError } = await supabase
         .schema('travel')
         .from('place_services')
         .select('place_id, service_id')
-        .eq('place_id', placeId)
+        .eq('place_id', placeId);
 
-      console.log('📊 Place services query - error:', psError)
-      console.log('📊 Place services query - data:', placeServices)
+      console.log('📊 Place services query - error:', psError);
+      console.log('📊 Place services query - data:', placeServices);
 
       if (psError) {
-        console.error('❌ Error fetching place_services:', psError.message)
-        throw new InternalServerErrorException(`Lỗi database: ${psError.message}`)
+        console.error('❌ Error fetching place_services:', psError.message);
+        throw new InternalServerErrorException(
+          `Lỗi database: ${psError.message}`,
+        );
       }
 
       // Step 2: Get food items for paid services
@@ -373,29 +399,33 @@ export class BusinessService {
         .schema('order_sys')
         .from('food_items')
         .select('id, name, price, description, image_url')
-        .eq('place_id', placeId)
+        .eq('place_id', placeId);
 
-      console.log('🍽️  Food items query - error:', foodError)
-      console.log('🍽️  Food items query - data:', foodItems)
+      console.log('🍽️  Food items query - error:', foodError);
+      console.log('🍽️  Food items query - data:', foodItems);
 
       // Try to get free and paid services
-      const freeServices: any[] = []
-      const paidServices: any[] = []
+      const freeServices: any[] = [];
+      const paidServices: any[] = [];
 
       // Process free services from place_services
-      if (placeServices && Array.isArray(placeServices) && placeServices.length > 0) {
-        const serviceIds = placeServices.map((ps: any) => ps.service_id)
-        console.log('🔍 Fetching services with IDs:', serviceIds)
+      if (
+        placeServices &&
+        Array.isArray(placeServices) &&
+        placeServices.length > 0
+      ) {
+        const serviceIds = placeServices.map((ps: any) => ps.service_id);
+        console.log('🔍 Fetching services with IDs:', serviceIds);
 
         // Fetch the services with their prices
         const { data: services, error: sError } = await supabase
           .schema('travel')
           .from('services')
           .select('id, name, price')
-          .in('id', serviceIds)
+          .in('id', serviceIds);
 
-        console.log('📊 Services query - error:', sError)
-        console.log('📊 Services query - data:', services)
+        console.log('📊 Services query - error:', sError);
+        console.log('📊 Services query - data:', services);
 
         if (!sError && services && Array.isArray(services)) {
           services.forEach((service: any) => {
@@ -403,49 +433,57 @@ export class BusinessService {
               id: service.id,
               name: service.name,
               description: service.description,
-              price: service.price
-            }
+              price: service.price,
+            };
 
             // Group by whether price is null (free) or has value (paid)
             if (service.price === null || service.price === undefined) {
-              freeServices.push(serviceData)
+              freeServices.push(serviceData);
             } else {
               paidServices.push({
                 ...serviceData,
-                price: typeof service.price === 'string' ? parseFloat(service.price) : service.price
-              })
+                price:
+                  typeof service.price === 'string'
+                    ? parseFloat(service.price)
+                    : service.price,
+              });
             }
-          })
+          });
         }
       }
 
       // Process food items separately (for restaurant menu section)
-      const menuItems: any[] = []
+      const menuItems: any[] = [];
       if (foodItems && Array.isArray(foodItems)) {
-        console.log('🍽️  Processing', foodItems.length, 'food items as menu')
+        console.log('🍽️  Processing', foodItems.length, 'food items as menu');
         foodItems.forEach((item: any) => {
           menuItems.push({
             id: item.id,
             name: item.name,
             description: item.description,
-            price: typeof item.price === 'string' ? parseFloat(item.price) : item.price,
-            image_url: Array.isArray(item.image_url) ? item.image_url[0] : (item.image_url ?? null),
-          })
-        })
+            price:
+              typeof item.price === 'string'
+                ? parseFloat(item.price)
+                : item.price,
+            image_url: Array.isArray(item.image_url)
+              ? item.image_url[0]
+              : (item.image_url ?? null),
+          });
+        });
       }
 
       const result = {
         freeServices,
         paidServices,
         menuItems,
-        total: freeServices.length + paidServices.length + menuItems.length
-      }
+        total: freeServices.length + paidServices.length + menuItems.length,
+      };
 
-      console.log('✅ Services fetched successfully:', result)
-      return result
+      console.log('✅ Services fetched successfully:', result);
+      return result;
     } catch (error) {
-      console.error('❌ Error in getPlaceServicesByType:', error)
-      throw new InternalServerErrorException('Không thể lấy dữ liệu dịch vụ')
+      console.error('❌ Error in getPlaceServicesByType:', error);
+      throw new InternalServerErrorException('Không thể lấy dữ liệu dịch vụ');
     }
   }
 
@@ -500,7 +538,8 @@ export class BusinessService {
     if (!name) throw new BadRequestException('Thiếu dữ liệu: Tên địa điểm');
     if (!address) throw new BadRequestException('Thiếu dữ liệu: Địa chỉ');
     if (!city) throw new BadRequestException('Thiếu dữ liệu: Tỉnh/Thành phố');
-    if (!categories || categories.length === 0) throw new BadRequestException('Thiếu dữ liệu: Danh mục');
+    if (!categories || categories.length === 0)
+      throw new BadRequestException('Thiếu dữ liệu: Danh mục');
     if (!vendorId) throw new BadRequestException('Thiếu dữ liệu: Vendor ID');
     if (!email) throw new BadRequestException('Thieu du lieu: Email lien he');
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
@@ -508,7 +547,9 @@ export class BusinessService {
     }
     if (!phone) throw new BadRequestException('Thieu du lieu: SDT lien he');
     if (!/^0\d{9}$/.test(phone)) {
-      throw new BadRequestException('SDT lien he phai gom dung 10 chu so va bat dau bang so 0');
+      throw new BadRequestException(
+        'SDT lien he phai gom dung 10 chu so va bat dau bang so 0',
+      );
     }
 
     let menu: any[] = [];
@@ -539,8 +580,12 @@ export class BusinessService {
     }
 
     const cityId = await this.resolveCityId(city);
-    const images = Array.isArray(dto.p_images || dto.images) ? (dto.p_images || dto.images) : [];
-    const services = Array.isArray(dto.p_services || dto.services) ? (dto.p_services || dto.services) : [];
+    const images = Array.isArray(dto.p_images || dto.images)
+      ? dto.p_images || dto.images
+      : [];
+    const services = Array.isArray(dto.p_services || dto.services)
+      ? dto.p_services || dto.services
+      : [];
 
     const { data: createdPlace, error: createPlaceError } = await supabase
       .schema('travel')
@@ -572,7 +617,9 @@ export class BusinessService {
 
     if (createPlaceError) {
       console.error('Supabase create place error:', createPlaceError);
-      throw new BadRequestException(createPlaceError.message || 'Loi khi tao dia diem');
+      throw new BadRequestException(
+        createPlaceError.message || 'Loi khi tao dia diem',
+      );
     }
 
     const createdPlaceId = createdPlace?.id;
@@ -598,13 +645,17 @@ export class BusinessService {
         p_lng: Number(dto.p_lng || dto.longitude),
         p_vendor_id: vendorId,
         p_categories: categoryNames,
-        p_services: Array.isArray(dto.p_services || dto.services) ? (dto.p_services || dto.services) : [],
+        p_services: Array.isArray(dto.p_services || dto.services)
+          ? dto.p_services || dto.services
+          : [],
         p_menu: menu,
         // BỔ SUNG CÁC THAM SỐ CÒN THIẾU Ở ĐÂY:
-        p_images: Array.isArray(dto.p_images || dto.images) ? (dto.p_images || dto.images) : [],
+        p_images: Array.isArray(dto.p_images || dto.images)
+          ? dto.p_images || dto.images
+          : [],
         p_open_time: dto.p_open_time || '08:00',
         p_close_time: dto.p_close_time || '22:00',
-        p_description: dto.p_description || ''
+        p_description: dto.p_description || '',
       });
 
     if (error) {
@@ -622,7 +673,9 @@ export class BusinessService {
 
       if (updateTypeError) {
         console.error('Supabase update type_id error:', updateTypeError);
-        throw new BadRequestException(updateTypeError?.message || 'Loi khi cap nhat loai hinh dia diem');
+        throw new BadRequestException(
+          updateTypeError?.message || 'Loi khi cap nhat loai hinh dia diem',
+        );
       }
     }
 
@@ -634,11 +687,23 @@ export class BusinessService {
 
   // ── Single service / menu-item CRUD ──────────────────────────────────────────
 
-  async addSingleMenuItem(placeId: string, name: string, description: string | null, price: number) {
+  async addSingleMenuItem(
+    placeId: string,
+    name: string,
+    description: string | null,
+    price: number,
+  ) {
     const { data, error } = await supabase
       .schema('order_sys')
       .from('food_items')
-      .insert({ id: randomUUID(), place_id: placeId, name: name.trim(), description: description || null, price: Number(price), image_url: [] })
+      .insert({
+        id: randomUUID(),
+        place_id: placeId,
+        name: name.trim(),
+        description: description || null,
+        price: Number(price),
+        image_url: [],
+      })
       .select('id, name, description, price')
       .single();
 
@@ -646,11 +711,21 @@ export class BusinessService {
     return { message: 'Thêm dịch vụ thành công', item: data };
   }
 
-  async updateSingleMenuItem(itemId: string, placeId: string, name: string, description: string | null, price: number) {
+  async updateSingleMenuItem(
+    itemId: string,
+    placeId: string,
+    name: string,
+    description: string | null,
+    price: number,
+  ) {
     const { data, error } = await supabase
       .schema('order_sys')
       .from('food_items')
-      .update({ name: name.trim(), description: description || null, price: Number(price) })
+      .update({
+        name: name.trim(),
+        description: description || null,
+        price: Number(price),
+      })
       .eq('id', itemId)
       .eq('place_id', placeId)
       .select('id')
@@ -699,18 +774,26 @@ export class BusinessService {
       serviceId = created?.id ?? null;
     }
 
-    if (!serviceId) throw new InternalServerErrorException('Không thể tạo tiện ích');
+    if (!serviceId)
+      throw new InternalServerErrorException('Không thể tạo tiện ích');
 
     const { error: linkError } = await supabase
       .schema('travel')
       .from('place_services')
-      .upsert({ place_id: placeId, service_id: serviceId }, { onConflict: 'place_id,service_id' });
+      .upsert(
+        { place_id: placeId, service_id: serviceId },
+        { onConflict: 'place_id,service_id' },
+      );
 
     if (linkError) throw new BadRequestException(linkError.message);
     return { message: 'Thêm tiện ích thành công', id: serviceId };
   }
 
-  async updateSingleFreeService(placeId: string, oldServiceId: string, newName: string) {
+  async updateSingleFreeService(
+    placeId: string,
+    oldServiceId: string,
+    newName: string,
+  ) {
     const { error: deleteError } = await supabase
       .schema('travel')
       .from('place_services')
@@ -878,7 +961,8 @@ export class BusinessService {
       .single();
 
     if (error) throw new InternalServerErrorException(error.message);
-    if (!data) throw new NotFoundException(`Không tìm thấy đơn hàng: ${orderId}`);
+    if (!data)
+      throw new NotFoundException(`Không tìm thấy đơn hàng: ${orderId}`);
 
     return { message: 'Cập nhật trạng thái thành công', order: data };
   }
@@ -907,4 +991,3 @@ export class BusinessService {
     };
   }
 }
-

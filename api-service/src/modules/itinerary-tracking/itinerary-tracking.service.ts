@@ -175,9 +175,7 @@ export class ItineraryTrackingService {
     if (error) this.dbError(error, 'loadItinerary');
     if (!data) throw new NotFoundException('Không tìm thấy lịch trình');
     if (touristId && data.creator_id !== touristId) {
-      throw new NotFoundException(
-        'Lịch trình không thuộc về người dùng này',
-      );
+      throw new NotFoundException('Lịch trình không thuộc về người dùng này');
     }
     return data;
   }
@@ -280,7 +278,7 @@ export class ItineraryTrackingService {
       .select('id, place_id, name, radius_m, is_active')
       .single<GeofenceRow>();
     if (insErr) this.dbError(insErr, 'ensureGeofence.insert');
-    return inserted!;
+    return inserted;
   }
 
   /** Tìm 1 visit theo itineraryDetailId, hoặc theo (itineraryId, placeId, date). */
@@ -714,8 +712,7 @@ export class ItineraryTrackingService {
         itineraryId: null,
         date: today,
         geofences: [],
-        message:
-          'Đã qua 23h, không khôi phục geofence cho ngày đã kết thúc.',
+        message: 'Đã qua 23h, không khôi phục geofence cho ngày đã kết thúc.',
       };
     }
 
@@ -740,8 +737,7 @@ export class ItineraryTrackingService {
         itineraryId: null,
         date: today,
         geofences: [],
-        message:
-          'Không có lịch trình đang bật theo dõi cho ngày hôm nay.',
+        message: 'Không có lịch trình đang bật theo dõi cho ngày hôm nay.',
       };
     }
 

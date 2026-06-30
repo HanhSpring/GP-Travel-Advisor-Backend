@@ -1,20 +1,20 @@
-import { IsUUID } from 'class-validator'
-import { ApiProperty } from '@nestjs/swagger'
+import { IsUUID } from 'class-validator';
+import { ApiProperty } from '@nestjs/swagger';
 
 export class VendorDto {
   @ApiProperty()
   @IsUUID()
-  vendorId: string
+  vendorId: string;
 }
 
 export class PlaceDto {
   @ApiProperty()
   @IsUUID()
-  placeId: string
+  placeId: string;
 }
 
 export class OrderDto {
   @ApiProperty()
   @IsUUID()
-  orderId: string
+  orderId: string;
 }

@@ -57,6 +57,13 @@ export class DashboardService {
   } | null = null;
   private readonly INTERACTION_CACHE_TTL_MS = 5 * 60 * 1000;
 
+  // ─── Cache: dashboard stats (TTL 2 phút) ────────────────────────────
+  private _statsCache: {
+    data: DashboardStatsResponse;
+    expiresAt: number;
+  } | null = null;
+  private readonly STATS_CACHE_TTL_MS = 2 * 60 * 1000;
+
 
   // ─── Cache helpers ───────────────────────────────────────────────────
   private getCachedPlaces(key: string): PopularPlaceStats[] | null {
@@ -84,10 +91,7 @@ export class DashboardService {
     return entry.data;
   }
 
-  private setCachedChart(
-    key: string,
-    data: ActiveUserChartResponse[],
-  ): void {
+  private setCachedChart(key: string, data: ActiveUserChartResponse[]): void {
     this._chartCache.set(key, {
       data,
       expiresAt: Date.now() + this.CHART_CACHE_TTL_MS,
@@ -174,10 +178,10 @@ export class DashboardService {
     const cached = this.getCachedPlaces(cacheKey);
     if (cached) return cached;
 
-    const { data, error } = (await supabase.rpc(
-      'get_place_popularity_stats',
-      { p_limit: limit, p_mode: mode },
-    )) as {
+    const { data, error } = (await supabase.rpc('get_place_popularity_stats', {
+      p_limit: limit,
+      p_mode: mode,
+    })) as {
       data: Array<{
         place_id: unknown;
         place_name: unknown;
@@ -277,6 +281,10 @@ export class DashboardService {
 
   // ─── Dashboard Stats (tổng hợp, 1 call thay 4 calls) ────────────────
   async getDashboardStats(): Promise<DashboardStatsResponse> {
+    if (this._statsCache && Date.now() < this._statsCache.expiresAt) {
+      return this._statsCache.data;
+    }
+
     const [rUsers, rReviewTotal, rReviewPending, rReviewViolation] =
       await Promise.allSettled([
         supabase.rpc('get_user_statistics'),
@@ -308,7 +316,6 @@ export class DashboardService {
         newUsersMonth = Number(d[0].new_this_month ?? 0);
       }
     }
-
     const totalReviews =
       rReviewTotal.status === 'fulfilled'
         ? Number(rReviewTotal.value.count ?? 0)
@@ -330,6 +337,11 @@ export class DashboardService {
       totalReviews,
       pendingReviews,
       violationReviews,
+    };
+
+    this._statsCache = {
+      data: result,
+      expiresAt: Date.now() + this.STATS_CACHE_TTL_MS,
     };
 
     return result;

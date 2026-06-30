@@ -18,7 +18,7 @@ export class CitiesController {
   })
   @ApiOkResponse({
     description: 'Lấy danh sách thành phố thành công.',
-    type: [City], 
+    type: [City],
   })
   async getCities(@Query() query: GetCitiesQueryDto): Promise<City[]> {
     return this.citiesService.findAll(query.search);

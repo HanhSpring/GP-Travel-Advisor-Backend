@@ -59,7 +59,9 @@ export class AdminAlgorithmSettingsController {
   }
 
   @Post('review-filter/reset')
-  @ApiOperation({ summary: 'Reset review filtering pipeline settings to defaults' })
+  @ApiOperation({
+    summary: 'Reset review filtering pipeline settings to defaults',
+  })
   @ApiResponse({ status: 200, type: ReviewFilterSettingsDto })
   resetReviewFilterSettings(): Promise<ReviewFilterSettingsDto> {
     return this.service.resetReviewFilterSettings();

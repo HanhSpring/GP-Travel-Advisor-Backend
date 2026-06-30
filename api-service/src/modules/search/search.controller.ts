@@ -1,34 +1,33 @@
-import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger'
-import { SearchService } from './search.service'
-import { SearchQueryDto } from './dto/search.dto'
-import { AutocompleteItemDto } from './dto/search-response.dto'
-import { SearchFilterDto } from './dto/search-filter.dto'
-import { Controller, Get, Query } from '@nestjs/common'
+import { ApiTags, ApiOperation, ApiResponse } from '@nestjs/swagger';
+import { SearchService } from './search.service';
+import { SearchQueryDto } from './dto/search.dto';
+import { AutocompleteItemDto } from './dto/search-response.dto';
+import { SearchFilterDto } from './dto/search-filter.dto';
+import { Controller, Get, Query } from '@nestjs/common';
 
 @ApiTags('Search')
 @Controller('search')
 export class SearchController {
-
-  constructor(private readonly service: SearchService) { }
+  constructor(private readonly service: SearchService) {}
 
   @Get('autocomplete')
   @ApiOperation({ summary: 'Search autocomplete (suggestions)' })
   @ApiResponse({ type: [AutocompleteItemDto] })
   autocomplete(@Query() query: SearchQueryDto) {
-    return this.service.autocomplete(query.q)
+    return this.service.autocomplete(query.q);
   }
 
   @Get('filter')
   @ApiOperation({ summary: 'Filter places by city and category' })
   getPlacesByFilter(@Query() query: SearchFilterDto) {
-    return this.service.getPlacesByFilter(
-      query.city,
-      query.category
-    )
+    return this.service.getPlacesByFilter(query.city, query.category);
   }
 
   @Get('all')
-  @ApiOperation({ summary: 'Search all types (itinerary, activity, restaurant, hotel) — top 10 each' })
+  @ApiOperation({
+    summary:
+      'Search all types (itinerary, activity, restaurant, hotel) — top 10 each',
+  })
   searchAll(@Query('q') q: string) {
     return this.service.searchAll(q ?? '');
   }
@@ -41,7 +40,12 @@ export class SearchController {
     @Query('page') page?: string,
     @Query('limit') limit?: string,
   ) {
-    return this.service.searchByType(q ?? '', type ?? 'activity', page ? parseInt(page, 10) : 1, limit ? parseInt(limit, 10) : 10);
+    return this.service.searchByType(
+      q ?? '',
+      type ?? 'activity',
+      page ? parseInt(page, 10) : 1,
+      limit ? parseInt(limit, 10) : 10,
+    );
   }
 
   @Get('nearby')

@@ -80,7 +80,9 @@ export class ItineraryService {
       : [];
     const itineraryIds = itineraries
       .map((item: any) => item?.id)
-      .filter((id: any): id is string => typeof id === 'string' && id.length > 0);
+      .filter(
+        (id: any): id is string => typeof id === 'string' && id.length > 0,
+      );
 
     if (itineraryIds.length === 0) {
       return payload;
@@ -159,6 +161,8 @@ export class ItineraryService {
       adult_count: dto.adultCount,
       children_count: dto.childCount ?? 0,
       trip_intent: dto.tripIntent,
+      daily_start_time: dto.dailyStartTime ?? '07:00',
+      daily_end_time: dto.dailyEndTime ?? '22:00',
     };
 
     let insertResult = await supabase
@@ -211,7 +215,10 @@ export class ItineraryService {
             entry.estimated_cost ?? placeCostById.get(entry.location_id) ?? 0,
           transport_cost:
             entry.transport_cost ??
-            this.estimateSelfDriveTransportCost(entry.distance_km, dto.transportMode),
+            this.estimateSelfDriveTransportCost(
+              entry.distance_km,
+              dto.transportMode,
+            ),
           sequence_order: index + 1,
           is_locked: false,
         }));
@@ -543,7 +550,7 @@ export class ItineraryService {
     const durationMinutes = dto.durationMinutes ?? 60; // Mặc định 60 phút
     let preferredTime = dto.preferredTime;
     let isLocked = !!dto.preferredTime;
-    
+
     // Tự động gán giờ cho các loại địa điểm đặc thù nếu người dùng chưa chọn giờ
     if (!preferredTime && place.categories && (place.categories as any).name) {
       const catName = ((place.categories as any).name as string).toLowerCase();
@@ -557,7 +564,7 @@ export class ItineraryService {
       } else if (catName.includes('chùa') || catName.includes('đền')) {
         preferredTime = '08:30:00';
       }
-      
+
       if (preferredTime) {
         isLocked = true;
       }
@@ -590,7 +597,12 @@ export class ItineraryService {
     }
 
     // ─── Bước 7: Tối ưu lại ngày để sắp xếp địa điểm mới vào đúng chỗ ─
-    return this._reOptimizeDay(itineraryId, visitDate);
+    return this._reOptimizeDay(
+      itineraryId,
+      visitDate,
+      inserted.id,
+      (dto as any).allowReduceTime,
+    );
   }
 
   /**
@@ -781,7 +793,12 @@ export class ItineraryService {
    * @param itineraryId - ID lịch trình
    * @param visitDate   - Ngày cần tối ưu ('YYYY-MM-DD')
    */
-  private async _reOptimizeDay(itineraryId: string, visitDate: string) {
+  private async _reOptimizeDay(
+    itineraryId: string,
+    visitDate: string,
+    newActivityId?: string,
+    allowReduceTime: boolean = false,
+  ) {
     // ─── Lấy thời gian hoạt động của lịch trình ───────────────────
     const { data: itinerary } = await supabase
       .schema('travel')
@@ -790,8 +807,8 @@ export class ItineraryService {
       .eq('id', itineraryId)
       .single();
 
-    const dailyStartTime = itinerary?.daily_start_time || '08:00';
-    const dailyEndTime = itinerary?.daily_end_time || '21:00';
+    const dailyStartTime = itinerary?.daily_start_time || '07:00';
+    const dailyEndTime = itinerary?.daily_end_time || '22:00';
 
     // ─── Lấy toàn bộ hoạt động trong ngày (JOIN với places) ──────
     const { data: activities, error: fetchErr } = await supabase
@@ -853,9 +870,14 @@ export class ItineraryService {
             open_time: a.places?.open_time ?? '07:00',
             close_time: a.places?.close_time ?? '22:00',
             estimated_cost: a.estimated_cost ?? 0,
+            category: a.places?.categories?.name ?? null,
+            is_restaurant: this.isRestaurant(a.places?.categories?.name),
+            original_arrival_time: a.arrival_time,
+            is_new: newActivityId ? a.id === newActivityId : false,
           })),
         day_start_time: dailyStartTime,
         day_end_time: dailyEndTime,
+        allow_reduce_time: allowReduceTime,
       };
 
       const response = await axios.post(
@@ -925,6 +947,8 @@ export class ItineraryService {
           image_url,
           average_rating,
           review_count,
+          latitude,
+          longitude,
           categories:category_id (name)
         )
       `,
@@ -957,25 +981,48 @@ export class ItineraryService {
       success: true,
       message: 'Lịch trình đã được cập nhật và sắp xếp lại',
       affectedDay,
-      updatedActivities: list.map((a: any) => ({
-        id: a.id,
-        placeId: a.place_id,
-        title: a.places?.name ?? '',
-        startTime: a.arrival_time ?? '',
-        endTime: a.departure_time ?? '',
-        address: a.places?.address ?? '',
-        imageUrl: a.places?.image_url ?? '',
-        estimatedCost: a.estimated_cost ?? 0,
-        isFree: (a.estimated_cost ?? 0) === 0,
-        durationMinutes: a.duration_minutes ?? 60,
-        isLocked: a.is_locked ?? false,
-        lockedArriveTime: a.locked_arrive_time ?? null,
-        userNotes: a.user_notes ?? null,
-        sequenceOrder: a.sequence_order ?? 0,
-        rating: a.places?.average_rating ?? 0,
-        reviewCount: a.places?.review_count ?? 0,
-        category: a.places?.categories?.name ?? null,
-      })),
+      updatedActivities: list.map((a: any, idx: number) => {
+        const nextA: any = list[idx + 1];
+        let transportInfo: string | null = null;
+        if (nextA) {
+          const p1 = a.places;
+          const p2 = nextA.places;
+          if (
+            p1?.latitude != null &&
+            p1?.longitude != null &&
+            p2?.latitude != null &&
+            p2?.longitude != null
+          ) {
+            const dist = this._haversineKm(
+              p1.latitude,
+              p1.longitude,
+              p2.latitude,
+              p2.longitude,
+            );
+            transportInfo = `${this._transitMinutes(dist)} phút di chuyển`;
+          }
+        }
+        return {
+          id: a.id,
+          placeId: a.place_id,
+          title: a.places?.name ?? '',
+          startTime: a.arrival_time ?? '',
+          endTime: a.departure_time ?? '',
+          address: a.places?.address ?? '',
+          imageUrl: a.places?.image_url ?? '',
+          estimatedCost: a.estimated_cost ?? 0,
+          isFree: (a.estimated_cost ?? 0) === 0,
+          durationMinutes: a.duration_minutes ?? 60,
+          isLocked: a.is_locked ?? false,
+          lockedArriveTime: a.locked_arrive_time ?? null,
+          userNotes: a.user_notes ?? null,
+          sequenceOrder: a.sequence_order ?? 0,
+          rating: a.places?.average_rating ?? 0,
+          reviewCount: a.places?.review_count ?? 0,
+          category: a.places?.categories?.name ?? null,
+          transportInfo,
+        };
+      }),
     };
   }
 
@@ -1016,6 +1063,33 @@ export class ItineraryService {
 
   private _toRad(deg: number): number {
     return deg * (Math.PI / 180);
+  }
+
+  /** Khoảng cách thẳng Haversine (km) giữa 2 toạ độ. */
+  private _haversineKm(
+    lat1: number,
+    lng1: number,
+    lat2: number,
+    lng2: number,
+  ): number {
+    const R = 6371;
+    const dLat = this._toRad(lat2 - lat1);
+    const dLng = this._toRad(lng2 - lng1);
+    const a =
+      Math.sin(dLat / 2) ** 2 +
+      Math.cos(this._toRad(lat1)) *
+        Math.cos(this._toRad(lat2)) *
+        Math.sin(dLng / 2) ** 2;
+    return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+  }
+
+  /**
+   * Ước tính thời gian di chuyển xe máy (phút) từ khoảng cách Haversine.
+   * Công thức: đường thực tế ≈ dist × 1.3, tốc độ ~30 km/h → dist × 2.0 + 2
+   * Ví dụ: 2km → 6 phút (khớp Google Maps), 5km → 12 phút.
+   */
+  private _transitMinutes(distKm: number): number {
+    return Math.max(3, Math.ceil(distKm * 2.0 + 2));
   }
 
   async updateActivities(id: string, days: any[]) {
@@ -1059,7 +1133,9 @@ export class ItineraryService {
       .eq('itinerary_id', id);
 
     const incomingIds = allActivities.map((a) => a.id);
-    const toDelete = (currentActs || []).filter((a) => !incomingIds.includes(a.id));
+    const toDelete = (currentActs || []).filter(
+      (a) => !incomingIds.includes(a.id),
+    );
 
     if (toDelete.length > 0) {
       await supabase
@@ -1195,7 +1271,10 @@ export class ItineraryService {
       new Set(
         (details || [])
           .map((detail: any) => detail.place_id)
-          .filter((placeId: unknown): placeId is string => typeof placeId === 'string' && placeId.length > 0),
+          .filter(
+            (placeId: unknown): placeId is string =>
+              typeof placeId === 'string' && placeId.length > 0,
+          ),
       ),
     );
 
@@ -1290,13 +1369,35 @@ export class ItineraryService {
               ? images
               : 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80';
 
-        // Tính thời gian di chuyển đến địa điểm kế tiếp
+        // Tính thời gian di chuyển đến địa điểm kế tiếp bằng Haversine.
+        // KHÔNG dùng gap thời gian (departure → nextArrival) vì gap đó bao gồm
+        // cả thời gian rảnh (VD: hoạt động kết thúc 09:00, chợ đêm bắt đầu 19:00
+        // → gap = 10 tiếng nhưng di chuyển thực tế chỉ ~6 phút).
         const nextAct = activitiesRaw[actIndex + 1];
         let transitInfo: string | null = null;
         if (nextAct) {
-          const departureStr: string = act.departure_time || '';
-          const nextArrivalStr: string = nextAct.arrival_time || '';
-          transitInfo = this._calcTransitLabel(departureStr, nextArrivalStr);
+          const p1 = act.place;
+          const p2 = nextAct.place;
+          if (
+            p1?.latitude != null &&
+            p1?.longitude != null &&
+            p2?.latitude != null &&
+            p2?.longitude != null
+          ) {
+            const dist = this._haversineKm(
+              p1.latitude,
+              p1.longitude,
+              p2.latitude,
+              p2.longitude,
+            );
+            const mins = this._transitMinutes(dist);
+            transitInfo = `${mins} phút di chuyển`;
+          } else {
+            transitInfo = this._calcTransitLabel(
+              act.departure_time || '',
+              nextAct.arrival_time || '',
+            );
+          }
         }
 
         const typeData = Array.isArray(place?.types)
@@ -1473,6 +1574,10 @@ export class ItineraryService {
       destination: itinerary.destination || '',
       start_date: startStr,
       end_date: endStr,
+      dailyStartTime: itinerary.daily_start_time || '07:00',
+      dailyEndTime: itinerary.daily_end_time || '22:00',
+      daily_start_time: itinerary.daily_start_time || '07:00',
+      daily_end_time: itinerary.daily_end_time || '22:00',
       durationDays: diffDays || days.length || 1,
       activitiesCount: nonHotelDetailsCount,
       estimatedBudget: estimatedTripCost,
@@ -1540,25 +1645,107 @@ export class ItineraryService {
       return null;
     }
   }
+
+  /**
+   * Xác định giờ mở/đóng cửa cho một địa điểm.
+   * Ưu tiên: openTime/closeTime tường minh → parse openHourCompressed → default.
+   *
+   * openHourCompressed format (từ DB / Google):
+   *   {"Monday":[["07:00:00","22:00:00"]],"Tuesday":[...],...}
+   */
+  private _resolveOpenClose(
+    openTime: string | null | undefined,
+    closeTime: string | null | undefined,
+    openHourCompressed: string | null | undefined,
+    visitDate: string,
+  ): { open_time: string; close_time: string } {
+    const DEFAULT = { open_time: '07:00', close_time: '22:00' };
+
+    if (openTime && closeTime) {
+      return {
+        open_time: openTime.slice(0, 5),
+        close_time: closeTime.slice(0, 5),
+      };
+    }
+
+    if (openHourCompressed) {
+      try {
+        const hours: Record<string, string[][]> =
+          JSON.parse(openHourCompressed);
+        const DAY_NAMES = [
+          'Sunday',
+          'Monday',
+          'Tuesday',
+          'Wednesday',
+          'Thursday',
+          'Friday',
+          'Saturday',
+        ];
+        const dayName = DAY_NAMES[new Date(visitDate).getDay()];
+        const slots = hours[dayName];
+        if (Array.isArray(slots) && slots.length > 0) {
+          const [open, close] = slots[0];
+          if (open && close) {
+            return {
+              open_time: String(open).slice(0, 5),
+              close_time: String(close).slice(0, 5),
+            };
+          }
+        }
+      } catch (_) {
+        // JSON parse failed — fall through to default
+      }
+    }
+
+    return DEFAULT;
+  }
+
+  private isRestaurant(category: string | null | undefined): boolean {
+    if (!category) return false;
+    const lower = category.toLowerCase();
+    return (
+      lower.includes('nhà hàng') ||
+      lower.includes('quán ăn') ||
+      lower.includes('nhà ăn') ||
+      lower.includes('restaurant') ||
+      lower.includes('cafe') ||
+      lower.includes('cà phê') ||
+      lower.includes('quán bar') ||
+      lower.includes('bar')
+    );
+  }
   async optimizeDayRoute(
     activities: any[],
     dailyStartTime?: string,
     dailyEndTime?: string,
+    allowReduceTime: boolean = false,
+    visitDate?: string,
   ) {
     if (activities.length <= 2) return activities;
+
+    const resolvedVisitDate =
+      visitDate ?? new Date().toISOString().split('T')[0];
 
     try {
       // ─── Chuẩn bị payload cho TSPTW optimizer (đầy đủ ràng buộc) ─
       const payload = {
         itinerary_id: 'client-optimize', // placeholder — không cần lưu DB
-        visit_date: new Date().toISOString().split('T')[0],
-        day_start_time: dailyStartTime || '08:00',
-        day_end_time: dailyEndTime || '21:00',
+        visit_date: resolvedVisitDate,
+        day_start_time: dailyStartTime || '07:00',
+        day_end_time: dailyEndTime || '22:00',
         activities: activities.map((a: any) => {
           // Tính duration từ startTime/endTime nếu không có sẵn
-          const startMin = this.toMinutes(a.startTime || '08:00');
-          const endMin = this.toMinutes(a.endTime || '09:00');
+          const startMin = this.toMinutes(a.startTime || '07:00');
+          const endMin = this.toMinutes(a.endTime || '08:00');
           const duration = endMin - startMin > 0 ? endMin - startMin : 60;
+
+          // openTime/closeTime: ưu tiên trường tường minh, rồi parse openHourCompressed
+          const { open_time, close_time } = this._resolveOpenClose(
+            a.openTime,
+            a.closeTime,
+            a.openHourCompressed,
+            resolvedVisitDate,
+          );
 
           return {
             id: a.id,
@@ -1568,11 +1755,17 @@ export class ItineraryService {
             locked_arrive_time: a.lockedArriveTime ?? null,
             lat: a.latitude ?? null,
             lng: a.longitude ?? null,
-            open_time: a.openTime ?? '07:00',
-            close_time: a.closeTime ?? '22:00',
+            open_time,
+            close_time,
             estimated_cost: a.price ?? 0,
+            category: a.category ?? null,
+            is_restaurant: this.isRestaurant(a.category),
+            original_arrival_time: a.startTime ?? null,
+            // Flutter đánh dấu activity mới bằng isNew: true → optimizer chèn vào vị trí tối ưu
+            is_new: a.isNew ?? false,
           };
         }),
+        allow_reduce_time: allowReduceTime,
       };
 
       const response = await axios.post(
@@ -1594,7 +1787,14 @@ export class ItineraryService {
           transportInfo: opt.transport_to_next ?? original.transportInfo,
         };
       });
-    } catch (e) {
+    } catch (e: any) {
+      // Python AI service trả về 422 khi lịch kín — phải check 422, không phải 400
+      if (
+        e.response?.status === 422 &&
+        e.response?.data?.detail === 'SCHEDULE_FULL'
+      ) {
+        throw new BadRequestException('SCHEDULE_FULL');
+      }
       console.error('optimizeDayRoute failed:', e);
       return activities; // Fallback: giữ nguyên thứ tự cũ
     }
@@ -1674,7 +1874,9 @@ export class ItineraryService {
     };
   }
 
-  private async getPlaceEstimatedCostMap(plan: AIPlanResult): Promise<Map<string, number>> {
+  private async getPlaceEstimatedCostMap(
+    plan: AIPlanResult,
+  ): Promise<Map<string, number>> {
     const ids = new Set<string>();
     if (plan.hotel_id) ids.add(plan.hotel_id);
     for (const day of plan.days || []) {
@@ -1696,10 +1898,7 @@ export class ItineraryService {
     }
 
     return new Map(
-      (data || []).map((row: any) => [
-        row.id,
-        Number(row.estimated_cost ?? 0),
-      ]),
+      (data || []).map((row: any) => [row.id, Number(row.estimated_cost ?? 0)]),
     );
   }
 

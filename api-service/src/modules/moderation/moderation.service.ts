@@ -26,7 +26,11 @@ export class ModerationService {
 
   private isVideo(url: string): boolean {
     const lowerUrl = url.toLowerCase();
-    return lowerUrl.endsWith('.mp4') || lowerUrl.endsWith('.mov') || lowerUrl.endsWith('.avi');
+    return (
+      lowerUrl.endsWith('.mp4') ||
+      lowerUrl.endsWith('.mov') ||
+      lowerUrl.endsWith('.avi')
+    );
   }
 
   async moderateReview(
@@ -45,7 +49,7 @@ export class ModerationService {
 
     // --- STEP 2: OpenAI omni-moderation-latest (primary AI check, supports Vietnamese) ---
     let openaiApiOk = false;
-    let openaiViolations: string[] = [];
+    const openaiViolations: string[] = [];
     try {
       const inputs: any[] = [];
       if (textToAnalyze.trim()) {
@@ -88,7 +92,10 @@ export class ModerationService {
         openaiApiOk = true;
       }
     } catch (error) {
-      this.logger.error('OpenAI Moderation API error — will keep review as pending', error);
+      this.logger.error(
+        'OpenAI Moderation API error — will keep review as pending',
+        error,
+      );
     }
 
     if (openaiViolations.length > 0) {
@@ -118,7 +125,8 @@ export class ModerationService {
     }
 
     // 2. External Booking Links Detection
-    const urlRegex = /(booking\.com|agoda\.com|traveloka\.com|airbnb\.com|facebook\.com)/g;
+    const urlRegex =
+      /(booking\.com|agoda\.com|traveloka\.com|airbnb\.com|facebook\.com)/g;
     if (urlRegex.test(lowerText)) {
       violations.push('URL bên ngoài (External Booking Links)');
     }
@@ -143,27 +151,28 @@ export class ModerationService {
     // 6. Vietnamese Profanity / Hate Speech
     // Normalize text: remove diacritics for variant matching (e.g. "lon" = "lồn")
     const normalizeVi = (s: string) =>
-      s.normalize('NFD')
-       .replace(/[̀-ͯ]/g, '')  // strip combining diacritics
-       .replace(/đ/g, 'd')
-       .replace(/Đ/g, 'd');
+      s
+        .normalize('NFD')
+        .replace(/[̀-ͯ]/g, '') // strip combining diacritics
+        .replace(/đ/g, 'd')
+        .replace(/Đ/g, 'd');
 
     const normalizedText = normalizeVi(lowerText);
 
     // Exact profanity words (normalized, no diacritics)
     const profanityWords = [
-      'lon',       // lồn
-      'cac',       // cặc
-      'dit',       // địt
-      'du ma',     // đụ mẹ
+      'lon', // lồn
+      'cac', // cặc
+      'dit', // địt
+      'du ma', // đụ mẹ
       'du me',
       'du ba',
       'du bo',
-      'vl',        // viết tắt vãi lồn
+      'vl', // viết tắt vãi lồn
       'vcl',
       'vkl',
-      'clm',       // con lồn mẹ (phổ biến trong chat)
-      'dm',        // đụ mẹ (viết tắt)
+      'clm', // con lồn mẹ (phổ biến trong chat)
+      'dm', // đụ mẹ (viết tắt)
       'dkm',
       'dmm',
       'dmc',
@@ -173,15 +182,15 @@ export class ModerationService {
       'shit',
       'bitch',
       'asshole',
-      'con cho',   // con chó
-      'do cho',    // đồ chó
+      'con cho', // con chó
+      'do cho', // đồ chó
       'thang cho',
-      'con dieu',  // con điếm
-      'dieu',      // điếm
-      'mai dam',   // mại dâm
+      'con dieu', // con điếm
+      'dieu', // điếm
+      'mai dam', // mại dâm
       'chim chuot',
-      'dau buoi',  // đầu buồi
-      'buoi',      // buồi
+      'dau buoi', // đầu buồi
+      'buoi', // buồi
     ];
 
     // Check each profanity word — match as whole word or substring
@@ -190,7 +199,9 @@ export class ModerationService {
     );
 
     if (foundProfanity.length > 0) {
-      violations.push(`Ngôn ngữ thô tục (Profanity): ${foundProfanity.join(', ')}`);
+      violations.push(
+        `Ngôn ngữ thô tục (Profanity): ${foundProfanity.join(', ')}`,
+      );
     }
 
     return violations;

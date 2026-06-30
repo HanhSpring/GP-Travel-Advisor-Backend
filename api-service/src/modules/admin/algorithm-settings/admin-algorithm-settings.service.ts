@@ -213,7 +213,10 @@ function toNumber(value: number | string | null | undefined, fallback = 0) {
   return Number.isFinite(numeric) ? numeric : fallback;
 }
 
-const REVIEW_FILTER_TOPICS: Array<{ key: ReviewFilterTopicKey; label: string }> = [
+const REVIEW_FILTER_TOPICS: Array<{
+  key: ReviewFilterTopicKey;
+  label: string;
+}> = [
   { key: 'traffic', label: 'Giao thông' },
   { key: 'weather', label: 'Thời tiết' },
   { key: 'crowd', label: 'Đông đúc' },
@@ -238,13 +241,55 @@ const REVIEW_FILTER_PARAM_LABELS: Record<string, string> = {
 };
 
 const REVIEW_FILTER_DEFAULTS: Record<string, Omit<ParameterMetaDto, 'name'>> = {
-  topic_other_threshold: { defaultValue: 0.18, currentValue: 0.18, minValue: 0.05, maxValue: 0.5, description: REVIEW_FILTER_PARAM_LABELS.topic_other_threshold },
-  classifier_confidence_threshold: { defaultValue: 0.55, currentValue: 0.55, minValue: 0.5, maxValue: 0.95, description: REVIEW_FILTER_PARAM_LABELS.classifier_confidence_threshold },
-  classifier_ambiguity_margin: { defaultValue: 0.1, currentValue: 0.1, minValue: 0, maxValue: 0.4, description: REVIEW_FILTER_PARAM_LABELS.classifier_ambiguity_margin },
-  conflict_score_threshold: { defaultValue: 0.65, currentValue: 0.65, minValue: 0.5, maxValue: 0.9, description: REVIEW_FILTER_PARAM_LABELS.conflict_score_threshold },
-  candidate_mode: { defaultValue: 0, currentValue: 0, minValue: 0, maxValue: 1, description: REVIEW_FILTER_PARAM_LABELS.candidate_mode },
-  top_k: { defaultValue: 5, currentValue: 5, minValue: 1, maxValue: 50, description: REVIEW_FILTER_PARAM_LABELS.top_k },
-  promotion_mode: { defaultValue: 0, currentValue: 0, minValue: 0, maxValue: 1, description: REVIEW_FILTER_PARAM_LABELS.promotion_mode },
+  topic_other_threshold: {
+    defaultValue: 0.18,
+    currentValue: 0.18,
+    minValue: 0.05,
+    maxValue: 0.5,
+    description: REVIEW_FILTER_PARAM_LABELS.topic_other_threshold,
+  },
+  classifier_confidence_threshold: {
+    defaultValue: 0.55,
+    currentValue: 0.55,
+    minValue: 0.5,
+    maxValue: 0.95,
+    description: REVIEW_FILTER_PARAM_LABELS.classifier_confidence_threshold,
+  },
+  classifier_ambiguity_margin: {
+    defaultValue: 0.1,
+    currentValue: 0.1,
+    minValue: 0,
+    maxValue: 0.4,
+    description: REVIEW_FILTER_PARAM_LABELS.classifier_ambiguity_margin,
+  },
+  conflict_score_threshold: {
+    defaultValue: 0.65,
+    currentValue: 0.65,
+    minValue: 0.5,
+    maxValue: 0.9,
+    description: REVIEW_FILTER_PARAM_LABELS.conflict_score_threshold,
+  },
+  candidate_mode: {
+    defaultValue: 0,
+    currentValue: 0,
+    minValue: 0,
+    maxValue: 1,
+    description: REVIEW_FILTER_PARAM_LABELS.candidate_mode,
+  },
+  top_k: {
+    defaultValue: 5,
+    currentValue: 5,
+    minValue: 1,
+    maxValue: 50,
+    description: REVIEW_FILTER_PARAM_LABELS.top_k,
+  },
+  promotion_mode: {
+    defaultValue: 0,
+    currentValue: 0,
+    minValue: 0,
+    maxValue: 1,
+    description: REVIEW_FILTER_PARAM_LABELS.promotion_mode,
+  },
 };
 
 function setReviewFilterTopicParam(
@@ -277,19 +322,20 @@ const ttlDefaults: Record<ReviewFilterTopicKey, [number, number, number]> = {
   atmosphere: [720, 168, 2160],
   other: [48, 24, 168],
 };
-const lookbackDefaults: Record<ReviewFilterTopicKey, [number, number, number]> = {
-  traffic: [3, 1, 6],
-  weather: [3, 1, 6],
-  crowd: [6, 2, 12],
-  service: [6, 2, 12],
-  price: [6, 2, 12],
-  infra: [12, 3, 24],
-  cleanliness: [6, 2, 12],
-  food: [6, 2, 12],
-  activity: [12, 3, 24],
-  atmosphere: [12, 3, 24],
-  other: [6, 2, 12],
-};
+const lookbackDefaults: Record<ReviewFilterTopicKey, [number, number, number]> =
+  {
+    traffic: [3, 1, 6],
+    weather: [3, 1, 6],
+    crowd: [6, 2, 12],
+    service: [6, 2, 12],
+    price: [6, 2, 12],
+    infra: [12, 3, 24],
+    cleanliness: [6, 2, 12],
+    food: [6, 2, 12],
+    activity: [12, 3, 24],
+    atmosphere: [12, 3, 24],
+    other: [6, 2, 12],
+  };
 const windowDefaults: Record<ReviewFilterTopicKey, [number, number, number]> = {
   traffic: [7, 1, 14],
   weather: [7, 1, 14],
@@ -303,7 +349,10 @@ const windowDefaults: Record<ReviewFilterTopicKey, [number, number, number]> = {
   atmosphere: [90, 14, 180],
   other: [14, 3, 30],
 };
-const thresholdDefaults: Record<ReviewFilterTopicKey, [number, number, number]> = {
+const thresholdDefaults: Record<
+  ReviewFilterTopicKey,
+  [number, number, number]
+> = {
   traffic: [3, 2, 10],
   weather: [3, 2, 10],
   crowd: [3, 2, 15],
@@ -331,19 +380,45 @@ const simDefaults: Record<ReviewFilterTopicKey, [number, number, number]> = {
 };
 
 for (const { key, label } of REVIEW_FILTER_TOPICS) {
-  setReviewFilterTopicParam('ttl_hours', key, ...ttlDefaults[key], `Thời hạn hiệu lực theo chủ đề: ${label}`);
-  setReviewFilterTopicParam('lookback_multiplier', key, ...lookbackDefaults[key], `Hệ số cửa sổ tra cứu theo chủ đề: ${label}`);
-  setReviewFilterTopicParam('window_days', key, ...windowDefaults[key], `Cửa sổ quan sát theo chủ đề: ${label}`);
-  setReviewFilterTopicParam('threshold', key, ...thresholdDefaults[key], `Số đánh giá tối thiểu để tổng hợp theo chủ đề: ${label}`);
-  setReviewFilterTopicParam('sim_threshold', key, ...simDefaults[key], `Ngưỡng tương đồng nội dung theo chủ đề: ${label}`);
+  setReviewFilterTopicParam(
+    'ttl_hours',
+    key,
+    ...ttlDefaults[key],
+    `Thời hạn hiệu lực theo chủ đề: ${label}`,
+  );
+  setReviewFilterTopicParam(
+    'lookback_multiplier',
+    key,
+    ...lookbackDefaults[key],
+    `Hệ số cửa sổ tra cứu theo chủ đề: ${label}`,
+  );
+  setReviewFilterTopicParam(
+    'window_days',
+    key,
+    ...windowDefaults[key],
+    `Cửa sổ quan sát theo chủ đề: ${label}`,
+  );
+  setReviewFilterTopicParam(
+    'threshold',
+    key,
+    ...thresholdDefaults[key],
+    `Số đánh giá tối thiểu để tổng hợp theo chủ đề: ${label}`,
+  );
+  setReviewFilterTopicParam(
+    'sim_threshold',
+    key,
+    ...simDefaults[key],
+    `Ngưỡng tương đồng nội dung theo chủ đề: ${label}`,
+  );
 }
 
 @Injectable()
 export class AdminAlgorithmSettingsService {
   private readonly logger = new Logger(AdminAlgorithmSettingsService.name);
-  private reviewFilterCache:
-    | { expiresAt: number; data: ReviewFilterSettingsDto }
-    | null = null;
+  private reviewFilterCache: {
+    expiresAt: number;
+    data: ReviewFilterSettingsDto;
+  } | null = null;
 
   async getReviewFilterSettings(
     useCache = true,
@@ -516,12 +591,16 @@ export class AdminAlgorithmSettingsService {
 
     return {
       topic_other_threshold: value('topic_other_threshold', 0.18),
-      classifier_confidence_threshold: value('classifier_confidence_threshold', 0.55),
+      classifier_confidence_threshold: value(
+        'classifier_confidence_threshold',
+        0.55,
+      ),
       classifier_ambiguity_margin: value('classifier_ambiguity_margin', 0.1),
       conflict_score_threshold: value('conflict_score_threshold', 0.65),
       candidate_mode: value('candidate_mode', 0) === 1 ? 'topk' : 'all',
       top_k: Math.round(value('top_k', 5)),
-      promotion_mode: value('promotion_mode', 0) === 1 ? 'all' : 'representative',
+      promotion_mode:
+        value('promotion_mode', 0) === 1 ? 'all' : 'representative',
       ttl_hours_by_topic: byTopic('ttl_hours', {}),
       lookback_multiplier_by_topic: byTopic('lookback_multiplier', {}),
       observation_rules: observationRules,
@@ -795,8 +874,14 @@ export class AdminAlgorithmSettingsService {
       const row = params.get(name);
       parameters[name] = {
         name,
-        defaultValue: toNumber(row?.default_value, Number(fallback.defaultValue)),
-        currentValue: toNumber(row?.current_value, Number(fallback.currentValue)),
+        defaultValue: toNumber(
+          row?.default_value,
+          Number(fallback.defaultValue),
+        ),
+        currentValue: toNumber(
+          row?.current_value,
+          Number(fallback.currentValue),
+        ),
         minValue: toNumber(row?.min_value, fallback.minValue),
         maxValue: toNumber(row?.max_value, fallback.maxValue),
         description: row?.description ?? fallback.description,
@@ -1079,7 +1164,9 @@ export class AdminAlgorithmSettingsService {
       return value ? 'Bật' : 'Tắt';
     }
     if (typeof value === 'number') {
-      return Number.isInteger(value) ? String(value) : String(Number(value.toFixed(4)));
+      return Number.isInteger(value)
+        ? String(value)
+        : String(Number(value.toFixed(4)));
     }
     if (value === null || value === undefined) {
       return '-';
@@ -1104,7 +1191,9 @@ export class AdminAlgorithmSettingsService {
     return `Đã cập nhật ${changes.length} tham số.${details ? ` ${details}` : ''}`;
   }
 
-  private reviewFilterSectionForParameter(parameterName: string): string | null {
+  private reviewFilterSectionForParameter(
+    parameterName: string,
+  ): string | null {
     if (
       parameterName === 'topic_other_threshold' ||
       parameterName === 'classifier_confidence_threshold' ||
@@ -1141,7 +1230,8 @@ export class AdminAlgorithmSettingsService {
     const sections = sectionOrder.filter((section) =>
       changes.some(
         (change) =>
-          this.reviewFilterSectionForParameter(change.parameterName) === section,
+          this.reviewFilterSectionForParameter(change.parameterName) ===
+          section,
       ),
     );
 

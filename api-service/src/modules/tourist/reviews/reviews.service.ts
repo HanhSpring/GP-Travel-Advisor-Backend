@@ -438,6 +438,8 @@ export class ReviewsService {
       place_id: payload.place_id,
     });
 
+    this.eventEmitter.emit('review.submitted');
+
     return {
       id: reviewId,
       tourist_id: payload.tourist_id,

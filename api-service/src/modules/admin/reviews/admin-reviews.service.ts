@@ -197,7 +197,10 @@ export class AdminReviewsService {
       let query = supabase
         .schema('review_ai')
         .from('reviews')
-        .select('id, tourist_id, place_id, rating, created_at, review_type, status', { count: 'exact' });
+        .select(
+          'id, tourist_id, place_id, rating, created_at, review_type, status',
+          { count: 'exact' },
+        );
 
       if (status && ['pending', 'approved', 'violation'].includes(status)) {
         query = query.eq('status', status);
@@ -213,10 +216,34 @@ export class AdminReviewsService {
         let toDate: Date | null = null;
 
         if (dateSent === 'today') {
-          fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+          fromDate = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate(),
+            0,
+            0,
+            0,
+            0,
+          );
         } else if (dateSent === 'yesterday') {
-          fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, 0, 0, 0);
-          toDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+          fromDate = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate() - 1,
+            0,
+            0,
+            0,
+            0,
+          );
+          toDate = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate(),
+            0,
+            0,
+            0,
+            0,
+          );
         } else if (dateSent === 'last_7_days') {
           fromDate = new Date(now);
           fromDate.setDate(fromDate.getDate() - 7);
@@ -232,7 +259,9 @@ export class AdminReviewsService {
       if (dateExact) {
         const exactDate = new Date(`${dateExact}T00:00:00`);
         if (Number.isNaN(exactDate.getTime())) {
-          throw new BadRequestException('date_exact must be in YYYY-MM-DD format');
+          throw new BadRequestException(
+            'date_exact must be in YYYY-MM-DD format',
+          );
         }
         const nextDate = new Date(exactDate);
         nextDate.setDate(nextDate.getDate() + 1);
@@ -286,8 +315,12 @@ export class AdminReviewsService {
       }
 
       // Wave 2: batch fetch all related data in parallel — replaces N×4 sequential queries
-      const placeIds = [...new Set(reviewRows.map((r) => r.place_id).filter(Boolean))];
-      const touristIds = [...new Set(reviewRows.map((r) => r.tourist_id).filter(Boolean))];
+      const placeIds = [
+        ...new Set(reviewRows.map((r) => r.place_id).filter(Boolean)),
+      ];
+      const touristIds = [
+        ...new Set(reviewRows.map((r) => r.tourist_id).filter(Boolean)),
+      ];
       const reviewIds = reviewRows.map((r) => r.id);
 
       const [placesRes, usersRes, touristReviewsRes, contentsRes] =
@@ -316,22 +349,46 @@ export class AdminReviewsService {
 
       // Build O(1) lookup maps
       const placeMap = new Map<string, { name: string; address: string }>();
-      for (const p of (placesRes.data || []) as Array<{ id: string; name: string; address: string }>) {
+      for (const p of (placesRes.data || []) as Array<{
+        id: string;
+        name: string;
+        address: string;
+      }>) {
         placeMap.set(p.id, { name: p.name, address: p.address });
       }
 
       const userMap = new Map<string, string>();
-      for (const u of (usersRes.data || []) as Array<{ id: string; full_name: string }>) {
+      for (const u of (usersRes.data || []) as Array<{
+        id: string;
+        full_name: string;
+      }>) {
         userMap.set(u.id, u.full_name);
       }
 
       const touristCountMap = new Map<string, number>();
-      for (const r of (touristReviewsRes.data || []) as Array<{ tourist_id: string }>) {
-        touristCountMap.set(r.tourist_id, (touristCountMap.get(r.tourist_id) || 0) + 1);
+      for (const r of (touristReviewsRes.data || []) as Array<{
+        tourist_id: string;
+      }>) {
+        touristCountMap.set(
+          r.tourist_id,
+          (touristCountMap.get(r.tourist_id) || 0) + 1,
+        );
       }
 
-      const contentMap = new Map<string, { main_topic: string | null; content: string | null; time_label: string | null }>();
-      for (const c of (contentsRes.data || []) as Array<{ review_id: string; main_topic: string | null; content: string | null; time_label: string | null }>) {
+      const contentMap = new Map<
+        string,
+        {
+          main_topic: string | null;
+          content: string | null;
+          time_label: string | null;
+        }
+      >();
+      for (const c of (contentsRes.data || []) as Array<{
+        review_id: string;
+        main_topic: string | null;
+        content: string | null;
+        time_label: string | null;
+      }>) {
         contentMap.set(c.review_id, {
           main_topic: c.main_topic,
           content: c.content,
@@ -405,7 +462,9 @@ export class AdminReviewsService {
       const queryResult = await supabase
         .schema('review_ai')
         .from('reviews')
-        .select('id, tourist_id, place_id, rating, created_at, status, violation_reason')
+        .select(
+          'id, tourist_id, place_id, rating, created_at, status, violation_reason',
+        )
         .eq('id', reviewId)
         .single();
 
@@ -522,5 +581,4 @@ export class AdminReviewsService {
       throw new InternalServerErrorException('Failed to update review status');
     }
   }
-
 }

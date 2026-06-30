@@ -49,10 +49,16 @@ class ActivityInput(BaseModel):
     open_time: str = Field(default="07:00", description="Giờ mở cửa HH:mm")
     close_time: str = Field(default="22:00", description="Giờ đóng cửa HH:mm")
 
+    # Thông tin mới phục vụ CP-SAT constraints
+    category: Optional[str] = Field(default=None, description="Danh mục địa điểm (vd: 'chợ đêm', 'nhà thờ')")
+    is_restaurant: bool = Field(default=False, description="True nếu địa điểm là nhà hàng/quán ăn")
+    original_arrival_time: Optional[str] = Field(default=None, description="Giờ đến gốc (nếu đã có)")
+    is_new: bool = Field(default=False, description="True nếu đây là địa điểm vừa được thêm vào cần chèn")
+
     # Chi phí
     estimated_cost: float = Field(default=0.0, description="Chi phí ước tính (VNĐ)")
 
-    @field_validator("locked_arrive_time", "open_time", "close_time", mode="before")
+    @field_validator("locked_arrive_time", "open_time", "close_time", "original_arrival_time", mode="before")
     @classmethod
     def validate_time_format(cls, v: Optional[str]) -> Optional[str]:
         """Kiểm tra định dạng HH:mm"""
@@ -86,12 +92,17 @@ class OptimizeRequest(BaseModel):
 
     # Khung giờ hoạt động trong ngày
     day_start_time: str = Field(
-        default="08:00",
+        default="07:00",
         description="Giờ bắt đầu ngày HH:mm"
     )
     day_end_time: str = Field(
-        default="21:00",
+        default="22:00",
         description="Giờ kết thúc ngày HH:mm"
+    )
+
+    allow_reduce_time: bool = Field(
+        default=False,
+        description="Cho phép AI tự động giảm bớt duration_minutes của các điểm khác nếu lịch quá kín"
     )
 
     @field_validator("day_start_time", "day_end_time", mode="before")

@@ -29,18 +29,24 @@ export class ModerationCron {
         const settings = await this.adminSettingsService.getTwoTowerSettings();
         if (
           settings.core &&
-          typeof settings.core.moderationBatchIntervalMinutes?.currentValue === 'number'
+          typeof settings.core.moderationBatchIntervalMinutes?.currentValue ===
+            'number'
         ) {
-          intervalMinutes = settings.core.moderationBatchIntervalMinutes.currentValue;
+          intervalMinutes =
+            settings.core.moderationBatchIntervalMinutes.currentValue;
         }
       } catch (err: any) {
-        if (err.status === 404 || err.name === 'NotFoundException' || (err.message && err.message.includes('seeded'))) {
+        if (
+          err.status === 404 ||
+          err.name === 'NotFoundException' ||
+          (err.message && err.message.includes('seeded'))
+        ) {
           // Ignore unseeded config and use default
         } else {
           throw err;
         }
       }
-      
+
       const intervalMs = intervalMinutes * 60 * 1000;
       const now = Date.now();
 
@@ -61,12 +67,13 @@ export class ModerationCron {
         .limit(50);
 
       if (fetchError || !pendingReviews || pendingReviews.length === 0) {
-        if (fetchError) this.logger.error('Failed to fetch pending reviews', fetchError);
+        if (fetchError)
+          this.logger.error('Failed to fetch pending reviews', fetchError);
         return;
       }
 
       // We need to fetch contents for these reviews
-      const reviewIds = pendingReviews.map(r => r.id);
+      const reviewIds = pendingReviews.map((r) => r.id);
       const { data: contents } = await supabase
         .schema('review_ai')
         .from('review_contents')
@@ -75,13 +82,13 @@ export class ModerationCron {
 
       const contentMap = new Map<string, string>();
       if (contents) {
-        contents.forEach(c => contentMap.set(c.review_id, c.content || ''));
+        contents.forEach((c) => contentMap.set(c.review_id, c.content || ''));
       }
 
       // 3. Process each review
       for (const review of pendingReviews) {
         const textContent = contentMap.get(review.id);
-        
+
         // If there's no content, just approve it automatically
         if (!textContent || !textContent.trim()) {
           await this.updateReviewStatus(review.id, 'approved');
@@ -89,7 +96,7 @@ export class ModerationCron {
         }
 
         const result = await this.moderationService.moderateReview(textContent);
-        
+
         if (result.status === 'violation') {
           await this.updateReviewStatus(review.id, 'violation');
           await this.notificationsService.sendNotification(
@@ -104,12 +111,13 @@ export class ModerationCron {
           // await this.notificationsService.sendNotification(review.tourist_id, 'Đánh giá được phê duyệt', 'Đánh giá của bạn đã được công khai.', 'review_approved');
         } else if (result.status === 'pending') {
           // Manual review needed - keep status pending, don't send notification yet
-          this.logger.warn(`Review ${review.id} flagged for manual review: ${result.violations.join(', ')}`);
+          this.logger.warn(
+            `Review ${review.id} flagged for manual review: ${result.violations.join(', ')}`,
+          );
         }
       }
 
       this.logger.log(`Processed ${pendingReviews.length} pending reviews.`);
-
     } catch (error) {
       this.logger.error('Error during moderation batch job', error);
     } finally {
@@ -117,7 +125,10 @@ export class ModerationCron {
     }
   }
 
-  private async updateReviewStatus(reviewId: string, status: 'approved' | 'violation') {
+  private async updateReviewStatus(
+    reviewId: string,
+    status: 'approved' | 'violation',
+  ) {
     await supabase
       .schema('review_ai')
       .from('reviews')

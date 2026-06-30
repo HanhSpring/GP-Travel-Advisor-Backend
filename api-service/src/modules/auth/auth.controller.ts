@@ -93,7 +93,10 @@ export class AuthController {
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Làm mới Access Token bằng Refresh Token' })
   @ApiResponse({ status: 200, description: 'Trả về cặp token mới' })
-  @ApiResponse({ status: 401, description: 'Refresh token không hợp lệ hoặc hết hạn' })
+  @ApiResponse({
+    status: 401,
+    description: 'Refresh token không hợp lệ hoặc hết hạn',
+  })
   async refreshToken(@Body('refresh_token') refreshToken: string) {
     if (!refreshToken) {
       throw new BadRequestException('refresh_token là bắt buộc');

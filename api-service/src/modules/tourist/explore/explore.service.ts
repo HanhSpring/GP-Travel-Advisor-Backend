@@ -534,7 +534,7 @@ export class ExploreService implements OnModuleInit {
     // Top-level cache — 60 s TTL so repeated home visits (tab switch, back nav)
     // return instantly. Pull-to-refresh bypasses this via forceRefresh.
     const homeCacheKey = `explore:home:${touristId}`;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     const cachedHome = this.getFromCache<any>(homeCacheKey);
     if (cachedHome) return cachedHome;
 
@@ -561,7 +561,7 @@ export class ExploreService implements OnModuleInit {
     const cachedFeatured =
       this.getFromCache<ExplorePlacesResponse>(featuredKey);
     const speculativeCityId = cachedFeatured?.data[0]?.id ?? null;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     const cityOverviewPromise: Promise<any> = speculativeCityId
       ? this.getCityOverview(speculativeCityId).catch(() => null)
       : Promise.resolve(null);
@@ -1103,7 +1103,7 @@ export class ExploreService implements OnModuleInit {
     }
 
     const ovCacheKey = `explore:city_overview:${cityId}`;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+
     const cachedOverview = this.getFromCache<any>(ovCacheKey);
     if (cachedOverview) return cachedOverview;
 

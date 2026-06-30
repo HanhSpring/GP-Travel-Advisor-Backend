@@ -1,5 +1,5 @@
 import { Injectable, Logger } from '@nestjs/common';
-import { Cron } from '@nestjs/schedule';
+import { OnEvent } from '@nestjs/event-emitter';
 import { createClient } from '@supabase/supabase-js';
 import { ModerationService } from './moderation.service';
 import { NotificationsService } from '../tourist/notifications/notifications.service';
@@ -19,9 +19,9 @@ export class ReviewModerationCronService {
     );
   }
 
-  @Cron('*/5 * * * *') // Run every 5 minutes
-  async handleCron() {
-    this.logger.log('Starting batch review moderation...');
+  @OnEvent('review.submitted', { async: true })
+  async handleReviewSubmittedEvent() {
+    this.logger.log('Starting real-time review moderation...');
     await this.processReviews('reviews');
     await this.processReviews('itinerary_reviews');
   }
@@ -48,13 +48,16 @@ export class ReviewModerationCronService {
       try {
         const content = review.content || '';
         const url_image = review.url_image || [];
-        
+
         let finalStatus = 'approved';
         let violationReason = '';
 
         // 1. Check Text
         if (content) {
-          const textResult = await this.moderationService.moderateReview(content, []);
+          const textResult = await this.moderationService.moderateReview(
+            content,
+            [],
+          );
           if (textResult.status === 'violation') {
             finalStatus = 'violation';
             violationReason = `Nội dung văn bản: ${textResult.violations.join(', ')}`;
@@ -63,7 +66,10 @@ export class ReviewModerationCronService {
 
         // 2. Check Media if text is fine
         if (finalStatus === 'approved' && url_image.length > 0) {
-          const mediaResult = await this.moderationService.moderateReview(null, url_image);
+          const mediaResult = await this.moderationService.moderateReview(
+            null,
+            url_image,
+          );
           if (mediaResult.status === 'violation') {
             finalStatus = 'violation';
             violationReason = `Hình ảnh/Video vi phạm tiêu chuẩn cộng đồng`;
@@ -83,7 +89,10 @@ export class ReviewModerationCronService {
           .eq('id', review.id);
 
         if (updateError) {
-          this.logger.error(`Error updating ${tableName} ID ${review.id}:`, updateError);
+          this.logger.error(
+            `Error updating ${tableName} ID ${review.id}:`,
+            updateError,
+          );
           continue;
         }
 
@@ -92,7 +101,8 @@ export class ReviewModerationCronService {
           let notifContent = `Đánh giá của bạn vi phạm tiêu chuẩn cộng đồng`;
           if (violationReason.includes('Nội dung văn bản')) {
             // "trích xuất nội dung vi phạm" -> give a short snippet of their text
-            const snippet = content.length > 50 ? content.substring(0, 50) + '...' : content;
+            const snippet =
+              content.length > 50 ? content.substring(0, 50) + '...' : content;
             notifContent = `Đánh giá của bạn vi phạm tiêu chuẩn cộng đồng: "${snippet}"`;
           } else {
             notifContent = `Hình ảnh/Video trong đánh giá của bạn vi phạm tiêu chuẩn cộng đồng`;

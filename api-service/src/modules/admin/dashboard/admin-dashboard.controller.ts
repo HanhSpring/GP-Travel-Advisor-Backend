@@ -23,7 +23,10 @@ export class DashboardController {
 
   @Get('stats')
   @Header('Cache-Control', 'private, max-age=120')
-  @ApiOperation({ summary: 'Lấy tổng hợp thống kê dashboard (1 call thay cho 4 calls riêng lẻ)' })
+  @ApiOperation({
+    summary:
+      'Lấy tổng hợp thống kê dashboard (1 call thay cho 4 calls riêng lẻ)',
+  })
   async getDashboardStats() {
     const data = await this.dashboardService.getDashboardStats();
     return {

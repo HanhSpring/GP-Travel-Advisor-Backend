@@ -5,13 +5,19 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
  * Trả về đủ dữ liệu để Flutter cập nhật UI mà không cần gọi lại API lấy toàn bộ lịch trình.
  */
 export class ActivityCustomizeResultDto {
-  @ApiProperty({ example: 'detail-uuid-123', description: 'ID bản ghi itinerary_details' })
+  @ApiProperty({
+    example: 'detail-uuid-123',
+    description: 'ID bản ghi itinerary_details',
+  })
   id: string;
 
   @ApiProperty({ example: 'place-uuid-456', description: 'ID địa điểm' })
   placeId: string;
 
-  @ApiProperty({ example: 'Bảo tàng Mỹ thuật TP.HCM', description: 'Tên địa điểm' })
+  @ApiProperty({
+    example: 'Bảo tàng Mỹ thuật TP.HCM',
+    description: 'Tên địa điểm',
+  })
   title: string;
 
   @ApiProperty({ example: '09:30', description: 'Giờ bắt đầu tham quan' })
@@ -20,7 +26,10 @@ export class ActivityCustomizeResultDto {
   @ApiProperty({ example: '11:00', description: 'Giờ kết thúc tham quan' })
   endTime: string;
 
-  @ApiProperty({ example: '97A Phó Đức Chính, Quận 1, TP.HCM', description: 'Địa chỉ' })
+  @ApiProperty({
+    example: '97A Phó Đức Chính, Quận 1, TP.HCM',
+    description: 'Địa chỉ',
+  })
   address: string;
 
   @ApiProperty({
@@ -83,7 +92,10 @@ export class CustomizeActivityResponseDto {
   })
   message: string;
 
-  @ApiProperty({ example: 2, description: 'Ngày bị ảnh hưởng (Ngày 1, Ngày 2...)' })
+  @ApiProperty({
+    example: 2,
+    description: 'Ngày bị ảnh hưởng (Ngày 1, Ngày 2...)',
+  })
   affectedDay: number;
 
   @ApiProperty({
@@ -113,7 +125,10 @@ export class SuggestedPlaceDto {
   @ApiProperty({ example: 'Tham quan', description: 'Danh mục' })
   category: string;
 
-  @ApiProperty({ example: '1 Công xã Paris, Bến Nghé, Quận 1', description: 'Địa chỉ' })
+  @ApiProperty({
+    example: '1 Công xã Paris, Bến Nghé, Quận 1',
+    description: 'Địa chỉ',
+  })
   address: string;
 
   @ApiProperty({
@@ -139,6 +154,9 @@ export class SuggestedPlaceDto {
 }
 
 export class SuggestionsResponseDto {
-  @ApiProperty({ type: [SuggestedPlaceDto], description: 'Danh sách gợi ý địa điểm thay thế' })
+  @ApiProperty({
+    type: [SuggestedPlaceDto],
+    description: 'Danh sách gợi ý địa điểm thay thế',
+  })
   suggestions: SuggestedPlaceDto[];
 }

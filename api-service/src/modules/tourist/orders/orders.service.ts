@@ -167,7 +167,9 @@ export class OrdersService {
 
   private createOrderActionToken(orderId: string): string {
     const expiresAt = Date.now() + 1000 * 60 * 60 * 24 * 3;
-    const payload = this.base64UrlEncode(JSON.stringify({ orderId, expiresAt }));
+    const payload = this.base64UrlEncode(
+      JSON.stringify({ orderId, expiresAt }),
+    );
     return `${payload}.${this.signOrderActionPayload(payload)}`;
   }
 
@@ -209,7 +211,10 @@ export class OrdersService {
     ).replace(/\/$/, '');
   }
 
-  private getActionUrl(token: string, action: 'confirm' | 'complete' | 'cancel'): string {
+  private getActionUrl(
+    token: string,
+    action: 'confirm' | 'complete' | 'cancel',
+  ): string {
     return `${this.getApiBaseUrl()}/order-actions/${token}?action=${action}`;
   }
 
@@ -257,11 +262,15 @@ export class OrdersService {
     items: Array<{ name: string; quantity: number; total_price: number }>;
   }): Promise<boolean> {
     const apiKey = process.env.RESEND_API_KEY;
-    const to = process.env.ORDER_NOTIFICATION_EMAIL || 'trip.datn2026@gmail.com';
-    const from = process.env.RESEND_FROM || 'Travel Advisor <onboarding@resend.dev>';
+    const to =
+      process.env.ORDER_NOTIFICATION_EMAIL || 'trip.datn2026@gmail.com';
+    const from =
+      process.env.RESEND_FROM || 'Travel Advisor <onboarding@resend.dev>';
 
     if (!apiKey) {
-      console.warn('RESEND_API_KEY is missing. Skipped order email notification.');
+      console.warn(
+        'RESEND_API_KEY is missing. Skipped order email notification.',
+      );
       return false;
     }
 
@@ -291,14 +300,19 @@ export class OrdersService {
     return true;
   }
 
-  private getTargetStatus(action: string): 'processing' | 'completed' | 'cancelled' {
+  private getTargetStatus(
+    action: string,
+  ): 'processing' | 'completed' | 'cancelled' {
     if (action === 'confirm') return 'processing';
     if (action === 'complete') return 'completed';
     if (action === 'cancel') return 'cancelled';
     throw new BadRequestException('Thao tác xử lý đơn không hợp lệ');
   }
 
-  private canTransitionOrderStatus(currentStatus: string, targetStatus: string): boolean {
+  private canTransitionOrderStatus(
+    currentStatus: string,
+    targetStatus: string,
+  ): boolean {
     const transitions: Record<string, string[]> = {
       pending: ['processing', 'cancelled'],
       processing: ['completed', 'cancelled'],

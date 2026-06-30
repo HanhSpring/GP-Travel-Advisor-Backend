@@ -1,4 +1,3 @@
-/* eslint-disable @typescript-eslint/no-unsafe-call */
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsUUID,

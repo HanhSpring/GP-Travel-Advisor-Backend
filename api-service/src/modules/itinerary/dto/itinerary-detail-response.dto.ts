@@ -96,7 +96,11 @@ class ItineraryDayDto {
   @ApiProperty({ example: 1, description: 'Ngày số mấy (Ngày 1, Ngày 2)' })
   dayNumber: number;
 
-  @ApiProperty({ example: 32, description: 'Nhiệt độ dự báo (°C)', nullable: true })
+  @ApiProperty({
+    example: 32,
+    description: 'Nhiệt độ dự báo (°C)',
+    nullable: true,
+  })
   weatherTemp: number | null;
 
   @ApiProperty({

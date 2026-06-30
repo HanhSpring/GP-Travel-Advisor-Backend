@@ -1,49 +1,47 @@
-import { ApiProperty } from '@nestjs/swagger'
+import { ApiProperty } from '@nestjs/swagger';
 
 export class AutocompleteItemDto {
-
   @ApiProperty({ nullable: true })
-  id: string
+  id: string;
 
   @ApiProperty()
-  name: string
+  name: string;
 
   @ApiProperty({ description: "'place' | 'city'" })
-  type: string
+  type: string;
 
   @ApiProperty({ description: 'Ảnh đại diện (rỗng với city)' })
-  image: string
+  image: string;
 
   @ApiProperty({ description: 'Tên thành phố của địa điểm' })
-  city: string
+  city: string;
 
   @ApiProperty()
-  rating: number
+  rating: number;
 
   @ApiProperty()
-  score: number
+  score: number;
 }
 
 export class SearchResultDto {
-
   @ApiProperty({ nullable: true })
-  id: string
+  id: string;
 
   @ApiProperty()
-  name: string
+  name: string;
 
   @ApiProperty()
-  address: string
+  address: string;
 
   @ApiProperty()
-  city: string
+  city: string;
 
   @ApiProperty()
-  rating: number
+  rating: number;
 
   @ApiProperty()
-  type: string
+  type: string;
 
   @ApiProperty()
-  score: number
+  score: number;
 }

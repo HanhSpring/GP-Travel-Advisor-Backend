@@ -77,14 +77,15 @@ export class MlClientService {
   async encodeQuery(payload: EncodeQueryPayload): Promise<number[]> {
     const url = `${this.aiServiceUrl}/recommend/encode-query`;
     try {
-      const response: { data: { embedding: number[]; dim: number } } = await firstValueFrom(
-        this.http.post<{ embedding: number[]; dim: number }>(url, payload, {
-          timeout: 120_000,
-          maxBodyLength: Infinity,
-          maxContentLength: Infinity,
-          headers: { Connection: 'close' },
-        }),
-      );
+      const response: { data: { embedding: number[]; dim: number } } =
+        await firstValueFrom(
+          this.http.post<{ embedding: number[]; dim: number }>(url, payload, {
+            timeout: 120_000,
+            maxBodyLength: Infinity,
+            maxContentLength: Infinity,
+            headers: { Connection: 'close' },
+          }),
+        );
       return response.data.embedding;
     } catch (error) {
       const msg = error?.response?.data?.detail ?? error?.message ?? 'unknown';

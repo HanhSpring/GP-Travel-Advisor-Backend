@@ -59,11 +59,11 @@ async def optimize_itinerary(request: OptimizeRequest) -> OptimizeResponse:
     )
 
     try:
-        # Gọi thuật toán tối ưu
         optimized_activities, reorder_notes, total_transit = optimize_day_schedule(
             activities=request.activities,
             day_start_time=request.day_start_time,
             day_end_time=request.day_end_time,
+            allow_reduce_time=request.allow_reduce_time
         )
 
         # Tính tổng chi phí trong ngày

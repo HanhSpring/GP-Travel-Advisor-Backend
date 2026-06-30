@@ -1,11 +1,4 @@
-import {
-  Body,
-  Controller,
-  Get,
-  Patch,
-  Post,
-  Query,
-} from '@nestjs/common';
+import { Body, Controller, Get, Patch, Post, Query } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { AdminAlgorithmPipelineService } from './admin-algorithm-pipeline.service';
 import {
@@ -19,7 +12,9 @@ export class AdminAlgorithmPipelineController {
   constructor(private readonly service: AdminAlgorithmPipelineService) {}
 
   @Post('run')
-  @ApiOperation({ summary: 'Kích hoạt pipeline phân loại review (3 thuật toán)' })
+  @ApiOperation({
+    summary: 'Kích hoạt pipeline phân loại review (3 thuật toán)',
+  })
   async runPipeline(@Body() dto: PipelineRunRequestDto) {
     return this.service.runPipeline(dto);
   }
@@ -32,13 +27,17 @@ export class AdminAlgorithmPipelineController {
   }
 
   @Get('review-filter/schedule')
-  @ApiOperation({ summary: 'Lấy cấu hình lịch chạy tự động thuật toán lọc đánh giá' })
+  @ApiOperation({
+    summary: 'Lấy cấu hình lịch chạy tự động thuật toán lọc đánh giá',
+  })
   async getReviewFilterSchedule() {
     return this.service.getReviewFilterSchedule();
   }
 
   @Patch('review-filter/schedule')
-  @ApiOperation({ summary: 'Cập nhật lịch chạy tự động thuật toán lọc đánh giá' })
+  @ApiOperation({
+    summary: 'Cập nhật lịch chạy tự động thuật toán lọc đánh giá',
+  })
   async updateReviewFilterSchedule(@Body() dto: UpdateReviewFilterScheduleDto) {
     return this.service.updateReviewFilterSchedule(dto);
   }
