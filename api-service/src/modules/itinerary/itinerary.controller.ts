@@ -465,6 +465,8 @@ export class ItineraryController {
       activities: any[];
       dailyStartTime?: string;
       dailyEndTime?: string;
+      allowReduceTime?: boolean;
+      visitDate?: string;
     },
   ) {
     if (!body.activities || body.activities.length === 0) {
@@ -474,6 +476,8 @@ export class ItineraryController {
       body.activities,
       body.dailyStartTime,
       body.dailyEndTime,
+      body.allowReduceTime || false,
+      body.visitDate,
     );
     return { optimized };
   }
