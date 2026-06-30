@@ -244,6 +244,22 @@ export class UploadService {
     ].join('/');
   }
 
+  async uploadAvatarDraft(file: Express.Multer.File) {
+    try {
+      const optimizedBuffer = await sharp(file.buffer)
+        .resize(400, 400, { fit: 'cover', position: 'entropy' })
+        .webp({ quality: 80 })
+        .toBuffer();
+
+      const fileName = `avatars/draft-${Date.now()}-${randomUUID()}.webp`;
+      const url = await this.uploadAvatarBuffer(optimizedBuffer, fileName);
+
+      return { url };
+    } catch (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+  }
+
   async uploadAvatar(file: Express.Multer.File, userId: string) {
     try {
       const { data: user } = await this.supabase
@@ -497,7 +513,7 @@ export class UploadService {
     return url.replace(`${publicUrl}/`, '');
   }
 
-  private async deleteFromR2(fileUrl: string) {
+  async deleteFromR2(fileUrl: string) {
     try {
       const key = this.getRelativeKey(fileUrl);
       await this.s3Client.send(

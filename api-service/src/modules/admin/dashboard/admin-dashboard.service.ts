@@ -29,8 +29,6 @@ export interface UserInteractionStats {
 export interface DashboardStatsResponse {
   totalUsers: number;
   newUsersMonth: number;
-  totalLocations: number;
-  pendingApproval: number;
   totalReviews: number;
   pendingReviews: number;
   violationReviews: number;
@@ -59,12 +57,6 @@ export class DashboardService {
   } | null = null;
   private readonly INTERACTION_CACHE_TTL_MS = 5 * 60 * 1000;
 
-  // ─── Cache: dashboard stats (TTL 2 phút) ────────────────────────────
-  private _statsCache: {
-    data: DashboardStatsResponse;
-    expiresAt: number;
-  } | null = null;
-  private readonly STATS_CACHE_TTL_MS = 2 * 60 * 1000;
 
   // ─── Cache helpers ───────────────────────────────────────────────────
   private getCachedPlaces(key: string): PopularPlaceStats[] | null {
@@ -285,23 +277,9 @@ export class DashboardService {
 
   // ─── Dashboard Stats (tổng hợp, 1 call thay 4 calls) ────────────────
   async getDashboardStats(): Promise<DashboardStatsResponse> {
-    if (this._statsCache && Date.now() < this._statsCache.expiresAt) {
-      return this._statsCache.data;
-    }
-
-    const [rUsers, rLocTotal, rLocPending, rReviewTotal, rReviewPending, rReviewViolation] =
+    const [rUsers, rReviewTotal, rReviewPending, rReviewViolation] =
       await Promise.allSettled([
         supabase.rpc('get_user_statistics'),
-        supabase
-          .schema('travel')
-          .from('places')
-          .select('id', { count: 'exact', head: true }),
-        supabase
-          .schema('travel')
-          .from('places')
-          .select('id', { count: 'exact', head: true })
-          .is('is_approved', null)
-          .or('is_active.is.null,is_active.eq.true'),
         supabase
           .schema('review_ai')
           .from('reviews')
@@ -331,16 +309,6 @@ export class DashboardService {
       }
     }
 
-    const totalLocations =
-      rLocTotal.status === 'fulfilled'
-        ? Number(rLocTotal.value.count ?? 0)
-        : 0;
-
-    const pendingApproval =
-      rLocPending.status === 'fulfilled'
-        ? Number(rLocPending.value.count ?? 0)
-        : 0;
-
     const totalReviews =
       rReviewTotal.status === 'fulfilled'
         ? Number(rReviewTotal.value.count ?? 0)
@@ -359,16 +327,9 @@ export class DashboardService {
     const result: DashboardStatsResponse = {
       totalUsers,
       newUsersMonth,
-      totalLocations,
-      pendingApproval,
       totalReviews,
       pendingReviews,
       violationReviews,
-    };
-
-    this._statsCache = {
-      data: result,
-      expiresAt: Date.now() + this.STATS_CACHE_TTL_MS,
     };
 
     return result;

@@ -12,11 +12,12 @@ import {
   UserDeleteStatus,
 } from './dto/get-users-query.dto';
 import { CreateUserByAdminDto } from './dto/create-user-by-admin.dto';
+import { UploadService } from '../upload/upload.service';
 
 @Injectable()
 export class AdminService {
   private supabase: SupabaseClient;
-  constructor() {
+  constructor(private readonly uploadService: UploadService) {
     const supabaseUrl = process.env.SUPABASE_URL;
     const supabaseKey = process.env.SUPABASE_KEY;
     if (!supabaseUrl || !supabaseKey) {
@@ -333,6 +334,13 @@ export class AdminService {
       process.env.SUPABASE_KEY as string,
     );
 
+    // Lấy avatar cũ trước khi update để xóa sau nếu có thay đổi
+    const { data: currentUser } = await supabaseAdmin
+      .from('users')
+      .select('avatar_url')
+      .eq('id', userId)
+      .single();
+
     const { data, error } = await supabaseAdmin
       .from('users')
       .update({
@@ -348,6 +356,15 @@ export class AdminService {
       throw new InternalServerErrorException(
         `Lỗi khi cập nhật DB: ${error.message}`,
       );
+    }
+
+    // Xóa avatar cũ khỏi storage sau khi DB update thành công (non-blocking)
+    if (
+      currentUser?.avatar_url &&
+      updateDto.avatarUrl &&
+      currentUser.avatar_url !== updateDto.avatarUrl
+    ) {
+      void this.uploadService.deleteFromR2(currentUser.avatar_url);
     }
 
     const { error: authError } = await supabaseAdmin.auth.admin.updateUserById(
