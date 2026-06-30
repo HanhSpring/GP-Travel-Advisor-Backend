@@ -1,13 +1,12 @@
-import { IsString } from 'class-validator'
-import { ApiProperty } from '@nestjs/swagger'
+import { IsString } from 'class-validator';
+import { ApiProperty } from '@nestjs/swagger';
 
 export class SearchFilterDto {
-
   @ApiProperty({ example: 'ho chi minh' })
   @IsString()
-  city: string
+  city: string;
 
   @ApiProperty({ example: 'Restaurant' })
   @IsString()
-  category: string
+  category: string;
 }

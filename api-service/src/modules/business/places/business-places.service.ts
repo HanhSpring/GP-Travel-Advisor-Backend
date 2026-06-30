@@ -188,7 +188,10 @@ export class BusinessPlacesService {
 
     // Compute real-time ratings from review_ai.reviews (places.average_rating is not auto-updated)
     const placeIds = placeRows.map((item) => item.id);
-    const liveRatingByPlaceId = new Map<string, { average: number; count: number }>();
+    const liveRatingByPlaceId = new Map<
+      string,
+      { average: number; count: number }
+    >();
     if (placeIds.length > 0) {
       const { data: reviewRows } = await supabase
         .schema('review_ai')
@@ -198,13 +201,19 @@ export class BusinessPlacesService {
 
       if (reviewRows && reviewRows.length > 0) {
         const groups: Record<string, number[]> = {};
-        for (const row of reviewRows as { place_id: string; rating: number }[]) {
+        for (const row of reviewRows as {
+          place_id: string;
+          rating: number;
+        }[]) {
           if (!groups[row.place_id]) groups[row.place_id] = [];
           groups[row.place_id].push(row.rating);
         }
         for (const [placeId, ratings] of Object.entries(groups)) {
           const count = ratings.length;
-          const avg = count > 0 ? Number((ratings.reduce((a, b) => a + b, 0) / count).toFixed(1)) : 0;
+          const avg =
+            count > 0
+              ? Number((ratings.reduce((a, b) => a + b, 0) / count).toFixed(1))
+              : 0;
           liveRatingByPlaceId.set(placeId, { average: avg, count });
         }
       }
@@ -222,7 +231,9 @@ export class BusinessPlacesService {
         address: item.address ?? '',
         city: city ?? '',
         image_url: item.image_url ?? null,
-        categories: item.type_id ? [categoryNameByTypeId.get(item.type_id) ?? 'Khác'] : [],
+        categories: item.type_id
+          ? [categoryNameByTypeId.get(item.type_id) ?? 'Khác']
+          : [],
         rating: liveRating?.average ?? Number(item.average_rating) ?? 0,
         review_count: liveRating?.count ?? item.review_count ?? 0,
         status: this.mapStatus(item.is_approved),

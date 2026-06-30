@@ -632,7 +632,7 @@ export class NotificationsService {
       throw new InternalServerErrorException(error.message);
     }
 
-    return (data ?? []) as NotificationRow[];
+    return data ?? [];
   }
 
   private async selectNotificationById(notificationId: string) {
@@ -660,7 +660,7 @@ export class NotificationsService {
       throw new InternalServerErrorException(error.message);
     }
 
-    return data as NotificationRow | null;
+    return data;
   }
 
   async getNotifications(touristId: string) {
@@ -767,7 +767,7 @@ export class NotificationsService {
 
     return this.buildNotificationItem(
       linkRow as UserNotificationRow,
-      notificationRow as NotificationRow,
+      notificationRow,
     );
   }
 
@@ -811,7 +811,7 @@ export class NotificationsService {
 
     return this.buildNotificationItem(
       updatedLinks[0] as UserNotificationRow,
-      notificationRow as NotificationRow,
+      notificationRow,
     );
   }
 

@@ -93,8 +93,7 @@ export function buildCirclePolygonEWKT(
     const theta = (i / segments) * 2 * Math.PI;
     const dx = radiusM * Math.cos(theta);
     const dy = radiusM * Math.sin(theta);
-    const dLng =
-      ((dx / (EARTH_RADIUS_M * Math.cos(latRad))) * 180) / Math.PI;
+    const dLng = ((dx / (EARTH_RADIUS_M * Math.cos(latRad))) * 180) / Math.PI;
     const dLat = ((dy / EARTH_RADIUS_M) * 180) / Math.PI;
     points.push(
       `${(longitude + dLng).toFixed(7)} ${(latitude + dLat).toFixed(7)}`,

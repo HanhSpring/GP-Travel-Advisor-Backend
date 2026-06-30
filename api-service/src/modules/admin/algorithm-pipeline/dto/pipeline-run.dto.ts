@@ -1,19 +1,35 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsBoolean, IsIn, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
+import {
+  IsBoolean,
+  IsIn,
+  IsNumber,
+  IsOptional,
+  IsString,
+  Max,
+  Min,
+} from 'class-validator';
 
 export class PipelineRunRequestDto {
-  @ApiPropertyOptional({ description: 'Giới hạn số review xử lý (không truyền = tất cả pending)' })
+  @ApiPropertyOptional({
+    description: 'Giới hạn số review xử lý (không truyền = tất cả pending)',
+  })
   @IsOptional()
   @IsNumber()
   @Min(1)
   limit?: number;
 
-  @ApiPropertyOptional({ default: false, description: 'Bỏ qua ML models, chỉ dùng rule-based' })
+  @ApiPropertyOptional({
+    default: false,
+    description: 'Bỏ qua ML models, chỉ dùng rule-based',
+  })
   @IsOptional()
   @IsBoolean()
   no_pretrained?: boolean;
 
-  @ApiPropertyOptional({ default: 0.18, description: 'Ngưỡng E5 để gán topic=other' })
+  @ApiPropertyOptional({
+    default: 0.18,
+    description: 'Ngưỡng E5 để gán topic=other',
+  })
   @IsOptional()
   @IsNumber()
   topic_other_threshold?: number;
@@ -23,12 +39,18 @@ export class PipelineRunRequestDto {
   @IsString()
   candidate_mode?: string;
 
-  @ApiPropertyOptional({ default: 'representative', enum: ['representative', 'all'] })
+  @ApiPropertyOptional({
+    default: 'representative',
+    enum: ['representative', 'all'],
+  })
   @IsOptional()
   @IsString()
   promotion_mode?: string;
 
-  @ApiPropertyOptional({ default: false, description: 'Xử lý nhưng không ghi về Supabase' })
+  @ApiPropertyOptional({
+    default: false,
+    description: 'Xử lý nhưng không ghi về Supabase',
+  })
   @IsOptional()
   @IsBoolean()
   dry_run?: boolean;

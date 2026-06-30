@@ -7,7 +7,9 @@ export class ReviewFilterScheduleCron {
   private readonly logger = new Logger(ReviewFilterScheduleCron.name);
   private isRunning = false;
 
-  constructor(private readonly pipelineService: AdminAlgorithmPipelineService) {}
+  constructor(
+    private readonly pipelineService: AdminAlgorithmPipelineService,
+  ) {}
 
   @Cron('* * * * *')
   async handleReviewFilterSchedule(): Promise<void> {

@@ -155,10 +155,29 @@ def optimize_day_schedule(
                 model.Add(arrival[j] >= departure[i] + t).OnlyEnforceIf(edge_vars[(i, j)])
                 
     # 4. Giữ nguyên thứ tự tương đối cho các điểm cũ
+    # Điểm "trước 18h" (chùa/đền/vườn hoa/...) giữ thứ tự chặt với nhau.
+    # Điểm "linh hoạt" (không bắt buộc trước 18h, không khóa giờ) được phép
+    # dịch ra buổi tối để nhường slot sáng/chiều cho điểm mới trước 18h.
+    def _is_morning_constrained(act: ActivityInput) -> bool:
+        cat = (act.category or "").lower()
+        return any(c in cat for c in ["chùa", "đền", "nhà thờ", "bãi biển", "vườn hoa", "sinh thái"])
+
+    has_new_morning_activity = any(
+        act.is_new and _is_morning_constrained(act) for act in activities
+    )
+
     existing_indices = [i for i, act in enumerate(activities) if not act.is_new]
     for idx in range(len(existing_indices) - 1):
         idx1 = existing_indices[idx]
         idx2 = existing_indices[idx + 1]
+        act1 = activities[idx1]
+        act2 = activities[idx2]
+
+        # Nếu đang thêm một điểm buổi sáng mới và act2 là điểm linh hoạt (không bị ràng
+        # buộc trước 18h, không khóa giờ) → cho phép act2 dịch ra tối, không ép thứ tự
+        if has_new_morning_activity and not act2.is_locked and not _is_morning_constrained(act2):
+            continue
+
         model.Add(arrival[idx1] < arrival[idx2])
         
     # 5. Objective

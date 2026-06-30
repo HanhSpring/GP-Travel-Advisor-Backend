@@ -4,6 +4,7 @@ import {
   InternalServerErrorException,
   NotFoundException,
 } from '@nestjs/common';
+import { EventEmitter2 } from '@nestjs/event-emitter';
 import { ConfigService } from '@nestjs/config';
 import { randomUUID } from 'crypto';
 import { supabase } from '../../../config/supabase';
@@ -80,7 +81,10 @@ interface GeofenceVisitRow {
 
 @Injectable()
 export class ItineraryReviewsService {
-  constructor(private readonly configService: ConfigService) {}
+  constructor(
+    private readonly configService: ConfigService,
+    private readonly eventEmitter: EventEmitter2,
+  ) {}
 
   private getPlaceImage(value: string | string[] | null): string | null {
     const raw = Array.isArray(value) ? value[0] : value;
@@ -591,7 +595,7 @@ export class ItineraryReviewsService {
           .limit(1);
 
         if (byTourist) {
-          query = (query as typeof query).eq('tourist_id', touristId);
+          query = query.eq('tourist_id', touristId);
         }
 
         const { data, error } =
@@ -1177,6 +1181,8 @@ export class ItineraryReviewsService {
     }
 
     const savedMediaCount = allMediaUrls.length;
+
+    this.eventEmitter.emit('review.submitted');
 
     return {
       success: true,

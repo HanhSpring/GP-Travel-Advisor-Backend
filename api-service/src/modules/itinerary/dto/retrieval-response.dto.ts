@@ -18,13 +18,15 @@ export class CandidatePlaceDto {
 
   @ApiProperty({
     example: 0.923,
-    description: 'Cosine similarity score từ pgvector (0→1, cao hơn = liên quan hơn)',
+    description:
+      'Cosine similarity score từ pgvector (0→1, cao hơn = liên quan hơn)',
   })
   cosine_score: number;
 
   @ApiPropertyOptional({
     example: null,
-    description: 'Điểm ranking từ model thứ 2 (null — sẽ được thành viên khác điền sau)',
+    description:
+      'Điểm ranking từ model thứ 2 (null — sẽ được thành viên khác điền sau)',
     nullable: true,
   })
   predict_ranking: number | null;
@@ -34,7 +36,10 @@ export class TwoTowerRetrievalResponseDto {
   @ApiProperty({ example: 'Hà Nội', description: 'Tên thành phố điểm đến' })
   destination_name: string;
 
-  @ApiProperty({ example: 'uuid-city-hanoi', description: 'UUID của thành phố điểm đến' })
+  @ApiProperty({
+    example: 'uuid-city-hanoi',
+    description: 'UUID của thành phố điểm đến',
+  })
   city_id: string;
 
   @ApiProperty({ example: 85, description: 'Tổng số candidates tìm được' })

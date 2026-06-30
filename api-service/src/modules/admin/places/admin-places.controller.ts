@@ -1,4 +1,14 @@
-import { Body, Controller, Delete, Get, HttpCode, Param, Patch, Post, Query } from '@nestjs/common';
+import {
+  Body,
+  Controller,
+  Delete,
+  Get,
+  HttpCode,
+  Param,
+  Patch,
+  Post,
+  Query,
+} from '@nestjs/common';
 import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
 import { AdminPlacesService } from './admin-places.service';
 import { AdminPlaceListDto } from './dto/admin-place-list.dto';
@@ -91,7 +101,8 @@ export class AdminPlacesController {
   @Get('vendors')
   @ApiOperation({
     summary: 'Get business users for admin place creation',
-    description: 'Return active business users that can own an admin-created place',
+    description:
+      'Return active business users that can own an admin-created place',
   })
   async getBusinessVendors() {
     return this.service.getBusinessVendors();
@@ -125,7 +136,6 @@ export class AdminPlacesController {
   async getPlaceDetail(@Param('id') id: string) {
     return this.service.getPlaceDetail(id);
   }
-
 
   @Patch(':id/approve')
   @ApiOperation({

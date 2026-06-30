@@ -65,7 +65,8 @@ export class EditActivityDto {
    */
   @ApiPropertyOptional({
     example: false,
-    description: 'Bỏ ghim giờ (false) hoặc giữ ghim (true). Mặc định: null = không thay đổi.',
+    description:
+      'Bỏ ghim giờ (false) hoặc giữ ghim (true). Mặc định: null = không thay đổi.',
   })
   @IsOptional()
   isLocked?: boolean;

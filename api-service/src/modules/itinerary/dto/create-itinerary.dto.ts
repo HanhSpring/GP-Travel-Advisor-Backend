@@ -207,7 +207,8 @@ export class CreateItineraryDto {
   // ════════════════════════════════════════════════════════════════
   @ApiPropertyOptional({
     example: 'Khám phá Đà Nẵng • 10–13/06',
-    description: 'Tên chuyến đi (tùy chọn). Nếu không truyền, cột description sẽ là null.',
+    description:
+      'Tên chuyến đi (tùy chọn). Nếu không truyền, cột description sẽ là null.',
   })
   @IsOptional()
   @IsString()

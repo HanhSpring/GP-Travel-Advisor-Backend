@@ -11,15 +11,57 @@ export interface PlaceCandidate {
 }
 
 export const INTENT_QUOTA: Record<string, Record<string, number>> = {
-  'Khám phá tổng hợp': { attraction: 4, restaurant: 2, cafe: 1, entertainment: 1, accommodation: 1 },
-  'Ẩm thực & Bản địa': { attraction: 1, restaurant: 4, cafe: 2, entertainment: 0, accommodation: 1 },
-  'Đô thị & Vui chơi': { attraction: 2, restaurant: 2, cafe: 1, entertainment: 3, accommodation: 1 },
-  'Khám phá & Sinh thái': { attraction: 5, restaurant: 2, cafe: 0, entertainment: 0, accommodation: 1 },
-  'Nghỉ dưỡng & Biển': { attraction: 3, restaurant: 2, cafe: 1, entertainment: 1, accommodation: 1 },
-  'Văn hóa & Lịch sử': { attraction: 5, restaurant: 2, cafe: 1, entertainment: 1, accommodation: 1 },
+  'Khám phá tổng hợp': {
+    attraction: 4,
+    restaurant: 2,
+    cafe: 1,
+    entertainment: 1,
+    accommodation: 1,
+  },
+  'Ẩm thực & Bản địa': {
+    attraction: 1,
+    restaurant: 4,
+    cafe: 2,
+    entertainment: 0,
+    accommodation: 1,
+  },
+  'Đô thị & Vui chơi': {
+    attraction: 2,
+    restaurant: 2,
+    cafe: 1,
+    entertainment: 3,
+    accommodation: 1,
+  },
+  'Khám phá & Sinh thái': {
+    attraction: 5,
+    restaurant: 2,
+    cafe: 0,
+    entertainment: 0,
+    accommodation: 1,
+  },
+  'Nghỉ dưỡng & Biển': {
+    attraction: 3,
+    restaurant: 2,
+    cafe: 1,
+    entertainment: 1,
+    accommodation: 1,
+  },
+  'Văn hóa & Lịch sử': {
+    attraction: 5,
+    restaurant: 2,
+    cafe: 1,
+    entertainment: 1,
+    accommodation: 1,
+  },
 };
 
-const DEFAULT_QUOTA = { attraction: 4, restaurant: 2, cafe: 1, entertainment: 1, accommodation: 1 };
+const DEFAULT_QUOTA = {
+  attraction: 4,
+  restaurant: 2,
+  cafe: 1,
+  entertainment: 1,
+  accommodation: 1,
+};
 export interface RetrievalTuning {
   intentQuota?: Record<string, Record<string, number>>;
   fetchBufferMultiplier?: number;
@@ -124,7 +166,11 @@ export function normalizeCategory(category: string, typeName?: string): string {
   ) {
     return 'accommodation';
   }
-  if (lower.includes('mua sắm') || lower.includes('shopping') || lower.includes('dịch vụ')) {
+  if (
+    lower.includes('mua sắm') ||
+    lower.includes('shopping') ||
+    lower.includes('dịch vụ')
+  ) {
     return 'shopping';
   }
   return 'attraction';
@@ -208,7 +254,12 @@ function clamp(value: number, min: number, max: number): number {
   return Math.max(min, Math.min(max, value));
 }
 
-function overlaps(start: number, end: number, windowStart: number, windowEnd: number): boolean {
+function overlaps(
+  start: number,
+  end: number,
+  windowStart: number,
+  windowEnd: number,
+): boolean {
   return Math.max(start, windowStart) < Math.min(end, windowEnd);
 }
 
@@ -226,9 +277,16 @@ export function getPlannerTargets(
 
   // This only sizes the candidate pool. The GA still uses DB visit_duration,
   // Goong travel time, opening hours, and lunch feasibility to build the route.
-  const nonFoodAvailable = Math.max(0, availableMinutes - restaurantTarget * 80);
+  const nonFoodAvailable = Math.max(
+    0,
+    availableMinutes - restaurantTarget * 80,
+  );
   const minNonFood = availableMinutes >= 360 ? 2 : 1;
-  const nonFoodTarget = clamp(Math.floor(nonFoodAvailable / 130), minNonFood, 7);
+  const nonFoodTarget = clamp(
+    Math.floor(nonFoodAvailable / 130),
+    minNonFood,
+    7,
+  );
   const nonFoodSlots = ['attraction', 'cafe', 'entertainment'];
   const baseNonFoodTotal =
     nonFoodSlots.reduce((sum, slot) => sum + (baseQuota[slot] ?? 0), 0) || 1;
@@ -242,14 +300,20 @@ export function getPlannerTargets(
 
   let assigned = 0;
   for (const slot of nonFoodSlots) {
-    const value = Math.floor(((baseQuota[slot] ?? 0) / baseNonFoodTotal) * nonFoodTarget);
+    const value = Math.floor(
+      ((baseQuota[slot] ?? 0) / baseNonFoodTotal) * nonFoodTarget,
+    );
     dailyQuota[slot] = value;
     assigned += value;
   }
   while (assigned < nonFoodTarget) {
     const slot = [...nonFoodSlots].sort((a, b) => {
-      const aFrac = ((baseQuota[a] ?? 0) / baseNonFoodTotal) * nonFoodTarget - dailyQuota[a];
-      const bFrac = ((baseQuota[b] ?? 0) / baseNonFoodTotal) * nonFoodTarget - dailyQuota[b];
+      const aFrac =
+        ((baseQuota[a] ?? 0) / baseNonFoodTotal) * nonFoodTarget -
+        dailyQuota[a];
+      const bFrac =
+        ((baseQuota[b] ?? 0) / baseNonFoodTotal) * nonFoodTarget -
+        dailyQuota[b];
       return bFrac - aFrac;
     })[0];
     dailyQuota[slot] += 1;
@@ -341,16 +405,21 @@ export function diversifyTopK(
   }
 
   const dailyQuota = fetchPlan
-    ? Object.fromEntries(fetchPlan.map((plan) => [plan.slotType, plan.dailyTarget ?? 0]))
+    ? Object.fromEntries(
+        fetchPlan.map((plan) => [plan.slotType, plan.dailyTarget ?? 0]),
+      )
     : getDailyQuota(tripIntent, tuning);
-  const totalDailySlots = Object.values(dailyQuota).reduce((a, b) => a + b, 0) || 1;
+  const totalDailySlots =
+    Object.values(dailyQuota).reduce((a, b) => a + b, 0) || 1;
   const budgetPerCat: Record<string, number> = {};
 
   for (const [cat, q] of Object.entries(dailyQuota)) {
     if (q <= 0) continue;
     const proportional = Math.round((q / totalDailySlots) * topK);
     const minimum = q * numDays;
-    const fetchLimit = fetchPlan?.find((plan) => normalizeCategory(plan.slotType) === cat)?.limit;
+    const fetchLimit = fetchPlan?.find(
+      (plan) => normalizeCategory(plan.slotType) === cat,
+    )?.limit;
     budgetPerCat[cat] = fetchLimit ?? Math.max(proportional, minimum);
   }
 

@@ -759,9 +759,7 @@ export class RecommendationService {
       const dayTotals = this.aggregateScheduleByType(
         Array.isArray(day.schedule) ? day.schedule : [],
       );
-      for (const [key, value] of Object.entries(dayTotals) as Array<
-        [string, any]
-      >) {
+      for (const [key, value] of Object.entries(dayTotals)) {
         const bucket = acc[key] ?? {
           count: 0,
           travelMinutes: 0,
@@ -918,9 +916,7 @@ export class RecommendationService {
           .filter((item) => Number.isFinite(item.price));
       }
       if (parsed && typeof parsed === 'object' && 'price' in parsed) {
-        return [
-          { name: (parsed as any).name, price: Number((parsed as any).price) },
-        ];
+        return [{ name: parsed.name, price: Number(parsed.price) }];
       }
     } catch {
       const matches = text.match(/\d[\d.,]*/g) ?? [];

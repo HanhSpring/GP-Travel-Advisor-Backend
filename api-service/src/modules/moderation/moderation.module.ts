@@ -5,10 +5,7 @@ import { ReviewModerationCronService } from './review-moderation.cron';
 import { NotificationsModule } from '../tourist/notifications/notifications.module';
 
 @Module({
-  imports: [
-    ScheduleModule.forRoot(),
-    NotificationsModule,
-  ],
+  imports: [ScheduleModule.forRoot(), NotificationsModule],
   providers: [ModerationService, ReviewModerationCronService],
   exports: [ModerationService],
 })

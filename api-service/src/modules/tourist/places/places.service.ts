@@ -150,7 +150,9 @@ export class PlacesService {
       supabase
         .schema('travel')
         .from('places')
-        .select('*, cities(name), type_id, types(id, category_id, categories(id, name))')
+        .select(
+          '*, cities(name), type_id, types(id, category_id, categories(id, name))',
+        )
         .eq('id', placeId)
         .eq('is_approved', true)
         .eq('is_active', true)
@@ -195,7 +197,9 @@ export class PlacesService {
       .eq('place_id', placeId);
 
     if (touristId) {
-      ratingQuery = ratingQuery.or(`status.eq.approved,and(tourist_id.eq.${touristId},status.eq.pending)`);
+      ratingQuery = ratingQuery.or(
+        `status.eq.approved,and(tourist_id.eq.${touristId},status.eq.pending)`,
+      );
     } else {
       ratingQuery = ratingQuery.eq('status', 'approved');
     }
@@ -215,7 +219,9 @@ export class PlacesService {
       .limit(10);
 
     if (touristId) {
-      reviewsQuery = reviewsQuery.or(`status.eq.approved,and(tourist_id.eq.${touristId},status.eq.pending)`);
+      reviewsQuery = reviewsQuery.or(
+        `status.eq.approved,and(tourist_id.eq.${touristId},status.eq.pending)`,
+      );
     } else {
       reviewsQuery = reviewsQuery.eq('status', 'approved');
     }
@@ -272,7 +278,7 @@ export class PlacesService {
     const users = (usersResult.data ?? this.emptyUsers) as UserRow[];
     const contents = (contentsResult.data ??
       this.emptyContents) as ReviewContentRow[];
-    const vendor = vendorResult.data as UserRow | null;
+    const vendor = vendorResult.data;
 
     const reviewList = typedReviews.map((review) => {
       const user = users.find((item) => item.id === review.tourist_id);
@@ -293,7 +299,9 @@ export class PlacesService {
 
     // Extract category from type relationship
     let categoryList: string[] = [];
-    const typeData = Array.isArray(place.types) ? place.types?.[0] : place.types;
+    const typeData = Array.isArray(place.types)
+      ? place.types?.[0]
+      : place.types;
     if (typeData) {
       const categoryData = Array.isArray(typeData.categories)
         ? typeData.categories?.[0]

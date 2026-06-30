@@ -109,7 +109,9 @@ export class MoreInfoService {
       ? await supabase
           .schema('order_sys')
           .from('order_items')
-          .select('id, order_id, food_item_id, quantity, unit_price, total_price')
+          .select(
+            'id, order_id, food_item_id, quantity, unit_price, total_price',
+          )
           .in('order_id', orderIds)
       : { data: [], error: null };
 
@@ -329,7 +331,9 @@ export class MoreInfoService {
     const { data: order, error: orderError } = await supabase
       .schema('order_sys')
       .from('orders')
-      .select('id, status, ordered_at, total_amount, notes, tourist_id, itinerary_detail_id')
+      .select(
+        'id, status, ordered_at, total_amount, notes, tourist_id, itinerary_detail_id',
+      )
       .eq('id', orderId)
       .eq('tourist_id', touristId)
       .maybeSingle<OrderRow>();

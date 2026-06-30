@@ -321,7 +321,7 @@ export class AdminPlacesService {
           typeId: data.id,
           categoryNames: this.extractCategoryFromType(data)
             ? [this.extractCategoryFromType(data)]
-            : input.categories ?? [],
+            : (input.categories ?? []),
         };
       }
     }
@@ -350,7 +350,7 @@ export class AdminPlacesService {
       typeId: data.id,
       categoryNames: this.extractCategoryFromType(data)
         ? [this.extractCategoryFromType(data)]
-        : input.categories ?? [],
+        : (input.categories ?? []),
     };
   }
 
@@ -529,14 +529,21 @@ export class AdminPlacesService {
     const city = dto.p_city || dto.city;
     const email = (dto.p_email || dto.email || '').trim();
     const phone = (dto.p_phone || dto.phone || '').trim();
-    const vendorId = (dto.p_vendor_id || dto.vendorId || dto.vendor_id || '').trim();
+    const vendorId = (
+      dto.p_vendor_id ||
+      dto.vendorId ||
+      dto.vendor_id ||
+      ''
+    ).trim();
     const categories = Array.isArray(dto.p_categories || dto.categories)
       ? dto.p_categories || dto.categories
       : [];
     const services = Array.isArray(dto.p_services || dto.services)
       ? dto.p_services || dto.services
       : [];
-    const menu = Array.isArray(dto.p_menu || dto.menu) ? dto.p_menu || dto.menu : [];
+    const menu = Array.isArray(dto.p_menu || dto.menu)
+      ? dto.p_menu || dto.menu
+      : [];
     const images = Array.isArray(dto.p_images || dto.images)
       ? dto.p_images || dto.images
       : [];
@@ -553,7 +560,9 @@ export class AdminPlacesService {
       throw new BadRequestException('Email lien he khong dung dinh dang');
     }
     if (phone && !/^0\d{9}$/.test(phone)) {
-      throw new BadRequestException('SDT lien he phai gom dung 10 chu so va bat dau bang so 0');
+      throw new BadRequestException(
+        'SDT lien he phai gom dung 10 chu so va bat dau bang so 0',
+      );
     }
     if (sourceMode === 'vendor' && !vendorId) {
       throw new BadRequestException('Vui long chon doi tac quan ly dia diem');
@@ -605,13 +614,16 @@ export class AdminPlacesService {
         average_rating: 0,
         review_count: 0,
         registered_date: now.toISOString().slice(0, 10),
-        source: sourceMode === 'vendor' ? 'admin_created_for_business' : 'admin',
+        source:
+          sourceMode === 'vendor' ? 'admin_created_for_business' : 'admin',
       })
       .select('id')
       .single<{ id: string }>();
 
     if (createPlaceError) {
-      throw new BadRequestException(createPlaceError.message || 'Loi khi tao dia diem');
+      throw new BadRequestException(
+        createPlaceError.message || 'Loi khi tao dia diem',
+      );
     }
 
     await this.addPlaceServices(createdPlace.id, services);
@@ -782,15 +794,15 @@ export class AdminPlacesService {
         if (!keyword) {
           query = query.ilike('name', `%${simpleSearch}%`);
         } else {
-        const matchingVendorIds = await this.getVendorIdsBySearch(keyword);
+          const matchingVendorIds = await this.getVendorIdsBySearch(keyword);
 
-        if (matchingVendorIds.length > 0) {
-          query = query.or(
-            `name.ilike.%${keyword}%,vendor_id.in.(${matchingVendorIds.join(',')})`,
-          );
-        } else {
-          query = query.ilike('name', `%${keyword}%`);
-        }
+          if (matchingVendorIds.length > 0) {
+            query = query.or(
+              `name.ilike.%${keyword}%,vendor_id.in.(${matchingVendorIds.join(',')})`,
+            );
+          } else {
+            query = query.ilike('name', `%${keyword}%`);
+          }
         }
       }
     }

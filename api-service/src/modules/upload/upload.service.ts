@@ -491,9 +491,7 @@ export class UploadService {
 
   private async pushToR2(buffer: Buffer, key: string): Promise<string> {
     if (!this.hasR2Config()) {
-      throw new Error(
-        'Missing Cloudflare R2 configuration for image upload',
-      );
+      throw new Error('Missing Cloudflare R2 configuration for image upload');
     }
 
     await this.s3Client.send(

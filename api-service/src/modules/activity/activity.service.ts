@@ -77,9 +77,7 @@ export class ActivityService {
     placeId: string,
   ): Promise<boolean> {
     const now = Date.now();
-    const earliest = toVietnamTimestamp(
-      new Date(now - VIEW_CLICK_WINDOW_MS),
-    );
+    const earliest = toVietnamTimestamp(new Date(now - VIEW_CLICK_WINDOW_MS));
     const latest = toVietnamTimestamp(new Date(now - MIN_VIEW_DWELL_MS));
     const { data, error } = await supabase
       .schema('travel')
@@ -148,10 +146,7 @@ export class ActivityService {
       .eq('tourist_id', touristId)
       .eq('action_type', 'search')
       .is('place_id', null)
-      .gt(
-        'created_at',
-        latestClick?.created_at ?? '0001-01-01T00:00:00.000',
-      )
+      .gt('created_at', latestClick?.created_at ?? '0001-01-01T00:00:00.000')
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle<{ id: string; created_at: string }>();
@@ -187,7 +182,7 @@ export class ActivityService {
   private resolveImage(imageUrl: unknown): string {
     if (Array.isArray(imageUrl)) {
       const first = (imageUrl as unknown[]).find(
-        (i) => typeof i === 'string' && (i as string).trim(),
+        (i) => typeof i === 'string' && i.trim(),
       );
       if (first) return first as string;
     }

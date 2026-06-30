@@ -58,7 +58,9 @@ export class PushNotificationService implements OnModuleInit {
       });
     } catch (err) {
       // Token expired/unregistered — log but don't throw (not critical)
-      this.logger.warn(`FCM send failed for token ${fcmToken.slice(0, 20)}...: ${err?.message}`);
+      this.logger.warn(
+        `FCM send failed for token ${fcmToken.slice(0, 20)}...: ${err?.message}`,
+      );
     }
   }
 }

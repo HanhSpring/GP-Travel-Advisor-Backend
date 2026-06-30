@@ -47,7 +47,8 @@ export class AddActivityDto {
     example: 60,
     minimum: 15,
     maximum: 480,
-    description: 'Thời gian tham quan (phút). Nếu bỏ qua, dùng giá trị mặc định của địa điểm.',
+    description:
+      'Thời gian tham quan (phút). Nếu bỏ qua, dùng giá trị mặc định của địa điểm.',
   })
   @IsOptional()
   @IsInt({ message: 'durationMinutes phải là số nguyên' })

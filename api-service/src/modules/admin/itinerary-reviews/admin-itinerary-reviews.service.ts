@@ -32,7 +32,12 @@ interface UserRow {
 
 type ReviewStatus = 'all' | 'pending' | 'approved' | 'violation';
 type ReviewSort = 'newest' | 'oldest' | 'highest_rating' | 'lowest_rating';
-type ReviewDateSent = 'all' | 'today' | 'yesterday' | 'last_7_days' | 'last_30_days';
+type ReviewDateSent =
+  | 'all'
+  | 'today'
+  | 'yesterday'
+  | 'last_7_days'
+  | 'last_30_days';
 
 @Injectable()
 export class AdminItineraryReviewsService {
@@ -50,9 +55,14 @@ export class AdminItineraryReviewsService {
       .trim();
   }
 
-  private normalizeImageUrls(value: string[] | string | null | undefined): string[] {
+  private normalizeImageUrls(
+    value: string[] | string | null | undefined,
+  ): string[] {
     if (Array.isArray(value)) {
-      return value.filter((item): item is string => typeof item === 'string' && item.trim().length > 0);
+      return value.filter(
+        (item): item is string =>
+          typeof item === 'string' && item.trim().length > 0,
+      );
     }
 
     if (typeof value === 'string' && value.trim().length > 0) {
@@ -62,14 +72,18 @@ export class AdminItineraryReviewsService {
     return [];
   }
 
-  private resolveStatus(status: string | null): 'pending' | 'approved' | 'violation' {
+  private resolveStatus(
+    status: string | null,
+  ): 'pending' | 'approved' | 'violation' {
     if (status === 'approved' || status === 'violation') return status;
     return 'pending';
   }
 
   private async countReviews(status: ReviewStatus = 'all'): Promise<number> {
     if (!['all', 'pending', 'approved', 'violation'].includes(status)) {
-      throw new BadRequestException('status must be one of: all, pending, approved, violation');
+      throw new BadRequestException(
+        'status must be one of: all, pending, approved, violation',
+      );
     }
 
     let query = supabase
@@ -94,7 +108,9 @@ export class AdminItineraryReviewsService {
     return count ?? 0;
   }
 
-  private async buildSearchReviewIds(search?: string): Promise<string[] | null> {
+  private async buildSearchReviewIds(
+    search?: string,
+  ): Promise<string[] | null> {
     const normalizedSearch = this.normalizeForSearch(search);
 
     if (!normalizedSearch) {
@@ -107,8 +123,16 @@ export class AdminItineraryReviewsService {
     }
 
     const [usersResult, itinerariesResult] = await Promise.all([
-      supabase.schema('public').from('users').select('id').ilike('full_name', `%${simpleSearch}%`),
-      supabase.schema('travel').from('itineraries').select('id').ilike('destination', `%${simpleSearch}%`),
+      supabase
+        .schema('public')
+        .from('users')
+        .select('id')
+        .ilike('full_name', `%${simpleSearch}%`),
+      supabase
+        .schema('travel')
+        .from('itineraries')
+        .select('id')
+        .ilike('destination', `%${simpleSearch}%`),
     ]);
 
     if (usersResult.error) {
@@ -121,7 +145,9 @@ export class AdminItineraryReviewsService {
 
     const reviewIds = new Set<string>();
 
-    const userIds = (usersResult.data ?? []).map((item) => (item as UserRow).id).filter(Boolean);
+    const userIds = (usersResult.data ?? [])
+      .map((item) => (item as UserRow).id)
+      .filter(Boolean);
     if (userIds.length > 0) {
       const { data, error } = await supabase
         .schema('review_ai')
@@ -181,12 +207,13 @@ export class AdminItineraryReviewsService {
 
     const offset = (page - 1) * limit;
 
-    const [totalReviews, pendingCount, approvedCount, violationCount] = await Promise.all([
-      this.countReviews('all'),
-      this.countReviews('pending'),
-      this.countReviews('approved'),
-      this.countReviews('violation'),
-    ]);
+    const [totalReviews, pendingCount, approvedCount, violationCount] =
+      await Promise.all([
+        this.countReviews('all'),
+        this.countReviews('pending'),
+        this.countReviews('approved'),
+        this.countReviews('violation'),
+      ]);
 
     const summary = {
       total_reviews: totalReviews,
@@ -199,9 +226,12 @@ export class AdminItineraryReviewsService {
       let query = supabase
         .schema('review_ai')
         .from('itinerary_reviews')
-        .select('id, tourist_id, itinerary_id, rating, content, url_image, created_at, status, violation_reason', {
-          count: 'exact',
-        });
+        .select(
+          'id, tourist_id, itinerary_id, rating, content, url_image, created_at, status, violation_reason',
+          {
+            count: 'exact',
+          },
+        );
 
       if (status && ['pending', 'approved', 'violation'].includes(status)) {
         if (status === 'pending') {
@@ -221,12 +251,36 @@ export class AdminItineraryReviewsService {
         let toDate: Date | null = null;
 
         if (dateSent === 'today') {
-          fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+          fromDate = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate(),
+            0,
+            0,
+            0,
+            0,
+          );
         }
 
         if (dateSent === 'yesterday') {
-          fromDate = new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1, 0, 0, 0, 0);
-          toDate = new Date(now.getFullYear(), now.getMonth(), now.getDate(), 0, 0, 0, 0);
+          fromDate = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate() - 1,
+            0,
+            0,
+            0,
+            0,
+          );
+          toDate = new Date(
+            now.getFullYear(),
+            now.getMonth(),
+            now.getDate(),
+            0,
+            0,
+            0,
+            0,
+          );
         }
 
         if (dateSent === 'last_7_days') {
@@ -252,7 +306,9 @@ export class AdminItineraryReviewsService {
         const exactDate = new Date(`${dateExact}T00:00:00`);
 
         if (Number.isNaN(exactDate.getTime())) {
-          throw new BadRequestException('date_exact must be in YYYY-MM-DD format');
+          throw new BadRequestException(
+            'date_exact must be in YYYY-MM-DD format',
+          );
         }
 
         const nextDate = new Date(exactDate);
@@ -291,22 +347,37 @@ export class AdminItineraryReviewsService {
           query = query.order('created_at', { ascending: false });
       }
 
-      const { data, error, count } = await query.range(offset, offset + limit - 1);
+      const { data, error, count } = await query.range(
+        offset,
+        offset + limit - 1,
+      );
 
       if (error && error.code !== 'PGRST116') {
         throw error;
       }
 
       const reviewRows = (data ?? []) as ItineraryReviewRow[];
-      const itineraryIds = Array.from(new Set(reviewRows.map((item) => item.itinerary_id).filter(Boolean)));
-      const touristIds = Array.from(new Set(reviewRows.map((item) => item.tourist_id).filter(Boolean)));
+      const itineraryIds = Array.from(
+        new Set(reviewRows.map((item) => item.itinerary_id).filter(Boolean)),
+      );
+      const touristIds = Array.from(
+        new Set(reviewRows.map((item) => item.tourist_id).filter(Boolean)),
+      );
 
       const [itinerariesResult, usersResult] = await Promise.all([
         itineraryIds.length > 0
-          ? supabase.schema('travel').from('itineraries').select('id, destination, start_date, end_date').in('id', itineraryIds)
+          ? supabase
+              .schema('travel')
+              .from('itineraries')
+              .select('id, destination, start_date, end_date')
+              .in('id', itineraryIds)
           : Promise.resolve({ data: [], error: null }),
         touristIds.length > 0
-          ? supabase.schema('public').from('users').select('id, full_name').in('id', touristIds)
+          ? supabase
+              .schema('public')
+              .from('users')
+              .select('id, full_name')
+              .in('id', touristIds)
           : Promise.resolve({ data: [], error: null }),
       ]);
 
@@ -333,8 +404,17 @@ export class AdminItineraryReviewsService {
       const dataRows = await Promise.all(
         reviewRows.map(async (review) => {
           const [reviewCountResult, reportCountResult] = await Promise.all([
-            supabase.schema('review_ai').from('itinerary_reviews').select('id', { count: 'exact', head: true }).eq('tourist_id', review.tourist_id),
-            supabase.schema('review_ai').from('itinerary_reviews').select('id', { count: 'exact', head: true }).eq('tourist_id', review.tourist_id).eq('status', 'violation'),
+            supabase
+              .schema('review_ai')
+              .from('itinerary_reviews')
+              .select('id', { count: 'exact', head: true })
+              .eq('tourist_id', review.tourist_id),
+            supabase
+              .schema('review_ai')
+              .from('itinerary_reviews')
+              .select('id', { count: 'exact', head: true })
+              .eq('tourist_id', review.tourist_id)
+              .eq('status', 'violation'),
           ]);
 
           const user = userMap.get(review.tourist_id);
@@ -361,7 +441,12 @@ export class AdminItineraryReviewsService {
 
       return {
         data: dataRows,
-        pagination: { total: count ?? 0, page, limit, total_pages: Math.ceil((count ?? 0) / limit) },
+        pagination: {
+          total: count ?? 0,
+          page,
+          limit,
+          total_pages: Math.ceil((count ?? 0) / limit),
+        },
         summary,
       };
     } catch (error) {
@@ -369,11 +454,19 @@ export class AdminItineraryReviewsService {
         throw error;
       }
 
-      throw new InternalServerErrorException(error instanceof Error ? error.message : 'Failed to fetch itinerary reviews');
+      throw new InternalServerErrorException(
+        error instanceof Error
+          ? error.message
+          : 'Failed to fetch itinerary reviews',
+      );
     }
   }
 
-  async updateReviewStatus(id: string, status: 'approved' | 'violation', reason?: string) {
+  async updateReviewStatus(
+    id: string,
+    status: 'approved' | 'violation',
+    reason?: string,
+  ) {
     const updatePayload: Record<string, unknown> = { status };
     if (status === 'violation' && reason) {
       updatePayload.violation_reason = reason;
@@ -398,7 +491,10 @@ export class AdminItineraryReviewsService {
     return {
       id: data.id,
       status,
-      message: status === 'approved' ? 'Itinerary review approved successfully' : 'Itinerary review rejected successfully',
+      message:
+        status === 'approved'
+          ? 'Itinerary review approved successfully'
+          : 'Itinerary review rejected successfully',
       note: reason ?? null,
       note_saved: status === 'violation' && !!reason,
     };
@@ -416,21 +512,46 @@ export class AdminItineraryReviewsService {
     const { data: review, error } = await supabase
       .schema('review_ai')
       .from('itinerary_reviews')
-      .select('id, tourist_id, itinerary_id, rating, content, url_image, created_at, status, violation_reason')
+      .select(
+        'id, tourist_id, itinerary_id, rating, content, url_image, created_at, status, violation_reason',
+      )
       .eq('id', id)
       .single<ItineraryReviewRow>();
 
     if (error) throw new InternalServerErrorException(error.message);
-    if (!review) throw new InternalServerErrorException('Itinerary review not found');
+    if (!review)
+      throw new InternalServerErrorException('Itinerary review not found');
 
-    const [userResult, itineraryResult, reviewCountResult, reportCountResult] = await Promise.all([
-      supabase.schema('public').from('users').select('id, full_name').eq('id', review.tourist_id).single<UserRow>(),
-      supabase.schema('travel').from('itineraries').select('id, destination, start_date, end_date').eq('id', review.itinerary_id).single<ItineraryRow>(),
-      supabase.schema('review_ai').from('itinerary_reviews').select('id', { count: 'exact', head: true }).eq('tourist_id', review.tourist_id),
-      supabase.schema('review_ai').from('itinerary_reviews').select('id', { count: 'exact', head: true }).eq('tourist_id', review.tourist_id).eq('status', 'violation'),
-    ]);
+    const [userResult, itineraryResult, reviewCountResult, reportCountResult] =
+      await Promise.all([
+        supabase
+          .schema('public')
+          .from('users')
+          .select('id, full_name')
+          .eq('id', review.tourist_id)
+          .single<UserRow>(),
+        supabase
+          .schema('travel')
+          .from('itineraries')
+          .select('id, destination, start_date, end_date')
+          .eq('id', review.itinerary_id)
+          .single<ItineraryRow>(),
+        supabase
+          .schema('review_ai')
+          .from('itinerary_reviews')
+          .select('id', { count: 'exact', head: true })
+          .eq('tourist_id', review.tourist_id),
+        supabase
+          .schema('review_ai')
+          .from('itinerary_reviews')
+          .select('id', { count: 'exact', head: true })
+          .eq('tourist_id', review.tourist_id)
+          .eq('status', 'violation'),
+      ]);
 
-    const imageUrls = this.normalizeImageUrls(review.url_image).map((url) => ({ url }));
+    const imageUrls = this.normalizeImageUrls(review.url_image).map((url) => ({
+      url,
+    }));
     const resolvedStatus = this.resolveStatus(review.status);
 
     return {

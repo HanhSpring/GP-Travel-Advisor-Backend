@@ -121,5 +121,4 @@ export class SubmitItineraryReviewDto {
   @ValidateNested({ each: true })
   @Type(() => SubmitReviewMediaDto)
   media?: SubmitReviewMediaDto[];
-
 }

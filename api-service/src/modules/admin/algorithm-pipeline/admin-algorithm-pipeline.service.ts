@@ -63,11 +63,14 @@ export class AdminAlgorithmPipelineService {
     return url.trim().replace('://localhost:', '://127.0.0.1:');
   }
 
-  async runPipeline(dto: PipelineRunRequestDto): Promise<PipelineRunResponseDto> {
+  async runPipeline(
+    dto: PipelineRunRequestDto,
+  ): Promise<PipelineRunResponseDto> {
     this.logger.log('Kich hoat pipeline phan loai review...');
     let requestPayload: Record<string, any> = dto;
     try {
-      const settings = await this.algorithmSettingsService.getReviewFilterSettings();
+      const settings =
+        await this.algorithmSettingsService.getReviewFilterSettings();
       const settingsPayload =
         this.algorithmSettingsService.getReviewFilterPipelinePayload(settings);
       requestPayload = { ...dto, ...settingsPayload };
@@ -94,7 +97,6 @@ export class AdminAlgorithmPipelineService {
       );
     }
   }
-
 
   async getPipelineHistory(limit = 20): Promise<PipelineHistoryResponseDto> {
     const safeLimit = Math.min(Math.max(limit || 20, 1), 100);
@@ -168,7 +170,10 @@ export class AdminAlgorithmPipelineService {
         .select('*')
         .single();
 
-      this.throwIfSupabaseError(error, 'Could not update review filter schedule');
+      this.throwIfSupabaseError(
+        error,
+        'Could not update review filter schedule',
+      );
       const updated = data as ScheduleRow;
       await this.insertScheduleLog(algorithm.id, current, updated);
       return this.buildScheduleResponse(updated);
@@ -190,7 +195,10 @@ export class AdminAlgorithmPipelineService {
 
     this.logger.log(`Review filter auto schedule due at ${due.toISOString()}`);
     try {
-      await this.runPipeline({ dry_run: false, triggered_by: 'schedule' } as PipelineRunRequestDto);
+      await this.runPipeline({
+        dry_run: false,
+        triggered_by: 'schedule',
+      } as PipelineRunRequestDto);
     } finally {
       await this.markScheduleLastRun(due.getTime());
     }
@@ -320,13 +328,14 @@ export class AdminAlgorithmPipelineService {
       .select('*')
       .single();
 
-    this.throwIfSupabaseError(insertError, 'Could not seed review filter schedule');
+    this.throwIfSupabaseError(
+      insertError,
+      'Could not seed review filter schedule',
+    );
     return inserted as ScheduleRow;
   }
 
-  private buildScheduleResponse(
-    row: ScheduleRow,
-  ): ReviewFilterScheduleDto {
+  private buildScheduleResponse(row: ScheduleRow): ReviewFilterScheduleDto {
     return {
       autoEnabled: Boolean(row.is_enabled),
       frequency: row.frequency ?? 'daily',
@@ -370,14 +379,22 @@ export class AdminAlgorithmPipelineService {
     if (now < scheduled) {
       return null;
     }
-    if (schedule.frequency === 'weekly' && now.getDay() !== Number(schedule.runDay)) {
+    if (
+      schedule.frequency === 'weekly' &&
+      now.getDay() !== Number(schedule.runDay)
+    ) {
       return null;
     }
-    if (schedule.frequency === 'monthly' && now.getDate() !== Number(schedule.runDay)) {
+    if (
+      schedule.frequency === 'monthly' &&
+      now.getDate() !== Number(schedule.runDay)
+    ) {
       return null;
     }
 
-    const lastRunAt = schedule.lastRunAt ? new Date(schedule.lastRunAt).getTime() : 0;
+    const lastRunAt = schedule.lastRunAt
+      ? new Date(schedule.lastRunAt).getTime()
+      : 0;
     return lastRunAt >= scheduled.getTime() ? null : scheduled;
   }
 
@@ -422,11 +439,7 @@ export class AdminAlgorithmPipelineService {
       this.normalizeRunTime(before.run_time),
       this.normalizeRunTime(after.run_time),
     );
-    add(
-      'Ngày chạy',
-      String(before.run_day ?? 1),
-      String(after.run_day ?? 1),
-    );
+    add('Ngày chạy', String(before.run_day ?? 1), String(after.run_day ?? 1));
 
     if (!changes.length) {
       return;
@@ -446,7 +459,10 @@ export class AdminAlgorithmPipelineService {
         }),
       });
 
-    this.throwIfSupabaseError(error, 'Could not insert review filter schedule log');
+    this.throwIfSupabaseError(
+      error,
+      'Could not insert review filter schedule log',
+    );
   }
 
   private frequencyLabel(frequency: ReviewFilterScheduleFrequency): string {
