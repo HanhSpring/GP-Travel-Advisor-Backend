@@ -27,4 +27,3 @@ output/
 
 # PhoBERT model
 app/models/phobert_timelabel/
-models/phobert_timelabel/

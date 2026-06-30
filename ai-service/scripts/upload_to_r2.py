@@ -50,13 +50,20 @@ TRANSFER_CONFIG = TransferConfig(
     multipart_chunksize=64 * 1024 ** 2,
     max_concurrency=4,
 )
+FORCE_UPLOAD = os.environ.get("R2_FORCE_UPLOAD", "").strip().lower() in {
+    "1",
+    "true",
+    "yes",
+    "y",
+    "on",
+}
 
 # Thư mục nguồn (đường dẫn tương đối so với script này)
 SCRIPT_DIR   = Path(__file__).parent.parent   # gốc ai-service/
 UPLOAD_DIRS  = {
     "recommender_artifacts": SCRIPT_DIR / "recommender_artifacts",
     "data": SCRIPT_DIR / "data",
-    "phobert_timelabel/checkpoint-60": SCRIPT_DIR / "app" / "models" / "phobert_timelabel" / "checkpoint-60",
+    "phobert_timelabel/checkpoint-264": SCRIPT_DIR / "app" / "models" / "phobert_timelabel" / "checkpoint-264",
 }
 
 # File / thư mục không cần thiết cho serving (bỏ qua khi upload)
@@ -115,8 +122,8 @@ def main():
 
             # Kiểm tra đã upload chưa (so sánh size)
             try:
-                head = client.head_object(Bucket=BUCKET, Key=r2_key)
-                if head["ContentLength"] == local_path.stat().st_size:
+                head = None if FORCE_UPLOAD else client.head_object(Bucket=BUCKET, Key=r2_key)
+                if head and head["ContentLength"] == local_path.stat().st_size:
                     print(f"  ⏭ Skip (đã có): {r2_key}")
                     total_skipped += 1
                     continue
