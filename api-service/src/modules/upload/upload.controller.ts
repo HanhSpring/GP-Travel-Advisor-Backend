@@ -66,7 +66,36 @@ export class UploadController {
     return this.uploadService.uploadAvatar(file, userId);
   }
 
-  // 2. LUỒNG UPLOAD ẢNH REVIEW (Khách du lịch)
+  // 2. LUỒNG UPLOAD AVATAR DRAFT (dùng khi admin tạo user mới — chỉ upload, không update DB)
+  @Post('avatar-draft')
+  @ApiOperation({ summary: 'Upload avatar draft (no DB update)' })
+  @ApiBearerAuth('access-token')
+  @ApiConsumes('multipart/form-data')
+  @ApiBody({
+    schema: {
+      type: 'object',
+      properties: {
+        file: { type: 'string', format: 'binary' },
+      },
+    },
+  })
+  @UseGuards(JwtAuthGuard)
+  @UseInterceptors(FileInterceptor('file'))
+  async uploadAvatarDraft(
+    @UploadedFile(
+      new ParseFilePipe({
+        validators: [
+          new MaxFileSizeValidator({ maxSize: 2 * 1024 * 1024 }),
+          new FileTypeValidator({ fileType: '.(png|jpeg|jpg|webp)' }),
+        ],
+      }),
+    )
+    file: Express.Multer.File,
+  ) {
+    return this.uploadService.uploadAvatarDraft(file);
+  }
+
+  // 3. LUỒNG UPLOAD ẢNH REVIEW (Khách du lịch)
   @Post('reviews/presigned-urls')
   @ApiOperation({ summary: 'Create presigned R2 upload URLs for review media' })
   @ApiBearerAuth('access-token')
