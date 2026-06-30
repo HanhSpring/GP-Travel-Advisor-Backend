@@ -12,6 +12,7 @@ import {
   PipelineRunRequestDto,
   PipelineRunResponseDto,
 } from './dto/pipeline-run.dto';
+import { AdminAlgorithmSettingsService } from '../algorithm-settings/admin-algorithm-settings.service';
 
 const REVIEW_FILTER_ALGORITHM_NAME = 'review_filter';
 
@@ -34,7 +35,10 @@ export class AdminAlgorithmPipelineService {
   private readonly logger = new Logger(AdminAlgorithmPipelineService.name);
   private readonly aiServiceUrl: string;
 
-  constructor(private readonly httpService: HttpService) {
+  constructor(
+    private readonly httpService: HttpService,
+    private readonly algorithmSettingsService: AdminAlgorithmSettingsService,
+  ) {
     this.aiServiceUrl = this.normalizeAiServiceUrl(
       process.env.AI_SERVICE_URL || 'http://127.0.0.1:8000',
     );
@@ -45,30 +49,37 @@ export class AdminAlgorithmPipelineService {
   }
 
   async runPipeline(dto: PipelineRunRequestDto): Promise<PipelineRunResponseDto> {
-    this.logger.log('Kích hoạt pipeline phân loại review...');
+    this.logger.log('Kich hoat pipeline phan loai review...');
+    let requestPayload: Record<string, any> = dto;
     try {
+      const settings = await this.algorithmSettingsService.getReviewFilterSettings();
+      const settingsPayload =
+        this.algorithmSettingsService.getReviewFilterPipelinePayload(settings);
+      requestPayload = { ...dto, ...settingsPayload };
+
       const response = await firstValueFrom(
         this.httpService.post<PipelineRunResponseDto>(
           `${this.aiServiceUrl}/api/v1/review-pipeline/run`,
-          dto,
-          { timeout: 600_000 }, // 10 phút — pipeline ML có thể chạy lâu
+          requestPayload,
+          { timeout: 600_000 },
         ),
       );
-      await this.insertPipelineLog('active', response.data, dto);
+      await this.insertPipelineLog('active', response.data, requestPayload);
       return response.data;
     } catch (error) {
       this.logger.error(`Pipeline run failed: ${error.message}`);
-      await this.insertPipelineLog('failed', null, dto, error);
+      await this.insertPipelineLog('failed', null, requestPayload, error);
       if (error.response?.data) {
         throw new InternalServerErrorException(
-          error.response.data.detail || 'Pipeline thất bại',
+          error.response.data.detail || 'Pipeline th?t b?i',
         );
       }
       throw new InternalServerErrorException(
-        'Không thể kết nối đến AI service. Hãy kiểm tra ai-service đang chạy.',
+        'Kh?ng th? k?t n?i ??n AI service. H?y ki?m tra ai-service ?ang ch?y.',
       );
     }
   }
+
 
   async getPipelineHistory(limit = 20): Promise<PipelineHistoryResponseDto> {
     const safeLimit = Math.min(Math.max(limit || 20, 1), 100);
@@ -106,7 +117,7 @@ export class AdminAlgorithmPipelineService {
   private async insertPipelineLog(
     status: 'active' | 'failed',
     result: PipelineRunResponseDto | null,
-    request: PipelineRunRequestDto,
+    request: Record<string, any>,
     error?: any,
   ): Promise<void> {
     try {

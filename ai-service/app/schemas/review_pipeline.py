@@ -1,16 +1,23 @@
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import Dict, List, Optional
 from pydantic import BaseModel, Field
 
 
 class PipelineRunRequest(BaseModel):
-    limit: Optional[int] = Field(None, description="Giới hạn số review xử lý (None = tất cả pending)")
-    no_pretrained: bool = Field(False, description="Bỏ qua ML models, dùng rule-based nhanh hơn")
-    topic_other_threshold: float = Field(0.18, description="Ngưỡng E5 để gán topic=other")
-    candidate_mode: str = Field("all", description="Chế độ chọn candidates alg2: 'all' | 'topk'")
-    promotion_mode: str = Field("representative", description="Chế độ nâng cấp: 'representative' | 'all'")
-    dry_run: bool = Field(False, description="Xử lý nhưng không ghi lại Supabase")
+    limit: Optional[int] = Field(None, description="Gioi han so review xu ly")
+    no_pretrained: bool = Field(False, description="Bo qua ML models")
+    topic_other_threshold: float = Field(0.18, description="Nguong gan topic=other")
+    classifier_confidence_threshold: float = Field(0.55, description="Nguong tin cay PhoBERT")
+    classifier_ambiguity_margin: float = Field(0.10, description="Bien do phan biet nhan PhoBERT")
+    conflict_score_threshold: float = Field(0.65, description="Nguong xac nhan xung dot")
+    candidate_mode: str = Field("all", description="'all' | 'topk'")
+    top_k: int = Field(5, description="So candidate toi da khi candidate_mode='topk'")
+    promotion_mode: str = Field("representative", description="'representative' | 'all'")
+    ttl_hours_by_topic: Optional[Dict[str, int]] = None
+    lookback_multiplier_by_topic: Optional[Dict[str, int]] = None
+    observation_rules: Optional[Dict[str, Dict[str, float]]] = None
+    dry_run: bool = Field(False, description="Xu ly nhung khong ghi Supabase")
 
 
 class PipelineRunResponse(BaseModel):

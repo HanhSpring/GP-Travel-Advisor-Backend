@@ -57,7 +57,8 @@ TTL_HOURS_BY_TOPIC: Dict[str, int] = {
     "cleanliness": 168,
     "food": 168,
     "atmosphere": 720,   # cảnh quan/không khí rất ổn định, ít thay đổi
-    "activity":   168,   # chất lượng hoạt động tương đối ổn định
+    "activity":   168,
+    "other": 48,   # chất lượng hoạt động tương đối ổn định
 }
 
 
@@ -86,6 +87,7 @@ ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC: Dict[str, int] = {
     "infra": 12,
     "atmosphere": 12,
     "activity": 12,
+    "other": 6,
 }
 
 # Transient topics: a single weak time signal is enough to classify as short-term.
@@ -844,6 +846,10 @@ class PipelineConfig:
     top_k: int
     old_lookback_multiplier: int
     promotion_mode: str
+    conflict_score_threshold: float = 0.65
+    ttl_hours_by_topic: Optional[Dict[str, int]] = None
+    observation_rules: Optional[Dict[str, Any]] = None
+    lookback_multiplier_by_topic: Optional[Dict[str, int]] = None
     phobert_time_model_path: Optional[str] = None
     supabase_url: Optional[str] = None
     supabase_key: Optional[str] = None
@@ -1393,6 +1399,18 @@ class ReviewFilteringPipeline:
         output_path = self.config.output_dir / file_name
         with output_path.open("w", encoding="utf-8") as f:
             json.dump(payload, f, ensure_ascii=False, indent=2)
+
+    def _ttl_hours_for_topic(self, topic: str, fallback: int = 48) -> int:
+        values = self.config.ttl_hours_by_topic or TTL_HOURS_BY_TOPIC
+        return int(values.get(topic, fallback))
+
+    def _observation_rule_for_topic(self, topic: str) -> Dict[str, Any]:
+        values = self.config.observation_rules or OBSERVATION_RULES
+        return values.get(topic, values.get("other", OBSERVATION_RULES["other"]))
+
+    def _lookback_multiplier_for_topic(self, topic: str) -> int:
+        values = self.config.lookback_multiplier_by_topic or ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC
+        return int(values.get(topic, self.config.old_lookback_multiplier))
 
     def _read_input_reviews(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
@@ -2287,7 +2305,7 @@ class ReviewFilteringPipeline:
     def _assign_ttl(self, time_label: str, topic: str, base_time: datetime) -> Optional[datetime]:
         if time_label != "short-term":
             return None
-        ttl_hours = TTL_HOURS_BY_TOPIC.get(topic, 48)
+        ttl_hours = self._ttl_hours_for_topic(topic, 48)
         return base_time + timedelta(hours=ttl_hours)
 
     # --- Algorithm 2: Detect conflicts ---
@@ -2335,11 +2353,8 @@ class ReviewFilteringPipeline:
             ]
 
             topic = str(content.get("main_topic"))
-            ttl_hours = TTL_HOURS_BY_TOPIC.get(topic, 72)
-            lookback_multiplier = ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC.get(
-                topic,
-                self.config.old_lookback_multiplier,
-            )
+            ttl_hours = self._ttl_hours_for_topic(topic, 72)
+            lookback_multiplier = self._lookback_multiplier_for_topic(topic)
             lookback_hours = ttl_hours * max(1, lookback_multiplier)
             ref_time = parse_iso(content["created_at"])
             if ref_time is not None:
@@ -2374,7 +2389,7 @@ class ReviewFilteringPipeline:
                 conflict_score = 0.45 * adjusted_sim + 0.25 * sentiment_gap + 0.30 * p_contra
 
                 if sim >= 0.8 or (sim >= 0.5 and nli_label == "contradiction"):
-                    if conflict_score >= 0.65:
+                    if conflict_score >= self.config.conflict_score_threshold:
                         conflicts.append({
                             "id": str(uuid.uuid4()),
                             "new_content_id": content["id"],
@@ -2395,7 +2410,7 @@ class ReviewFilteringPipeline:
             "candidate_mode": self.config.candidate_mode,
             "top_k": self.config.top_k,
             "lookback_multiplier_default": self.config.old_lookback_multiplier,
-            "lookback_multiplier_by_topic": ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC,
+            "lookback_multiplier_by_topic": self.config.lookback_multiplier_by_topic or ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC,
         }
         return conflicts, meta
 
@@ -2578,7 +2593,7 @@ class ReviewFilteringPipeline:
         promoted_content_ids: List[str] = []
 
         for (place_id, topic), group_items in by_group.items():
-            rule = OBSERVATION_RULES.get(topic, OBSERVATION_RULES["other"])
+            rule = self._observation_rule_for_topic(topic)
             window_days = int(rule["window_days"])
             threshold = int(rule["threshold"])
             sim_threshold = float(rule["sim_threshold"])
