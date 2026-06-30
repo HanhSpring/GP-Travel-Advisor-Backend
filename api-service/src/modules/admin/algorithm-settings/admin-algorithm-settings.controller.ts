@@ -24,7 +24,9 @@ import {
   AlgorithmLogDto,
   TwoTowerSettingsDto,
 } from './dto/two-tower-settings.dto';
+import { ReviewFilterSettingsDto } from './dto/review-filter-settings.dto';
 import { UpdateTwoTowerSettingsDto } from './dto/update-two-tower-settings.dto';
+import { UpdateReviewFilterSettingsDto } from './dto/update-review-filter-settings.dto';
 
 @ApiTags('Admin - Algorithm Settings')
 @ApiBearerAuth('access-token')
@@ -33,6 +35,35 @@ import { UpdateTwoTowerSettingsDto } from './dto/update-two-tower-settings.dto';
 @Roles(Role.ADMIN)
 export class AdminAlgorithmSettingsController {
   constructor(private readonly service: AdminAlgorithmSettingsService) {}
+
+  @Get('statuses')
+  @ApiOperation({ summary: 'Get algorithm active statuses' })
+  getAlgorithmStatuses(): Promise<Record<string, boolean>> {
+    return this.service.getAlgorithmStatuses();
+  }
+
+  @Get('review-filter')
+  @ApiOperation({ summary: 'Get review filtering pipeline settings' })
+  @ApiResponse({ status: 200, type: ReviewFilterSettingsDto })
+  getReviewFilterSettings(): Promise<ReviewFilterSettingsDto> {
+    return this.service.getReviewFilterSettings();
+  }
+
+  @Patch('review-filter')
+  @ApiOperation({ summary: 'Update review filtering pipeline settings' })
+  @ApiResponse({ status: 200, type: ReviewFilterSettingsDto })
+  updateReviewFilterSettings(
+    @Body() dto: UpdateReviewFilterSettingsDto,
+  ): Promise<ReviewFilterSettingsDto> {
+    return this.service.updateReviewFilterSettings(dto);
+  }
+
+  @Post('review-filter/reset')
+  @ApiOperation({ summary: 'Reset review filtering pipeline settings to defaults' })
+  @ApiResponse({ status: 200, type: ReviewFilterSettingsDto })
+  resetReviewFilterSettings(): Promise<ReviewFilterSettingsDto> {
+    return this.service.resetReviewFilterSettings();
+  }
 
   @Get('two-tower')
   @ApiOperation({ summary: 'Get Two Tower retrieval settings' })

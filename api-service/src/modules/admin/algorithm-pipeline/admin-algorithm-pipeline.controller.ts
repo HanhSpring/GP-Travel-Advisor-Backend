@@ -2,12 +2,16 @@ import {
   Body,
   Controller,
   Get,
+  Patch,
   Post,
   Query,
 } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { AdminAlgorithmPipelineService } from './admin-algorithm-pipeline.service';
-import { PipelineRunRequestDto } from './dto/pipeline-run.dto';
+import {
+  PipelineRunRequestDto,
+  UpdateReviewFilterScheduleDto,
+} from './dto/pipeline-run.dto';
 
 @ApiTags('Admin - Algorithm Pipeline')
 @Controller('admin/algorithm-pipeline')
@@ -25,5 +29,17 @@ export class AdminAlgorithmPipelineController {
   async getPipelineHistory(@Query('limit') limit?: string) {
     const limitNum = limit ? parseInt(limit, 10) : 20;
     return this.service.getPipelineHistory(limitNum);
+  }
+
+  @Get('review-filter/schedule')
+  @ApiOperation({ summary: 'Lấy cấu hình lịch chạy tự động thuật toán lọc đánh giá' })
+  async getReviewFilterSchedule() {
+    return this.service.getReviewFilterSchedule();
+  }
+
+  @Patch('review-filter/schedule')
+  @ApiOperation({ summary: 'Cập nhật lịch chạy tự động thuật toán lọc đánh giá' })
+  async updateReviewFilterSchedule(@Body() dto: UpdateReviewFilterScheduleDto) {
+    return this.service.updateReviewFilterSchedule(dto);
   }
 }

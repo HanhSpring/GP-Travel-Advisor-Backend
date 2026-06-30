@@ -11,7 +11,11 @@ import {
   PipelineHistoryResponseDto,
   PipelineRunRequestDto,
   PipelineRunResponseDto,
+  ReviewFilterScheduleDto,
+  ReviewFilterScheduleFrequency,
+  UpdateReviewFilterScheduleDto,
 } from './dto/pipeline-run.dto';
+import { AdminAlgorithmSettingsService } from '../algorithm-settings/admin-algorithm-settings.service';
 
 const REVIEW_FILTER_ALGORITHM_NAME = 'review_filter';
 
@@ -29,12 +33,27 @@ type AlgorithmLogRow = {
   created_at: string;
 };
 
+type ScheduleRow = {
+  id: string;
+  algorithm_id: string;
+  is_enabled: boolean;
+  frequency: ReviewFilterScheduleFrequency;
+  run_time: string;
+  run_day: number | null;
+  timezone: string | null;
+  last_run_at: string | null;
+  updated_at?: string | null;
+};
+
 @Injectable()
 export class AdminAlgorithmPipelineService {
   private readonly logger = new Logger(AdminAlgorithmPipelineService.name);
   private readonly aiServiceUrl: string;
 
-  constructor(private readonly httpService: HttpService) {
+  constructor(
+    private readonly httpService: HttpService,
+    private readonly algorithmSettingsService: AdminAlgorithmSettingsService,
+  ) {
     this.aiServiceUrl = this.normalizeAiServiceUrl(
       process.env.AI_SERVICE_URL || 'http://127.0.0.1:8000',
     );
@@ -45,30 +64,37 @@ export class AdminAlgorithmPipelineService {
   }
 
   async runPipeline(dto: PipelineRunRequestDto): Promise<PipelineRunResponseDto> {
-    this.logger.log('Kích hoạt pipeline phân loại review...');
+    this.logger.log('Kich hoat pipeline phan loai review...');
+    let requestPayload: Record<string, any> = dto;
     try {
+      const settings = await this.algorithmSettingsService.getReviewFilterSettings();
+      const settingsPayload =
+        this.algorithmSettingsService.getReviewFilterPipelinePayload(settings);
+      requestPayload = { ...dto, ...settingsPayload };
+
       const response = await firstValueFrom(
         this.httpService.post<PipelineRunResponseDto>(
           `${this.aiServiceUrl}/api/v1/review-pipeline/run`,
-          dto,
-          { timeout: 600_000 }, // 10 phút — pipeline ML có thể chạy lâu
+          requestPayload,
+          { timeout: 600_000 },
         ),
       );
-      await this.insertPipelineLog('active', response.data, dto);
+      await this.insertPipelineLog('active', response.data, requestPayload);
       return response.data;
     } catch (error) {
       this.logger.error(`Pipeline run failed: ${error.message}`);
-      await this.insertPipelineLog('failed', null, dto, error);
+      await this.insertPipelineLog('failed', null, requestPayload, error);
       if (error.response?.data) {
         throw new InternalServerErrorException(
-          error.response.data.detail || 'Pipeline thất bại',
+          error.response.data.detail || 'Pipeline th?t b?i',
         );
       }
       throw new InternalServerErrorException(
-        'Không thể kết nối đến AI service. Hãy kiểm tra ai-service đang chạy.',
+        'Kh?ng th? k?t n?i ??n AI service. H?y ki?m tra ai-service ?ang ch?y.',
       );
     }
   }
+
 
   async getPipelineHistory(limit = 20): Promise<PipelineHistoryResponseDto> {
     const safeLimit = Math.min(Math.max(limit || 20, 1), 100);
@@ -103,10 +129,77 @@ export class AdminAlgorithmPipelineService {
     }
   }
 
+  async getReviewFilterSchedule(): Promise<ReviewFilterScheduleDto> {
+    const algorithm = await this.ensureReviewFilterAlgorithm();
+    const schedule = await this.ensureScheduleRow(algorithm.id);
+    return this.buildScheduleResponse(schedule);
+  }
+
+  async updateReviewFilterSchedule(
+    dto: UpdateReviewFilterScheduleDto,
+  ): Promise<ReviewFilterScheduleDto> {
+    const algorithm = await this.ensureReviewFilterAlgorithm();
+    const current = await this.ensureScheduleRow(algorithm.id);
+    const updates: Partial<ScheduleRow> = {};
+
+    if (typeof dto.autoEnabled === 'boolean') {
+      updates.is_enabled = dto.autoEnabled;
+    }
+    if (dto.frequency) {
+      updates.frequency = dto.frequency;
+    }
+    if (dto.runTime !== undefined) {
+      updates.run_time = this.normalizeRunTime(dto.runTime);
+    }
+    if (dto.runDay !== undefined) {
+      updates.run_day = Number(dto.runDay);
+    }
+
+    const nextFrequency = updates.frequency ?? current.frequency;
+    const nextRunDay = updates.run_day ?? current.run_day ?? 1;
+    this.validateScheduleDay(nextFrequency, nextRunDay);
+
+    if (Object.keys(updates).length > 0) {
+      const { data, error } = await supabase
+        .schema('ai_config')
+        .from('algorithm_schedules')
+        .update({ ...updates, updated_at: new Date().toISOString() })
+        .eq('algorithm_id', algorithm.id)
+        .select('*')
+        .single();
+
+      this.throwIfSupabaseError(error, 'Could not update review filter schedule');
+      const updated = data as ScheduleRow;
+      await this.insertScheduleLog(algorithm.id, current, updated);
+      return this.buildScheduleResponse(updated);
+    }
+
+    return this.buildScheduleResponse(current);
+  }
+
+  async runReviewFilterIfDue(): Promise<void> {
+    const schedule = await this.getReviewFilterSchedule();
+    if (!schedule.autoEnabled) {
+      return;
+    }
+
+    const due = this.getDueScheduleTime(schedule);
+    if (!due) {
+      return;
+    }
+
+    this.logger.log(`Review filter auto schedule due at ${due.toISOString()}`);
+    try {
+      await this.runPipeline({ dry_run: false, triggered_by: 'schedule' } as PipelineRunRequestDto);
+    } finally {
+      await this.markScheduleLastRun(due.getTime());
+    }
+  }
+
   private async insertPipelineLog(
     status: 'active' | 'failed',
     result: PipelineRunResponseDto | null,
-    request: PipelineRunRequestDto,
+    request: Record<string, any>,
     error?: any,
   ): Promise<void> {
     try {
@@ -200,6 +293,172 @@ export class AdminAlgorithmPipelineService {
     return inserted as AlgorithmRow;
   }
 
+  private async ensureScheduleRow(algorithmId: string): Promise<ScheduleRow> {
+    const { data, error } = await supabase
+      .schema('ai_config')
+      .from('algorithm_schedules')
+      .select('*')
+      .eq('algorithm_id', algorithmId)
+      .maybeSingle();
+
+    this.throwIfSupabaseError(error, 'Could not load review filter schedule');
+    if (data) {
+      return data as ScheduleRow;
+    }
+
+    const { data: inserted, error: insertError } = await supabase
+      .schema('ai_config')
+      .from('algorithm_schedules')
+      .insert({
+        algorithm_id: algorithmId,
+        is_enabled: false,
+        frequency: 'daily',
+        run_time: '02:00',
+        run_day: 1,
+        timezone: 'Asia/Ho_Chi_Minh',
+      })
+      .select('*')
+      .single();
+
+    this.throwIfSupabaseError(insertError, 'Could not seed review filter schedule');
+    return inserted as ScheduleRow;
+  }
+
+  private buildScheduleResponse(
+    row: ScheduleRow,
+  ): ReviewFilterScheduleDto {
+    return {
+      autoEnabled: Boolean(row.is_enabled),
+      frequency: row.frequency ?? 'daily',
+      runTime: this.normalizeRunTime(row.run_time),
+      runDay: String(row.run_day ?? 1),
+      lastRunAt: row.last_run_at ?? null,
+    };
+  }
+
+  private normalizeRunTime(runTime: string): string {
+    const match = /^(\d{2}):(\d{2})(?::\d{2})?$/.exec(runTime);
+    if (!match) {
+      throw new InternalServerErrorException('Invalid run time format');
+    }
+    const hours = Number(match[1]);
+    const minutes = Number(match[2]);
+    if (hours < 0 || hours > 23 || minutes < 0 || minutes > 59) {
+      throw new InternalServerErrorException('Invalid run time value');
+    }
+    return `${String(hours).padStart(2, '0')}:${String(minutes).padStart(2, '0')}`;
+  }
+
+  private validateScheduleDay(
+    frequency: ReviewFilterScheduleFrequency,
+    runDay: number,
+  ): void {
+    if (frequency === 'weekly' && (runDay < 0 || runDay > 6)) {
+      throw new InternalServerErrorException('Weekly run day must be 0 - 6');
+    }
+    if (frequency === 'monthly' && (runDay < 1 || runDay > 28)) {
+      throw new InternalServerErrorException('Monthly run day must be 1 - 28');
+    }
+  }
+
+  private getDueScheduleTime(schedule: ReviewFilterScheduleDto): Date | null {
+    const now = new Date();
+    const [hours, minutes] = schedule.runTime.split(':').map(Number);
+    const scheduled = new Date(now);
+    scheduled.setHours(hours, minutes, 0, 0);
+
+    if (now < scheduled) {
+      return null;
+    }
+    if (schedule.frequency === 'weekly' && now.getDay() !== Number(schedule.runDay)) {
+      return null;
+    }
+    if (schedule.frequency === 'monthly' && now.getDate() !== Number(schedule.runDay)) {
+      return null;
+    }
+
+    const lastRunAt = schedule.lastRunAt ? new Date(schedule.lastRunAt).getTime() : 0;
+    return lastRunAt >= scheduled.getTime() ? null : scheduled;
+  }
+
+  private async markScheduleLastRun(epochMs: number): Promise<void> {
+    const algorithm = await this.ensureReviewFilterAlgorithm();
+    const { error } = await supabase
+      .schema('ai_config')
+      .from('algorithm_schedules')
+      .update({
+        last_run_at: new Date(epochMs).toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('algorithm_id', algorithm.id);
+
+    this.throwIfSupabaseError(error, 'Could not update schedule last_run_at');
+  }
+
+  private async insertScheduleLog(
+    algorithmId: string,
+    before: ScheduleRow,
+    after: ScheduleRow,
+  ): Promise<void> {
+    const changes: string[] = [];
+    const add = (label: string, oldValue: string, newValue: string) => {
+      if (oldValue !== newValue) {
+        changes.push(`${label}: ${oldValue} → ${newValue}`);
+      }
+    };
+
+    add(
+      'Tự động',
+      before.is_enabled ? 'Bật' : 'Tắt',
+      after.is_enabled ? 'Bật' : 'Tắt',
+    );
+    add(
+      'Định kỳ',
+      this.frequencyLabel(before.frequency),
+      this.frequencyLabel(after.frequency),
+    );
+    add(
+      'Giờ chạy',
+      this.normalizeRunTime(before.run_time),
+      this.normalizeRunTime(after.run_time),
+    );
+    add(
+      'Ngày chạy',
+      String(before.run_day ?? 1),
+      String(after.run_day ?? 1),
+    );
+
+    if (!changes.length) {
+      return;
+    }
+
+    const { error } = await supabase
+      .schema('ai_config')
+      .from('algorithm_logs')
+      .insert({
+        algorithm_id: algorithmId,
+        status: 'active',
+        action: 'parameter_changed',
+        details: JSON.stringify({
+          requestedAction: 'review_filter_schedule_update',
+          message: `Đã cập nhật lịch chạy tự động thuật toán lọc đánh giá. ${changes.join('; ')}`,
+          changes,
+        }),
+      });
+
+    this.throwIfSupabaseError(error, 'Could not insert review filter schedule log');
+  }
+
+  private frequencyLabel(frequency: ReviewFilterScheduleFrequency): string {
+    if (frequency === 'weekly') {
+      return 'Hàng tuần';
+    }
+    if (frequency === 'monthly') {
+      return 'Hàng tháng';
+    }
+    return 'Hàng ngày';
+  }
+
   private async loadAlgorithmMap(
     algorithmIds: string[],
   ): Promise<Map<string, AlgorithmRow>> {
@@ -283,5 +542,17 @@ export class AdminAlgorithmPipelineService {
   ): number {
     const value = details?.[key];
     return typeof value === 'number' && Number.isFinite(value) ? value : 0;
+  }
+
+  private throwIfSupabaseError(error: unknown, message: string): void {
+    if (!error) {
+      return;
+    }
+    const detail =
+      typeof error === 'object' && error !== null && 'message' in error
+        ? String((error as { message: unknown }).message)
+        : String(error);
+    this.logger.error(`${message}: ${detail}`);
+    throw new InternalServerErrorException(message);
   }
 }

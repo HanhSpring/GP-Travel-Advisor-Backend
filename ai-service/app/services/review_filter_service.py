@@ -23,6 +23,7 @@ from app.services.review_filter_pipeline import (
     ReviewFilteringPipeline,
     _create_supabase_client,
     fetch_pending_reviews,
+    mark_conflicted_contents,
     utc_now,
     write_conflicts_to_db,
     write_contents_to_db,
@@ -30,19 +31,49 @@ from app.services.review_filter_pipeline import (
 
 logger = get_logger(__name__)
 
+_AI_SERVICE_DIR = Path(__file__).resolve().parents[2]
+
+
+def _resolve_ai_service_path(path_value: str) -> Path:
+    path = Path(path_value)
+    if path.is_absolute():
+        return path
+    return _AI_SERVICE_DIR / path
+
+
+def _is_valid_phobert_checkpoint(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    has_config = (path / "config.json").is_file()
+    has_weights = any(
+        (path / name).is_file()
+        for name in ("model.safetensors", "pytorch_model.bin", "tf_model.h5")
+    )
+    has_tokenizer = any(
+        (path / name).is_file()
+        for name in ("tokenizer_config.json", "vocab.txt", "bpe.codes")
+    )
+    return has_config and has_weights and has_tokenizer
+
 
 def _resolve_phobert_time_model_path() -> str | None:
     """Return a local filesystem path for the PhoBERT time-label model."""
     r2_prefix = (settings.phobert_time_model_r2_prefix or "").strip()
     if r2_prefix:
-        cache_dir = Path(settings.phobert_time_model_cache_dir)
+        cache_dir = _resolve_ai_service_path(settings.phobert_time_model_cache_dir)
         logger.info(
             "[pipeline] Sync PhoBERT time model from R2 prefix '%s' to '%s'",
             r2_prefix,
             cache_dir,
         )
         try:
-            return str(ensure_r2_prefix(settings, r2_prefix, cache_dir))
+            synced_path = ensure_r2_prefix(settings, r2_prefix, cache_dir)
+            if _is_valid_phobert_checkpoint(synced_path):
+                return str(synced_path)
+            logger.warning(
+                "[pipeline] PhoBERT R2 cache is incomplete at '%s'. Fallback to local path.",
+                synced_path,
+            )
         except Exception as exc:
             logger.warning(
                 "[pipeline] Cannot sync PhoBERT model from R2: %s. Fallback to local path.",
@@ -53,9 +84,10 @@ def _resolve_phobert_time_model_path() -> str | None:
     if not local_path:
         return None
 
-    path = Path(local_path)
-    if not path.exists():
-        logger.warning("[pipeline] PhoBERT local model path does not exist: %s", path)
+    path = _resolve_ai_service_path(local_path)
+    if not _is_valid_phobert_checkpoint(path):
+        logger.warning("[pipeline] PhoBERT local checkpoint is missing or incomplete: %s", path)
+        return None
     return str(path)
 
 
@@ -104,17 +136,27 @@ def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         sentiment_model_name=DEFAULT_SENTIMENT_MODEL,
         zeroshot_model_name=DEFAULT_ZEROSHOT_MODEL,
         topic_model_name=DEFAULT_TOPIC_MODEL,
-        classifier_confidence_threshold=0.55,
-        classifier_ambiguity_margin=0.10,
+        classifier_confidence_threshold=request.classifier_confidence_threshold,
+        classifier_ambiguity_margin=request.classifier_ambiguity_margin,
         topic_other_threshold=request.topic_other_threshold,
         candidate_mode=request.candidate_mode,
-        top_k=5,
+        top_k=request.top_k,
         old_lookback_multiplier=6,
         promotion_mode=request.promotion_mode,
+        conflict_score_threshold=request.conflict_score_threshold,
+        ttl_hours_by_topic=request.ttl_hours_by_topic,
+        observation_rules=request.observation_rules,
+        lookback_multiplier_by_topic=request.lookback_multiplier_by_topic,
         phobert_time_model_path=phobert_time_model_path,
     )
 
-    pipeline = ReviewFilteringPipeline(config)
+    pipeline = ReviewFilteringPipeline(config, supabase_client=supabase)
+    if not pipeline.classifier_provider.phobert_time_active:
+        logger.warning(
+            "[pipeline] PhoBERT time-label model is not active. path=%s error=%s",
+            phobert_time_model_path,
+            pipeline.classifier_provider.phobert_time_error,
+        )
     report, contents, conflicts = pipeline.run(reviews)
 
     if not request.dry_run:
@@ -122,6 +164,7 @@ def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         write_contents_to_db(supabase, contents)
         logger.info(f"[pipeline] Ghi {len(conflicts)} conflicts về Supabase...")
         write_conflicts_to_db(supabase, conflicts)
+        mark_conflicted_contents(supabase, conflicts)
     else:
         logger.info("[pipeline] dry_run=True — bỏ qua ghi DB.")
 

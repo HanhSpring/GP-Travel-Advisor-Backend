@@ -1,15 +1,19 @@
 from dotenv import load_dotenv
 from pydantic_settings import BaseSettings
 from typing import Optional
+from pathlib import Path
 from pydantic import ConfigDict
 
 
-load_dotenv(".env", override=False)
+BASE_DIR = Path(__file__).resolve().parents[2]
+ENV_FILE = BASE_DIR / ".env"
+
+load_dotenv(ENV_FILE, override=False)
 
 
 class Settings(BaseSettings):
     model_config = ConfigDict(
-        env_file=".env",
+        env_file=str(ENV_FILE),
         extra="ignore",
         protected_namespaces=(),
     )
@@ -32,7 +36,7 @@ class Settings(BaseSettings):
     # PhoBERT path (optional)
     phobert_time_model_path: Optional[str] = None
     phobert_time_model_r2_prefix: Optional[str] = None
-    phobert_time_model_cache_dir: str = "/tmp/ai_cache/phobert_timelabel/checkpoint-60"
+    phobert_time_model_cache_dir: str = "/tmp/ai_cache/phobert_timelabel/checkpoint-264"
 
     # Recommender local paths
     reco_artifact_dir: str = "recommender_artifacts"

@@ -1,5 +1,5 @@
 import { ApiPropertyOptional } from '@nestjs/swagger';
-import { IsBoolean, IsNumber, IsOptional, IsString, Min } from 'class-validator';
+import { IsBoolean, IsIn, IsNumber, IsOptional, IsString, Max, Min } from 'class-validator';
 
 export class PipelineRunRequestDto {
   @ApiPropertyOptional({ description: 'Giới hạn số review xử lý (không truyền = tất cả pending)' })
@@ -75,4 +75,47 @@ export interface PipelineHistoryItemDto {
 export interface PipelineHistoryResponseDto {
   history: PipelineHistoryItemDto[];
   total: number;
+}
+
+export type ReviewFilterScheduleFrequency = 'daily' | 'weekly' | 'monthly';
+
+export class ReviewFilterScheduleDto {
+  @ApiPropertyOptional()
+  autoEnabled: boolean;
+
+  @ApiPropertyOptional({ enum: ['daily', 'weekly', 'monthly'] })
+  frequency: ReviewFilterScheduleFrequency;
+
+  @ApiPropertyOptional({ example: '02:00' })
+  runTime: string;
+
+  @ApiPropertyOptional({ example: '1' })
+  runDay: string;
+
+  @ApiPropertyOptional({ nullable: true })
+  lastRunAt: string | null;
+}
+
+export class UpdateReviewFilterScheduleDto {
+  @ApiPropertyOptional()
+  @IsOptional()
+  @IsBoolean()
+  autoEnabled?: boolean;
+
+  @ApiPropertyOptional({ enum: ['daily', 'weekly', 'monthly'] })
+  @IsOptional()
+  @IsIn(['daily', 'weekly', 'monthly'])
+  frequency?: ReviewFilterScheduleFrequency;
+
+  @ApiPropertyOptional({ example: '02:00' })
+  @IsOptional()
+  @IsString()
+  runTime?: string;
+
+  @ApiPropertyOptional({ minimum: 0, maximum: 31 })
+  @IsOptional()
+  @IsNumber()
+  @Min(0)
+  @Max(31)
+  runDay?: number;
 }
