@@ -193,7 +193,7 @@ export class BusinessService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, description, address, city_id, cities(name), latitude, longitude, open_time, close_time, image_url, is_approved, is_active, average_rating, review_count, type_id, types(id, name, categories(id, name))',
+        'id, name, description, address, email, phone, city_id, cities(name), latitude, longitude, open_time, close_time, image_url, is_approved, is_active, average_rating, review_count, type_id, types(id, name, categories(id, name))',
       )
       .eq('id', placeId)
       .maybeSingle();
@@ -241,6 +241,10 @@ export class BusinessService {
 
     if (typeof dto.name === 'string') updatePayload.name = dto.name.trim();
     if (typeof dto.address === 'string') updatePayload.address = dto.address.trim();
+    if (typeof dto.email === 'string') updatePayload.email = dto.email.trim();
+    if (typeof dto.p_email === 'string') updatePayload.email = dto.p_email.trim();
+    if (typeof dto.phone === 'string') updatePayload.phone = dto.phone.trim();
+    if (typeof dto.p_phone === 'string') updatePayload.phone = dto.p_phone.trim();
     if (typeof dto.description === 'string') updatePayload.description = dto.description;
     if (typeof dto.openTime === 'string') updatePayload.open_time = dto.openTime;
     if (typeof dto.closeTime === 'string') updatePayload.close_time = dto.closeTime;
@@ -485,6 +489,7 @@ export class BusinessService {
     const categories = dto.p_categories || dto.categories;
     const vendorId = dto.p_vendor_id || dto.vendorId;
     const email = (dto.p_email || dto.email || '').trim();
+    const phone = (dto.p_phone || dto.phone || '').trim();
     const resolvedType = await this.resolvePlaceType({
       typeId: dto.p_type_id || dto.typeId,
       typeName: dto.p_type_name || dto.typeName,
@@ -500,6 +505,10 @@ export class BusinessService {
     if (!email) throw new BadRequestException('Thieu du lieu: Email lien he');
     if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
       throw new BadRequestException('Email lien he khong dung dinh dang');
+    }
+    if (!phone) throw new BadRequestException('Thieu du lieu: SDT lien he');
+    if (!/^0\d{9}$/.test(phone)) {
+      throw new BadRequestException('SDT lien he phai gom dung 10 chu so va bat dau bang so 0');
     }
 
     let menu: any[] = [];
@@ -541,6 +550,7 @@ export class BusinessService {
         name,
         address,
         email,
+        phone,
         city_id: cityId,
         latitude: Number(dto.p_lat || dto.latitude),
         longitude: Number(dto.p_lng || dto.longitude),
