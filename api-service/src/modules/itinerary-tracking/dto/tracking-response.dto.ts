@@ -137,7 +137,7 @@ export class EndDayResponseDto {
   nextDayAlarmAt!: string | null;
   @ApiProperty({
     description: 'Trạng thái lịch trình sau khi kết thúc ngày',
-    enum: ['ongoing', 'completed'],
+    enum: ['ongoing', 'completed', 'uncompleted'],
   })
   itineraryStatus!: string;
   @ApiProperty() message!: string;
