@@ -48,7 +48,7 @@ def format_transit_label(dist_km: float) -> str:
     if dist_km == float("inf"):
         return "Di chuyển chưa rõ khoảng cách"
     mins = estimate_transit_minutes(dist_km)
-    return f"~{mins} phút di chuyển ({dist_km:.1f}km)"
+    return f"{mins} phút di chuyển"
 
 
 def optimize_day_schedule(
@@ -104,8 +104,8 @@ def optimize_day_schedule(
         
         orig_dur = act.duration_minutes
         if allow_reduce_time and not act.is_locked:
-            # Cho phép giảm thời gian tham quan tối đa 30 phút, thời gian tối thiểu 30p
-            min_dur = max(30, orig_dur - 30)
+            # Cho phép giảm thời gian tham quan tối đa 50%, thời gian tối thiểu 15p
+            min_dur = min(orig_dur, max(15, orig_dur // 2))
             duration[i] = model.NewIntVar(min_dur, orig_dur, f'duration_{i}')
         else:
             duration[i] = model.NewIntVar(orig_dur, orig_dur, f'duration_{i}')
@@ -193,7 +193,7 @@ def optimize_day_schedule(
                 max_dur = activities[i].duration_minutes
                 red = model.NewIntVar(0, max_dur, f'red_{i}')
                 model.Add(red == max_dur - duration[i])
-                penalty_terms.append(red * 100) # Phạt nặng để ưu tiên giữ nguyên duration
+                penalty_terms.append(red * 10) # Phạt nhẹ hơn (10) để ưu tiên giữ nguyên thời gian tham quan nếu có thể, nhưng sẵn sàng giảm nếu vi phạm lịch
                 
     model.Minimize(sum(travel_time_terms) + sum(penalty_terms))
     

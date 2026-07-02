@@ -45,19 +45,22 @@ export class EditActivityDto {
   @Max(480, { message: 'Thời gian tham quan tối đa 480 phút (8 tiếng)' })
   durationMinutes?: number;
 
-  /**
-   * Ghi chú cá nhân của user cho địa điểm này.
-   * VD: "Mua đồ lưu niệm ở đây, nhớ mặc cả!"
-   */
   @ApiPropertyOptional({
-    example: 'Nhớ mang theo thẻ sinh viên để được giảm giá 50%',
-    maxLength: 500,
-    description: 'Ghi chú cá nhân (tối đa 500 ký tự)',
+    example: 'Mua đồ lưu niệm ở đây, nhớ mặc cả!',
+    description: 'Ghi chú cá nhân của user',
   })
   @IsOptional()
-  @IsString({ message: 'userNotes phải là chuỗi ký tự' })
+  @IsString()
   @MaxLength(500, { message: 'Ghi chú không được vượt quá 500 ký tự' })
   userNotes?: string;
+
+  @ApiPropertyOptional({ description: 'Cờ cho phép giảm giờ các hoạt động khác để xử lý xung đột' })
+  @IsOptional()
+  allowReduceTime?: boolean;
+
+  @ApiPropertyOptional({ description: 'Cờ cho phép kéo dài thời gian hoạt động của ngày để xử lý xung đột' })
+  @IsOptional()
+  extendTime?: boolean;
 
   /**
    * Gỡ ghim giờ — cho phép optimizer tự sắp xếp lại thời gian.
