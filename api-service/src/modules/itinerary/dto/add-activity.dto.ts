@@ -7,6 +7,7 @@ import {
   Min,
   Max,
   Matches,
+  IsBoolean,
 } from 'class-validator';
 
 /**
@@ -70,4 +71,27 @@ export class AddActivityDto {
     message: 'preferredTime phải đúng định dạng HH:mm',
   })
   preferredTime?: string;
+
+  @ApiPropertyOptional({
+    example: 'Giữ chỗ cho 4 người lúc 19:00',
+    description: 'Ghi chú cá nhân',
+  })
+  @IsOptional()
+  @IsString()
+  userNotes?: string;
+
+  @ApiPropertyOptional({ description: 'Cờ cho phép giảm giờ các hoạt động khác để xử lý xung đột' })
+  @IsOptional()
+  @IsBoolean()
+  allowReduceTime?: boolean;
+
+  @ApiPropertyOptional({ description: 'Cờ cho phép kéo dài thời gian hoạt động của ngày để xử lý xung đột' })
+  @IsOptional()
+  @IsBoolean()
+  extendTime?: boolean;
+
+  @ApiPropertyOptional({ description: 'Cờ cho phép thêm 1 ngày vào lịch trình nếu bị đầy' })
+  @IsOptional()
+  @IsBoolean()
+  addExtraDay?: boolean;
 }

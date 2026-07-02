@@ -29,6 +29,7 @@ import { ToggleVisibilityDto } from './dto/toggle-visibility.dto';
 import { EditActivityDto } from './dto/edit-activity.dto';
 import { AddActivityDto } from './dto/add-activity.dto';
 import { UpdateItineraryDto } from './dto/update-itinerary.dto';
+import { ReplaceActivityDto } from './dto/replace-activity.dto';
 import {
   CustomizeActivityResponseDto,
   SuggestionsResponseDto,
@@ -386,26 +387,14 @@ export class ItineraryController {
   })
   @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
   @ApiParam({ name: 'activityId', description: 'ID hoạt động cần thay thế' })
-  @ApiBody({
-    schema: {
-      type: 'object',
-      required: ['newPlaceId'],
-      properties: {
-        newPlaceId: {
-          type: 'string',
-          example: 'place-uuid-789',
-          description: 'UUID của địa điểm mới từ travel.places',
-        },
-      },
-    },
-  })
+  @ApiBody({ type: ReplaceActivityDto })
   @ApiResponse({ status: 200, type: CustomizeActivityResponseDto })
   async replaceActivity(
     @Param('itineraryId') itineraryId: string,
     @Param('activityId') activityId: string,
-    @Body('newPlaceId') newPlaceId: string,
+    @Body() dto: ReplaceActivityDto,
   ) {
-    return this.service.replaceActivity(itineraryId, activityId, newPlaceId);
+    return this.service.replaceActivity(itineraryId, activityId, dto);
   }
 
   /**
@@ -470,16 +459,19 @@ export class ItineraryController {
     },
   ) {
     if (!body.activities || body.activities.length === 0) {
-      return { optimized: [] };
+      return { optimized: [], reorderNotes: [] };
     }
-    const optimized = await this.service.optimizeDayRoute(
+    const result = await this.service.optimizeDayRoute(
       body.activities,
       body.dailyStartTime,
       body.dailyEndTime,
       body.allowReduceTime || false,
       body.visitDate,
     );
-    return { optimized };
+    return {
+      optimized: result.optimized,
+      reorderNotes: result.reorderNotes,
+    };
   }
 
   private calcRequestedDays(startDate: string, endDate: string): number {

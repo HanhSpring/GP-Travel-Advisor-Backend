@@ -3,12 +3,14 @@ import {
   InternalServerErrorException,
   NotFoundException,
   BadRequestException,
+  ConflictException,
   Logger,
 } from '@nestjs/common';
 import axios from 'axios';
 import { supabase } from '../../config/supabase';
 import { EditActivityDto } from './dto/edit-activity.dto';
 import { AddActivityDto } from './dto/add-activity.dto';
+import { ReplaceActivityDto } from './dto/replace-activity.dto';
 
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
 
@@ -172,15 +174,26 @@ export class ItineraryService {
       .select('id')
       .single();
 
-    if (insertResult.error && /trip_intent/i.test(insertResult.error.message)) {
-      // Backward-compatible fallback for DBs that have not added trip_intent yet.
-      delete itineraryInsert.trip_intent;
+    let retries = 3;
+    while (
+      insertResult.error &&
+      (insertResult.error.message.includes('Could not find the') ||
+        insertResult.error.message.includes('column')) &&
+      retries > 0
+    ) {
+      const errorMsg = insertResult.error.message;
+      if (errorMsg.includes('daily_start_time')) delete itineraryInsert.daily_start_time;
+      if (errorMsg.includes('daily_end_time')) delete itineraryInsert.daily_end_time;
+      if (errorMsg.includes('trip_intent')) delete itineraryInsert.trip_intent;
+
       insertResult = await supabase
         .schema('travel')
         .from('itineraries')
         .insert(itineraryInsert)
         .select('id')
         .single();
+        
+      retries--;
     }
 
     const { data: itinerary, error: itineraryError } = insertResult;
@@ -376,7 +389,7 @@ export class ItineraryService {
       .schema('travel')
       .from('itinerary_details')
       .select(
-        'id, itinerary_id, visit_date, arrival_time, duration_minutes, is_locked',
+        'id, itinerary_id, visit_date, arrival_time, duration_minutes, is_locked, locked_arrive_time',
       )
       .eq('id', activityId)
       .eq('itinerary_id', itineraryId)
@@ -444,8 +457,59 @@ export class ItineraryService {
     if (!needsReOptimize) {
       return this._buildDayResponse(itineraryId, visitDate, []);
     }
+    try {
+      return await this._reOptimizeDay(
+        itineraryId,
+        visitDate,
+        undefined,
+        dto.allowReduceTime || false,
+        dto.extendTime || false,
+      );
+    } catch (e: any) {
+      if (e instanceof ConflictException && e.message === 'SCHEDULE_FULL') {
+        // Rollback
+        await supabase
+          .schema('travel')
+          .from('itinerary_details')
+          .update({
+            arrival_time: existing.arrival_time,
+            duration_minutes: existing.duration_minutes,
+            is_locked: existing.is_locked,
+            locked_arrive_time: existing.locked_arrive_time,
+          })
+          .eq('id', activityId);
 
-    return this._reOptimizeDay(itineraryId, visitDate);
+        // Calculate canExtend
+        const { data: itin } = await supabase
+          .schema('travel')
+          .from('itineraries')
+          .select('daily_end_time')
+          .eq('id', itineraryId)
+          .single();
+        const dailyEndTimeStr = itin?.daily_end_time || '22:00';
+        const canExtend = dailyEndTimeStr < '23:50:00';
+
+        // Calculate canReduce (dry-run)
+        let canReduce = false;
+        try {
+          const { data: siblingActivities } = await supabase
+            .schema('travel')
+            .from('itinerary_details')
+            .select('duration_minutes, is_locked')
+            .eq('itinerary_id', itineraryId)
+            .eq('visit_date', visitDate);
+          canReduce = siblingActivities?.some((a: any) => !a.is_locked && (a.duration_minutes || 60) > 30) ?? false;
+        } catch (_) {}
+
+        throw new ConflictException({
+          message: 'Thời gian tham quan đã bị quá tải hoặc vượt quá khung giờ hoạt động.',
+          canExtend,
+          canReduce,
+          canAddDay: false,
+        });
+      }
+      throw e;
+    }
   }
 
   /**
@@ -514,8 +578,33 @@ export class ItineraryService {
 
     // ─── Bước 2: Tính toán visit_date từ dayNumber ────────────────
     const startDate = new Date(itinerary.start_date);
-    startDate.setDate(startDate.getDate() + (dto.dayNumber - 1));
-    const visitDate = startDate.toISOString().split('T')[0]; // 'YYYY-MM-DD'
+    let visitDate = '';
+
+    if (dto.addExtraDay) {
+      const endDate = new Date(itinerary.end_date);
+      endDate.setDate(endDate.getDate() + 1);
+      visitDate = endDate.toISOString().split('T')[0];
+
+      const { data: itin2 } = await supabase
+        .schema('travel')
+        .from('itineraries')
+        .select('duration_days')
+        .eq('id', itineraryId)
+        .single();
+      const newDuration = (itin2?.duration_days || 1) + 1;
+
+      await supabase
+        .schema('travel')
+        .from('itineraries')
+        .update({
+          end_date: visitDate,
+          duration_days: newDuration,
+        })
+        .eq('id', itineraryId);
+    } else {
+      startDate.setDate(startDate.getDate() + (dto.dayNumber - 1));
+      visitDate = startDate.toISOString().split('T')[0]; // 'YYYY-MM-DD'
+    }
 
     // ─── Bước 3: Lấy thông tin địa điểm từ travel.places ─────────
     const { data: place, error: placeErr } = await supabase
@@ -597,12 +686,57 @@ export class ItineraryService {
     }
 
     // ─── Bước 7: Tối ưu lại ngày để sắp xếp địa điểm mới vào đúng chỗ ─
-    return this._reOptimizeDay(
-      itineraryId,
-      visitDate,
-      inserted.id,
-      (dto as any).allowReduceTime,
-    );
+    try {
+      return await this._reOptimizeDay(
+        itineraryId,
+        visitDate,
+        inserted.id,
+        dto.allowReduceTime || false,
+        dto.extendTime || false,
+      );
+    } catch (e: any) {
+      if (e instanceof ConflictException && e.message === 'SCHEDULE_FULL') {
+        // Rollback
+        await supabase
+          .schema('travel')
+          .from('itinerary_details')
+          .delete()
+          .eq('id', inserted.id);
+
+        if (dto.addExtraDay) {
+          // If we added an extra day and it STILL failed, just rollback the itinerary too?
+          // Too complex. Usually an empty day won't fail.
+        }
+
+        const { data: itin } = await supabase
+          .schema('travel')
+          .from('itineraries')
+          .select('daily_end_time')
+          .eq('id', itineraryId)
+          .single();
+        const dailyEndTimeStr = itin?.daily_end_time || '22:00';
+        const canExtend = dailyEndTimeStr < '23:50:00';
+
+        let canReduce = false;
+        try {
+          const { data: siblingActivities } = await supabase
+            .schema('travel')
+            .from('itinerary_details')
+            .select('duration_minutes, is_locked')
+            .eq('itinerary_id', itineraryId)
+            .eq('visit_date', visitDate);
+          canReduce = siblingActivities?.some((a: any) => !a.is_locked && (a.duration_minutes || 60) > 30) ?? false;
+        } catch (_) {}
+
+        throw new ConflictException({
+          message: 'Thời gian tham quan trong ngày đã kín.',
+          canExtend,
+          canReduce,
+          canAddDay: true, // Always true for Add Activity
+        });
+      }
+      throw e;
+    }
   }
 
   /**
@@ -616,14 +750,14 @@ export class ItineraryService {
   async replaceActivity(
     itineraryId: string,
     activityId: string,
-    newPlaceId: string,
+    dto: ReplaceActivityDto,
   ) {
     // ─── Bước 1: Lấy thông tin bản ghi cần thay thế ──────────────
     const { data: existing, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
       .select(
-        'id, visit_date, sequence_order, is_locked, locked_arrive_time, duration_minutes',
+        'id, visit_date, sequence_order, is_locked, locked_arrive_time, duration_minutes, place_id, estimated_cost',
       )
       .eq('id', activityId)
       .eq('itinerary_id', itineraryId)
@@ -640,12 +774,12 @@ export class ItineraryService {
       .schema('travel')
       .from('places')
       .select('id, estimated_cost')
-      .eq('id', newPlaceId)
+      .eq('id', dto.newPlaceId)
       .single();
 
     if (placeErr || !newPlace) {
       throw new NotFoundException(
-        `Không tìm thấy địa điểm với id: ${newPlaceId}`,
+        `Không tìm thấy địa điểm với id: ${dto.newPlaceId}`,
       );
     }
 
@@ -654,7 +788,7 @@ export class ItineraryService {
       .schema('travel')
       .from('itinerary_details')
       .update({
-        place_id: newPlaceId,
+        place_id: dto.newPlaceId,
         estimated_cost: newPlace.estimated_cost ?? 0,
         // Giữ nguyên: sequence_order, is_locked, locked_arrive_time, duration_minutes
       })
@@ -671,7 +805,55 @@ export class ItineraryService {
     }
 
     // ─── Bước 4: Tối ưu lại ngày ─────────────────────────────────
-    return this._reOptimizeDay(itineraryId, existing.visit_date);
+    try {
+      return await this._reOptimizeDay(
+        itineraryId,
+        existing.visit_date,
+        undefined,
+        dto.allowReduceTime || false,
+        dto.extendTime || false,
+      );
+    } catch (e: any) {
+      if (e instanceof ConflictException && e.message === 'SCHEDULE_FULL') {
+        // Rollback
+        await supabase
+          .schema('travel')
+          .from('itinerary_details')
+          .update({
+            place_id: existing.place_id,
+            estimated_cost: existing.estimated_cost,
+          })
+          .eq('id', activityId);
+
+        const { data: itin } = await supabase
+          .schema('travel')
+          .from('itineraries')
+          .select('daily_end_time')
+          .eq('id', itineraryId)
+          .single();
+        const dailyEndTimeStr = itin?.daily_end_time || '22:00';
+        const canExtend = dailyEndTimeStr < '23:50:00';
+
+        let canReduce = false;
+        try {
+          const { data: siblingActivities } = await supabase
+            .schema('travel')
+            .from('itinerary_details')
+            .select('duration_minutes, is_locked')
+            .eq('itinerary_id', itineraryId)
+            .eq('visit_date', existing.visit_date);
+          canReduce = siblingActivities?.some((a: any) => !a.is_locked && (a.duration_minutes || 60) > 30) ?? false;
+        } catch (_) {}
+
+        throw new ConflictException({
+          message: 'Thời gian tham quan trong ngày đã kín.',
+          canExtend,
+          canReduce,
+          canAddDay: false,
+        });
+      }
+      throw e;
+    }
   }
 
   /**
@@ -798,6 +980,7 @@ export class ItineraryService {
     visitDate: string,
     newActivityId?: string,
     allowReduceTime: boolean = false,
+    extendTime: boolean = false,
   ) {
     // ─── Lấy thời gian hoạt động của lịch trình ───────────────────
     const { data: itinerary } = await supabase
@@ -808,7 +991,11 @@ export class ItineraryService {
       .single();
 
     const dailyStartTime = itinerary?.daily_start_time || '07:00';
-    const dailyEndTime = itinerary?.daily_end_time || '22:00';
+    let dailyEndTime = itinerary?.daily_end_time || '22:00';
+
+    if (extendTime) {
+      dailyEndTime = '23:59:00';
+    }
 
     // ─── Lấy toàn bộ hoạt động trong ngày (JOIN với places) ──────
     const { data: activities, error: fetchErr } = await supabase
@@ -886,7 +1073,10 @@ export class ItineraryService {
         { timeout: 10000 }, // 10 giây timeout
       );
       optimizedSchedule = response.data.optimized_activities;
-    } catch (aiErr) {
+    } catch (aiErr: any) {
+      if (aiErr.response?.status === 422) {
+        throw new ConflictException('SCHEDULE_FULL');
+      }
       // AI Service không khả dụng → giữ nguyên thứ tự cũ, không throw lỗi
       console.warn(
         '[ItineraryService] AI optimizer không khả dụng, giữ nguyên thứ tự:',
@@ -906,6 +1096,7 @@ export class ItineraryService {
               arrival_time: opt.arrival_time,
               departure_time: opt.departure_time,
               sequence_order: opt.sequence_order,
+              duration_minutes: opt.duration_minutes,
             })
             .eq('id', opt.id),
         ),
@@ -1160,11 +1351,16 @@ export class ItineraryService {
           startDate.setDate(startDate.getDate() + (act.dayNumber - 1));
           const visitDate = startDate.toISOString().split('T')[0];
 
+          const startMin = this.toMinutes(act.startTime);
+          const endMin = this.toMinutes(act.endTime);
+          const duration = endMin - startMin > 0 ? endMin - startMin : 60;
+
           const updatePayload: any = {
             arrival_time: act.startTime,
             departure_time: act.endTime,
             visit_date: visitDate,
             sequence_order: act.sequenceOrder,
+            duration_minutes: duration,
           };
           if (act.placeId) {
             updatePayload.place_id = act.placeId;
@@ -1188,6 +1384,27 @@ export class ItineraryService {
           startDate.setDate(startDate.getDate() + (act.dayNumber - 1));
           const visitDate = startDate.toISOString().split('T')[0];
 
+          const startMin = this.toMinutes(act.startTime);
+          const endMin = this.toMinutes(act.endTime);
+          const duration = endMin - startMin > 0 ? endMin - startMin : 60;
+
+          // ─── Validate place_id tồn tại trong bảng places trước khi INSERT ───
+          // Tránh lỗi FK constraint "itinerary_details_place_id_fkey"
+          // khi placeId là ID tạm thời hoặc không tồn tại trong travel.places
+          const { data: placeExists } = await supabase
+            .schema('travel')
+            .from('places')
+            .select('id')
+            .eq('id', act.placeId)
+            .single();
+
+          if (!placeExists) {
+            console.warn(
+              `[Supabase] Bỏ qua activity ${act.id}: place_id "${act.placeId}" không tồn tại trong bảng places`,
+            );
+            return;
+          }
+
           const { error } = await supabase
             .schema('travel')
             .from('itinerary_details')
@@ -1197,6 +1414,7 @@ export class ItineraryService {
               visit_date: visitDate,
               arrival_time: act.startTime,
               departure_time: act.endTime,
+              duration_minutes: duration,
               sequence_order: act.sequenceOrder,
             });
 
@@ -1720,8 +1938,8 @@ export class ItineraryService {
     dailyEndTime?: string,
     allowReduceTime: boolean = false,
     visitDate?: string,
-  ) {
-    if (activities.length <= 2) return activities;
+  ): Promise<{ optimized: any[]; reorderNotes: string[] }> {
+    if (activities.length === 0) return { optimized: [], reorderNotes: [] };
 
     const resolvedVisitDate =
       visitDate ?? new Date().toISOString().split('T')[0];
@@ -1731,8 +1949,8 @@ export class ItineraryService {
       const payload = {
         itinerary_id: 'client-optimize', // placeholder — không cần lưu DB
         visit_date: resolvedVisitDate,
-        day_start_time: dailyStartTime || '07:00',
-        day_end_time: dailyEndTime || '22:00',
+        day_start_time: this.trimTime(dailyStartTime) || '07:00',
+        day_end_time: this.trimTime(dailyEndTime) || '22:00',
         activities: activities.map((a: any) => {
           // Tính duration từ startTime/endTime nếu không có sẵn
           const startMin = this.toMinutes(a.startTime || '07:00');
@@ -1740,12 +1958,17 @@ export class ItineraryService {
           const duration = endMin - startMin > 0 ? endMin - startMin : 60;
 
           // openTime/closeTime: ưu tiên trường tường minh, rồi parse openHourCompressed
-          const { open_time, close_time } = this._resolveOpenClose(
+          let { open_time, close_time } = this._resolveOpenClose(
             a.openTime,
             a.closeTime,
             a.openHourCompressed,
             resolvedVisitDate,
           );
+
+          const dayEndStr = this.trimTime(dailyEndTime) || '22:00';
+          if (this.toMinutes(dayEndStr) > this.toMinutes(close_time)) {
+             close_time = dayEndStr;
+          }
 
           return {
             id: a.id,
@@ -1775,18 +1998,32 @@ export class ItineraryService {
       );
 
       const optimized: any[] = response.data?.optimized_activities ?? [];
-      if (optimized.length === 0) return activities;
+      let reorderNotes: string[] = response.data?.reorder_notes ?? [];
+      if (optimized.length === 0) return { optimized: activities, reorderNotes: [] };
+
+      reorderNotes = reorderNotes.map(note => {
+        let newNote = note;
+        for (const a of activities) {
+          if (newNote.includes(a.id)) {
+            newNote = newNote.replace(a.id, a.title || a.locationName || 'địa điểm');
+          }
+        }
+        return newNote;
+      });
 
       // Map kết quả TSPTW về format Flutter mong đợi
-      return optimized.map((opt: any) => {
+      const mappedOptimized = optimized.map((opt: any) => {
         const original = activities.find((a: any) => a.id === opt.id) ?? {};
         return {
           ...original,
           startTime: opt.arrival_time,
           endTime: opt.departure_time,
           transportInfo: opt.transport_to_next ?? original.transportInfo,
+          durationMinutes: opt.duration_minutes ?? original.durationMinutes,
         };
       });
+
+      return { optimized: mappedOptimized, reorderNotes };
     } catch (e: any) {
       // Python AI service trả về 422 khi lịch kín — phải check 422, không phải 400
       if (
@@ -1796,7 +2033,11 @@ export class ItineraryService {
         throw new BadRequestException('SCHEDULE_FULL');
       }
       console.error('optimizeDayRoute failed:', e);
-      return activities; // Fallback: giữ nguyên thứ tự cũ
+      if (allowReduceTime) {
+        // Ném lỗi 500 nếu AI server timeout, để khách hàng biết là do server chứ không phải do lịch kín
+        throw new Error('AI Server is unresponsive or timed out.');
+      }
+      return { optimized: activities, reorderNotes: [] }; // Fallback: giữ nguyên thứ tự cũ
     }
   }
 
