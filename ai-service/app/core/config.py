@@ -1,19 +1,30 @@
-from dotenv import load_dotenv
+import os
+from pathlib import Path
+
+from dotenv import dotenv_values, load_dotenv
 from pydantic_settings import BaseSettings
 from typing import Optional
 from pathlib import Path
 from pydantic import ConfigDict
 
 
-BASE_DIR = Path(__file__).resolve().parents[2]
-ENV_FILE = BASE_DIR / ".env"
+AI_SERVICE_ROOT = Path(__file__).resolve().parents[2]
+BACKEND_ROOT = AI_SERVICE_ROOT.parent
 
-load_dotenv(ENV_FILE, override=False)
+load_dotenv(AI_SERVICE_ROOT / ".env", override=False)
+
+# NestJS owns the active database configuration. Reuse exactly the same
+# Supabase URL/key so AI config and review jobs cannot drift to another DB.
+api_env = dotenv_values(BACKEND_ROOT / "api-service" / ".env")
+for key in ("SUPABASE_URL", "SUPABASE_KEY"):
+    value = str(api_env.get(key) or "").strip()
+    if value:
+        os.environ[key] = value
 
 
 class Settings(BaseSettings):
     model_config = ConfigDict(
-        env_file=str(ENV_FILE),
+        env_file=str(AI_SERVICE_ROOT / ".env"),
         extra="ignore",
         protected_namespaces=(),
     )

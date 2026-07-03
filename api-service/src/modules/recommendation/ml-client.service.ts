@@ -31,6 +31,7 @@ export interface ItineraryPlanPayload {
     open_hour_compressed?: string | null;
     visit_duration?: number | null;
     average_rating?: number | null;
+    review_count?: number | null;
     retrieval_score?: number | null;
     candidate_rank?: number | null;
     candidate_total?: number | null;
@@ -39,6 +40,8 @@ export interface ItineraryPlanPayload {
     price_max?: number | null;
     price_basis?: string | null;
     price_inferred?: boolean | null;
+    best_time?: 'MORNING' | 'AFTERNOON' | 'NIGHT' | 'ALL_DAY' | null;
+    best_time_source?: string | null;
     planner_source?: string | null;
   }>;
   num_days: number;
@@ -47,8 +50,9 @@ export interface ItineraryPlanPayload {
   trip_start_date?: string | null;
   adult_count?: number;
   child_count?: number;
-  budget_per_person?: number;
+  trip_budget_total?: number;
   selected_hotel_id?: string | null;
+  hotel_total_cost?: number;
   return_to_hotel?: boolean;
   use_goong?: boolean;
   require_goong?: boolean;

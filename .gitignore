@@ -164,6 +164,8 @@ pids
 tmp/
 temp/
 .tmp/
+docs/
+scripts/
 Note/
 tmp-run-logs/
 

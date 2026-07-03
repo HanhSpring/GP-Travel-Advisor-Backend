@@ -4,9 +4,8 @@ import {
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import * as XLSX from 'xlsx';
 import { supabase } from '../../config/supabase';
 import { ItineraryPlanPayload, MlClientService } from './ml-client.service';
 import { CreateItineraryDto } from '../itinerary/dto/create-itinerary.dto';
@@ -29,25 +28,21 @@ import {
   DEFAULT_TWO_TOWER_RUNTIME_CONFIG,
   TwoTowerRuntimeConfig,
 } from './two-tower-config.types';
-
-type PriceBasis = 'per_person' | 'per_room_per_night' | 'per_group' | 'unknown';
-
-interface PriceInfo {
-  estimatedCost: number | null;
-  min: number | null;
-  max: number | null;
-  avg: number | null;
-  basis: PriceBasis;
-  inferred: boolean | null;
-  itemCount: number;
-  rawItems: Array<{ name?: string; price: number }>;
+interface HotelSelection {
+  hotelId: string;
+  hotelTotalCost: number;
+  pricePerPersonPerNight: number;
+  groupNightlyCost: number;
+  fullPeople: number;
+  nights: number;
+  score: number;
+  budgetRelaxed: boolean;
 }
 
 @Injectable()
 export class RecommendationService {
   private readonly logger = new Logger(RecommendationService.name);
   private readonly foodCategoryId = '97029cfb-069b-4dba-a152-dfb3d36634d3';
-  private priceIndex: Map<string, PriceInfo> | null = null;
 
   constructor(private readonly mlClient: MlClientService) {}
 
@@ -306,16 +301,20 @@ export class RecommendationService {
     const retrievalMs = Date.now() - retrievalStartedAt;
     const plannerCandidates = retrieval.candidates;
     const detailsStartedAt = Date.now();
-    const details = await this.fetchPlannerPlaceDetails(plannerCandidates);
+    const details = await this.fetchPlannerPlaceDetails(
+      plannerCandidates,
+      dto.adultCount,
+      dto.childCount ?? 0,
+    );
     const detailsMs = Date.now() - detailsStartedAt;
     if (!details.length) {
       throw new NotFoundException(
-        `Thành phố ${retrieval.destination_name} hiện chưa có đủ dữ liệu địa điểm để tạo lịch trình. Vui lòng chọn thành phố khác.`,
+        'No place details found for itinerary planning',
       );
     }
     if (!details.some((place) => place.place_type === 'hotel')) {
       throw new NotFoundException(
-        `Thành phố ${retrieval.destination_name} hiện chưa có dữ liệu khách sạn/nơi lưu trú. Vui lòng chọn thành phố khác.`,
+        'No real hotel/accommodation candidate found for itinerary planning',
       );
     }
 
@@ -349,6 +348,25 @@ export class RecommendationService {
         `(retrieval mix: ${this.formatCandidateCounts(retrieval.candidates)})`,
     );
 
+    const hotelSelection = this.selectHotelByEstimatedPrice(
+      details,
+      dto.adultCount + (dto.childCount ?? 0),
+      Math.max(1, numDays - 1),
+      Number(dto.budget ?? 0),
+    );
+    const selectedHotel = details.find(
+      (place) => place.id === hotelSelection.hotelId,
+    );
+    if (selectedHotel) {
+      selectedHotel.price_basis = 'per_person_per_night';
+    }
+    this.logger.warn(
+      `Selected hotel ${hotelSelection.hotelId}: ` +
+        `price/person/night=${hotelSelection.pricePerPersonPerNight}, ` +
+        `people=${hotelSelection.fullPeople}, nights=${hotelSelection.nights}, ` +
+        `cost=${hotelSelection.hotelTotalCost}, relaxed=${hotelSelection.budgetRelaxed}`,
+    );
+
     const payload: ItineraryPlanPayload = {
       places: details,
       num_days: numDays,
@@ -357,11 +375,12 @@ export class RecommendationService {
       trip_start_date: dto.startDate,
       adult_count: dto.adultCount,
       child_count: dto.childCount ?? 0,
-      budget_per_person: dto.budget ?? 0,
-      // GOONG: Bật use_goong=true khi đã có GOONG_API_KEY trong ai-service/.env.
-      // QUAN TRọNG: require_goong phải =false nếu không có key.
-      // require_goong=true + không có key → GA skip toàn bộ địa điểm → visited_count=0!
-      use_goong: false,
+      trip_budget_total: dto.budget ?? 0,
+      selected_hotel_id: hotelSelection.hotelId,
+      hotel_total_cost: hotelSelection.hotelTotalCost,
+      // Prefer real road travel times. The AI service still reads its cache
+      // first and falls back to Haversine when Goong is unavailable.
+      use_goong: true,
       require_goong: false,
       travel_vehicle: this.resolveGoongVehicle(dto.transportMode),
       population_size: 50,
@@ -375,13 +394,30 @@ export class RecommendationService {
       const aiStartedAt = Date.now();
       const plan = await this.mlClient.planItinerary(payload);
       const aiPlannerMs = Date.now() - aiStartedAt;
+      const enrichedPlan =
+        plan != null && typeof plan === 'object'
+          ? {
+              ...plan,
+              hotel_selection: {
+                hotel_id: hotelSelection.hotelId,
+                hotel_total_cost: hotelSelection.hotelTotalCost,
+                price_per_person_per_night:
+                  hotelSelection.pricePerPersonPerNight,
+                group_nightly_cost: hotelSelection.groupNightlyCost,
+                full_people: hotelSelection.fullPeople,
+                nights: hotelSelection.nights,
+                budget_relaxed: hotelSelection.budgetRelaxed,
+                score: Number(hotelSelection.score.toFixed(6)),
+              },
+            }
+          : plan;
       this.logItineraryRunJson({
         dto,
         topK,
         numDays,
         retrieval,
         details,
-        plan,
+        plan: enrichedPlan,
         candidateBuilder: {
           availableMinutes: plannerTargets.availableMinutes,
           dailyQuota: plannerTargets.dailyQuota,
@@ -395,7 +431,7 @@ export class RecommendationService {
           backendTotalMs: Date.now() - runStartedAt,
         },
       });
-      return plan;
+      return enrichedPlan;
     } catch (err: any) {
       const detail = err?.message ?? String(err);
       throw new ServiceUnavailableException(`AI Service error: ${detail}`);
@@ -496,6 +532,8 @@ export class RecommendationService {
 
   private async fetchPlannerPlaceDetails(
     candidates: CandidatePlaceDto[],
+    adultCount: number,
+    childCount: number,
   ): Promise<ItineraryPlanPayload['places']> {
     const candidateById = new Map(
       candidates.map((candidate, index) => [
@@ -504,11 +542,14 @@ export class RecommendationService {
       ]),
     );
     const ids = candidates.map((candidate) => candidate.place_id);
+    const payingPeople =
+      Math.max(0, Number(adultCount) || 0) +
+      Math.max(0, Number(childCount) || 0) * 0.5;
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
       .select(
-        'id,name,longitude,latitude,open_hour_compressed,source,type_id,slot_type,visit_duration,average_rating,types(name,categories(id,name))',
+        'id,name,longitude,latitude,open_hour_compressed,source,type_id,slot_type,visit_duration,average_rating,review_count,price,price_inferred,best_time,types(name,categories(id,name))',
       )
       .in('id', ids);
 
@@ -538,7 +579,27 @@ export class RecommendationService {
           categoryName,
           typeData?.name ?? '',
         );
-        const price = this.getPriceInfo(row.id, placeType);
+        const rawPrice =
+          row.price == null || row.price === '' ? null : Number(row.price);
+        const normalizedPrice =
+          rawPrice != null && Number.isFinite(rawPrice) && rawPrice > 0
+            ? Math.round(rawPrice)
+            : 0;
+        const estimatedCost =
+          placeType === 'hotel'
+            ? normalizedPrice
+            : Math.round(normalizedPrice * payingPeople);
+        const rawBestTime = String(row.best_time ?? '')
+          .trim()
+          .toUpperCase();
+        const bestTime = [
+          'MORNING',
+          'AFTERNOON',
+          'NIGHT',
+          'ALL_DAY',
+        ].includes(rawBestTime)
+          ? (rawBestTime as 'MORNING' | 'AFTERNOON' | 'NIGHT' | 'ALL_DAY')
+          : null;
         return {
           id: row.id,
           name: row.name,
@@ -559,14 +620,22 @@ export class RecommendationService {
           visit_duration: row.visit_duration ?? null,
           average_rating:
             row.average_rating != null ? Number(row.average_rating) : null,
+          review_count:
+            row.review_count != null ? Number(row.review_count) : null,
           retrieval_score: candidate?.cosine_score ?? null,
           candidate_rank: candidateMeta?.index ?? null,
           candidate_total: candidates.length,
-          estimated_cost: price.estimatedCost,
-          price_min: price.min,
-          price_max: price.max,
-          price_basis: price.basis,
-          price_inferred: price.inferred,
+          estimated_cost: estimatedCost,
+          price_min: rawPrice != null && rawPrice > 0 ? normalizedPrice : null,
+          price_max: rawPrice != null && rawPrice > 0 ? normalizedPrice : null,
+          price_basis:
+            placeType === 'hotel'
+              ? 'per_person_per_night'
+              : 'group_total',
+          price_inferred:
+            typeof row.price_inferred === 'boolean' ? row.price_inferred : null,
+          best_time: bestTime,
+          best_time_source: bestTime ? 'database' : null,
           planner_source: 'two_tower',
         };
       })
@@ -574,6 +643,130 @@ export class RecommendationService {
         (a: any, b: any) =>
           (a.candidate_rank ?? 999_999) - (b.candidate_rank ?? 999_999),
       );
+  }
+
+  private selectHotelByEstimatedPrice(
+    places: ItineraryPlanPayload['places'],
+    totalGuests: number,
+    nights: number,
+    tripBudgetTotal: number,
+  ): HotelSelection {
+    const hotels = places.filter((place) => place.place_type === 'hotel');
+    const fullPeople = Math.max(1, Math.trunc(totalGuests));
+    const stayNights = Math.max(1, Math.trunc(nights));
+    const centroid = this.candidateCentroid(
+      places.filter((place) => place.place_type !== 'hotel'),
+    );
+    const candidates: HotelSelection[] = [];
+    for (const hotel of hotels) {
+      const pricePerPersonPerNight = Math.max(
+        0,
+        Math.round(Number(hotel.estimated_cost ?? 0)),
+      );
+      if (pricePerPersonPerNight <= 0) continue;
+      const groupNightlyCost = pricePerPersonPerNight * fullPeople;
+      const hotelTotalCost = groupNightlyCost * stayNights;
+
+      const twoTowerScore = this.clamp01(
+        Number(hotel.retrieval_score ?? 0),
+      );
+      const ratingScore = this.clamp01(
+        Number(hotel.average_rating ?? 0) / 5,
+      );
+      const distanceKm = centroid
+        ? this.haversineKm(
+            Number(hotel.latitude),
+            Number(hotel.longitude),
+            centroid.latitude,
+            centroid.longitude,
+          )
+        : 0;
+      const locationScore =
+        distanceKm <= 3
+          ? 1
+          : distanceKm <= 7
+            ? 0.8
+            : distanceKm <= 15
+              ? 0.5
+              : 0.2;
+      const hotelBudgetCap = tripBudgetTotal * 0.45;
+      const priceScore =
+        hotelBudgetCap > 0
+          ? 1 - Math.min(1, hotelTotalCost / hotelBudgetCap)
+          : 0.5;
+      const score =
+        0.45 * twoTowerScore +
+        0.2 * ratingScore +
+        0.2 * locationScore +
+        0.15 * priceScore;
+
+      candidates.push({
+        hotelId: hotel.id,
+        pricePerPersonPerNight,
+        groupNightlyCost,
+        hotelTotalCost,
+        fullPeople,
+        nights: stayNights,
+        score,
+        budgetRelaxed: hotelBudgetCap > 0 && hotelTotalCost > hotelBudgetCap,
+      });
+    }
+
+    if (!candidates.length) {
+      throw new NotFoundException(
+        'Không tìm thấy khách sạn có giá ước tính/người/đêm hợp lệ',
+      );
+    }
+
+    const withinBudget = candidates.filter(
+      (candidate) => !candidate.budgetRelaxed,
+    );
+    const pool = withinBudget.length ? withinBudget : candidates;
+    return [...pool].sort(
+      (left, right) =>
+        right.score - left.score ||
+        left.hotelTotalCost - right.hotelTotalCost,
+    )[0];
+  }
+
+  private candidateCentroid(
+    places: ItineraryPlanPayload['places'],
+  ): { latitude: number; longitude: number } | null {
+    const valid = places.filter(
+      (place) =>
+        Number.isFinite(Number(place.latitude)) &&
+        Number.isFinite(Number(place.longitude)),
+    );
+    if (!valid.length) return null;
+    return {
+      latitude:
+        valid.reduce((sum, place) => sum + Number(place.latitude), 0) /
+        valid.length,
+      longitude:
+        valid.reduce((sum, place) => sum + Number(place.longitude), 0) /
+        valid.length,
+    };
+  }
+
+  private haversineKm(
+    lat1: number,
+    lng1: number,
+    lat2: number,
+    lng2: number,
+  ): number {
+    const radians = (value: number) => (value * Math.PI) / 180;
+    const deltaLat = radians(lat2 - lat1);
+    const deltaLng = radians(lng2 - lng1);
+    const value =
+      Math.sin(deltaLat / 2) ** 2 +
+      Math.cos(radians(lat1)) *
+        Math.cos(radians(lat2)) *
+        Math.sin(deltaLng / 2) ** 2;
+    return 6371 * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
+  }
+
+  private clamp01(value: number): number {
+    return Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0));
   }
 
   private resolvePlannerPlaceType(
@@ -787,191 +980,16 @@ export class RecommendationService {
     }, {});
   }
 
-  private getPriceInfo(placeId: string, placeType?: string | null): PriceInfo {
-    const indexed = this.getPriceIndex().get(placeId);
-    if (indexed) return indexed;
-    return {
-      estimatedCost: null,
-      min: null,
-      max: null,
-      avg: null,
-      basis: this.inferPriceBasis(placeType ?? 'unknown'),
-      inferred: null,
-      itemCount: 0,
-      rawItems: [],
-    };
-  }
-
-  private getPriceIndex(): Map<string, PriceInfo> {
-    if (this.priceIndex) return this.priceIndex;
-    const index = new Map<string, PriceInfo>();
-    const csvPath = join(
-      process.cwd(),
-      '..',
-      'docs',
-      'places_rows_after_fill.csv',
-    );
-    if (!existsSync(csvPath)) {
-      this.logger.warn(`Price CSV not found: ${csvPath}`);
-      this.priceIndex = index;
-      return index;
-    }
-
-    try {
-      const workbook = XLSX.readFile(csvPath, { raw: false });
-      const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const rows = XLSX.utils.sheet_to_json<Record<string, any>>(sheet, {
-        defval: null,
-      });
-      for (const row of rows) {
-        const id = String(row.id ?? '').trim();
-        if (!id) continue;
-        const slotType = normalizeCategory(String(row.slot_type ?? ''), '');
-        const placeType = slotType === 'accommodation' ? 'hotel' : slotType;
-        index.set(
-          id,
-          this.normalizePriceInfo(row.price, row.price_inferred, placeType),
-        );
-      }
-      this.logger.warn(`Loaded ${index.size} place prices from ${csvPath}`);
-    } catch (err: any) {
-      this.logger.warn(
-        `Failed to load price CSV: ${err?.message ?? String(err)}`,
-      );
-    }
-
-    this.priceIndex = index;
-    return index;
-  }
-
-  private normalizePriceInfo(
-    rawPrice: unknown,
-    rawInferred: unknown,
-    placeType: string,
-  ): PriceInfo {
-    const rawItems = this.parsePriceItems(rawPrice);
-    const parsedPrices = rawItems
-      .map((item) => Number(item.price))
-      .filter((price) => Number.isFinite(price) && price >= 0);
-    const prices = parsedPrices
-      .filter((price) => price === 0 || price >= 1000)
-      .sort((a, b) => a - b);
-    const inferred = this.parseBoolean(rawInferred);
-    if (!prices.length) {
-      return {
-        estimatedCost: null,
-        min: null,
-        max: null,
-        avg: null,
-        basis: this.inferPriceBasis(placeType),
-        inferred,
-        itemCount: 0,
-        rawItems: [],
-      };
-    }
-    if (prices.every((price) => price === 0)) {
-      return {
-        estimatedCost: 0,
-        min: 0,
-        max: 0,
-        avg: 0,
-        basis: this.inferPriceBasis(placeType),
-        inferred,
-        itemCount: prices.length,
-        rawItems,
-      };
-    }
-
-    const billablePrices = prices.filter((price) => price > 0);
-    const avg = Math.round(
-      billablePrices.reduce((sum, price) => sum + price, 0) /
-        billablePrices.length,
-    );
-    return {
-      estimatedCost: this.percentile(billablePrices, 0.5),
-      min: billablePrices[0],
-      max: billablePrices[billablePrices.length - 1],
-      avg,
-      basis: this.inferPriceBasis(placeType),
-      inferred,
-      itemCount: billablePrices.length,
-      rawItems,
-    };
-  }
-
-  private parsePriceItems(
-    rawPrice: unknown,
-  ): Array<{ name?: string; price: number }> {
-    if (rawPrice == null || rawPrice === '') return [];
-    if (Array.isArray(rawPrice)) {
-      return rawPrice
-        .map((item: any) => ({ name: item?.name, price: Number(item?.price) }))
-        .filter((item) => Number.isFinite(item.price));
-    }
-    const text = String(rawPrice).trim();
-    if (!text) return [];
-    try {
-      const parsed = JSON.parse(text);
-      if (Array.isArray(parsed)) {
-        return parsed
-          .map((item: any) => ({
-            name: item?.name,
-            price: Number(item?.price),
-          }))
-          .filter((item) => Number.isFinite(item.price));
-      }
-      if (parsed && typeof parsed === 'object' && 'price' in parsed) {
-        return [{ name: parsed.name, price: Number(parsed.price) }];
-      }
-    } catch {
-      const matches = text.match(/\d[\d.,]*/g) ?? [];
-      return matches
-        .map((value) => ({ price: Number(value.replace(/[.,]/g, '')) }))
-        .filter((item) => Number.isFinite(item.price));
-    }
-    return [];
-  }
-
-  private parseBoolean(value: unknown): boolean | null {
-    if (value == null || value === '') return null;
-    if (typeof value === 'boolean') return value;
-    const text = String(value).trim().toLowerCase();
-    if (text === 'true' || text === '1') return true;
-    if (text === 'false' || text === '0') return false;
-    return null;
-  }
-
-  private inferPriceBasis(placeType: string): PriceBasis {
-    if (placeType === 'hotel' || placeType === 'accommodation')
-      return 'per_room_per_night';
-    if (
-      ['restaurant', 'cafe', 'attraction', 'entertainment'].includes(placeType)
-    ) {
-      return 'per_person';
-    }
-    return 'unknown';
-  }
-
-  private percentile(values: number[], p: number): number {
-    if (!values.length) return 0;
-    const idx = Math.min(
-      values.length - 1,
-      Math.max(0, Math.round((values.length - 1) * p)),
-    );
-    return values[idx];
-  }
-
   private estimateTripCostFromPrices(
     dto: CreateItineraryDto,
     numDays: number,
     days: any[],
+    details: ItineraryPlanPayload['places'],
     hotelId?: string | null,
   ): Record<string, any> {
     const adults = Number(dto.adultCount ?? 0);
     const children = Number(dto.childCount ?? 0);
-    const payingPeople = adults + children * 0.5;
     const fullPeople = adults + children;
-    const rooms = Math.max(1, Math.ceil(fullPeople / 2));
     const nights = Math.max(1, numDays - 1);
     const scheduleEntries = days.flatMap((day: any) =>
       Array.isArray(day.schedule) ? day.schedule : [],
@@ -987,51 +1005,45 @@ export class RecommendationService {
           ? 'restaurant'
           : (entry.place_type ?? 'attraction');
       if (type === 'return_to_hotel') continue;
-      const price = this.getPriceInfo(entry.location_id, type);
-      if (price.estimatedCost == null) {
+      const cost = Math.max(0, Math.round(Number(entry.estimated_cost ?? 0)));
+      if (entry.estimated_cost == null) {
         confidence.missing += 1;
-        continue;
-      }
-      if (price.inferred === false) confidence.observed += 1;
-      else if (price.inferred === true) confidence.inferred += 1;
+      } else if (entry.price_inferred === false) confidence.observed += 1;
+      else if (entry.price_inferred === true) confidence.inferred += 1;
       else confidence.missing += 1;
-      const multiplier = price.basis === 'per_person' ? payingPeople : 1;
-      const cost = Math.round(price.estimatedCost * multiplier);
       byType[type] = (byType[type] ?? 0) + cost;
       variableCost += cost;
     }
 
-    const hotelPrice = this.getPriceInfo(hotelId ?? '', 'hotel');
-    const hotelPerNight = hotelPrice.estimatedCost ?? 400_000;
-    const hotel = Math.round(hotelPerNight * nights * rooms);
-    if (hotelPrice.estimatedCost == null) {
+    const hotelDetail = details.find((place) => place.id === hotelId);
+    const hotelPerPersonPerNight = Math.max(
+      0,
+      Math.round(Number(hotelDetail?.estimated_cost ?? 0)),
+    );
+    const hotel = Math.round(
+      hotelPerPersonPerNight * Math.max(1, fullPeople) * nights,
+    );
+    if (hotelDetail?.estimated_cost == null) {
       confidence.missing += 1;
-    } else if (hotelPrice.inferred === false) {
+    } else if (hotelDetail.price_inferred === false) {
       confidence.observed += 1;
-    } else if (hotelPrice.inferred === true) {
+    } else if (hotelDetail.price_inferred === true) {
       confidence.inferred += 1;
     }
-    const totalsByType = this.aggregateDaysByType(days);
     const transport = Math.round(
-      Object.values(totalsByType).reduce(
-        (sum, value: any) => sum + Number(value?.distanceKm ?? 0),
+      days.reduce(
+        (sum: number, day: any) => sum + Number(day.total_transport_cost ?? 0),
         0,
-      ) * 5_000,
+      ),
     );
     const total = Math.round(hotel + variableCost + transport);
-    const budget = Number(dto.budget ?? 0);
-    const totalBudget = budget * Math.max(1, adults + children);
+    const totalBudget = Number(dto.budget ?? 0);
     return {
-      mode: 'csv_price_preview',
-      note: 'Prices are read from docs/places_rows_after_fill.csv until price columns are uploaded to DB.',
-      assumptionsVnd: {
-        fallbackHotelPerRoomNight: 400_000,
-        transportPerKm: 5_000,
-        childFactor: 0.5,
-        roomCapacity: 2,
-      },
+      mode: 'database_place_price',
+      note: 'All places.price values are per person. Hotel price is per person per night and is multiplied by full_people and nights.',
+      assumptionsVnd: {},
       confidence,
-      travelers: { adults, children, adultEquivalent: payingPeople, rooms },
+      travelers: { adults, children, fullPeople },
       nights,
       breakdownVnd: {
         hotel,
@@ -1042,7 +1054,6 @@ export class RecommendationService {
         transport,
       },
       totalVnd: total,
-      userBudgetPerPersonVnd: budget,
       userBudgetVnd: totalBudget,
       overBudgetVnd: totalBudget > 0 ? Math.max(0, total - totalBudget) : null,
     };
@@ -1131,7 +1142,11 @@ export class RecommendationService {
         priceMax: place.price_max ?? null,
         priceBasis: place.price_basis ?? null,
         priceInferred: place.price_inferred ?? null,
+        bestTime: place.best_time ?? null,
+        bestTimeSource: place.best_time_source ?? null,
         plannerSource: place.planner_source ?? 'two_tower',
+        latitude: place.latitude ?? null,
+        longitude: place.longitude ?? null,
       })),
       timingsMs: {
         twoTower: args.timings.twoTowerMs,
@@ -1140,8 +1155,11 @@ export class RecommendationService {
         aiTotal: plan.total_ms ?? null,
         goongMatrix: plan.matrix_ms ?? null,
         ga: plan.ga_ms ?? null,
+        solver: plan.solver_ms ?? null,
         backendTotal: args.timings.backendTotalMs,
       },
+      plannerEngine: plan.planner_engine ?? 'ga_v1',
+      travelSourceCounts: plan.travel_source_counts ?? {},
       hotel: {
         id: plan.hotel_id ?? null,
         name: plan.hotel_name ?? null,
@@ -1149,6 +1167,7 @@ export class RecommendationService {
       assignment: {
         dayLoads: plan.assignment_day_loads ?? [],
         warnings: plan.assignment_warnings ?? [],
+        dayPools: plan.assignment_debug ?? [],
       },
       validation: {
         isFeasible: plan.validation_is_feasible ?? true,
@@ -1160,6 +1179,7 @@ export class RecommendationService {
         args.dto,
         args.numDays,
         days,
+        args.details,
         plan.hotel_id ?? null,
       ),
       days: days.map((day: any) => ({
@@ -1192,7 +1212,6 @@ export class RecommendationService {
                 : entry.is_restaurant
                   ? 'restaurant'
                   : (entry.place_type ?? 'attraction');
-              const price = this.getPriceInfo(entry.location_id, type);
               return {
                 sequence: index + 1,
                 locationId: entry.location_id,
@@ -1213,11 +1232,11 @@ export class RecommendationService {
                 baseDurationMinutes: entry.base_duration_minutes,
                 activeDurationMinutes: entry.active_duration_minutes,
                 unknownHours: entry.unknown_hours,
-                estimatedCost: entry.estimated_cost ?? price.estimatedCost,
-                priceMin: price.min,
-                priceMax: price.max,
-                priceBasis: entry.price_basis ?? price.basis,
-                priceInferred: entry.price_inferred ?? price.inferred,
+                estimatedCost: entry.estimated_cost ?? 0,
+                priceMin: null,
+                priceMax: null,
+                priceBasis: entry.price_basis ?? 'group_total',
+                priceInferred: entry.price_inferred ?? null,
               };
             })
           : [],

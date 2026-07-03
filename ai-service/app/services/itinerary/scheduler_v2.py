@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import datetime
 import math
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
-from app.services.itinerary.assignment import AssignmentResult
+from app.services.itinerary.assignment import (
+    AssignmentConfig,
+    AssignmentResult,
+    ConstrainedKMeansAssignment,
+)
 from app.services.itinerary import planner
 
 try:
@@ -28,6 +31,55 @@ except ImportError:  # pragma: no cover
 # ── Lunch cutoff ────────────────────────────────────────────────────────
 # Nếu ngày bắt đầu sau mốc này → không enforce ăn trưa.
 LUNCH_ENFORCE_CUTOFF = 13 * 60 + 30  # 13:30
+DINNER_START = 18 * 60
+DINNER_END = 19 * 60 + 30
+MEAL_MIN_GAP_MINUTES = 210
+ENTERTAINMENT_EARLIEST_START = 13 * 60
+LATE_ENTERTAINMENT_EARLIEST_START = 18 * 60
+ENTERTAINMENT_EARLY_PENALTY_PER_MIN = 4
+IDLE_TIME_PENALTY_PER_MIN = 2
+HEAD_IDLE_TIME_PENALTY_PER_MIN = 4
+BEST_TIME_WINDOWS = {
+    "MORNING": (7 * 60, 11 * 60 + 30),
+    "AFTERNOON": (13 * 60, 17 * 60 + 30),
+    "NIGHT": (18 * 60, 22 * 60),
+}
+BEST_TIME_BASE_PENALTY_PER_MIN = 2
+BEST_TIME_LARGE_DEVIATION_PENALTY_PER_MIN = 4
+BEST_TIME_GRACE_MINUTES = 30
+
+
+def preferred_time_window(
+    poi: planner.POI,
+    day_start: int,
+    day_end: int,
+) -> Optional[Tuple[int, int]]:
+    window = BEST_TIME_WINDOWS.get(
+        str(getattr(poi, "best_time", "ALL_DAY") or "ALL_DAY").upper()
+    )
+    if window is None:
+        return None
+    start = max(day_start, poi.open_time, window[0])
+    end = min(day_end, poi.close_time, window[1])
+    if start > end:
+        return None
+    return start, end
+
+
+def best_time_deviation_minutes(
+    poi: planner.POI,
+    service_start: int,
+    day_start: int,
+    day_end: int,
+) -> int:
+    window = preferred_time_window(poi, day_start, day_end)
+    if window is None:
+        return 0
+    if service_start < window[0]:
+        return window[0] - service_start
+    if service_start > window[1]:
+        return service_start - window[1]
+    return 0
 
 
 # ── Config ──────────────────────────────────────────────────────────────
@@ -41,11 +93,12 @@ class SchedulerV2Config:
     travel_sources: Dict[Tuple[str, str], str]
     travel_reliability: Dict[Tuple[str, str], List[dict]]
     selected_hotel_id: Optional[str]
+    hotel_total_cost: float
     day_start_time: int
     day_end_time: int
     return_to_hotel: bool
     require_goong_edges: bool
-    budget_per_person: float
+    trip_budget_total: float
     adult_count: int
     child_count: int
     travel_vehicle: str
@@ -116,9 +169,8 @@ class SchedulerV2Planner:
         self.adult_equivalent = (
             self.adult_count + self.child_count * planner.CHILD_COST_FACTOR
         )
-        self.rooms = max(1, math.ceil(self.full_people / planner.ROOM_CAPACITY))
-        self.budget_per_person = max(0.0, float(config.budget_per_person or 0))
-        self.trip_budget = (self.budget_per_person * self.full_people) * 0.9
+        self.trip_budget_total = max(0.0, float(config.trip_budget_total or 0))
+        self.trip_budget = self.trip_budget_total * 0.9
 
         if config.selected_hotel_id:
             hotel_place = next(
@@ -158,15 +210,123 @@ class SchedulerV2Planner:
         self.target_nonmeal_per_day = max(1, self.target_pois_per_day - 1)
 
         # ── Budget: linh hoạt giữa các ngày ──
-        self.hotel_total_cost = self._hotel_total_cost(hotel_place)
+        self.hotel_total_cost = (
+            max(0.0, float(config.hotel_total_cost or 0))
+            or self._hotel_total_cost(hotel_place)
+        )
         residual_budget = max(0.0, self.trip_budget - self.hotel_total_cost)
         self.trip_residual_budget = residual_budget
-        self.daily_budget_soft = (
-            residual_budget / self.num_days if self.num_days > 0 else 0.0
-        )
+        self.daily_budget_soft = residual_budget
 
         # ── Cluster ──
         self.assignment_result = self._preallocate_days()
+
+    def _is_late_entertainment(self, poi: planner.POI) -> bool:
+        text = planner.normalize_text(f"{poi.name} {poi.place_type}")
+        return any(
+            keyword in text
+            for keyword in (
+                "karaoke",
+                "bar",
+                "pub",
+                "club",
+                "cinema",
+                "rap phim",
+                "billiard",
+                "bida",
+                "game",
+                "escape",
+                "bowling",
+            )
+        )
+
+    def _entertainment_earliest_start(self, poi: planner.POI) -> int:
+        if poi.place_type != "entertainment":
+            return 0
+        if self._is_late_entertainment(poi):
+            return LATE_ENTERTAINMENT_EARLIEST_START
+        return ENTERTAINMENT_EARLIEST_START
+
+    def _apply_restaurant_constraints(
+        self,
+        model: cp_model.CpModel,
+        pois: List[planner.POI],
+        selected: dict,
+        start_var: dict,
+        lunch_window: Optional[Tuple[int, int]],
+        enforce_lunch: bool,
+        scope_tag: str,
+    ) -> None:
+        restaurant_nodes = [
+            idx + 1
+            for idx, poi in enumerate(pois)
+            if poi.place_type == "restaurant"
+        ]
+        if not restaurant_nodes:
+            return
+
+        model.Add(sum(selected[i] for i in restaurant_nodes) <= 2)
+
+        lunch_flags = []
+        dinner_flags = []
+        for node in restaurant_nodes:
+            poi = pois[node - 1]
+            if (
+                lunch_window
+                and poi.open_time <= lunch_window[1]
+                and poi.close_time >= lunch_window[0]
+            ):
+                lunch_flag = model.NewBoolVar(f"{scope_tag}_lunch_{node}")
+                model.Add(start_var[node] >= lunch_window[0]).OnlyEnforceIf(lunch_flag)
+                model.Add(start_var[node] <= lunch_window[1]).OnlyEnforceIf(lunch_flag)
+                model.AddImplication(lunch_flag, selected[node])
+                lunch_flags.append(lunch_flag)
+
+            if poi.open_time <= DINNER_END and poi.close_time >= DINNER_START:
+                dinner_flag = model.NewBoolVar(f"{scope_tag}_dinner_{node}")
+                model.Add(start_var[node] >= DINNER_START).OnlyEnforceIf(dinner_flag)
+                model.Add(start_var[node] <= DINNER_END).OnlyEnforceIf(dinner_flag)
+                model.AddImplication(dinner_flag, selected[node])
+                dinner_flags.append(dinner_flag)
+
+        if enforce_lunch and lunch_flags:
+            model.Add(sum(lunch_flags) >= 1)
+
+        if len(restaurant_nodes) >= 2:
+            second_meal = model.NewBoolVar(f"{scope_tag}_second_meal")
+            model.Add(sum(selected[i] for i in restaurant_nodes) >= 2).OnlyEnforceIf(
+                second_meal
+            )
+            model.Add(sum(selected[i] for i in restaurant_nodes) <= 1).OnlyEnforceIf(
+                second_meal.Not()
+            )
+            if dinner_flags:
+                model.Add(sum(dinner_flags) >= 1).OnlyEnforceIf(second_meal)
+            else:
+                model.Add(second_meal == 0)
+
+            for left_idx in range(len(restaurant_nodes)):
+                for right_idx in range(left_idx + 1, len(restaurant_nodes)):
+                    left = restaurant_nodes[left_idx]
+                    right = restaurant_nodes[right_idx]
+                    pair_selected = model.NewBoolVar(
+                        f"{scope_tag}_pair_{left}_{right}"
+                    )
+                    model.AddBoolAnd([selected[left], selected[right]]).OnlyEnforceIf(
+                        pair_selected
+                    )
+                    model.AddBoolOr(
+                        [selected[left].Not(), selected[right].Not(), pair_selected]
+                    )
+                    left_before_right = model.NewBoolVar(
+                        f"{scope_tag}_order_{left}_{right}"
+                    )
+                    model.Add(
+                        start_var[right] >= start_var[left] + MEAL_MIN_GAP_MINUTES
+                    ).OnlyEnforceIf([pair_selected, left_before_right])
+                    model.Add(
+                        start_var[left] >= start_var[right] + MEAL_MIN_GAP_MINUTES
+                    ).OnlyEnforceIf([pair_selected, left_before_right.Not()])
 
     # ────────────────────────────────────────────────────────────────────
     # PUBLIC: run
@@ -175,6 +335,7 @@ class SchedulerV2Planner:
     def run(self, seed: Optional[int] = None) -> planner.MultiDayResult:
         del seed
         start_day_idx = self.start_date.weekday()
+        remaining_budget = self.trip_residual_budget
 
         def solve_one_day(day_idx: int) -> planner.DayResult:
             pool = self.assignment_result.day_pools[day_idx]
@@ -195,18 +356,16 @@ class SchedulerV2Planner:
             )
 
         # Chạy song song các ngày
-        workers = min(self.num_days, 4)
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(solve_one_day, d): d
-                for d in range(self.num_days)
-            }
-            results_map: dict[int, planner.DayResult] = {}
-            for future in as_completed(futures):
-                day_idx = futures[future]
-                results_map[day_idx] = future.result()
-
-        day_results = [results_map[d] for d in range(self.num_days)]
+        day_results: list[planner.DayResult] = []
+        for day_idx in range(self.num_days):
+            self.daily_budget_soft = max(0.0, remaining_budget)
+            day_result = solve_one_day(day_idx)
+            day_results.append(day_result)
+            remaining_budget = max(
+                0.0,
+                remaining_budget
+                - max(0.0, float(day_result.ga_result.total_day_cost or 0)),
+            )
         return planner.MultiDayResult(
             hotel=self.hotel,
             num_days=self.num_days,
@@ -236,9 +395,9 @@ class SchedulerV2Planner:
     ) -> planner.GAResult:
         """
         Solve with fallback chain:
-          1. Strict lunch window + 10% budget tolerance
-          2. Relaxed lunch window (±30 min) + 20% budget tolerance
-          3. No lunch constraint + 35% budget tolerance
+          1. Strict lunch window + hard budget
+          2. Relaxed lunch window (±30 min) + hard budget
+          3. Super-relaxed lunch window + hard budget
           4. Greedy fallback
         """
         # PRE-PRUNING
@@ -247,7 +406,7 @@ class SchedulerV2Planner:
             if p.open_time >= self.day_end_time or p.close_time <= self.day_start_time:
                 continue
             p_cost = getattr(p, "estimated_cost", 0)
-            if self.daily_budget_soft > 0 and p_cost > self.daily_budget_soft * 1.5:
+            if self.trip_budget_total > 0 and p_cost > self.daily_budget_soft * 1.5:
                 total = max(1, p.candidate_total)
                 bounded_rank = min(max(p.candidate_rank, 0), total - 1)
                 rank_score = 1.0 - (bounded_rank / total)
@@ -258,10 +417,6 @@ class SchedulerV2Planner:
             pruned_pois.append(p)
         pois = pruned_pois
         
-        # Limit to top 10
-        if len(pois) > 10:
-            pois = sorted(pois, key=lambda x: getattr(x, "candidate_rank", 100))[:10]
-
         # Xác định có enforce lunch hay không
         if is_day_1:
             day1_start = self.config.check_in_time or self.day_start_time
@@ -284,20 +439,23 @@ class SchedulerV2Planner:
             relaxed = (lunch_win[0] - 30, lunch_win[1] + 30)
             result = self._solve_day_core(
                 day_number, pois, is_day_1,
-                enforce_lunch=True, lunch_window=relaxed, budget_tolerance_ratio=0.05
+                enforce_lunch=True, lunch_window=relaxed, budget_tolerance_ratio=0.00
             )
             if result is not None:
                 return result
 
-        # ── Attempt 3: no lunch ──
-        result = self._solve_day_core(
-            day_number, pois, is_day_1,
-            enforce_lunch=False, lunch_window=None, budget_tolerance_ratio=0.15
-        )
-        if result is not None:
-            return result
+            # ── Attempt 3: super relaxed lunch (10:00 - 15:00) ──
+            super_relaxed = (10 * 60, 15 * 60)
+            result = self._solve_day_core(
+                day_number, pois, is_day_1,
+                enforce_lunch=True, lunch_window=super_relaxed, budget_tolerance_ratio=0.00
+            )
+            if result is not None:
+                return result
 
-        # ── Attempt 4: greedy fallback ──
+
+
+        # ── Attempt 5: greedy fallback ──
         return self._greedy_fallback(day_number, pois, is_day_1)
 
     # ────────────────────────────────────────────────────────────────────
@@ -458,12 +616,12 @@ class SchedulerV2Planner:
                     to_id = pois[j - 1].id
                     raw = helper._raw_travel(from_id, to_id)
                     buf, _ = helper._travel_buffer(from_id, to_id, raw, None)
-                    travel_minutes[(i, j)] = raw + buf
+                    travel_minutes[(i, j)] = self._round_travel_minutes(raw + buf)
                     travel_distance[(i, j)] = helper._distance(from_id, to_id)
             # place → hotel
             raw = helper._raw_travel(from_id, self.hotel.id)
             buf, _ = helper._travel_buffer(from_id, self.hotel.id, raw, None)
-            travel_minutes[(i, HOTEL)] = raw + buf
+            travel_minutes[(i, HOTEL)] = self._round_travel_minutes(raw + buf)
             travel_distance[(i, HOTEL)] = helper._distance(
                 from_id, self.hotel.id
             )
@@ -492,19 +650,15 @@ class SchedulerV2Planner:
                 depart[j] <= min(self.day_end_time, int(poi.close_time))
             ).OnlyEnforceIf(selected[j])
             # Lunch constraint
-            if (
-                poi.place_type == "restaurant"
-                and enforce_lunch
-                and lunch_window
-            ):
-                model.Add(
-                    start_var[j] >= lunch_window[0]
-                ).OnlyEnforceIf(selected[j])
-                model.Add(
-                    start_var[j] <= lunch_window[1]
-                ).OnlyEnforceIf(selected[j])
+            if poi.place_type == "restaurant" and enforce_lunch:
+                lunch_flag = model.NewBoolVar(f"lunch_flag_{j}")
+                model.AddImplication(lunch_flag, selected[j])
+                lunch_flags.append(lunch_flag)
+                if lunch_window and poi.open_time <= lunch_window[1] and poi.close_time >= lunch_window[0]:
+                    model.Add(start_var[j] >= lunch_window[0]).OnlyEnforceIf(lunch_flag)
+                    model.Add(start_var[j] <= lunch_window[1]).OnlyEnforceIf(lunch_flag)
 
-        if enforce_lunch and lunch_window:
+        if enforce_lunch:
             if lunch_flags:
                 model.Add(sum(lunch_flags) >= 1)
 
@@ -527,13 +681,20 @@ class SchedulerV2Planner:
         model.Add(return_time <= self.day_end_time)
 
         # ── Restaurant constraint ──
-        restaurant_nodes = [
-            idx + 1
-            for idx, poi in enumerate(pois)
-            if poi.place_type == "restaurant"
+        self._apply_restaurant_constraints(
+            model,
+            pois,
+            selected,
+            start_var,
+            lunch_window,
+            enforce_lunch,
+            "day1",
+        )
+        cafe_nodes = [
+            i for i in range(1, n + 1) if pois[i - 1].place_type == "cafe"
         ]
-        if restaurant_nodes:
-            model.Add(sum(selected[i] for i in restaurant_nodes) <= 2)
+        if cafe_nodes:
+            model.Add(sum(selected[i] for i in cafe_nodes) <= 1)
 
         # ── Max/Min POIs ──
         target_max = min(n, max(1, self.target_pois_per_day))
@@ -543,8 +704,10 @@ class SchedulerV2Planner:
 
         # ── Objective ──
         self._add_objective(
-            model, n, pois, selected, wait,
-            arc_vars, travel_minutes, travel_distance, helper, budget_tolerance_ratio
+            model, n, pois, selected, start_var, wait,
+            arc_vars, travel_minutes, travel_distance, helper, budget_tolerance_ratio,
+            return_time=return_time,
+            day_start=day_start,
         )
 
         # ── Solve ──
@@ -559,7 +722,7 @@ class SchedulerV2Planner:
         reason = (
             "cpsat_optimal" if status == cp_model.OPTIMAL else "cpsat_feasible"
         )
-        if not enforce_lunch or not lunch_flags:
+        if not enforce_lunch:
             reason += "_no_lunch"
 
         return self._build_result_from_route(
@@ -653,7 +816,7 @@ class SchedulerV2Planner:
                 to_id = self.hotel.id if j == 0 else pois[j - 1].id
                 raw = helper._raw_travel(from_id, to_id)
                 buf, _ = helper._travel_buffer(from_id, to_id, raw, None)
-                travel_minutes[(i, j)] = raw + buf
+                travel_minutes[(i, j)] = self._round_travel_minutes(raw + buf)
                 travel_distance[(i, j)] = helper._distance(from_id, to_id)
 
         # ── Time constraints ──
@@ -680,18 +843,15 @@ class SchedulerV2Planner:
                 depart[j] <= min(self.day_end_time, int(poi.close_time))
             ).OnlyEnforceIf(selected[j])
             # Lunch
-            if (
-                poi.place_type == "restaurant"
-                and enforce_lunch
-                and lunch_window
-            ):
+            if poi.place_type == "restaurant" and enforce_lunch:
                 lunch_flag = model.NewBoolVar(f"lunch_flag_{j}")
-                model.Add(start_var[j] >= lunch_window[0]).OnlyEnforceIf(lunch_flag)
-                model.Add(start_var[j] <= lunch_window[1]).OnlyEnforceIf(lunch_flag)
                 model.AddImplication(lunch_flag, selected[j])
                 lunch_flags.append(lunch_flag)
+                if lunch_window and poi.open_time <= lunch_window[1] and poi.close_time >= lunch_window[0]:
+                    model.Add(start_var[j] >= lunch_window[0]).OnlyEnforceIf(lunch_flag)
+                    model.Add(start_var[j] <= lunch_window[1]).OnlyEnforceIf(lunch_flag)
 
-        if enforce_lunch and lunch_window:
+        if enforce_lunch:
             if lunch_flags:
                 model.Add(sum(lunch_flags) >= 1)
 
@@ -714,13 +874,20 @@ class SchedulerV2Planner:
         model.Add(return_time <= self.day_end_time)
 
         # ── Restaurant constraint ──
-        restaurant_nodes = [
-            idx + 1
-            for idx, poi in enumerate(pois)
-            if poi.place_type == "restaurant"
+        self._apply_restaurant_constraints(
+            model,
+            pois,
+            selected,
+            start_var,
+            lunch_window,
+            enforce_lunch,
+            "day1",
+        )
+        cafe_nodes = [
+            i for i in range(1, n + 1) if pois[i - 1].place_type == "cafe"
         ]
-        if restaurant_nodes:
-            model.Add(sum(selected[i] for i in restaurant_nodes) <= 2)
+        if cafe_nodes:
+            model.Add(sum(selected[i] for i in cafe_nodes) <= 1)
 
         # ── Max/Min POIs ──
         target_max = min(n, max(1, self.target_pois_per_day))
@@ -730,8 +897,10 @@ class SchedulerV2Planner:
 
         # ── Objective ──
         self._add_objective(
-            model, n, pois, selected, wait,
-            arc_vars, travel_minutes, travel_distance, helper, budget_tolerance_ratio
+            model, n, pois, selected, start_var, wait,
+            arc_vars, travel_minutes, travel_distance, helper, budget_tolerance_ratio,
+            return_time=return_time,
+            day_start=day_start,
         )
 
         # ── Solve ──
@@ -746,7 +915,7 @@ class SchedulerV2Planner:
         reason = (
             "cpsat_optimal" if status == cp_model.OPTIMAL else "cpsat_feasible"
         )
-        if not enforce_lunch or not lunch_flags:
+        if not enforce_lunch:
             reason += "_no_lunch"
 
         return self._build_result_from_route(
@@ -772,34 +941,39 @@ class SchedulerV2Planner:
         n: int,
         pois: List[planner.POI],
         selected: dict,
+        start_var: dict,
         wait: dict,
         arc_vars: dict,
         travel_minutes: dict,
         travel_distance: dict,
         helper,
         budget_tolerance_ratio: float,
+        return_time,
+        day_start: int = None,
     ) -> None:
+        effective_day_start = day_start if day_start is not None else self.day_start_time
+        available_minutes = max(1, self.day_end_time - effective_day_start)
+
         utility_terms = []
         travel_terms = []
         wait_terms = []
         skipped_terms = []
         activity_cost_terms = []
-        transport_cost_terms = []
+        best_time_penalty_terms = []
 
-        daily_budget_per_person = self.budget_per_person / max(1, self.num_days)
+        daily_budget_target = self.trip_budget / max(1, self.num_days)
         user_tier = "low"
-        if daily_budget_per_person >= 1200000:
+        if daily_budget_target >= 1200000:
             user_tier = "high"
-        elif daily_budget_per_person >= 500000:
+        elif daily_budget_target >= 500000:
             user_tier = "medium"
 
         for i, poi in enumerate(pois, start=1):
             poi_cost = helper._poi_cost(poi)
-            cost_per_person = poi_cost / max(1, self.full_people)
             poi_price_tier = "cheap"
-            if cost_per_person >= 500000:
+            if poi_cost >= 500000:
                 poi_price_tier = "premium"
-            elif cost_per_person >= 100000:
+            elif poi_cost >= 100000:
                 poi_price_tier = "medium"
 
             price_fit_bonus = 0
@@ -818,63 +992,215 @@ class SchedulerV2Planner:
                 premium_low_score_penalty = 250
 
             cost_penalty = int(poi_cost // 10000)
-            poi_reward = int(round(two_tower_score * 1000))
+            # Food utility is scaled down: restaurants 300x, cafes 150x (vs attractions 1000x)
+            if poi.place_type == "restaurant":
+                poi_reward = int(round(two_tower_score * 300))
+            elif poi.place_type == "cafe":
+                poi_reward = int(round(two_tower_score * 150))
+            else:
+                poi_reward = int(round(two_tower_score * 1000))
             stay_penalty = int(poi.visit_duration)
             effective_reward = poi_reward + price_fit_bonus - premium_low_score_penalty - cost_penalty - stay_penalty
 
             utility_terms.append(effective_reward * selected[i])
             wait_terms.append(wait[i] * 30)
-            skipped_terms.append(2000 * selected[i].Not())
+            # Reduced skipped weight (80) to match winner scoring and let density penalty steer count
+            skipped_terms.append(80 * selected[i].Not())
             activity_cost_terms.append(int(round(poi_cost)) * selected[i])
+
+            preferred_window = preferred_time_window(
+                poi,
+                effective_day_start,
+                self.day_end_time,
+            )
+            if preferred_window is not None:
+                early = model.NewIntVar(0, 24 * 60, f"best_time_early_{i}")
+                late = model.NewIntVar(0, 24 * 60, f"best_time_late_{i}")
+                model.Add(early >= preferred_window[0] - start_var[i]).OnlyEnforceIf(
+                    selected[i]
+                )
+                model.Add(late >= start_var[i] - preferred_window[1]).OnlyEnforceIf(
+                    selected[i]
+                )
+                model.Add(early == 0).OnlyEnforceIf(selected[i].Not())
+                model.Add(late == 0).OnlyEnforceIf(selected[i].Not())
+                large_early = model.NewIntVar(
+                    0, 24 * 60, f"best_time_large_early_{i}"
+                )
+                large_late = model.NewIntVar(
+                    0, 24 * 60, f"best_time_large_late_{i}"
+                )
+                model.Add(large_early >= early - BEST_TIME_GRACE_MINUTES)
+                model.Add(large_late >= late - BEST_TIME_GRACE_MINUTES)
+                best_time_penalty_terms.append(
+                    (early + late) * BEST_TIME_BASE_PENALTY_PER_MIN
+                    + (large_early + large_late)
+                    * BEST_TIME_LARGE_DEVIATION_PENALTY_PER_MIN
+                )
+
+        entertainment_penalty_terms = []
+        for i, poi in enumerate(pois, start=1):
+            earliest = self._entertainment_earliest_start(poi)
+            if earliest <= 0:
+                continue
+            early_minutes = model.NewIntVar(
+                0, 24 * 60, f"entertainment_early_minutes_{i}"
+            )
+            model.Add(early_minutes >= earliest - start_var[i])
+            model.Add(early_minutes >= 0)
+            entertainment_penalty_terms.append(
+                early_minutes * ENTERTAINMENT_EARLY_PENALTY_PER_MIN
+            )
 
         for (i, j), var in arc_vars.items():
             tm = travel_minutes.get((i, j), 0)
-            td = travel_distance.get((i, j), 0.0)
-            travel_terms.append(
-                tm * 2 * var
-            )
-            transport_cost_terms.append(
-                int(round(td * self.cost_per_km)) * var
-            )
+            travel_terms.append(tm * 2 * var)
 
-        # Budget: soft penalty tính theo đơn vị 1k VND vượt ngân sách/ngày.
-        # Dùng O(n) approximation cho transport cost thay vì tổng qua arc_vars (O(n²)).
-        # Xấp xỉ: mỗi POI được chọn đóng góp transport ≈ dist(hotel, place) × cost_per_km.
-        # Giữ nguyên độ chính xác thực tế (transport << activity cost) nhưng giảm LP complexity.
-        budget_unit = planner.BUDGET_OVERAGE_UNIT_VND  # 1_000 VND
+        # ── Budget: soft penalty in 1k-VND units ──
+        budget_unit = planner.BUDGET_OVERAGE_UNIT_VND
         daily_budget_k = max(0, int(self.daily_budget_soft) // budget_unit)
 
         activity_cost_k = sum(
             (int(round(helper._poi_cost(pois[i - 1]))) // budget_unit) * selected[i]
             for i in range(1, n + 1)
         )
-        # O(n): xấp xỉ transport theo khoảng cách 1 chiều hotel→place mỗi POI được chọn
+        # Use the same route arcs as the CP-SAT circuit/path. The previous
+        # hotel-to-each-selected-POI approximation could disagree materially
+        # with the final route cost reported after solving.
         transport_cost_k = sum(
-            (int(round(
-                helper._distance(self.hotel.id, pois[i - 1].id) * self.cost_per_km
-            )) // budget_unit) * selected[i]
-            for i in range(1, n + 1)
+            (
+                int(
+                    round(
+                        max(0.0, float(travel_distance.get((i, j), 0.0)))
+                        * self.cost_per_km
+                    )
+                )
+                // budget_unit
+            )
+            * var
+            for (i, j), var in arc_vars.items()
         )
 
-        if daily_budget_k > 0:
+        if self.trip_budget_total > 0:
             max_allowed_cost_k = int(daily_budget_k * (1 + budget_tolerance_ratio))
             model.Add(activity_cost_k + transport_cost_k <= max_allowed_cost_k)
 
         budget_k_overage = model.NewIntVar(0, 2_000_000, "budget_k_overage")
-        if self.daily_budget_soft > 0:
+        if self.trip_budget_total > 0:
             model.Add(budget_k_overage >= activity_cost_k + transport_cost_k - daily_budget_k)
         else:
             model.Add(budget_k_overage == 0)
 
-        # weight = BUDGET_PENALTY_WEIGHT (3) — 1 đơn vị penalty mỗi 1k VND vượt budget
-        budget_penalty = budget_k_overage * 2  # equivalent to excess // 500
+        budget_penalty = budget_k_overage * 2
+
+        # ── Day-density penalty ──
+        # target: one POI per 150 min of available time
+        target_poi_count = max(1, round(available_minutes / 150))
+
+        selected_total = model.NewIntVar(0, n, "selected_total")
+        model.Add(selected_total == sum(selected.values()))
+
+        density_diff = model.NewIntVar(0, n, "density_diff")
+        model.AddAbsEquality(density_diff, selected_total - target_poi_count)
+        density_penalty_term = density_diff * 200
+
+        # Dense-day penalty: avg_minutes_per_poi < 90 ⟺ selected > available // 90
+        dense_threshold = max(1, available_minutes // 90)
+        is_too_dense = model.NewBoolVar("is_too_dense")
+        model.Add(selected_total > dense_threshold).OnlyEnforceIf(is_too_dense)
+        model.Add(selected_total <= dense_threshold).OnlyEnforceIf(is_too_dense.Not())
+        dense_penalty_term = is_too_dense * 500
+
+        # Sparse-day penalty: selected_count <= 2 on a full-length day
+        sparse_penalty_term: object = 0
+        if available_minutes >= 720:
+            is_too_sparse = model.NewBoolVar("is_too_sparse")
+            model.Add(selected_total <= 2).OnlyEnforceIf(is_too_sparse)
+            model.Add(selected_total > 2).OnlyEnforceIf(is_too_sparse.Not())
+            sparse_penalty_term = is_too_sparse * 600
+
+        # ── Distance penalty (in 0.1-km integer units) ──
+        arc_dist_10 = {
+            (i, j): int(round(travel_distance.get((i, j), 0.0) * 10))
+            for (i, j) in arc_vars
+        }
+        dist_total_10 = model.NewIntVar(0, 20000, "dist_total_10")
+        model.Add(
+            dist_total_10 == sum(arc_dist_10[(i, j)] * arc_vars[(i, j)] for (i, j) in arc_vars)
+        )
+
+        # >60 km: +20/km over = +2 per 0.1-km unit over 600
+        dist_over_600 = model.NewIntVar(0, 20000, "dist_over_600")
+        model.Add(dist_over_600 >= dist_total_10 - 600)
+        # >80 km: additional +50/km = +5 per unit over 800
+        dist_over_800 = model.NewIntVar(0, 20000, "dist_over_800")
+        model.Add(dist_over_800 >= dist_total_10 - 800)
+        # >100 km: +2000 flat
+        is_extreme_dist = model.NewBoolVar("is_extreme_dist")
+        model.Add(dist_total_10 > 1000).OnlyEnforceIf(is_extreme_dist)
+        model.Add(dist_total_10 <= 1000).OnlyEnforceIf(is_extreme_dist.Not())
+
+        distance_penalty_term = dist_over_600 * 2 + dist_over_800 * 5 + is_extreme_dist * 2000
+
+        # ── Travel-time penalty ──
+        raw_travel_terms = [
+            travel_minutes.get((i, j), 0) * var
+            for (i, j), var in arc_vars.items()
+        ]
+        total_travel_var = model.NewIntVar(0, 24 * 60, "total_travel_var")
+        model.Add(total_travel_var == sum(raw_travel_terms))
+
+        # >180 min: +5/min; >240 min: +10/min additional; >300 min: +2000 flat
+        travel_over_180 = model.NewIntVar(0, 1440, "travel_over_180")
+        model.Add(travel_over_180 >= total_travel_var - 180)
+        travel_over_240 = model.NewIntVar(0, 1440, "travel_over_240")
+        model.Add(travel_over_240 >= total_travel_var - 240)
+        is_extreme_travel = model.NewBoolVar("is_extreme_travel")
+        model.Add(total_travel_var > 300).OnlyEnforceIf(is_extreme_travel)
+        model.Add(total_travel_var <= 300).OnlyEnforceIf(is_extreme_travel.Not())
+
+        travel_penalty_term = (
+            travel_over_180 * 5
+            + travel_over_240 * 10
+            + is_extreme_travel * 2000
+        )
+
+        idle_tail = model.NewIntVar(0, 24 * 60, "idle_tail")
+        model.Add(idle_tail == self.day_end_time - return_time)
+        idle_penalty_term = idle_tail * IDLE_TIME_PENALTY_PER_MIN
+
+        # Penalize an unnecessarily late first stop. Previously only the idle
+        # tail was penalized, so a route could start at lunch and still finish
+        # late enough to look attractive to the objective.
+        head_idle_terms = []
+        for (i, j), arc in arc_vars.items():
+            if i not in (0, -1) or not (1 <= j <= n):
+                continue
+            head_idle = model.NewIntVar(0, 24 * 60, f"head_idle_{j}")
+            model.Add(
+                head_idle
+                >= start_var[j]
+                - effective_day_start
+                - travel_minutes.get((i, j), 0)
+            ).OnlyEnforceIf(arc)
+            model.Add(head_idle == 0).OnlyEnforceIf(arc.Not())
+            head_idle_terms.append(head_idle * HEAD_IDLE_TIME_PENALTY_PER_MIN)
 
         model.Minimize(
             sum(travel_terms)
             + sum(wait_terms)
+            + sum(entertainment_penalty_terms)
+            + sum(best_time_penalty_terms)
             + budget_penalty
             + sum(skipped_terms)
             - sum(utility_terms)
+            + density_penalty_term
+            + dense_penalty_term
+            + sparse_penalty_term
+            + distance_penalty_term
+            + travel_penalty_term
+            + idle_penalty_term
+            + sum(head_idle_terms)
         )
 
     # ────────────────────────────────────────────────────────────────────
@@ -954,7 +1280,8 @@ class SchedulerV2Planner:
             buffer, buffer_source = helper._travel_buffer(
                 current_id, poi.id, raw, None
             )
-            travel = raw + buffer
+            travel = self._round_travel_minutes(raw + buffer)
+            buffer = max(0, travel - raw)
             distance = helper._distance(current_id, poi.id)
             wait_minutes = max(
                 0, solver.Value(start[node]) - solver.Value(arrival[node])
@@ -982,6 +1309,12 @@ class SchedulerV2Planner:
                     estimated_cost=poi_cost,
                     price_basis=poi.price_basis,
                     price_inferred=poi.price_inferred,
+                    best_time=poi.best_time,
+                    best_time_source=poi.best_time_source,
+                    best_time_applicable=preferred_time_window(
+                        poi, self.day_start_time, self.day_end_time
+                    )
+                    is not None,
                     two_tower_score=helper._poi_utility(poi) / planner.UTILITY_SCALE,
                 )
             )
@@ -1005,7 +1338,8 @@ class SchedulerV2Planner:
             buffer, buffer_source = helper._travel_buffer(
                 current_id, self.hotel.id, raw, None
             )
-            travel = raw + buffer
+            travel = self._round_travel_minutes(raw + buffer)
+            buffer = max(0, travel - raw)
             distance = helper._distance(current_id, self.hotel.id)
             arrival_time = schedule[-1].departure_time + travel
             schedule.append(
@@ -1036,7 +1370,7 @@ class SchedulerV2Planner:
         total_day_cost = total_activity_cost + total_transport_cost
         budget_overage = (
             max(0.0, total_day_cost - self.daily_budget_soft)
-            if self.daily_budget_soft > 0
+            if self.trip_budget_total > 0
             else 0.0
         )
         budget_penalty = (
@@ -1132,6 +1466,10 @@ class SchedulerV2Planner:
             enumerate(pois),
             key=lambda x: (
                 1 if x[1].place_type == "restaurant" else 0,
+                (
+                    preferred_time_window(x[1], day_start, self.day_end_time)
+                    or (day_start, self.day_end_time)
+                )[0],
                 x[1].candidate_rank,
             ),
         )
@@ -1147,6 +1485,7 @@ class SchedulerV2Planner:
         total_activity_cost = 0.0
         total_utility = 0.0
         restaurant_count = 0
+        restaurant_starts: list[int] = []
         selected_indices: list[int] = []
 
         for idx, poi in sorted_pois:
@@ -1154,7 +1493,8 @@ class SchedulerV2Planner:
             buf, buffer_source = helper._travel_buffer(
                 current_id, poi.id, raw, None
             )
-            travel = raw + buf
+            travel = self._round_travel_minutes(raw + buf)
+            buf = max(0, travel - raw)
             distance = helper._distance(current_id, poi.id)
             arrival_t = current_time + travel
             service_start = max(arrival_t, poi.open_time)
@@ -1165,17 +1505,30 @@ class SchedulerV2Planner:
             if self.return_to_hotel:
                 raw_to_hotel = helper._raw_travel(poi.id, self.hotel.id)
                 buf_to_hotel, _ = helper._travel_buffer(poi.id, self.hotel.id, raw_to_hotel, None)
-                if departure + raw_to_hotel + buf_to_hotel > self.day_end_time:
+                if (
+                    departure
+                    + self._round_travel_minutes(raw_to_hotel + buf_to_hotel)
+                    > self.day_end_time
+                ):
                     continue
             wait_minutes = max(0, service_start - arrival_t)
             if poi.place_type == "restaurant" and restaurant_count >= 2:
                 continue
+            if poi.place_type == "restaurant":
+                if restaurant_count == 0:
+                    if not (planner.LUNCH_START <= service_start <= planner.LUNCH_END):
+                        continue
+                else:
+                    if not (DINNER_START <= service_start <= DINNER_END):
+                        continue
+                    if restaurant_starts and service_start - restaurant_starts[-1] < MEAL_MIN_GAP_MINUTES:
+                        continue
             if wait_minutes > planner.MAX_NON_MEAL_WAIT_MINUTES:
                 continue
             poi_cost = helper._poi_cost(poi)
             
-            if self.daily_budget_soft > 0:
-                if total_activity_cost + poi_cost > self.daily_budget_soft * 1.05:
+            if self.trip_budget_total > 0:
+                if total_activity_cost + poi_cost > self.daily_budget_soft:
                     if len(schedule) > 0:
                         continue
 
@@ -1201,6 +1554,12 @@ class SchedulerV2Planner:
                     estimated_cost=poi_cost,
                     price_basis=poi.price_basis,
                     price_inferred=poi.price_inferred,
+                    best_time=poi.best_time,
+                    best_time_source=poi.best_time_source,
+                    best_time_applicable=preferred_time_window(
+                        poi, day_start, self.day_end_time
+                    )
+                    is not None,
                     two_tower_score=helper._poi_utility(poi) / planner.UTILITY_SCALE,
                 )
             )
@@ -1211,6 +1570,8 @@ class SchedulerV2Planner:
             total_activity_cost += poi_cost
             total_utility += helper._poi_utility(poi)
             restaurant_count += 1 if poi.place_type == "restaurant" else 0
+            if poi.place_type == "restaurant":
+                restaurant_starts.append(service_start)
             selected_indices.append(idx)
             current_time = departure
             current_id = poi.id
@@ -1226,7 +1587,8 @@ class SchedulerV2Planner:
             buf, buffer_source = helper._travel_buffer(
                 current_id, self.hotel.id, raw, None
             )
-            travel = raw + buf
+            travel = self._round_travel_minutes(raw + buf)
+            buf = max(0, travel - raw)
             distance = helper._distance(current_id, self.hotel.id)
             arrival_time = current_time + travel
             schedule.append(
@@ -1257,7 +1619,7 @@ class SchedulerV2Planner:
         total_day_cost = total_activity_cost + total_transport_cost
         budget_overage = (
             max(0.0, total_day_cost - self.daily_budget_soft)
-            if self.daily_budget_soft > 0
+            if self.trip_budget_total > 0
             else 0.0
         )
         budget_penalty = (
@@ -1329,92 +1691,101 @@ class SchedulerV2Planner:
         )
 
     # ────────────────────────────────────────────────────────────────────
-    # K-MEANS CLUSTERING
+    # SWEEP ALLOCATION
     # ────────────────────────────────────────────────────────────────────
 
     def _preallocate_days(self) -> AssignmentResult:
+        """Use the same constrained K-means assignment as the GA engine."""
+        assignment = ConstrainedKMeansAssignment(
+            AssignmentConfig(
+                num_days=self.num_days,
+                daily_start_time=self.day_start_time,
+                daily_end_time=self.day_end_time,
+                trip_intent="",
+                hotel=self.hotel_place,
+                target_nonmeal_per_day=max(1, self.target_pois_per_day - 1),
+            ),
+            self.travel_times,
+        )
+        return assignment.assign(self.attractions + self.restaurants)
+
+    def _preallocate_days_sweep_legacy(self) -> AssignmentResult:
         """
-        K-Means clustering có ràng buộc:
-        - Feature: [lat, lng, dist_to_hotel * 0.3]
-        - Hotel là trung tâm (centroid gợi ý)
-        - Sau cluster: đảm bảo mỗi ngày có ≥ 1 restaurant
+        Sweep Allocation: angle-based sequential day assignment with capacity
+        and distance guardrails. Replaces K-Means.
+
+        Flow:
+          1. Deduplicate candidates
+          2. Separate: primary attractions | cafes | restaurants
+          3. Sweep-assign primary attractions into days (remote POIs get own day)
+          4. Balance uneven pools
+          5. Compute cluster centroids
+          6. Inject cafes near each day cluster (cap 1/day)
+          7. Assign restaurants from global pool (proximity-gated)
+          8. Trim + snapshot counts
         """
-        candidates = self.attractions + self.restaurants
+        candidates = self._deduplicate_candidates(self.attractions + self.restaurants)
+
         if not candidates or self.num_days <= 0:
             return AssignmentResult(
-                day_pools=[
-                    {"attractions": [], "restaurants": []}
-                    for _ in range(self.num_days)
-                ],
+                day_pools=[{"attractions": [], "restaurants": []} for _ in range(self.num_days)],
                 day_loads=[0] * self.num_days,
             )
 
-        # Fallback: round-robin nếu sklearn không có hoặc quá ít candidates
-        if not _sklearn_available or len(candidates) < self.num_days:
+        # Very few candidates → round-robin fallback
+        primary_only = [p for p in candidates if p.place_type in {"attraction", "entertainment"}]
+        if len(primary_only) < self.num_days:
             return self._round_robin_assign(candidates)
 
-        hotel_lat = self.hotel_place.latitude
-        hotel_lng = self.hotel_place.longitude
-        features = []
-        for p in candidates:
-            # Scale lat/lng to kilometers relative to hotel
-            d_lat_km = (p.latitude - hotel_lat) * 111.0
-            d_lng_km = (p.longitude - hotel_lng) * 111.0 * math.cos(math.radians(hotel_lat))
-            dist_hotel_km = math.sqrt(d_lat_km**2 + d_lng_km**2)
-            
-            features.append([d_lat_km, d_lng_km, dist_hotel_km * 0.2])
+        cafes = [p for p in candidates if p.place_type == "cafe"]
+        restaurants = [p for p in candidates if p.place_type == "restaurant"]
 
-        features_np = np.array(features)
-        n_clusters = min(self.num_days, len(candidates))
+        # Sweep-assign primary attractions
+        day_pools = self._sweep_allocate_days(primary_only)
 
-        init_centers = "k-means++"
-        if len(self.restaurants) >= n_clusters and n_clusters > 0:
-            # Lấy top n_clusters nhà hàng tốt nhất (dựa trên candidate_rank)
-            top_restaurants = sorted(self.restaurants, key=lambda p: p.candidate_rank)[:n_clusters]
-            init_list = []
-            for r in top_restaurants:
-                d_lat_km = (r.latitude - hotel_lat) * 111.0
-                d_lng_km = (r.longitude - hotel_lng) * 111.0 * math.cos(math.radians(hotel_lat))
-                dist_hotel_km = math.sqrt(d_lat_km**2 + d_lng_km**2)
-                init_list.append([d_lat_km, d_lng_km, dist_hotel_km * 0.2])
-            init_centers = np.array(init_list)
-
-        if isinstance(init_centers, str):
-            km = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        else:
-            km = KMeans(n_clusters=n_clusters, random_state=42, init=init_centers, n_init=1)
-
-        labels = km.fit_predict(features_np)
-
-        day_pools: list[dict] = [
-            {"attractions": [], "restaurants": []}
-            for _ in range(self.num_days)
-        ]
-        for idx, place in enumerate(candidates):
-            day_idx = int(labels[idx])
-            if place.place_type == "restaurant":
-                day_pools[day_idx]["restaurants"].append(place)
-            else:
-                day_pools[day_idx]["attractions"].append(place)
-
+        # Balance uneven days after sweep
         self._balance_day_pools(day_pools)
-        self._ensure_restaurant_per_day(day_pools)
+
+        # Centroids from pure attractions only
+        self._compute_cluster_centroids(day_pools)
+
+        # Inject cafes near each day's cluster (1 per day)
+        self._inject_cafes_to_days(cafes, day_pools)
+
+        # Snapshot base counts (before restaurant injection)
+        for pool in day_pools:
+            pool["base_candidate_count"] = len(pool["attractions"]) + len(pool["restaurants"])
+            pool["base_restaurant_count"] = len(pool["restaurants"])
+
+        # Assign restaurants from global pool
+        self._assign_restaurants_to_days(restaurants, day_pools)
+
+        # Record injected restaurant count
+        for pool in day_pools:
+            pool["injected_restaurant_count"] = max(
+                0, len(pool["restaurants"]) - pool["base_restaurant_count"]
+            )
+
         self._trim_day_pools(day_pools)
+
+        for pool in day_pools:
+            pool["final_candidate_count"] = len(pool["attractions"]) + len(pool["restaurants"])
+
         day_loads = [self._day_load(pool) for pool in day_pools]
-        warnings = [
-            f"kmeans_v2 n_clusters={n_clusters} "
-            f"candidates={len(candidates)}"
-        ]
         return AssignmentResult(
-            day_pools=day_pools, day_loads=day_loads, warnings=warnings
+            day_pools=day_pools,
+            day_loads=day_loads,
+            warnings=[f"sweep_v1 primary={len(primary_only)} cafes={len(cafes)} restaurants={len(restaurants)}"],
         )
 
-    def _round_robin_assign(
-        self, candidates: list
-    ) -> AssignmentResult:
-        """Fallback round-robin khi sklearn không khả dụng."""
+    def _round_robin_assign(self, candidates: list) -> AssignmentResult:
+        """Fallback: distribute candidates evenly when too few for sweep."""
         day_pools: list[dict] = [
-            {"attractions": [], "restaurants": []}
+            {
+                "attractions": [], "restaurants": [],
+                "allocation_method": "round_robin",
+                "is_remote_day": False,
+            }
             for _ in range(self.num_days)
         ]
         for idx, place in enumerate(candidates):
@@ -1423,48 +1794,374 @@ class SchedulerV2Planner:
                 day_pools[day_idx]["restaurants"].append(place)
             else:
                 day_pools[day_idx]["attractions"].append(place)
-        self._ensure_restaurant_per_day(day_pools)
+
+        self._compute_cluster_centroids(day_pools)
+
+        cafes_global = [p for p in candidates if p.place_type == "cafe"]
+        rest_global = [p for p in candidates if p.place_type == "restaurant"]
+        self._inject_cafes_to_days(cafes_global, day_pools)
+        self._assign_restaurants_to_days(rest_global, day_pools)
+
+        for pool in day_pools:
+            pool.setdefault("base_candidate_count", len(pool["attractions"]) + len(pool["restaurants"]))
+            pool.setdefault("base_restaurant_count", len(pool["restaurants"]))
+            pool.setdefault("injected_restaurant_count", 0)
+            pool.setdefault("final_candidate_count", len(pool["attractions"]) + len(pool["restaurants"]))
+            pool.setdefault("cafe_filtered_count", 0)
+
         day_loads = [self._day_load(pool) for pool in day_pools]
         return AssignmentResult(
-            day_pools=day_pools,
-            day_loads=day_loads,
-            warnings=["round_robin_fallback"],
+            day_pools=day_pools, day_loads=day_loads, warnings=["round_robin_fallback"],
         )
 
-    def _ensure_restaurant_per_day(self, day_pools: list) -> None:
-        """Hoán đổi restaurant gần nhất từ ngày thừa sang ngày thiếu."""
-        for day_idx, pool in enumerate(day_pools):
+    def _deduplicate_candidates(self, places: list) -> list:
+        """
+        Remove near-duplicate POIs before allocation.
+        Keep the better-ranked one (lower candidate_rank = better).
+
+        Rules (any → duplicate):
+          - Same place_type + distance < 200 m
+          - Same category group + distance < 500 m + token-overlap >= 40 %
+        """
+        if len(places) <= 1:
+            return list(places)
+
+        import re as _re
+
+        def _tokens(name: str) -> set:
+            s = name.lower()
+            s = _re.sub(r'[^\w\s]', ' ', s)
+            stop = {'và', 'của', 'ở', 'tại', 'the', 'a', 'an', 'in', '-', ''}
+            return set(s.split()) - stop
+
+        def _cat(place_type: str) -> str:
+            if place_type in {"restaurant", "cafe"}:
+                return place_type
+            return "poi"
+
+        # Sort best-ranked first so we keep the better option
+        sorted_places = sorted(places, key=lambda p: p.candidate_rank)
+        kept: list = []
+
+        for place in sorted_places:
+            p_tokens = _tokens(place.name)
+            p_cat = _cat(place.place_type)
+            is_dup = False
+
+            for existing in kept:
+                dist = self._haversine_km(
+                    place.latitude, place.longitude,
+                    existing.latitude, existing.longitude,
+                )
+                # Same type, very close → obvious duplicate
+                if place.place_type == existing.place_type and dist < 0.2:
+                    is_dup = True
+                    break
+                # Same category group, somewhat close, and name overlaps
+                if _cat(existing.place_type) == p_cat and dist < 0.5:
+                    e_tokens = _tokens(existing.name)
+                    union = p_tokens | e_tokens
+                    if union:
+                        jaccard = len(p_tokens & e_tokens) / len(union)
+                        if jaccard >= 0.4:
+                            is_dup = True
+                            break
+
+            if not is_dup:
+                kept.append(place)
+
+        return kept
+
+    def _sweep_allocate_days(self, primary: list) -> list[dict]:
+        """
+        Assign primary attractions to days via angular sweep with capacity
+        and distance guardrails.
+
+        Remote POIs (distance >= 30 km OR one-way travel >= 60 min) are
+        assigned to dedicated day slots and not mixed with city-centre POIs.
+
+        Returns day_pools with only attractions (no cafes, no restaurants yet).
+        """
+        anchor_lat = self.hotel_place.latitude
+        anchor_lng = self.hotel_place.longitude
+        avail_min = max(60, self.day_end_time - self.day_start_time)
+        max_used = int(avail_min * 0.90)
+        target_used = int(avail_min * 0.70)
+
+        # Classify
+        remote: list[tuple] = []   # (place, dist_km)
+        normal: list[tuple] = []   # (place, angle_rad, dist_km)
+
+        for p in primary:
+            dist_km = self._haversine_km(p.latitude, p.longitude, anchor_lat, anchor_lng)
+            one_way_min = self._haversine_minutes(p.latitude, p.longitude, anchor_lat, anchor_lng)
+            if dist_km >= 30.0 or one_way_min >= 60:
+                remote.append((p, dist_km))
+            else:
+                angle = math.atan2(p.latitude - anchor_lat, p.longitude - anchor_lng)
+                normal.append((p, angle, dist_km))
+
+        # Farthest-first for remote; angular order for normal
+        remote.sort(key=lambda x: -x[1])
+        normal.sort(key=lambda x: x[1])
+
+        # Initialise day pools
+        day_pools: list[dict] = [
+            {
+                "attractions": [], "restaurants": [],
+                "_used_min": 0, "_est_dist_km": 0.0,
+                "is_remote_day": False, "remote_anchor_name": None,
+                "allocation_method": "sweep",
+            }
+            for _ in range(self.num_days)
+        ]
+
+        # Phase 1: reserve dedicated slots for remote POIs
+        remote_day_set: set[int] = set()
+
+        for r_poi, r_dist in remote:
+            one_way_min = self._haversine_minutes(
+                r_poi.latitude, r_poi.longitude, anchor_lat, anchor_lng
+            )
+            est_day_min = one_way_min * 2 + getattr(r_poi, "visit_duration", 120)
+            stay_min = getattr(r_poi, "visit_duration", 120)
+
+            best_day: Optional[int] = None
+
+            # 1st: an existing remote day whose anchor is within 8 km and has capacity
+            for di in list(remote_day_set):
+                if not day_pools[di]["attractions"]:
+                    continue
+                anchor_poi = day_pools[di]["attractions"][0]
+                if (self._haversine_km(
+                    r_poi.latitude, r_poi.longitude,
+                    anchor_poi.latitude, anchor_poi.longitude,
+                ) <= 8.0 and day_pools[di]["_used_min"] + stay_min + 30 <= max_used):
+                    best_day = di
+                    break
+
+            # 2nd: first empty non-remote day
+            if best_day is None:
+                for di in range(self.num_days):
+                    if di not in remote_day_set and not day_pools[di]["attractions"]:
+                        best_day = di
+                        break
+
+            # 3rd: any non-remote day with enough capacity
+            if best_day is None:
+                for di in range(self.num_days):
+                    if di not in remote_day_set and day_pools[di]["_used_min"] + est_day_min <= max_used:
+                        best_day = di
+                        break
+
+            # Last resort: least-loaded day
+            if best_day is None:
+                best_day = min(range(self.num_days), key=lambda di: day_pools[di]["_used_min"])
+
+            pool = day_pools[best_day]
+            pool["attractions"].append(r_poi)
+            pool["_used_min"] += est_day_min
+            pool["_est_dist_km"] += r_dist * 2
+            pool["is_remote_day"] = True
+            if pool["remote_anchor_name"] is None:
+                pool["remote_anchor_name"] = r_poi.name
+            remote_day_set.add(best_day)
+
+        # Phase 2: sweep normal POIs into non-remote days
+        normal_days = [di for di in range(self.num_days) if di not in remote_day_set]
+        if not normal_days:
+            normal_days = list(range(self.num_days))
+
+        day_cursor = 0
+
+        for poi, angle, poi_dist in normal:
+            assigned = False
+
+            for attempt in range(len(normal_days)):
+                di = normal_days[(day_cursor + attempt) % len(normal_days)]
+                pool = day_pools[di]
+
+                if pool["attractions"]:
+                    prev = pool["attractions"][-1]
+                    travel_min = self._haversine_minutes(
+                        prev.latitude, prev.longitude, poi.latitude, poi.longitude
+                    )
+                    seg_dist = self._haversine_km(
+                        prev.latitude, prev.longitude, poi.latitude, poi.longitude
+                    )
+                else:
+                    travel_min = self._haversine_minutes(
+                        anchor_lat, anchor_lng, poi.latitude, poi.longitude
+                    )
+                    seg_dist = poi_dist
+
+                incremental = travel_min + getattr(poi, "visit_duration", 90)
+                new_used = pool["_used_min"] + incremental
+                new_dist = pool["_est_dist_km"] + seg_dist
+
+                if new_used <= max_used and new_dist <= 80.0:
+                    pool["attractions"].append(poi)
+                    pool["_used_min"] = new_used
+                    pool["_est_dist_km"] = new_dist
+                    assigned = True
+                    if pool["_used_min"] >= target_used:
+                        day_cursor = (day_cursor + 1) % len(normal_days)
+                    break
+
+            if not assigned:
+                # Force-assign to least-loaded normal day (distance limit relaxed)
+                best = min(normal_days, key=lambda di: day_pools[di]["_used_min"])
+                day_pools[best]["attractions"].append(poi)
+                day_pools[best]["_used_min"] += (
+                    self._haversine_minutes(anchor_lat, anchor_lng, poi.latitude, poi.longitude)
+                    + getattr(poi, "visit_duration", 90)
+                )
+
+        # Promote tracking state to diagnostics, clean up temp keys
+        for pool in day_pools:
+            pool["day_used_minutes"] = pool.pop("_used_min", 0)
+            pool["day_estimated_distance"] = round(pool.pop("_est_dist_km", 0.0), 2)
+
+        return day_pools
+
+    def _inject_cafes_to_days(self, cafes: list, day_pools: list) -> None:
+        """
+        Inject at most 1 cafe per day from the global cafe list.
+        Only cafes within 2 km of a day's pure attraction are eligible.
+        Records cafe_filtered_count = total_cafes - total_injected.
+        """
+        available = sorted(cafes, key=lambda p: p.candidate_rank)
+        assigned_ids: set[str] = set()
+        total_injected = 0
+
+        for pool in day_pools:
+            pure_attractions = [p for p in pool["attractions"] if p.place_type == "attraction"]
+            if not pure_attractions:
+                continue
+
+            best_cafe = None
+            best_dist = float("inf")
+
+            for c in available:
+                if c.id in assigned_ids:
+                    continue
+                min_dist = min(
+                    self._haversine_km(c.latitude, c.longitude, a.latitude, a.longitude)
+                    for a in pure_attractions
+                )
+                if min_dist <= 2.0 and min_dist < best_dist:
+                    best_dist = min_dist
+                    best_cafe = c
+
+            if best_cafe is not None:
+                pool["attractions"].append(best_cafe)
+                assigned_ids.add(best_cafe.id)
+                total_injected += 1
+
+        # Store how many cafes weren't injected (useful for diagnostics)
+        remainder = len(cafes) - total_injected
+        for pool in day_pools:
+            pool.setdefault("cafe_filtered_count", remainder)
+
+    def _assign_restaurants_to_days(self, restaurants: list, day_pools: list) -> None:
+        """
+        Assign restaurants from the global pool to day pools using proximity gates.
+
+        Pass 1: give each day exactly 1 qualifying restaurant (centroid ≤3 km OR
+                nearest attraction ≤2.5 km).
+        Pass 2: top up days that still have 0 restaurants with best-available fallback.
+        Pass 3: allow a 2nd restaurant per day if unassigned restaurants remain.
+
+        Restaurants are not shared between days.
+        """
+        available = sorted(restaurants, key=lambda r: r.candidate_rank)
+        assigned_ids: set[str] = set()
+
+        def _best_dist(r, pool: dict) -> float:
+            pure = [p for p in pool["attractions"] if p.place_type == "attraction"]
+            centroid = pool.get("day_cluster_center")
+            if pure:
+                return min(
+                    self._haversine_km(r.latitude, r.longitude, a.latitude, a.longitude)
+                    for a in pure
+                )
+            if centroid:
+                return self._haversine_km(r.latitude, r.longitude, centroid[0], centroid[1])
+            return self._haversine_km(
+                r.latitude, r.longitude,
+                self.hotel_place.latitude, self.hotel_place.longitude,
+            )
+
+        def _qualifies(r, pool: dict) -> bool:
+            centroid = pool.get("day_cluster_center")
+            pure = [p for p in pool["attractions"] if p.place_type == "attraction"]
+            if centroid and self._haversine_km(r.latitude, r.longitude, centroid[0], centroid[1]) <= 3.0:
+                return True
+            if pure and min(
+                self._haversine_km(r.latitude, r.longitude, a.latitude, a.longitude)
+                for a in pure
+            ) <= 2.5:
+                return True
+            return False
+
+        # Pass 1: one qualifying restaurant per day
+        for pool in day_pools:
+            best_r = None
+            best_d = float("inf")
+            for r in available:
+                if r.id in assigned_ids or not _qualifies(r, pool):
+                    continue
+                d = _best_dist(r, pool)
+                if d < best_d:
+                    best_d = d
+                    best_r = r
+            if best_r:
+                pool["restaurants"].append(best_r)
+                assigned_ids.add(best_r.id)
+                pool["injected_reason"] = "near_cluster"
+
+        # Pass 2: fallback for days still missing a restaurant
+        for pool in day_pools:
             if pool["restaurants"]:
                 continue
-            best_donor: Optional[int] = None
-            best_restaurant = None
-            best_dist = float("inf")
-            for donor_idx, donor_pool in enumerate(day_pools):
-                if donor_idx == day_idx or len(donor_pool["restaurants"]) <= 1:
+            best_r = None
+            best_d = float("inf")
+            for r in available:
+                if r.id in assigned_ids:
                     continue
-                for r in donor_pool["restaurants"]:
-                    if pool["attractions"]:
-                        avg_dist = sum(
-                            self._haversine_minutes(
-                                r.latitude, r.longitude,
-                                a.latitude, a.longitude,
-                            )
-                            for a in pool["attractions"]
-                        ) / len(pool["attractions"])
-                    else:
-                        avg_dist = self._haversine_minutes(
-                            r.latitude,
-                            r.longitude,
-                            self.hotel_place.latitude,
-                            self.hotel_place.longitude,
-                        )
-                    if avg_dist < best_dist:
-                        best_dist = avg_dist
-                        best_donor = donor_idx
-                        best_restaurant = r
-            if best_restaurant is not None and best_donor is not None:
-                day_pools[best_donor]["restaurants"].remove(best_restaurant)
-                day_pools[day_idx]["restaurants"].append(best_restaurant)
+                d = _best_dist(r, pool)
+                if d < best_d:
+                    best_d = d
+                    best_r = r
+            if best_r:
+                pool["restaurants"].append(best_r)
+                assigned_ids.add(best_r.id)
+                pool["injected_reason"] = "best_available"
+
+        # Pass 3: 2nd restaurant per day if budget allows
+        for pool in day_pools:
+            if len(pool["restaurants"]) >= 2:
+                continue
+            best_r = None
+            best_d = float("inf")
+            for r in available:
+                if r.id in assigned_ids or not _qualifies(r, pool):
+                    continue
+                d = _best_dist(r, pool)
+                if d < best_d:
+                    best_d = d
+                    best_r = r
+            if best_r:
+                pool["restaurants"].append(best_r)
+                assigned_ids.add(best_r.id)
+
+    def _compute_cluster_centroids(self, day_pools: list) -> None:
+        """Compute attraction-only centroid per day and store as day_cluster_center."""
+        for pool in day_pools:
+            pure_attractions = [
+                p for p in pool["attractions"] if p.place_type == "attraction"
+            ]
+            pool["day_cluster_center"] = self._centroid(pure_attractions)
 
     def _balance_day_pools(self, day_pools: list) -> None:
         """
@@ -1557,10 +2254,10 @@ class SchedulerV2Planner:
         """
         max_pool = max(self.target_pois_per_day + 8, 20)
         for pool in day_pools:
-            if len(pool["restaurants"]) > 3:
+            if len(pool["restaurants"]) > 2:
                 pool["restaurants"] = sorted(
                     pool["restaurants"], key=lambda p: p.candidate_rank
-                )[:3]
+                )[:2]
                 
             total = len(pool["attractions"]) + len(pool["restaurants"])
             if total <= max_pool:
@@ -1576,6 +2273,25 @@ class SchedulerV2Planner:
     # ────────────────────────────────────────────────────────────────────
     # HELPERS
     # ────────────────────────────────────────────────────────────────────
+
+    @staticmethod
+    def _round_travel_minutes(minutes: int | float) -> int:
+        value = max(0, int(math.ceil(float(minutes))))
+        return int(math.ceil(value / 5.0) * 5) if value > 0 else 0
+
+    @staticmethod
+    def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+        """Great-circle distance in km."""
+        R = 6371.0
+        rlat1, rlng1 = math.radians(lat1), math.radians(lng1)
+        rlat2, rlng2 = math.radians(lat2), math.radians(lng2)
+        dlat = rlat2 - rlat1
+        dlng = rlng2 - rlng1
+        a = (
+            math.sin(dlat / 2) ** 2
+            + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlng / 2) ** 2
+        )
+        return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
     @staticmethod
     def _haversine_minutes(
@@ -1598,6 +2314,15 @@ class SchedulerV2Planner:
         km = 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
         return int(km / speed_kmh * 60) + 5
 
+    @staticmethod
+    def _centroid(places: list) -> Optional[Tuple[float, float]]:
+        """Geographic centroid of a non-empty list of places."""
+        if not places:
+            return None
+        lat = sum(p.latitude for p in places) / len(places)
+        lng = sum(p.longitude for p in places) / len(places)
+        return (lat, lng)
+
     def _target_pois_per_day(self) -> int:
         available_minutes = max(0, self.day_end_time - self.day_start_time)
         time_target = max(
@@ -1614,17 +2339,22 @@ class SchedulerV2Planner:
         return max(1, min(time_target, candidate_avg))
 
     def _hotel_total_cost(self, hotel: planner.Place) -> float:
-        nightly = (
+        per_person_nightly = (
             hotel.estimated_cost
             if hotel.estimated_cost > 0
-            else planner.FALLBACK_HOTEL_COST_PER_NIGHT
+            else planner.FALLBACK_HOTEL_COST_PER_NIGHT / planner.ROOM_CAPACITY
         )
         nights = max(1, self.num_days - 1)
-        return nightly * nights * self.rooms
+        return per_person_nightly * nights * self.full_people
 
     def _select_hotel(self, hotels: List[planner.Place]) -> planner.Place:
         """Chọn hotel có score cao nhất (candidate_rank thấp nhất)."""
-        return min(hotels, key=lambda h: h.candidate_rank)
+        return planner.select_geographic_hotel(
+            hotels,
+            self.places,
+            trip_budget=self.trip_budget,
+            hotel_total_cost_fn=self._hotel_total_cost,
+        )
 
     @staticmethod
     def _day_load(pool: dict) -> int:

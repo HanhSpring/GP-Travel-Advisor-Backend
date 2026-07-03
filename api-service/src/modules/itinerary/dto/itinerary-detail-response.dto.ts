@@ -14,6 +14,18 @@ class TransitInfoDto {
   })
   durationStr: string;
 
+  @ApiProperty({
+    example: 15,
+    description: 'Thời gian di chuyển, làm tròn lên theo block 5 phút',
+  })
+  durationMinutes: number;
+
+  @ApiProperty({
+    example: 6.4,
+    description: 'Khoảng cách đến điểm tiếp theo (km)',
+  })
+  distanceKm: number;
+
   @ApiPropertyOptional({
     example: 45000,
     description: 'Chi phí ước tính (nếu có, VD: Taxi)',

@@ -29,7 +29,6 @@ interface ItineraryDetailRow {
   place_id: string;
   visit_date: string | null;
   arrival_time: string | null;
-  departure_time: string | null;
 }
 
 interface PlaceRow {
@@ -173,9 +172,7 @@ export class ItineraryReviewsService {
     const { data: details, error } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select(
-        'id, itinerary_id, place_id, visit_date, arrival_time, departure_time',
-      )
+      .select('id, itinerary_id, place_id, visit_date, arrival_time')
       .eq('itinerary_id', itineraryId)
       .order('visit_date', { ascending: true })
       .order('arrival_time', { ascending: true });
