@@ -2,6 +2,12 @@ import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { supabase } from 'src/config/supabase';
 
 type SearchRow = Record<string, unknown>;
+type CityImageRow = {
+  id?: string | null;
+  name?: string | null;
+  image_url?: string | null;
+  url_image?: string | null;
+};
 
 export interface AutocompleteItem {
   id: string;
@@ -21,6 +27,19 @@ export class SearchService {
 
   private asString(value: unknown): string {
     return typeof value === 'string' ? value : '';
+  }
+
+  private resolveOptionalImage(...values: unknown[]): string {
+    for (const value of values) {
+      if (Array.isArray(value)) {
+        const first = value.find(
+          (item) => typeof item === 'string' && item.trim(),
+        );
+        if (first) return (first as string).trim();
+      }
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return '';
   }
 
   /**
@@ -91,7 +110,11 @@ export class SearchService {
           this.asString(row['type']).trim().toLowerCase() === 'city'
             ? 'city'
             : 'place';
-        const image = this.asString(row['image']).trim();
+        const image = this.resolveOptionalImage(
+          row['image'],
+          row['image_url'],
+          row['url_image'],
+        );
         return {
           id: this.asString(row['id']),
           name: this.asString(row['name']),
@@ -102,6 +125,7 @@ export class SearchService {
           score: Number(row['score']) || 0,
         };
       });
+      placeItems = await this.attachCityImages(placeItems);
     }
 
     // Map itinerary results (append after places)
@@ -124,17 +148,20 @@ export class SearchService {
   }
 
   private async autocompleteFallback(q: string): Promise<AutocompleteItem[]> {
-    const { data } = await supabase
-      .schema('travel')
-      .from('places')
-      .select('id, name, image_url, average_rating')
-      .eq('is_approved', true)
-      .eq('is_active', true)
-      .ilike('name', `${q}%`)
-      .order('average_rating', { ascending: false })
-      .limit(15);
+    const [cityItems, placeResult] = await Promise.all([
+      this.queryCitySuggestions(q),
+      supabase
+        .schema('travel')
+        .from('places')
+        .select('id, name, image_url, average_rating')
+        .eq('is_approved', true)
+        .eq('is_active', true)
+        .ilike('name', `${q}%`)
+        .order('average_rating', { ascending: false })
+        .limit(15),
+    ]);
 
-    return ((data ?? []) as any[]).map((p) => ({
+    const placeItems = ((placeResult.data ?? []) as any[]).map((p) => ({
       id: String(p.id ?? ''),
       name: String(p.name ?? ''),
       type: 'place' as const,
@@ -143,6 +170,154 @@ export class SearchService {
       rating: Number(p.average_rating) || 0,
       score: 0,
     }));
+
+    return [...cityItems, ...placeItems].slice(0, 15);
+  }
+
+  private mapCitySuggestion(city: CityImageRow, score = 0): AutocompleteItem {
+    const image = this.resolveOptionalImage(city.image_url, city.url_image);
+    return {
+      id: String(city.id ?? ''),
+      name: String(city.name ?? ''),
+      type: 'city',
+      image,
+      city: String(city.name ?? ''),
+      rating: 0,
+      score,
+    };
+  }
+
+  private isMissingImageColumnError(
+    error: { message?: string } | null,
+  ): boolean {
+    const message = error?.message?.toLowerCase() ?? '';
+    return (
+      message.includes('image_url') ||
+      message.includes('url_image') ||
+      message.includes('schema cache')
+    );
+  }
+
+  private async queryCityRowsByPrefix(
+    q: string,
+    limit = 5,
+  ): Promise<CityImageRow[]> {
+    const primary = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name, image_url')
+      .ilike('name', `${q}%`)
+      .order('name', { ascending: true })
+      .limit(limit)
+      .returns<CityImageRow[]>();
+
+    if (!primary.error) return primary.data ?? [];
+    if (!this.isMissingImageColumnError(primary.error)) {
+      console.error('queryCityRowsByPrefix error:', primary.error.message);
+      return [];
+    }
+
+    const fallback = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name, url_image')
+      .ilike('name', `${q}%`)
+      .order('name', { ascending: true })
+      .limit(limit)
+      .returns<CityImageRow[]>();
+
+    if (fallback.error) {
+      console.error(
+        'queryCityRowsByPrefix fallback error:',
+        fallback.error.message,
+      );
+      return [];
+    }
+
+    return fallback.data ?? [];
+  }
+
+  private async queryCityRowsByColumn(
+    column: 'id' | 'name',
+    values: string[],
+  ): Promise<CityImageRow[]> {
+    if (!values.length) return [];
+
+    const primary = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name, image_url')
+      .in(column, values)
+      .returns<CityImageRow[]>();
+
+    if (!primary.error) return primary.data ?? [];
+    if (!this.isMissingImageColumnError(primary.error)) {
+      console.error(
+        `queryCityRowsByColumn.${column} error:`,
+        primary.error.message,
+      );
+      return [];
+    }
+
+    const fallback = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name, url_image')
+      .in(column, values)
+      .returns<CityImageRow[]>();
+
+    if (fallback.error) {
+      console.error(
+        `queryCityRowsByColumn.${column} fallback error:`,
+        fallback.error.message,
+      );
+      return [];
+    }
+
+    return fallback.data ?? [];
+  }
+
+  private async queryCitySuggestions(q: string): Promise<AutocompleteItem[]> {
+    const data = await this.queryCityRowsByPrefix(q, 5);
+    return data.map((city) => this.mapCitySuggestion(city));
+  }
+
+  private async attachCityImages(
+    items: AutocompleteItem[],
+  ): Promise<AutocompleteItem[]> {
+    const missingCityItems = items.filter(
+      (item) => item.type === 'city' && !item.image,
+    );
+    if (!missingCityItems.length) return items;
+
+    const ids = [
+      ...new Set(missingCityItems.map((item) => item.id).filter(Boolean)),
+    ];
+    const names = [
+      ...new Set(missingCityItems.map((item) => item.name).filter(Boolean)),
+    ];
+
+    const [byIdRows, byNameRows] = await Promise.all([
+      this.queryCityRowsByColumn('id', ids),
+      this.queryCityRowsByColumn('name', names),
+    ]);
+
+    const imageById = new Map<string, string>();
+    const imageByName = new Map<string, string>();
+    for (const city of [...byIdRows, ...byNameRows]) {
+      const image = this.resolveOptionalImage(city.image_url, city.url_image);
+      if (!image) continue;
+      if (city.id) imageById.set(String(city.id), image);
+      if (city.name) imageByName.set(String(city.name), image);
+    }
+
+    return items.map((item) => {
+      if (item.type !== 'city' || item.image) return item;
+      return {
+        ...item,
+        image: imageById.get(item.id) ?? imageByName.get(item.name) ?? '',
+      };
+    });
   }
 
   async searchAdvanced(query: string): Promise<SearchRow[]> {

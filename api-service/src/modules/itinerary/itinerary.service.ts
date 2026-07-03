@@ -7,15 +7,23 @@ import {
   Logger,
 } from '@nestjs/common';
 import axios from 'axios';
+import { randomUUID } from 'crypto';
 import { supabase } from '../../config/supabase';
 import { EditActivityDto } from './dto/edit-activity.dto';
 import { AddActivityDto } from './dto/add-activity.dto';
 import { ReplaceActivityDto } from './dto/replace-activity.dto';
+import { ShareItineraryDto } from './dto/share-itinerary.dto';
+import { RespondItineraryShareDto } from './dto/respond-itinerary-share.dto';
+import { CreateItineraryShareLinkDto } from './dto/create-itinerary-share-link.dto';
+import { RespondItineraryShareLinkDto } from './dto/respond-itinerary-share-link.dto';
 
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
 
 // ─── Địa chỉ FastAPI optimizer (đọc từ env hoặc dùng mặc định) ───
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL ?? 'http://localhost:8000';
+const APP_DEEP_LINK_SCHEME =
+  process.env.APP_DEEP_LINK_SCHEME ?? 'gptraveladvisor';
+const APP_PLAY_STORE_URL = process.env.APP_PLAY_STORE_URL ?? null;
 
 interface ScheduleEntry {
   location_id: string;
@@ -73,7 +81,228 @@ export class ItineraryService {
       console.error('[ItineraryService] getMyItineraries error:', error);
       throw error;
     }
-    return this.withEstimatedListCosts(data);
+    const sharedItineraries = await this.getSharedItineraryListItems(
+      userId,
+      trimmedQuery,
+      data?.itineraries ?? [],
+    );
+    const merged = await this.enrichListTrackingFlags({
+      ...(data ?? {}),
+      itineraries: [
+        ...((data?.itineraries as any[]) ?? []),
+        ...sharedItineraries,
+      ],
+    });
+    return this.withEstimatedListCosts(this.withListStats(merged));
+  }
+
+  private async enrichListTrackingFlags(payload: any) {
+    const itineraries = Array.isArray(payload?.itineraries)
+      ? payload.itineraries
+      : [];
+    const ids = itineraries
+      .map((item: any) => item?.id)
+      .filter(
+        (id: any): id is string => typeof id === 'string' && id.length > 0,
+      );
+    if (ids.length === 0) return payload;
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, status, tracking_active')
+      .in('id', ids);
+
+    if (error) {
+      this.logger.warn(`Cannot enrich tracking flags: ${error.message}`);
+      return payload;
+    }
+
+    const byId = new Map((data ?? []).map((item: any) => [item.id, item]));
+    return {
+      ...payload,
+      itineraries: itineraries.map((item: any) => {
+        const fresh = byId.get(item.id);
+        if (!fresh) return item;
+        return {
+          ...item,
+          status: fresh.status ?? item.status,
+          tracking_active: fresh.tracking_active === true,
+        };
+      }),
+    };
+  }
+
+  private async getSharedItineraryListItems(
+    userId: string,
+    query: string | null,
+    existingItems: any[],
+  ) {
+    const { data: memberships, error: membershipError } = await supabase
+      .schema('travel')
+      .from('itinerary_members')
+      .select('itinerary_id')
+      .eq('user_id', userId);
+
+    if (membershipError) {
+      this.logger.warn(
+        `Cannot load shared itinerary memberships: ${membershipError.message}`,
+      );
+      return [];
+    }
+
+    const existingIds = new Set(
+      existingItems
+        .map((item) => item?.id)
+        .filter((id): id is string => typeof id === 'string'),
+    );
+    const sharedIds = Array.from(
+      new Set(
+        (memberships ?? [])
+          .map((item: any) => item.itinerary_id)
+          .filter(
+            (id: any): id is string =>
+              typeof id === 'string' && !existingIds.has(id),
+          ),
+      ),
+    );
+
+    if (sharedIds.length === 0) {
+      return [];
+    }
+
+    let itineraryQuery = supabase
+      .schema('travel')
+      .from('itineraries')
+      .select(
+        'id, description, destination, start_date, end_date, status, tracking_active, estimated_cost',
+      )
+      .in('id', sharedIds);
+
+    if (query) {
+      itineraryQuery = itineraryQuery.ilike('description', `%${query}%`);
+    }
+
+    const { data: itineraries, error: itineraryError } = await itineraryQuery;
+    if (itineraryError) {
+      this.logger.warn(
+        `Cannot load shared itineraries: ${itineraryError.message}`,
+      );
+      return [];
+    }
+
+    const itineraryIds = (itineraries ?? []).map((item: any) => item.id);
+    const statsById = await this.getItineraryListStats(itineraryIds);
+
+    return (itineraries ?? []).map((item: any) => {
+      const stats = statsById.get(item.id) ?? {
+        totalLocations: 0,
+        visitedLocations: 0,
+        placeImages: [] as string[],
+      };
+      return {
+        id: item.id,
+        description: item.description ?? item.destination ?? 'Lịch trình',
+        destination: item.destination ?? '',
+        start_date: item.start_date,
+        end_date: item.end_date,
+        status: item.status ?? 'pending',
+        tracking_active: item.tracking_active === true,
+        days: this.calcListDays(item.start_date, item.end_date),
+        progress:
+          stats.totalLocations > 0
+            ? Math.round((stats.visitedLocations / stats.totalLocations) * 100)
+            : 0,
+        estimated_cost: item.estimated_cost ?? 0,
+        total_locations: stats.totalLocations,
+        visited_locations: stats.visitedLocations,
+        place_images: stats.placeImages,
+        rating: null,
+        shared: true,
+      };
+    });
+  }
+
+  private async getItineraryListStats(itineraryIds: string[]) {
+    const stats = new Map<
+      string,
+      {
+        totalLocations: number;
+        visitedLocations: number;
+        placeImages: string[];
+      }
+    >();
+    for (const id of itineraryIds) {
+      stats.set(id, {
+        totalLocations: 0,
+        visitedLocations: 0,
+        placeImages: [],
+      });
+    }
+    if (itineraryIds.length === 0) {
+      return stats;
+    }
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select('itinerary_id, status, places(image_url)')
+      .in('itinerary_id', itineraryIds);
+
+    if (error) {
+      this.logger.warn(`Cannot load shared itinerary stats: ${error.message}`);
+      return stats;
+    }
+
+    for (const row of data ?? []) {
+      const itineraryId = (row as any).itinerary_id;
+      const current = stats.get(itineraryId);
+      if (!current) continue;
+      current.totalLocations += 1;
+      if ((row as any).status === 'visited') {
+        current.visitedLocations += 1;
+      }
+      const place = Array.isArray((row as any).places)
+        ? (row as any).places[0]
+        : (row as any).places;
+      const imageUrl = place?.image_url;
+      if (
+        typeof imageUrl === 'string' &&
+        imageUrl.length > 0 &&
+        current.placeImages.length < 5
+      ) {
+        current.placeImages.push(imageUrl);
+      }
+    }
+
+    return stats;
+  }
+
+  private calcListDays(startDate?: string | null, endDate?: string | null) {
+    if (!startDate || !endDate) return 1;
+    const start = new Date(`${startDate}T00:00:00.000Z`);
+    const end = new Date(`${endDate}T00:00:00.000Z`);
+    const diff = Math.round((end.getTime() - start.getTime()) / 86_400_000) + 1;
+    return Number.isFinite(diff) ? Math.max(1, diff) : 1;
+  }
+
+  private withListStats(payload: any) {
+    const itineraries = Array.isArray(payload?.itineraries)
+      ? payload.itineraries
+      : [];
+    const stats = {
+      total: itineraries.length,
+      completed: itineraries.filter((item: any) => item.status === 'completed')
+        .length,
+      ongoing: itineraries.filter((item: any) => item.status === 'ongoing')
+        .length,
+      upcoming: itineraries.filter((item: any) =>
+        ['pending', 'upcoming'].includes(item.status),
+      ).length,
+      draft: itineraries.filter((item: any) => item.status === 'draft').length,
+    };
+
+    return { ...payload, stats };
   }
 
   private async withEstimatedListCosts(payload: any) {
@@ -182,8 +411,10 @@ export class ItineraryService {
       retries > 0
     ) {
       const errorMsg = insertResult.error.message;
-      if (errorMsg.includes('daily_start_time')) delete itineraryInsert.daily_start_time;
-      if (errorMsg.includes('daily_end_time')) delete itineraryInsert.daily_end_time;
+      if (errorMsg.includes('daily_start_time'))
+        delete itineraryInsert.daily_start_time;
+      if (errorMsg.includes('daily_end_time'))
+        delete itineraryInsert.daily_end_time;
       if (errorMsg.includes('trip_intent')) delete itineraryInsert.trip_intent;
 
       insertResult = await supabase
@@ -192,7 +423,7 @@ export class ItineraryService {
         .insert(itineraryInsert)
         .select('id')
         .single();
-        
+
       retries--;
     }
 
@@ -362,6 +593,435 @@ export class ItineraryService {
     return { success: true, ...data };
   }
 
+  async shareItinerary(itineraryId: string, dto: ShareItineraryDto) {
+    const recipientInput = dto.recipient.trim();
+    if (!recipientInput) {
+      throw new BadRequestException('Vui lòng nhập email hoặc số điện thoại');
+    }
+
+    const { data: itinerary, error: itineraryError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, creator_id, description, destination, start_date, end_date')
+      .eq('id', itineraryId)
+      .maybeSingle();
+
+    if (itineraryError) {
+      throw new InternalServerErrorException(itineraryError.message);
+    }
+    if (!itinerary) {
+      throw new NotFoundException(`Itinerary not found: ${itineraryId}`);
+    }
+    if ((itinerary as any).creator_id !== dto.senderUserId) {
+      throw new BadRequestException(
+        'Bạn không có quyền chia sẻ lịch trình này',
+      );
+    }
+
+    const recipient = await this.findUserByEmailOrPhone(recipientInput);
+    if (!recipient) {
+      throw new NotFoundException(
+        'Người dùng không tồn tại, vui lòng kiểm tra và nhập lại',
+      );
+    }
+    if (recipient.id === dto.senderUserId) {
+      throw new BadRequestException(
+        'Bạn không thể chia sẻ lịch trình cho chính mình',
+      );
+    }
+
+    const alreadyMember = await this.isItineraryMember(
+      itineraryId,
+      recipient.id,
+    );
+    if (alreadyMember) {
+      throw new ConflictException('Người dùng này đã là thành viên lịch trình');
+    }
+
+    const notificationId = randomUUID();
+    const nowIso = new Date().toISOString();
+    const title = 'Lời mời chia sẻ lịch trình';
+    const itineraryTitle =
+      (itinerary as any).description ||
+      (itinerary as any).destination ||
+      'một lịch trình';
+    const content = `Bạn được mời tham gia lịch trình "${itineraryTitle}". Vui lòng xác nhận hoặc từ chối lời mời.`;
+
+    const { error: notificationError } = await supabase
+      .schema('public')
+      .from('notifications')
+      .insert({
+        id: notificationId,
+        title,
+        content,
+        type: 'itinerary_share',
+        is_global: false,
+        action_type: 'respond_itinerary_share',
+        target_type: 'itinerary_share_invitation',
+        metadata: {
+          action_label: 'Phản hồi lời mời',
+          itinerary_id: itineraryId,
+          sender_user_id: dto.senderUserId,
+          recipient_user_id: recipient.id,
+          share_status: 'pending',
+        },
+        created_at: nowIso,
+      });
+
+    if (notificationError) {
+      throw new InternalServerErrorException(notificationError.message);
+    }
+
+    const { error: linkError } = await supabase
+      .schema('public')
+      .from('users_notifications')
+      .insert({
+        id: randomUUID(),
+        user_id: recipient.id,
+        notification_id: notificationId,
+        is_read: false,
+        sent_at: nowIso,
+      });
+
+    if (linkError) {
+      throw new InternalServerErrorException(linkError.message);
+    }
+
+    return {
+      success: true,
+      notificationId,
+      recipientUserId: recipient.id,
+      message: 'Đã gửi lời mời chia sẻ lịch trình',
+    };
+  }
+
+  async createShareLink(itineraryId: string, dto: CreateItineraryShareLinkDto) {
+    const itinerary = await this.getShareableItineraryForOwner(
+      itineraryId,
+      dto.senderUserId,
+    );
+    const owner = await this.getUserDisplayInfo(dto.senderUserId);
+    const token = randomUUID();
+    const notificationId = randomUUID();
+    const nowIso = new Date().toISOString();
+    const itineraryTitle =
+      (itinerary as any).description ||
+      (itinerary as any).destination ||
+      'lịch trình';
+
+    const { error } = await supabase
+      .schema('public')
+      .from('notifications')
+      .insert({
+        id: notificationId,
+        title: 'Link mời tham gia lịch trình',
+        content: `${owner.displayName} đã tạo link mời tham gia lịch trình "${itineraryTitle}".`,
+        type: 'itinerary_share',
+        is_global: false,
+        action_type: 'respond_itinerary_share_link',
+        target_type: 'itinerary_share_link',
+        metadata: {
+          action_label: 'Phản hồi lời mời',
+          share_token: token,
+          share_status: 'active',
+          itinerary_id: itineraryId,
+          itinerary_title: itineraryTitle,
+          sender_user_id: dto.senderUserId,
+          sender_name: owner.displayName,
+        },
+        created_at: nowIso,
+      });
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    const deepLink = this.buildShareDeepLink(token);
+    return {
+      success: true,
+      token,
+      itineraryId,
+      itineraryTitle,
+      ownerName: owner.displayName,
+      deepLink,
+      playStoreUrl: APP_PLAY_STORE_URL,
+      message:
+        `${owner.displayName} mời bạn tham gia lịch trình "${itineraryTitle}". ` +
+        `Mở link để xác nhận: ${deepLink}`,
+    };
+  }
+
+  async getShareLinkPreview(token: string) {
+    const invitation = await this.findShareLinkInvitation(token);
+    const metadata = invitation.metadata;
+    return {
+      success: true,
+      token,
+      itineraryId: metadata.itinerary_id,
+      itineraryTitle: metadata.itinerary_title ?? 'lịch trình',
+      ownerName: metadata.sender_name ?? 'Chủ lịch trình',
+      status: metadata.share_status ?? 'active',
+    };
+  }
+
+  async respondToShareLink(dto: RespondItineraryShareLinkDto) {
+    const invitation = await this.findShareLinkInvitation(dto.token);
+    const metadata = invitation.metadata;
+    const itineraryId = String(metadata.itinerary_id ?? '');
+    const senderUserId = String(metadata.sender_user_id ?? '');
+
+    if (!itineraryId || !senderUserId) {
+      throw new BadRequestException('Link chia sẻ không hợp lệ');
+    }
+    if (dto.userId === senderUserId) {
+      throw new BadRequestException(
+        'Bạn là chủ lịch trình nên không cần tham gia bằng link mời',
+      );
+    }
+
+    if (dto.action === 'accept') {
+      await this.addItineraryMember(itineraryId, dto.userId);
+    }
+
+    return {
+      success: true,
+      status: dto.action === 'accept' ? 'accepted' : 'rejected',
+      itineraryId,
+      message:
+        dto.action === 'accept'
+          ? 'Đã xác nhận tham gia lịch trình'
+          : 'Đã từ chối lời mời tham gia lịch trình',
+    };
+  }
+
+  async respondToShareInvitation(
+    itineraryId: string,
+    dto: RespondItineraryShareDto,
+  ) {
+    const { data: link, error: linkError } = await supabase
+      .schema('public')
+      .from('users_notifications')
+      .select('id, notification_id, user_id')
+      .eq('user_id', dto.userId)
+      .eq('notification_id', dto.notificationId)
+      .maybeSingle();
+
+    if (linkError) {
+      throw new InternalServerErrorException(linkError.message);
+    }
+    if (!link) {
+      throw new NotFoundException('Không tìm thấy lời mời chia sẻ');
+    }
+
+    const { data: notification, error: notificationError } = await supabase
+      .schema('public')
+      .from('notifications')
+      .select('id, action_type, target_type, metadata')
+      .eq('id', dto.notificationId)
+      .maybeSingle();
+
+    if (notificationError) {
+      throw new InternalServerErrorException(notificationError.message);
+    }
+    if (!notification) {
+      throw new NotFoundException('Không tìm thấy thông báo chia sẻ');
+    }
+
+    const metadata = ((notification as any).metadata ?? {}) as Record<
+      string,
+      unknown
+    >;
+    if (
+      (notification as any).action_type !== 'respond_itinerary_share' ||
+      metadata.itinerary_id !== itineraryId ||
+      metadata.recipient_user_id !== dto.userId
+    ) {
+      throw new BadRequestException('Lời mời chia sẻ không hợp lệ');
+    }
+
+    if (dto.action === 'accept') {
+      await this.addItineraryMember(itineraryId, dto.userId);
+    }
+
+    const shareStatus = dto.action === 'accept' ? 'accepted' : 'rejected';
+    const readAt = new Date().toISOString();
+    const [notificationUpdate, linkUpdate] = await Promise.all([
+      supabase
+        .schema('public')
+        .from('notifications')
+        .update({
+          action_type:
+            dto.action === 'accept'
+              ? 'itinerary_share_accepted'
+              : 'itinerary_share_rejected',
+          metadata: {
+            ...metadata,
+            share_status: shareStatus,
+            responded_at: readAt,
+          },
+        })
+        .eq('id', dto.notificationId),
+      supabase
+        .schema('public')
+        .from('users_notifications')
+        .update({ is_read: true, read_at: readAt })
+        .eq('user_id', dto.userId)
+        .eq('notification_id', dto.notificationId),
+    ]);
+
+    if (notificationUpdate.error) {
+      throw new InternalServerErrorException(notificationUpdate.error.message);
+    }
+    if (linkUpdate.error) {
+      throw new InternalServerErrorException(linkUpdate.error.message);
+    }
+
+    return {
+      success: true,
+      status: shareStatus,
+      message:
+        dto.action === 'accept'
+          ? 'Đã xác nhận lời mời chia sẻ lịch trình'
+          : 'Đã từ chối lời mời chia sẻ lịch trình',
+    };
+  }
+
+  private async findUserByEmailOrPhone(value: string) {
+    const normalized = value.trim();
+    const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
+    const query = supabase
+      .schema('public')
+      .from('users')
+      .select('id, full_name, email, phone_number')
+      .limit(1);
+
+    const { data, error } = isEmail
+      ? await query.ilike('email', normalized).maybeSingle()
+      : await query
+          .eq('phone_number', normalized.replace(/[\s.-]/g, ''))
+          .maybeSingle();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+    return data as { id: string; full_name?: string; email?: string } | null;
+  }
+
+  private async getShareableItineraryForOwner(
+    itineraryId: string,
+    senderUserId: string,
+  ) {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, creator_id, description, destination, start_date, end_date')
+      .eq('id', itineraryId)
+      .maybeSingle();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+    if (!data) {
+      throw new NotFoundException(`Itinerary not found: ${itineraryId}`);
+    }
+    if ((data as any).creator_id !== senderUserId) {
+      throw new BadRequestException(
+        'Bạn không có quyền chia sẻ lịch trình này',
+      );
+    }
+    return data;
+  }
+
+  private async getUserDisplayInfo(userId: string) {
+    const { data, error } = await supabase
+      .schema('public')
+      .from('users')
+      .select('id, full_name, email')
+      .eq('id', userId)
+      .maybeSingle();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return {
+      id: userId,
+      displayName:
+        ((data as any)?.full_name || (data as any)?.email || 'Chủ lịch trình')
+          .toString()
+          .trim() || 'Chủ lịch trình',
+    };
+  }
+
+  private buildShareDeepLink(token: string) {
+    return `${APP_DEEP_LINK_SCHEME}://itinerary-share?token=${encodeURIComponent(
+      token,
+    )}`;
+  }
+
+  private async findShareLinkInvitation(token: string): Promise<{
+    id: string;
+    metadata: Record<string, any>;
+  }> {
+    if (!token?.trim()) {
+      throw new BadRequestException('Token chia sẻ không hợp lệ');
+    }
+
+    const { data, error } = await supabase
+      .schema('public')
+      .from('notifications')
+      .select('id, action_type, target_type, metadata')
+      .eq('action_type', 'respond_itinerary_share_link')
+      .eq('target_type', 'itinerary_share_link')
+      .filter('metadata->>share_token', 'eq', token.trim())
+      .maybeSingle();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+    if (!data) {
+      throw new NotFoundException('Không tìm thấy link chia sẻ lịch trình');
+    }
+
+    return {
+      id: (data as any).id,
+      metadata: ((data as any).metadata ?? {}) as Record<string, any>,
+    };
+  }
+
+  private async isItineraryMember(itineraryId: string, userId: string) {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itinerary_members')
+      .select('itinerary_id')
+      .eq('itinerary_id', itineraryId)
+      .eq('user_id', userId)
+      .maybeSingle();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+    return Boolean(data);
+  }
+
+  private async addItineraryMember(itineraryId: string, userId: string) {
+    if (await this.isItineraryMember(itineraryId, userId)) {
+      return;
+    }
+
+    const { error } = await supabase
+      .schema('travel')
+      .from('itinerary_members')
+      .insert({
+        itinerary_id: itineraryId,
+        user_id: userId,
+      });
+
+    if (error && error.code !== '23505') {
+      throw new InternalServerErrorException(error.message);
+    }
+  }
+
   // ════════════════════════════════════════════════════════════════
   // TÍNH NĂNG TÙY CHỈNH LỊCH TRÌNH
   // ════════════════════════════════════════════════════════════════
@@ -498,11 +1158,15 @@ export class ItineraryService {
             .select('duration_minutes, is_locked')
             .eq('itinerary_id', itineraryId)
             .eq('visit_date', visitDate);
-          canReduce = siblingActivities?.some((a: any) => !a.is_locked && (a.duration_minutes || 60) > 30) ?? false;
+          canReduce =
+            siblingActivities?.some(
+              (a: any) => !a.is_locked && (a.duration_minutes || 60) > 30,
+            ) ?? false;
         } catch (_) {}
 
         throw new ConflictException({
-          message: 'Thời gian tham quan đã bị quá tải hoặc vượt quá khung giờ hoạt động.',
+          message:
+            'Thời gian tham quan đã bị quá tải hoặc vượt quá khung giờ hoạt động.',
           canExtend,
           canReduce,
           canAddDay: false,
@@ -725,7 +1389,10 @@ export class ItineraryService {
             .select('duration_minutes, is_locked')
             .eq('itinerary_id', itineraryId)
             .eq('visit_date', visitDate);
-          canReduce = siblingActivities?.some((a: any) => !a.is_locked && (a.duration_minutes || 60) > 30) ?? false;
+          canReduce =
+            siblingActivities?.some(
+              (a: any) => !a.is_locked && (a.duration_minutes || 60) > 30,
+            ) ?? false;
         } catch (_) {}
 
         throw new ConflictException({
@@ -842,7 +1509,10 @@ export class ItineraryService {
             .select('duration_minutes, is_locked')
             .eq('itinerary_id', itineraryId)
             .eq('visit_date', existing.visit_date);
-          canReduce = siblingActivities?.some((a: any) => !a.is_locked && (a.duration_minutes || 60) > 30) ?? false;
+          canReduce =
+            siblingActivities?.some(
+              (a: any) => !a.is_locked && (a.duration_minutes || 60) > 30,
+            ) ?? false;
         } catch (_) {}
 
         throw new ConflictException({
@@ -1779,6 +2449,8 @@ export class ItineraryService {
       trip_intent: itinerary.trip_intent ?? null,
       dateRangeLabel: `${startStr} - ${endStr}`,
       status: (itinerary.status || 'pending').toUpperCase(),
+      trackingActive: itinerary.tracking_active === true,
+      tracking_active: itinerary.tracking_active === true,
       isPublic: itinerary.is_public || false,
       is_favorite: isFavorite,
       isFavorite,
@@ -1967,7 +2639,7 @@ export class ItineraryService {
 
           const dayEndStr = this.trimTime(dailyEndTime) || '22:00';
           if (this.toMinutes(dayEndStr) > this.toMinutes(close_time)) {
-             close_time = dayEndStr;
+            close_time = dayEndStr;
           }
 
           return {
@@ -1999,13 +2671,17 @@ export class ItineraryService {
 
       const optimized: any[] = response.data?.optimized_activities ?? [];
       let reorderNotes: string[] = response.data?.reorder_notes ?? [];
-      if (optimized.length === 0) return { optimized: activities, reorderNotes: [] };
+      if (optimized.length === 0)
+        return { optimized: activities, reorderNotes: [] };
 
-      reorderNotes = reorderNotes.map(note => {
+      reorderNotes = reorderNotes.map((note) => {
         let newNote = note;
         for (const a of activities) {
           if (newNote.includes(a.id)) {
-            newNote = newNote.replace(a.id, a.title || a.locationName || 'địa điểm');
+            newNote = newNote.replace(
+              a.id,
+              a.title || a.locationName || 'địa điểm',
+            );
           }
         }
         return newNote;
