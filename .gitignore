@@ -164,8 +164,22 @@ pids
 tmp/
 temp/
 .tmp/
+docs/
+scripts/
 Note/
 tmp-run-logs/
+
+# Local one-off analysis, database inspection, and data-fix scripts
+/analyze_*.py
+/merge_csv.py
+/patch.py
+/sample_price.py
+/api-service/check_*.js
+/api-service/db_stats.js
+/api-service/fix_*.py
+/api-service/fix_*.js
+/api-service/list_tables.js
+/api-service/test_places.js
 
 # Generated planner/debug artifacts
 api-service/logs/

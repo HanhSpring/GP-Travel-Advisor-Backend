@@ -17,7 +17,9 @@ import { RespondItineraryShareDto } from './dto/respond-itinerary-share.dto';
 import { CreateItineraryShareLinkDto } from './dto/create-itinerary-share-link.dto';
 import { RespondItineraryShareLinkDto } from './dto/respond-itinerary-share-link.dto';
 
-import { CreateItineraryDto } from './dto/create-itinerary.dto';
+import { CreateItineraryDto, TransportMode } from './dto/create-itinerary.dto';
+import { HotelRoomResponseDto } from './dto/hotel-room-response.dto';
+import { getRoomsByPlaceId } from './room-catalog';
 
 // ─── Địa chỉ FastAPI optimizer (đọc từ env hoặc dùng mặc định) ───
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL ?? 'http://localhost:8000';
@@ -29,6 +31,13 @@ const APP_PUBLIC_SHARE_BASE_URL =
   process.env.API_PUBLIC_URL ??
   process.env.BASE_URL ??
   null;
+const SELF_DRIVE_TRANSPORT_COST_PER_KM: Record<string, number> = {
+  [TransportMode.MOTORBIKE]: 3000,
+  [TransportMode.CAR]: 15000,
+  [TransportMode.ROAD]: 15000,
+};
+const DEFAULT_SELF_DRIVE_TRANSPORT_COST_PER_KM =
+  SELF_DRIVE_TRANSPORT_COST_PER_KM[TransportMode.CAR];
 
 interface ScheduleEntry {
   location_id: string;
@@ -53,6 +62,13 @@ interface PlanDay {
 export interface AIPlanResult {
   hotel_id?: string;
   hotel_name?: string;
+  hotel_selection?: {
+    hotel_total_cost?: number;
+    price_per_person_per_night?: number;
+    group_nightly_cost?: number;
+    full_people?: number;
+    nights?: number;
+  };
   num_days: number;
   total_visited: number;
   days: PlanDay[];
@@ -61,6 +77,41 @@ export interface AIPlanResult {
 @Injectable()
 export class ItineraryService {
   private readonly logger = new Logger(ItineraryService.name);
+
+  async getHotelRooms(placeId: string): Promise<HotelRoomResponseDto[]> {
+    const normalizedPlaceId = placeId?.trim();
+    if (!normalizedPlaceId) {
+      throw new BadRequestException('placeId is required');
+    }
+
+    let rows;
+    try {
+      rows = await getRoomsByPlaceId(normalizedPlaceId);
+    } catch (error) {
+      this.logger.error(`getHotelRooms failed: ${String(error)}`);
+      throw new InternalServerErrorException(
+        'Không thể tải danh sách phòng khách sạn',
+      );
+    }
+
+    return rows
+      .map((row) => ({
+        id: row.id,
+        placeId: row.place_id,
+        roomName: row.room_name,
+        roomType: row.room_type,
+        quantity: row.quantity,
+        price: row.price,
+      }))
+      .filter(
+        (room) =>
+          room.roomName.length > 0 &&
+          Number.isFinite(room.price) &&
+          room.price > 0 &&
+          Number.isFinite(room.quantity) &&
+          room.quantity > 0,
+      );
+  }
 
   // ════════════════════════════════════════════════════════════════
   // ITINERARY CRUD + LIST QUERIES
@@ -324,49 +375,52 @@ export class ItineraryService {
       return payload;
     }
 
-    const { data: detailRows, error } = await supabase
+    const { data: itineraryRows, error } = await supabase
       .schema('travel')
-      .from('itinerary_details')
-      .select('itinerary_id, estimated_cost, transport_cost')
-      .in('itinerary_id', itineraryIds);
+      .from('itineraries')
+      .select('id, estimated_cost, adult_count, children_count')
+      .in('id', itineraryIds);
 
     if (error) {
       this.logger.warn(
-        `Cannot enrich itinerary list estimated costs: ${error.message}`,
+        `Cannot enrich itinerary list budget metadata: ${error.message}`,
       );
       return payload;
     }
 
-    const estimatedByItinerary = new Map<string, number>();
-    for (const row of detailRows ?? []) {
-      const itineraryId = row.itinerary_id;
-      if (!itineraryId) continue;
-      const current = estimatedByItinerary.get(itineraryId) ?? 0;
-      estimatedByItinerary.set(
-        itineraryId,
-        current +
-          Number(row.estimated_cost ?? 0) +
-          Number(row.transport_cost ?? 0),
-      );
-    }
+    const metadataByItinerary = new Map(
+      (itineraryRows ?? []).map((row: any) => [row.id, row]),
+    );
 
     return {
       ...payload,
       itineraries: itineraries.map((item: any) => {
-        const calculatedEstimatedCost = estimatedByItinerary.get(item.id) ?? 0;
-        const userBudget = Number(item.estimated_cost ?? 0);
+        const metadata: any = metadataByItinerary.get(item.id);
+        const estimatedCost = Math.max(
+          0,
+          Math.round(
+            Number(metadata?.estimated_cost ?? item.estimated_cost ?? 0),
+          ),
+        );
+        const adultCount = Math.max(
+          0,
+          Math.round(Number(metadata?.adult_count ?? item.adult_count ?? 0)),
+        );
+        const childCount = Math.max(
+          0,
+          Math.round(
+            Number(metadata?.children_count ?? item.children_count ?? 0),
+          ),
+        );
+        const participantCount = Math.max(1, adultCount + childCount);
         return {
           ...item,
-          estimated_cost:
-            calculatedEstimatedCost > 0
-              ? Math.round(calculatedEstimatedCost)
-              : item.estimated_cost,
-          estimatedCost:
-            calculatedEstimatedCost > 0
-              ? Math.round(calculatedEstimatedCost)
-              : item.estimated_cost,
-          user_budget: userBudget,
-          userBudget,
+          estimated_cost: estimatedCost,
+          estimatedCost,
+          adult_count: adultCount,
+          children_count: childCount,
+          participant_count: participantCount,
+          participantCount,
         };
       }),
     };
@@ -389,7 +443,7 @@ export class ItineraryService {
       description: dto.description ?? null,
       start_date: dto.startDate,
       end_date: dto.endDate,
-      estimated_cost: dto.budget,
+      estimated_cost: this.calculateRecommendedBudget(plan),
       status: 'pending',
       departure_point: departureName ?? dto.departureLocationId,
       destination: destinationName ?? dto.destinationLocationId,
@@ -399,6 +453,7 @@ export class ItineraryService {
       trip_intent: dto.tripIntent,
       daily_start_time: dto.dailyStartTime ?? '07:00',
       daily_end_time: dto.dailyEndTime ?? '22:00',
+      travel_mode: this.normalizeMatrixTravelMode(dto.transportMode),
     };
 
     let insertResult = await supabase
@@ -441,38 +496,39 @@ export class ItineraryService {
     }
 
     const placeCostById = await this.getPlaceEstimatedCostMap(plan);
-    const detailRows = plan.days.flatMap((day) => {
+    const hotelTotalCost = Math.max(
+      0,
+      Math.round(Number(plan.hotel_selection?.hotel_total_cost ?? 0)),
+    );
+    const hotelRow = this.buildHotelDetailRow(
+      (itinerary as any).id,
+      plan,
+      dto.startDate,
+      dto.dailyStartTime,
+      hotelTotalCost,
+    );
+    const activityRows = plan.days.flatMap((day) => {
       const schedule = Array.isArray(day.schedule) ? day.schedule : [];
       const visitDate = this.addDays(dto.startDate, day.day - 1);
-      const hotelRow = this.buildHotelDetailRow(
-        (itinerary as any).id,
-        plan,
-        visitDate,
-        dto.dailyStartTime,
-        placeCostById.get(plan.hotel_id ?? '') ?? 0,
-      );
-      const activityRows = schedule
+      return schedule
         .filter((entry) => this.shouldPersistScheduleEntry(entry))
         .map((entry, index) => ({
           itinerary_id: (itinerary as any).id,
           place_id: entry.location_id,
           visit_date: visitDate,
-          arrival_time: entry.arrival_time,
-          departure_time: entry.departure_time,
+          // itinerary_details.arrival_time is the time shown as the activity
+          // start on mobile. A traveller may physically arrive earlier and
+          // wait for opening/meal windows, so persist service_start_time.
+          arrival_time: entry.service_start_time || entry.arrival_time,
           duration_minutes: entry.active_duration_minutes,
           estimated_cost:
             entry.estimated_cost ?? placeCostById.get(entry.location_id) ?? 0,
-          transport_cost:
-            entry.transport_cost ??
-            this.estimateSelfDriveTransportCost(
-              entry.distance_km,
-              dto.transportMode,
-            ),
           sequence_order: index + 1,
+          detail_type: 'ACTIVITY',
           is_locked: false,
         }));
-      return [hotelRow, ...activityRows];
     });
+    const detailRows = [hotelRow, ...activityRows];
 
     if (detailRows.length === 0) {
       await supabase
@@ -1857,7 +1913,6 @@ export class ItineraryService {
             .from('itinerary_details')
             .update({
               arrival_time: opt.arrival_time,
-              departure_time: opt.departure_time,
               sequence_order: opt.sequence_order,
               duration_minutes: opt.duration_minutes,
             })
@@ -1886,7 +1941,6 @@ export class ItineraryService {
         id,
         place_id,
         arrival_time,
-        departure_time,
         duration_minutes,
         is_locked,
         locked_arrive_time,
@@ -1961,7 +2015,11 @@ export class ItineraryService {
           placeId: a.place_id,
           title: a.places?.name ?? '',
           startTime: a.arrival_time ?? '',
-          endTime: a.departure_time ?? '',
+          endTime:
+            this.addMinutesToTime(
+              a.arrival_time,
+              Number(a.duration_minutes ?? 0),
+            ) ?? '',
           address: a.places?.address ?? '',
           imageUrl: a.places?.image_url ?? '',
           estimatedCost: a.estimated_cost ?? 0,
@@ -2120,7 +2178,6 @@ export class ItineraryService {
 
           const updatePayload: any = {
             arrival_time: act.startTime,
-            departure_time: act.endTime,
             visit_date: visitDate,
             sequence_order: act.sequenceOrder,
             duration_minutes: duration,
@@ -2224,13 +2281,12 @@ export class ItineraryService {
         place_id,
         visit_date,
         arrival_time,
-        departure_time,
         notes,
         estimated_cost,
-        transport_cost,
         actual_cost,
         duration_minutes,
         sequence_order,
+        detail_type,
         user_notes,
         locked_arrive_time
       `,
@@ -2247,6 +2303,11 @@ export class ItineraryService {
         `Failed to load itinerary details: ${detailError.message}`,
       );
     }
+
+    await this.hydrateMissingTravelSnapshots(
+      details ?? [],
+      itinerary.travel_mode,
+    );
 
     const placeIds = Array.from(
       new Set(
@@ -2274,6 +2335,7 @@ export class ItineraryService {
           longitude,
           average_rating,
           review_count,
+          slot_type,
           open_hour_compressed,
           types(categories(name))
         `,
@@ -2317,8 +2379,21 @@ export class ItineraryService {
       // Nếu query tracking thất bại thì vẫn trả về dữ liệu bình thường với status mặc định.
     }
 
+    const hotelDetail = (details || []).find(
+      (detail: any) =>
+        detail.detail_type === 'HOTEL' || this.isStartPointDetail(detail),
+    );
+    const adultCount = Math.max(0, Number(itinerary.adult_count ?? 0));
+    const childCount = Math.max(0, Number(itinerary.children_count ?? 0));
+    const participantCount = Math.max(1, adultCount + childCount);
     const daysMap = new Map<string, any[]>();
     for (const detail of details || []) {
+      if (
+        detail.detail_type === 'HOTEL' ||
+        this.isStartPointDetail(detail)
+      ) {
+        continue;
+      }
       const dateStr = detail.visit_date;
       if (!dateStr) {
         this.logger.warn(
@@ -2339,8 +2414,22 @@ export class ItineraryService {
     const days = sortedDates.map((dateStr, index) => {
       const dayNumber = index + 1;
       const activitiesRaw = daysMap.get(dateStr) || [];
+      // Day 1 starts directly from the first scheduled activity. From day 2
+      // onward the hotel is shown as the day's departure point, but its cost
+      // remains exclusively in the trip-level accommodation breakdown.
+      const displayRows = hotelDetail && index > 0
+        ? [
+            {
+              ...hotelDetail,
+              visit_date: dateStr,
+              estimated_cost: 0,
+              place: placesById.get(hotelDetail.place_id) ?? null,
+            },
+            ...activitiesRaw,
+          ]
+        : activitiesRaw;
 
-      const activities = activitiesRaw.map((act, actIndex) => {
+      const activities = displayRows.map((act, actIndex) => {
         const place = act.place;
         const images = place?.image_url;
         const imageUrl =
@@ -2350,36 +2439,52 @@ export class ItineraryService {
               ? images
               : 'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80';
 
-        // Tính thời gian di chuyển đến địa điểm kế tiếp bằng Haversine.
-        // KHÔNG dùng gap thời gian (departure → nextArrival) vì gap đó bao gồm
-        // cả thời gian rảnh (VD: hoạt động kết thúc 09:00, chợ đêm bắt đầu 19:00
-        // → gap = 10 tiếng nhưng di chuyển thực tế chỉ ~6 phút).
-        const nextAct = activitiesRaw[actIndex + 1];
-        let transitInfo: string | null = null;
-        if (nextAct) {
-          const p1 = act.place;
-          const p2 = nextAct.place;
-          if (
-            p1?.latitude != null &&
-            p1?.longitude != null &&
-            p2?.latitude != null &&
-            p2?.longitude != null
-          ) {
-            const dist = this._haversineKm(
-              p1.latitude,
-              p1.longitude,
-              p2.latitude,
-              p2.longitude,
-            );
-            const mins = this._transitMinutes(dist);
-            transitInfo = `${mins} phút di chuyển`;
-          } else {
-            transitInfo = this._calcTransitLabel(
-              act.departure_time || '',
-              nextAct.arrival_time || '',
-            );
-          }
-        }
+        // Dữ liệu chặng được lưu trên điểm đến. Chuyển chặng kế tiếp sang
+        // hoạt động hiện tại để khớp contract transitToNext của mobile.
+        const nextAct = displayRows[actIndex + 1];
+        const nextTravelMinutes = nextAct
+          ? this.roundTravelMinutes(nextAct.travel_minutes)
+          : 0;
+        const nextTravelDistanceKm = nextAct
+          ? Number(nextAct.travel_distance_km ?? 0)
+          : 0;
+        const nextTransportCost = nextAct
+          ? Number(nextAct.transport_cost ?? 0)
+          : 0;
+        const transitInfo =
+          nextTravelMinutes > 0
+            ? `${this.formatDuration(nextTravelMinutes)} di chuyển`
+            : null;
+        // Do not synthesize a wait activity from legacy timestamp gaps.
+        // Scheduler v2 enforces wait = 0 for newly generated itineraries.
+        const waitMinutes = 0;
+        const groupEstimatedCost = Math.max(
+          0,
+          Number(act.estimated_cost ?? 0),
+        );
+        const perPersonEstimatedCost = Math.round(
+          groupEstimatedCost / participantCount,
+        );
+        const groupTransportCost = Math.max(
+          0,
+          Number(act.transport_cost ?? 0),
+        );
+        const perPersonTransportCost = Math.round(
+          groupTransportCost / participantCount,
+        );
+        const transportDisplay = nextAct
+          ? [
+              nextTravelMinutes > 0
+                ? `${this.formatDuration(nextTravelMinutes)} di chuyển`
+                : null,
+              nextTravelDistanceKm > 0
+                ? `${Number(nextTravelDistanceKm.toFixed(1))} km`
+                : null,
+              waitMinutes > 0
+                ? `${this.formatDuration(waitMinutes)} chờ`
+                : null,
+            ].filter((value): value is string => Boolean(value)).join(' • ')
+          : null;
 
         const typeData = Array.isArray(place?.types)
           ? place.types[0]
@@ -2392,14 +2497,19 @@ export class ItineraryService {
         const sequenceOrder = act.sequence_order ?? actIndex + 1;
         const isAccommodation = this.isAccommodationCategory(category);
         const isStartPoint =
-          isAccommodation && durationMinutes === 0 && sequenceOrder === 0;
+          act.detail_type === 'HOTEL' ||
+          (isAccommodation && durationMinutes === 0 && sequenceOrder === 0);
 
         return {
           id: act.id,
           placeId: act.place_id,
           sequenceOrder,
           startTime: act.arrival_time || '08:00',
-          endTime: act.departure_time || '09:00',
+          endTime:
+            this.addMinutesToTime(
+              act.arrival_time,
+              Number(act.duration_minutes ?? 0),
+            ) || '09:00',
           placeName: place?.name || 'Điểm tham quan',
           address: place?.address || '',
           imageUrl: imageUrl,
@@ -2410,19 +2520,52 @@ export class ItineraryService {
           transitToNext: transitInfo
             ? {
                 durationStr: transitInfo,
-                estimatedCost: act.transport_cost || 0,
+                durationMinutes: nextTravelMinutes,
+                distanceKm: nextTravelDistanceKm,
+                estimatedCost: nextTransportCost,
+                waitMinutes,
+                waitStr:
+                  waitMinutes > 0
+                    ? `${this.formatDuration(waitMinutes)} chờ`
+                    : null,
               }
             : null,
-          transport_info: transitInfo,
+          transport_info: transportDisplay,
           title: place?.name || 'Điểm tham quan',
           locationName: place?.name || 'Điểm tham quan',
           estimatedCost: act.estimated_cost || 0,
+          groupEstimatedCost,
+          group_estimated_cost: groupEstimatedCost,
+          perPersonEstimatedCost,
+          per_person_estimated_cost: perPersonEstimatedCost,
+          costScope: 'TOTAL_GROUP',
+          cost_scope: 'TOTAL_GROUP',
+          participantCount,
+          participant_count: participantCount,
           price: act.estimated_cost || 0,
           transportCost: act.transport_cost || 0,
           transport_cost: act.transport_cost || 0,
+          groupTransportCost,
+          group_transport_cost: groupTransportCost,
+          perPersonTransportCost,
+          per_person_transport_cost: perPersonTransportCost,
+          travelDistanceKm: Number(act.travel_distance_km ?? 0),
+          travel_distance_km: Number(act.travel_distance_km ?? 0),
           currency: 'VNĐ',
           isFree: !act.estimated_cost,
-          category,
+          category:
+            act.detail_type === 'HOTEL'
+              ? 'hotel'
+              : (place?.slot_type ?? category),
+          categoryName: category,
+          placeType:
+            act.detail_type === 'HOTEL'
+              ? 'hotel'
+              : (place?.slot_type ?? 'attraction'),
+          place_type:
+            act.detail_type === 'HOTEL'
+              ? 'hotel'
+              : (place?.slot_type ?? 'attraction'),
           durationMinutes,
           isAccommodation,
           isStartPoint,
@@ -2447,6 +2590,16 @@ export class ItineraryService {
         (sum, activity) => sum + Number(activity.transportCost ?? 0),
         0,
       );
+      const totalDistanceKm = activitiesRaw.reduce(
+        (sum, activity) =>
+          sum + Math.max(0, Number(activity.travel_distance_km ?? 0)),
+        0,
+      );
+      const totalTransitMinutes = activitiesRaw.reduce(
+        (sum, activity) =>
+          sum + this.roundTravelMinutes(activity.travel_minutes),
+        0,
+      );
       const totalDuration = this.formatDuration(totalDurationMinutes);
       const activityCount = activities.filter(
         (activity) => !activity.isStartPoint,
@@ -2467,9 +2620,21 @@ export class ItineraryService {
         weatherTemp: 30,
         activeTimeStr: totalDuration,
         dayBudget: totalActivityCost + totalTransportCost,
+        groupEstimatedCost: totalActivityCost + totalTransportCost,
+        group_estimated_cost: totalActivityCost + totalTransportCost,
+        perPersonEstimatedCost: Math.round(
+          (totalActivityCost + totalTransportCost) / participantCount,
+        ),
+        per_person_estimated_cost: Math.round(
+          (totalActivityCost + totalTransportCost) / participantCount,
+        ),
+        costScope: 'TOTAL_GROUP',
+        cost_scope: 'TOTAL_GROUP',
+        participantCount,
+        participant_count: participantCount,
         progressPercent: 0,
-        totalDistanceStr: '0km',
-        totalTransitTimeStr: '0 phút',
+        totalDistanceStr: `${Number(totalDistanceKm.toFixed(1))}km`,
+        totalTransitTimeStr: this.formatDuration(totalTransitMinutes),
         activities: activities,
         day_number: dayNumber,
         locations_count: activityCount,
@@ -2502,7 +2667,10 @@ export class ItineraryService {
       const catData = Array.isArray(typeData?.categories)
         ? typeData.categories[0]
         : typeData?.categories;
-      const isHotel = this.isAccommodationCategory(catData?.name);
+      const isHotel =
+        detail.detail_type === 'HOTEL' ||
+        this.isStartPointDetail(detail) ||
+        this.isAccommodationCategory(catData?.name);
       return {
         detail,
         isHotel,
@@ -2525,15 +2693,23 @@ export class ItineraryService {
       .reduce((sum, row) => sum + row.estimatedCost, 0);
     const hotelCost = costRows
       .filter((row) => row.isHotel)
-      .reduce((sum, row) => sum + row.estimatedCost, 0);
+      .reduce((max, row) => Math.max(max, row.estimatedCost), 0);
     const transportCost = costRows.reduce(
       (sum, row) => sum + row.transportCost,
       0,
     );
     const rideHailingTransportCost =
       transportCost > 0 ? Math.round(transportCost * 2.5) : 0;
+    const calculatedTripCost = placeCost + hotelCost + transportCost;
     const estimatedTripCost =
-      placeCost + hotelCost + transportCost || itinerary.estimated_cost || 0;
+      Number(itinerary.estimated_cost ?? 0) > 0
+        ? Number(itinerary.estimated_cost)
+        : calculatedTripCost;
+    const hotelNights = Math.max(1, (diffDays || days.length || 1) - 1);
+    const hotelCostPerPersonPerNight =
+      hotelCost > 0
+        ? Math.round(hotelCost / participantCount / hotelNights)
+        : 0;
 
     return {
       id: itinerary.id,
@@ -2548,8 +2724,24 @@ export class ItineraryService {
       is_favorite: isFavorite,
       isFavorite,
       totalBudget: estimatedTripCost,
-      userBudget: itinerary.estimated_cost || 0,
-      user_budget: itinerary.estimated_cost || 0,
+      groupEstimatedCost: estimatedTripCost,
+      group_estimated_cost: estimatedTripCost,
+      perPersonEstimatedCost: Math.round(
+        estimatedTripCost / participantCount,
+      ),
+      per_person_estimated_cost: Math.round(
+        estimatedTripCost / participantCount,
+      ),
+      costScope: 'TOTAL_GROUP',
+      cost_scope: 'TOTAL_GROUP',
+      calculatedTripCost,
+      calculated_trip_cost: calculatedTripCost,
+      adultCount,
+      adult_count: adultCount,
+      childCount,
+      children_count: childCount,
+      participantCount,
+      participant_count: participantCount,
       totalDays: diffDays || days.length || 1,
       totalPlaces: nonHotelDetailsCount,
       hotelsCount: hotelDetailsCount,
@@ -2570,6 +2762,10 @@ export class ItineraryService {
       place_cost: placeCost,
       hotelCost,
       hotel_cost: hotelCost,
+      hotelNights,
+      hotel_nights: hotelNights,
+      hotelCostPerPersonPerNight,
+      hotel_cost_per_person_per_night: hotelCostPerPersonPerNight,
       transportCost,
       transport_cost: transportCost,
       rideHailingTransportCost,
@@ -2874,13 +3070,15 @@ export class ItineraryService {
       place_id: plan.hotel_id,
       visit_date: visitDate,
       arrival_time: startTime,
-      departure_time: startTime,
       duration_minutes: 0,
       sequence_order: 0,
+      detail_type: 'HOTEL',
       estimated_cost: estimatedCost,
-      transport_cost: 0,
       is_locked: true,
-      notes: 'Hotel/start point selected by GA planner',
+      notes:
+        estimatedCost > 0
+          ? 'Estimated hotel cost for the full group and stay'
+          : 'Hotel/start point; hotel cost is recorded on the first day',
     };
   }
 
@@ -2899,7 +3097,7 @@ export class ItineraryService {
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, estimated_cost')
+      .select('id, price')
       .in('id', Array.from(ids));
 
     if (error) {
@@ -2908,7 +3106,7 @@ export class ItineraryService {
     }
 
     return new Map(
-      (data || []).map((row: any) => [row.id, Number(row.estimated_cost ?? 0)]),
+      (data || []).map((row: any) => [row.id, Number(row.price ?? 0)]),
     );
   }
 
@@ -2919,8 +3117,39 @@ export class ItineraryService {
     const km = Number(distanceKm ?? 0);
     if (!Number.isFinite(km) || km <= 0) return 0;
     const mode = (transportMode ?? '').toUpperCase();
-    const costPerKm = mode === 'MOTORBIKE' ? 3000 : 15000;
+    const costPerKm =
+      SELF_DRIVE_TRANSPORT_COST_PER_KM[mode] ??
+      DEFAULT_SELF_DRIVE_TRANSPORT_COST_PER_KM;
     return Math.round(km * costPerKm);
+  }
+
+  calculatePlanEstimatedCost(plan: AIPlanResult): number {
+    const hotelCost = Math.max(
+      0,
+      Number(plan.hotel_selection?.hotel_total_cost ?? 0),
+    );
+    const activityCost = (plan.days ?? []).reduce(
+      (total, day) =>
+        total +
+        (day.schedule ?? []).reduce((dayTotal, entry) => {
+          if (entry.is_return_to_hotel) return dayTotal;
+          return dayTotal + Math.max(0, Number(entry.estimated_cost ?? 0));
+        }, 0),
+      0,
+    );
+    const transportCost = (plan.days ?? []).reduce(
+      (total, day: any) =>
+        total + Math.max(0, Number(day.total_transport_cost ?? 0)),
+      0,
+    );
+    return Math.round(hotelCost + activityCost + transportCost);
+  }
+
+  calculateRecommendedBudget(plan: AIPlanResult): number {
+    const calculatedCost = this.calculatePlanEstimatedCost(plan);
+    if (calculatedCost <= 0) return 0;
+    const withReserve = calculatedCost / 0.9;
+    return Math.ceil(withReserve / 1_000_000) * 1_000_000;
   }
 
   private formatDuration(totalMinutes: number): string {
@@ -2930,6 +3159,298 @@ export class ItineraryService {
     if (hours > 0 && minutes > 0) return `${hours} giờ ${minutes} phút`;
     if (hours > 0) return `${hours} giờ`;
     return `${minutes} phút`;
+  }
+
+  private roundTravelMinutes(value: unknown): number {
+    const minutes = Number(value ?? 0);
+    if (!Number.isFinite(minutes) || minutes <= 0) return 0;
+    return Math.ceil(minutes / 5) * 5;
+  }
+
+  private addMinutesToTime(
+    time: string | null | undefined,
+    minutes: number,
+  ): string | null {
+    if (!time) return null;
+    const parts = time.split(':').map(Number);
+    if (parts.length < 2 || parts.some((part) => !Number.isFinite(part))) {
+      return null;
+    }
+    const total = parts[0] * 60 + parts[1] + Math.max(0, minutes);
+    return `${String(Math.floor(total / 60) % 24).padStart(2, '0')}:${String(
+      total % 60,
+    ).padStart(2, '0')}`;
+  }
+
+  private minutesBetween(
+    from: string | null | undefined,
+    to: string | null | undefined,
+  ): number {
+    if (!from || !to) return 0;
+    const fromParts = from.split(':').map(Number);
+    const toParts = to.split(':').map(Number);
+    if (
+      fromParts.length < 2 ||
+      toParts.length < 2 ||
+      [...fromParts, ...toParts].some((value) => !Number.isFinite(value))
+    ) {
+      return 0;
+    }
+    return Math.max(
+      0,
+      toParts[0] * 60 +
+        toParts[1] -
+        (fromParts[0] * 60 + fromParts[1]),
+    );
+  }
+
+  private async hydrateMissingTravelSnapshots(
+    details: any[],
+    travelMode?: string | null,
+  ): Promise<void> {
+    if (!Array.isArray(details) || details.length === 0) return;
+
+    const hotel = details.find((detail) => this.isStartPointDetail(detail));
+    const activitiesByDate = new Map<string, any[]>();
+    for (const detail of details) {
+      if (this.isStartPointDetail(detail) || !detail.visit_date) continue;
+      const rows = activitiesByDate.get(detail.visit_date) ?? [];
+      rows.push(detail);
+      activitiesByDate.set(detail.visit_date, rows);
+    }
+
+    const legs: Array<{ originId: string; destination: any }> = [];
+    for (const rows of activitiesByDate.values()) {
+      rows.sort(
+        (left, right) =>
+          Number(left.sequence_order ?? 0) - Number(right.sequence_order ?? 0),
+      );
+      let previousPlaceId = hotel?.place_id;
+      for (const destination of rows) {
+        if (
+          previousPlaceId &&
+          destination.place_id &&
+          previousPlaceId !== destination.place_id &&
+          (Number(destination.travel_distance_km ?? 0) <= 0 ||
+            Number(destination.travel_minutes ?? 0) <= 0)
+        ) {
+          legs.push({ originId: previousPlaceId, destination });
+        }
+        previousPlaceId = destination.place_id;
+      }
+    }
+
+    if (legs.length === 0) return;
+
+    const originIds = [...new Set(legs.map((leg) => leg.originId))];
+    const destinationIds = [
+      ...new Set(legs.map((leg) => leg.destination.place_id)),
+    ];
+
+    const matrixMode = this.normalizeMatrixTravelMode(travelMode);
+    try {
+      const { data, error } = await supabase
+        .schema('travel')
+        .from('distance_matrix')
+        .select(
+          'origin_place_id, destination_place_id, distance_meters, duration_seconds',
+        )
+        .eq('travel_mode', matrixMode)
+        .in('origin_place_id', originIds)
+        .in('destination_place_id', destinationIds);
+
+      if (error) {
+        this.logger.warn(`Distance matrix fallback unavailable: ${error.message}`);
+        return;
+      }
+
+      const matrix = new Map<string, any>(
+        (data ?? []).map((row: any) => [
+          `${row.origin_place_id}:${row.destination_place_id}`,
+          row,
+        ]),
+      );
+      const missingLegs = legs.filter(
+        (leg) => !matrix.has(`${leg.originId}:${leg.destination.place_id}`),
+      );
+      if (missingLegs.length > 0) {
+        const goongRows = await this.fetchAndCacheGoongLegs(
+          missingLegs,
+          matrixMode,
+        );
+        for (const row of goongRows) {
+          matrix.set(
+            `${row.origin_place_id}:${row.destination_place_id}`,
+            row,
+          );
+        }
+      }
+
+      for (const leg of legs) {
+        const row = matrix.get(
+          `${leg.originId}:${leg.destination.place_id}`,
+        ) as any;
+        if (!row) continue;
+        if (Number(leg.destination.travel_distance_km ?? 0) <= 0) {
+          leg.destination.travel_distance_km =
+            Number(row.distance_meters ?? 0) / 1000;
+        }
+        if (Number(leg.destination.travel_minutes ?? 0) <= 0) {
+          leg.destination.travel_minutes = this.roundTravelMinutes(
+            Math.ceil(Number(row.duration_seconds ?? 0) / 60),
+          );
+        }
+        if (Number(leg.destination.transport_cost ?? 0) <= 0) {
+          leg.destination.transport_cost =
+            this.estimateSelfDriveTransportCost(
+              leg.destination.travel_distance_km,
+              matrixMode === 'MOTORBIKE'
+                ? TransportMode.MOTORBIKE
+                : TransportMode.CAR,
+            );
+        }
+      }
+    } catch (error) {
+      this.logger.warn(`Distance matrix fallback failed: ${String(error)}`);
+    }
+  }
+
+  private normalizeMatrixTravelMode(mode?: string | null): 'DRIVING' | 'MOTORBIKE' {
+    return (mode ?? '').toUpperCase() === TransportMode.MOTORBIKE
+      ? 'MOTORBIKE'
+      : 'DRIVING';
+  }
+
+  private async fetchAndCacheGoongLegs(
+    legs: Array<{ originId: string; destination: any }>,
+    travelMode: 'DRIVING' | 'MOTORBIKE',
+  ): Promise<any[]> {
+    const apiKey = process.env.GOONG_API_KEY?.trim();
+    if (legs.length === 0) return [];
+
+    const placeIds = [
+      ...new Set(
+        legs.flatMap((leg) => [leg.originId, leg.destination.place_id]),
+      ),
+    ];
+    const { data: places, error } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, latitude, longitude')
+      .in('id', placeIds);
+    if (error) {
+      this.logger.warn(`Cannot load coordinates for Goong fallback: ${error.message}`);
+      return [];
+    }
+
+    const coordinates = new Map(
+      (places ?? [])
+        .filter(
+          (place: any) =>
+            Number.isFinite(Number(place.latitude)) &&
+            Number.isFinite(Number(place.longitude)),
+        )
+        .map((place: any) => [
+          place.id,
+          `${Number(place.latitude)},${Number(place.longitude)}`,
+        ]),
+    );
+    const rows: any[] = [];
+    const goongRows: any[] = [];
+    const vehicle = travelMode === 'MOTORBIKE' ? 'bike' : 'car';
+
+    for (const leg of legs) {
+      const origin = coordinates.get(leg.originId);
+      const destination = coordinates.get(leg.destination.place_id);
+      if (!origin || !destination) continue;
+      try {
+        if (!apiKey) throw new Error('GOONG_API_KEY is not configured');
+        const response = await axios.get(
+          'https://rsapi.goong.io/v2/distancematrix',
+          {
+            params: {
+              origins: origin,
+              destinations: destination,
+              vehicle,
+              api_key: apiKey,
+            },
+            timeout: 10000,
+          },
+        );
+        const element = response.data?.rows?.[0]?.elements?.[0];
+        if (element?.status !== 'OK') continue;
+        const row = {
+          origin_place_id: leg.originId,
+          destination_place_id: leg.destination.place_id,
+          travel_mode: travelMode,
+          distance_meters: Math.max(
+            0,
+            Math.round(Number(element.distance?.value ?? 0)),
+          ),
+          duration_seconds: Math.max(
+            0,
+            Math.round(Number(element.duration?.value ?? 0)),
+          ),
+          updated_at: new Date().toISOString(),
+        };
+        rows.push(row);
+        goongRows.push(row);
+      } catch (error) {
+        this.logger.warn(
+          `Goong fallback failed for ${leg.originId} -> ${leg.destination.place_id}: ${String(error)}`,
+        );
+        const [originLat, originLng] = origin.split(',').map(Number);
+        const [destinationLat, destinationLng] = destination
+          .split(',')
+          .map(Number);
+        const distanceKm = this.haversineDistanceKm(
+          originLat,
+          originLng,
+          destinationLat,
+          destinationLng,
+        );
+        rows.push({
+          origin_place_id: leg.originId,
+          destination_place_id: leg.destination.place_id,
+          travel_mode: travelMode,
+          distance_meters: Math.round(distanceKm * 1000),
+          duration_seconds: Math.max(
+            60,
+            Math.ceil((distanceKm / 30) * 3600),
+          ),
+        });
+      }
+    }
+
+    if (goongRows.length > 0) {
+      const { error: upsertError } = await supabase
+        .schema('travel')
+        .from('distance_matrix')
+        .upsert(goongRows, {
+          onConflict: 'origin_place_id,destination_place_id,travel_mode',
+        });
+      if (upsertError) {
+        this.logger.warn(`Cannot cache Goong distance matrix: ${upsertError.message}`);
+      }
+    }
+    return rows;
+  }
+
+  private haversineDistanceKm(
+    latitude1: number,
+    longitude1: number,
+    latitude2: number,
+    longitude2: number,
+  ): number {
+    const toRadians = (value: number) => (value * Math.PI) / 180;
+    const deltaLatitude = toRadians(latitude2 - latitude1);
+    const deltaLongitude = toRadians(longitude2 - longitude1);
+    const a =
+      Math.sin(deltaLatitude / 2) ** 2 +
+      Math.cos(toRadians(latitude1)) *
+        Math.cos(toRadians(latitude2)) *
+        Math.sin(deltaLongitude / 2) ** 2;
+    return 6371 * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
   }
   private isAccommodationCategory(category?: string | null): boolean {
     const normalized = (category ?? '')
@@ -2946,8 +3467,9 @@ export class ItineraryService {
 
   private isStartPointDetail(detail: any): boolean {
     return (
-      (detail?.sequence_order ?? null) === 0 &&
-      (detail?.duration_minutes ?? 0) === 0
+      detail?.detail_type === 'HOTEL' ||
+      ((detail?.sequence_order ?? null) === 0 &&
+        (detail?.duration_minutes ?? 0) === 0)
     );
   }
   /** Cộng thêm N ngày vào chuỗi ngày 'YYYY-MM-DD', trả về chuỗi mới */

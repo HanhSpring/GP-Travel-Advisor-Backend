@@ -4,7 +4,13 @@ from dataclasses import dataclass, field
 from typing import Any
 
 
-HARD_VIOLATIONS = {"closed", "late_departure", "missing_lunch"}
+HARD_VIOLATIONS = {
+    "closed",
+    "late_departure",
+    "missing_lunch",
+    "budget_exceeded",
+    "no_feasible_activities",
+}
 
 
 @dataclass
@@ -35,6 +41,8 @@ class FeasibilityValidator:
         self,
         schedule: Any,
         places_map: dict[str, Any],
+        trip_budget_total: float = 0,
+        hotel_total_cost: float = 0,
     ) -> ValidationResult:
         violations: list[Violation] = []
         warnings: list[str] = []
@@ -42,15 +50,19 @@ class FeasibilityValidator:
         for day_result in schedule.days:
             ga = day_result.ga_result
             if ga.restaurant_count < 1:
-                violations.append(
-                    Violation(
-                        day=day_result.day,
-                        location_id="",
-                        location_name="",
-                        violation_type="missing_lunch",
-                        detail="Day has no valid restaurant/lunch stop",
+                # Don't flag missing_lunch if it was intentionally skipped
+                # (e.g., day 1 late check-in, or infeasible fallback)
+                reason = getattr(ga, "stopped_reason", "") or ""
+                if "no_lunch" not in reason and "greedy_fallback" not in reason:
+                    violations.append(
+                        Violation(
+                            day=day_result.day,
+                            location_id="",
+                            location_name="",
+                            violation_type="missing_lunch",
+                            detail="Day has no valid restaurant/lunch stop",
+                        )
                     )
-                )
             if ga.skipped_count > 3:
                 warnings.append(
                     f"Day {day_result.day}: skipped_count={ga.skipped_count} (>3), assignment may be overloaded"
@@ -102,6 +114,43 @@ class FeasibilityValidator:
                                 ),
                             )
                         )
+
+        scheduled_cost = sum(
+            max(0.0, float(day_result.ga_result.total_day_cost or 0))
+            for day_result in schedule.days
+        )
+        trip_cost = max(0.0, float(hotel_total_cost or 0)) + scheduled_cost
+        budget = max(0.0, float(trip_budget_total or 0))
+        if budget > 0 and trip_cost > budget:
+            violations.append(
+                Violation(
+                    day=0,
+                    location_id="",
+                    location_name="",
+                    violation_type="budget_exceeded",
+                    detail=(
+                        f"Không tìm được lịch trình trong ngân sách: "
+                        f"tổng chi phí {round(trip_cost)} VND vượt "
+                        f"ngân sách nhóm {round(budget)} VND."
+                    ),
+                )
+            )
+
+        visited_count = sum(len(day_result.visited_pois) for day_result in schedule.days)
+        if visited_count == 0:
+            violations.append(
+                Violation(
+                    day=0,
+                    location_id="",
+                    location_name="",
+                    violation_type="no_feasible_activities",
+                    detail=(
+                        "Không tìm được địa điểm phù hợp đồng thời với ngân sách, "
+                        "thời gian và giờ mở cửa. Vui lòng tăng ngân sách hoặc nới "
+                        "thời gian chuyến đi."
+                    ),
+                )
+            )
 
         is_feasible = not any(
             violation.violation_type in HARD_VIOLATIONS

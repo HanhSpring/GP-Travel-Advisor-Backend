@@ -11,6 +11,7 @@ import {
   Query,
   Logger,
   Res,
+  UnprocessableEntityException,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -40,16 +41,59 @@ import {
   SuggestionsResponseDto,
 } from './dto/customize-response.dto';
 import { TwoTowerRetrievalResponseDto } from './dto/retrieval-response.dto';
+import { HotelRoomResponseDto } from './dto/hotel-room-response.dto';
+import { ConfigService } from '@nestjs/config';
+import {
+  PlannerEngine,
+  resolvePlannerEngine,
+} from '../../config/planner-engine';
 
 @ApiTags('Itinerary')
 @Controller('itinerary')
 export class ItineraryController {
   private readonly logger = new Logger(ItineraryController.name);
+  private readonly plannerEngine: PlannerEngine;
 
   constructor(
     private readonly service: ItineraryService,
     private readonly recommendationService: RecommendationService,
-  ) {}
+    configService: ConfigService,
+  ) {
+    const configuredValue = configService.get<string>(
+      'ITINERARY_PLANNER_ENGINE',
+    );
+    const resolution = resolvePlannerEngine(configuredValue);
+    this.plannerEngine = resolution.engine;
+    if (resolution.usedFallback) {
+      this.logger.warn(
+        `ITINERARY_PLANNER_ENGINE=${JSON.stringify(configuredValue)} is missing or invalid; ` +
+          'falling back to scheduler_v2.',
+      );
+    }
+  }
+
+  @Get('hotels/:placeId/rooms')
+  @ApiOperation({
+    summary: 'Lấy danh sách phòng và giá của một khách sạn',
+    description:
+      'Đọc danh sách phòng theo place_id từ order_sys.hotel_rooms.',
+  })
+  @ApiParam({
+    name: 'placeId',
+    description: 'UUID của địa điểm lưu trú trong travel.places',
+  })
+  @ApiResponse({
+    status: 200,
+    description:
+      'Danh sách phòng đang có giá hợp lệ, sắp xếp theo giá tăng dần.',
+    type: HotelRoomResponseDto,
+    isArray: true,
+  })
+  getHotelRooms(
+    @Param('placeId') placeId: string,
+  ): Promise<HotelRoomResponseDto[]> {
+    return this.service.getHotelRooms(placeId);
+  }
 
   @Get('my-itineraries')
   @ApiOperation({ summary: 'Lấy danh sách lịch trình của user' })
@@ -93,7 +137,7 @@ export class ItineraryController {
   @Post('plan')
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({
-    summary: 'Create a full itinerary from Two-Tower candidates and GA planner',
+    summary: 'Create a full itinerary using the configured planner engine',
     description:
       'Runs candidate retrieval, fetches full place details, calls FastAPI /itinerary/plan, then persists to DB.',
   })
@@ -139,9 +183,51 @@ export class ItineraryController {
       : this.calcRetrievalTopK(requestedDays);
 
     const planStartedAt = Date.now();
-    const plan = await this.recommendationService.planItinerary(body, k);
+    const plannerEngine = this.plannerEngine;
+    let plan: any = await this.recommendationService.planItinerary(
+      body,
+      k,
+      plannerEngine,
+    );
+    this.logPlanSummary(plan as any, plannerEngine);
+    if (plan?.validation_is_feasible === false) {
+      // A hard budget can leave the solver with zero activities, which the
+      // validator reports as no_feasible_activities instead of
+      // budget_exceeded. Confirm the cause by retrying without the cap.
+      if (Number(body.budget ?? 0) > 0) {
+        const unconstrainedBody = { ...body, budget: 0 };
+        const unconstrainedPlan: any =
+          await this.recommendationService.planItinerary(
+            unconstrainedBody,
+            k,
+            plannerEngine,
+          );
+        if (unconstrainedPlan?.validation_is_feasible !== false) {
+          const calculatedCost =
+            this.service.calculatePlanEstimatedCost(unconstrainedPlan as any);
+          const recommendedBudget =
+            this.service.calculateRecommendedBudget(unconstrainedPlan as any);
+          const participantCount = Math.max(
+            1,
+            Number(body.adultCount ?? 0) + Number(body.childCount ?? 0),
+          );
+          throw new UnprocessableEntityException({
+            code: 'BUDGET_CONFIRMATION_REQUIRED',
+            message:
+              'Ngân sách đã nhập chưa đủ cho một lịch trình phù hợp. Bạn có muốn dùng mức ngân sách ước tính được đề xuất không?',
+            userBudget: Number(body.budget),
+            calculatedCost,
+            reserveRate: 0.1,
+            recommendedBudget,
+            participantCount,
+            costScope: 'TOTAL_GROUP',
+          });
+        }
+        plan = unconstrainedPlan;
+      }
+    }
     const planTimeMs = Date.now() - planStartedAt;
-    this.logPlanSummary(plan as any);
+    this.assertPlanFeasible(plan, plannerEngine);
 
     const persistStartedAt = Date.now();
     const created = await this.service.createGeneratedItinerary(
@@ -155,7 +241,7 @@ export class ItineraryController {
     this.logger.warn(
       `POST /itinerary/plan completed in ${executionTimeMs}ms ` +
         `(planner=${planTimeMs}ms, persist=${persistTimeMs}ms, ` +
-        `details=${created.totalDetails}, days=${requestedDays}, topK=${k})`,
+        `details=${created.totalDetails}, days=${requestedDays}, topK=${k}, engine=${plannerEngine})`,
     );
 
     return {
@@ -165,6 +251,7 @@ export class ItineraryController {
       totalDetails: created.totalDetails,
       executionTimeMs,
       executionTimeSeconds: Number((executionTimeMs / 1000).toFixed(2)),
+      planner_engine: plannerEngine,
       metrics: {
         topK: k,
         requestedDays,
@@ -173,6 +260,7 @@ export class ItineraryController {
         totalMs: executionTimeMs,
         totalDetails: created.totalDetails,
         sparseResult,
+        engine: plannerEngine,
       },
       warning: sparseResult
         ? 'Khu vực này hiện có ít địa điểm phù hợp, lịch trình có thể ngắn hơn số ngày yêu cầu.'
@@ -183,9 +271,9 @@ export class ItineraryController {
   @Post('plan/preview')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
-    summary: 'Preview itinerary from Two-Tower candidates and GA planner',
+    summary: 'Preview itinerary using the configured planner engine',
     description:
-      'Runs candidate retrieval and GA planner, returns the full plan JSON, but does not persist anything to DB.',
+      'Runs candidate retrieval and the server-configured planner, returns the full plan JSON, but does not persist anything to DB.',
   })
   @ApiQuery({
     name: 'top_k',
@@ -205,24 +293,31 @@ export class ItineraryController {
       ? Math.min(parseInt(topK, 10) || 60, 200)
       : this.calcRetrievalTopK(requestedDays);
 
-    const plan = await this.recommendationService.planItinerary(body, k);
+    const plannerEngine = this.plannerEngine;
+    const plan = await this.recommendationService.planItinerary(
+      body,
+      k,
+      plannerEngine,
+    );
     const executionTimeMs = Date.now() - startedAt;
-    this.logPlanSummary(plan as any);
+    this.logPlanSummary(plan as any, plannerEngine);
 
     this.logger.warn(
       `POST /itinerary/plan/preview completed in ${executionTimeMs}ms ` +
-        `(persist=skipped, days=${requestedDays}, topK=${k})`,
+        `(persist=skipped, days=${requestedDays}, topK=${k}, engine=${plannerEngine})`,
     );
 
     return {
       mode: 'preview',
       persisted: false,
+      planner_engine: plannerEngine,
       executionTimeMs,
       executionTimeSeconds: Number((executionTimeMs / 1000).toFixed(2)),
       metrics: {
         topK: k,
         requestedDays,
         totalMs: executionTimeMs,
+        engine: plannerEngine,
       },
       plan,
     };
@@ -570,19 +665,75 @@ export class ItineraryController {
     return Math.min(200, Math.max(60, numDays * 20));
   }
 
-  private logPlanSummary(plan: any): void {
-    const days = Array.isArray(plan?.days) ? plan.days : [];
+  private assertPlanFeasible(plan: any, engine: string): void {
+    if (plan?.validation_is_feasible !== false) {
+      return;
+    }
+    const violations = Array.isArray(plan?.validation_violations)
+      ? plan.validation_violations
+      : [];
+    const budgetViolation = violations.find(
+      (violation: any) => violation?.violation_type === 'budget_exceeded',
+    );
+    const emptyViolation = violations.find(
+      (violation: any) =>
+        violation?.violation_type === 'no_feasible_activities',
+    );
+    const selected = budgetViolation ?? emptyViolation ?? violations[0];
+    const message =
+      selected?.detail ??
+      'Không tìm được lịch trình thỏa ngân sách, thời gian và giờ mở cửa.';
     this.logger.warn(
-      `GA plan summary: hotel=${plan?.hotel_name ?? 'unknown'} ` +
+      `Rejected infeasible ${engine} plan before persistence: ${message}`,
+    );
+    throw new UnprocessableEntityException({
+      code: 'ITINERARY_INFEASIBLE',
+      message,
+      engine,
+      violations,
+      suggestions: [
+        'Tăng tổng ngân sách chuyến đi.',
+        'Giảm số ngày hoặc số người.',
+        'Nới rộng khung giờ hoạt động.',
+      ],
+    });
+  }
+
+  private logPlanSummary(plan: any, configuredEngine: PlannerEngine): void {
+    const days = Array.isArray(plan?.days) ? plan.days : [];
+    const actualEngine = resolvePlannerEngine(
+      plan?.planner_engine ?? configuredEngine,
+    ).engine;
+    const label = actualEngine.toUpperCase();
+    this.logger.warn(
+      `${label} plan summary: hotel=${plan?.hotel_name ?? 'unknown'} ` +
         `(${plan?.hotel_id ?? 'unknown'}), days=${days.length}, ` +
         `visited=${plan?.total_visited ?? 0}`,
     );
     for (const day of days) {
       this.logger.warn(
-        `GA day ${day.day}: fitness=${day.fitness}, ` +
+        `${label} day ${day.day}: fitness=${day.fitness}, ` +
           `visited=${day.visited_count}, travel=${day.total_travel_minutes}m, ` +
           `wait=${day.total_wait_minutes}m, visit=${day.total_visit_minutes}m, ` +
           `restaurant=${day.restaurant_count}, stopped=${day.stopped_reason}`,
+      );
+    }
+  }
+
+  private logComparisonSummary(plan: any): void {
+    const comparison = plan?.comparison;
+    if (!comparison?.engines) {
+      return;
+    }
+    this.logger.warn(
+      `Planner compare winner=${comparison.winner_hint ?? 'unknown'}`,
+    );
+    for (const [engine, summary] of Object.entries<any>(comparison.engines)) {
+      this.logger.warn(
+        `Compare ${engine}: elapsed=${summary.elapsed_ms}ms ` +
+          `visited=${summary.total_visited}, travel=${summary.total_travel_minutes}m, ` +
+          `wait=${summary.total_wait_minutes}m, distance=${summary.total_distance_km}km, ` +
+          `cost=${summary.total_cost}, feasible=${summary.validation?.is_feasible}`,
       );
     }
   }

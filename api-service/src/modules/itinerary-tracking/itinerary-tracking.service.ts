@@ -47,6 +47,7 @@ interface DetailRow {
   duration_minutes: number | null;
   arrival_time: string | null;
   sequence_order: number | null;
+  detail_type: 'HOTEL' | 'ACTIVITY';
 }
 
 interface PlaceRow {
@@ -188,10 +189,11 @@ export class ItineraryTrackingService {
       .schema('travel')
       .from('itinerary_details')
       .select(
-        'id, itinerary_id, place_id, visit_date, duration_minutes, arrival_time, sequence_order',
+        'id, itinerary_id, place_id, visit_date, duration_minutes, arrival_time, sequence_order, detail_type',
       )
       .eq('itinerary_id', itineraryId)
       .eq('visit_date', date)
+      .eq('detail_type', 'ACTIVITY')
       .order('sequence_order', { ascending: true })
       .order('arrival_time', { ascending: true })
       .returns<DetailRow[]>();
@@ -303,6 +305,7 @@ export class ItineraryTrackingService {
         .eq('itinerary_id', args.itineraryId)
         .eq('place_id', args.placeId)
         .eq('visit_date', this.resolveDate(args.date))
+        .eq('detail_type', 'ACTIVITY')
         .limit(1)
         .returns<{ id: string }[]>();
       if (error) this.dbError(error, 'resolveVisit.detail');

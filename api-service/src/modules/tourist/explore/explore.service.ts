@@ -24,7 +24,7 @@ interface ItineraryRow {
 
 interface ItineraryTimeRow {
   arrival_time: string | null;
-  departure_time: string | null;
+  duration_minutes: number | null;
 }
 
 interface ItineraryWithDetailsRow extends ItineraryRow {
@@ -552,7 +552,10 @@ export class ExploreService implements OnModuleInit {
     );
     const first = sorted[0];
     const last = sorted[sorted.length - 1];
-    return `${first.arrival_time ?? '??'} - ${last.departure_time ?? '??'}`;
+    return `${first.arrival_time ?? '??'} - ${this.addMinutesToTime(
+      last.arrival_time,
+      last.duration_minutes ?? 0,
+    )}`;
   }
 
   private pickRandomItem<T>(items: T[]): T | null {
@@ -781,7 +784,7 @@ export class ExploreService implements OnModuleInit {
       .schema('travel')
       .from('itineraries')
       .select(
-        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public, itinerary_details(arrival_time, departure_time)',
+        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public, itinerary_details(arrival_time, duration_minutes)',
       )
       .eq('creator_id', touristId)
       .eq('status', 'ongoing')
@@ -1906,7 +1909,7 @@ export class ExploreService implements OnModuleInit {
     const { data, error } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('arrival_time, departure_time')
+      .select('arrival_time, duration_minutes')
       .eq('itinerary_id', itineraryId)
       .order('arrival_time', { ascending: true })
       .returns<ItineraryTimeRow[]>();
@@ -1922,7 +1925,19 @@ export class ExploreService implements OnModuleInit {
     const first = data[0];
     const last = data[data.length - 1];
 
-    return `${first.arrival_time ?? '??'} - ${last.departure_time ?? '??'}`;
+    return `${first.arrival_time ?? '??'} - ${this.addMinutesToTime(
+      last.arrival_time,
+      last.duration_minutes ?? 0,
+    )}`;
+  }
+
+  private addMinutesToTime(time: string | null, minutes: number): string {
+    if (!time) return '??';
+    const [hours, minute] = time.split(':').map(Number);
+    const total = hours * 60 + minute + Math.max(0, minutes);
+    return `${String(Math.floor(total / 60) % 24).padStart(2, '0')}:${String(
+      total % 60,
+    ).padStart(2, '0')}`;
   }
 
   private async getItineraryImageMap(

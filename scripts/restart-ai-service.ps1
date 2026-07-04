@@ -3,7 +3,7 @@ $ErrorActionPreference = "Stop"
 $Port = 8050
 $BackendRoot = Split-Path -Parent $PSScriptRoot
 $AiServiceDir = Join-Path $BackendRoot "ai-service"
-$LogPath = "E:\DATN\ai-service-restart.log"
+$LogPath = Join-Path $PSScriptRoot "ai-service-restart.log"
 
 Write-Host "Restarting AI service on port $Port..."
 

@@ -13,10 +13,26 @@ from app.schemas.itinerary import (
     ScheduleEntryResponse,
 )
 from app.services.itinerary import planner
+from app.services.itinerary.scheduler_v2 import (
+    BEST_TIME_WINDOWS,
+    SchedulerV2Config,
+    SchedulerV2Planner,
+)
 from app.services.itinerary.validator import FeasibilityValidator, ValidationResult
 
 logger = logging.getLogger(__name__)
 FOOD_CATEGORY_ID = "97029cfb-069b-4dba-a152-dfb3d36634d3"
+
+
+def _normalize_planner_engine(value: str | None) -> str:
+    normalized = (value or "scheduler_v2").strip().lower()
+    if normalized in {"scheduler_v2", "or_tools"}:
+        return "scheduler_v2"
+    if normalized in {"ga_v1", "ga"}:
+        return "ga_v1"
+    raise ValueError(
+        "planner_engine must be one of: scheduler_v2, or_tools, ga_v1, ga."
+    )
 
 
 def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
@@ -56,83 +72,54 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
     else:
         logger.info("[Planner] No Goong config. Using Haversine fallback (speed=%.1f km/h)", req.speed_kmh)
 
+    engine_name = _normalize_planner_engine(req.planner_engine)
+
     matrix_started_at = time.perf_counter()
     try:
+        # Never call Goong for the O(N^2) candidate matrix. All engines start
+        # from DB cache/Haversine; scheduler_v2 refreshes only its much smaller
+        # per-day pools after assignment.
+        initial_matrix_key = ""
         travel_times, travel_distances, travel_sources, travel_reliability = planner.build_travel_matrix(
             coords,
-            api_key=goong_key,
+            api_key=initial_matrix_key,
             vehicle=req.travel_vehicle,
             cache_path=travel_cache,
             speed_kmh=req.speed_kmh,
             require_goong=req.require_goong,
         )
     except Exception as e:
-        logger.exception("[Planner] Lỗi khi tính toán travel matrix (Goong API/Haversine)")
+        logger.exception("[Planner] Travel matrix calculation failed (Goong API/Haversine)")
         raise RuntimeError(f"Travel matrix calculation failed: {str(e)}") from e
 
-    engine = planner.MultiDayTripPlanner(
-        places=places,
-        num_days=req.num_days,
-        travel_times=travel_times,
-        travel_distances=travel_distances,
-        travel_sources=travel_sources,
-        travel_reliability=travel_reliability,
-        selected_hotel_id=req.selected_hotel_id,
-        day_start_time=planner.time_to_minutes(req.daily_start_time),
-        day_end_time=planner.time_to_minutes(req.daily_end_time),
-        population_size=req.population_size,
-        generations=req.generations,
-        mutation_rate=req.mutation_rate,
-        return_to_hotel=req.return_to_hotel,
-        require_goong_edges=req.require_goong,
-        budget_per_person=req.budget_per_person,
-        adult_count=req.adult_count,
-        child_count=req.child_count,
-        travel_vehicle=req.travel_vehicle,
-        trip_start_date=req.trip_start_date,
-    )
     matrix_ms = round((time.perf_counter() - matrix_started_at) * 1000)
-    ga_started_at = time.perf_counter()
-    try:
-        result = engine.run(seed=req.seed)
-    except Exception as e:
-        logger.exception("[Planner] Lỗi khi chạy Genetic Algorithm (TSP-TW GA)")
-        raise RuntimeError(f"Genetic Algorithm planning failed: {str(e)}") from e
-    places_map = {place.id: place for place in places}
-    for day_idx in range(req.num_days):
-        weekday_idx = (trip_start_date.weekday() + day_idx) % 7
-        for place in places:
-            places_map[(day_idx + 1, place.id)] = place.to_poi_for_day(weekday_idx)
-    validation = FeasibilityValidator().validate(result, places_map)
+    result, ga_ms, scheduler_ms, validation, response_engine = (
+        _dispatch_planner_engine(
+            engine_name,
+            req,
+            places,
+            travel_times,
+            travel_distances,
+            travel_sources,
+            travel_reliability,
+            goong_key,
+        )
+    )
     result.validation_result = validation
-    ga_ms = round((time.perf_counter() - ga_started_at) * 1000)
+    _persist_selected_route_matrix(result, req.travel_vehicle)
+    _log_result(response_engine.upper(), result, ga_ms or scheduler_ms)
     total_ms = round((time.perf_counter() - started_at) * 1000)
 
     logger.info(
-        "[Planner] completed total=%sms matrix=%sms ga=%sms hotel=%s (%s)",
+        "[Planner] completed engine=%s total=%sms matrix=%sms ga=%sms solver=%sms hotel=%s (%s)",
+        response_engine,
         total_ms,
         matrix_ms,
         ga_ms,
+        scheduler_ms,
         result.hotel.name,
         result.hotel.id,
     )
-    for day in result.days:
-        ga = day.ga_result
-        logger.info(
-            "[GA][Day %s] fitness=%.4f candidates=%s visited=%s skipped=%s travel=%s wait=%s idle=%s visit=%s restaurant=%s stopped=%s@%s",
-            day.day,
-            ga.fitness,
-            len(day.pois),
-            len(day.visited_pois),
-            ga.skipped_count,
-            ga.total_travel_time,
-            ga.total_wait_time,
-            ga.idle_time,
-            ga.total_visit_time,
-            ga.restaurant_count,
-            ga.stopped_reason,
-            ga.generations_run,
-        )
     try:
         planner.print_multi_day_schedule(result)
     except UnicodeEncodeError as exc:
@@ -143,8 +130,562 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
         total_ms=total_ms,
         matrix_ms=matrix_ms,
         ga_ms=ga_ms,
+        planner_engine=response_engine,
+        solver_ms=scheduler_ms,
         validation=validation,
+        comparison=None,
+        travel_source_counts={
+            source: sum(1 for value in travel_sources.values() if value == source)
+            for source in sorted(set(travel_sources.values()))
+        },
     )
+
+
+def _dispatch_planner_engine(
+    engine_name: str,
+    req: ItineraryPlanRequest,
+    places: list[planner.Place],
+    travel_times: dict,
+    travel_distances: dict,
+    travel_sources: dict,
+    travel_reliability: dict,
+    goong_api_key: str,
+) -> tuple[planner.MultiDayResult, int, int, ValidationResult, str]:
+    """Run exactly one planner engine for the request."""
+    if engine_name == "ga_v1":
+        result, ga_ms, validation = _run_ga_engine(
+            req,
+            places,
+            travel_times,
+            travel_distances,
+            travel_sources,
+            travel_reliability,
+        )
+        return result, ga_ms, 0, validation, "ga_v1"
+
+    result, solver_ms, validation = _run_scheduler_v2_engine(
+        req,
+        places,
+        travel_times,
+        travel_distances,
+        travel_sources,
+        travel_reliability,
+        goong_api_key,
+    )
+    return result, 0, solver_ms, validation, "scheduler_v2"
+
+
+def _persist_selected_route_matrix(
+    result: planner.MultiDayResult,
+    vehicle: str,
+) -> None:
+    """Persist the exact rounded legs used by the winning schedule.
+
+    This keeps itinerary timestamps, subsequent solver runs, and API/UI
+    reconstruction on the same travel-time and distance values without adding
+    travel snapshot columns to itinerary_details.
+    """
+    travel_minutes: dict[tuple[str, str], int] = {}
+    travel_distances: dict[tuple[str, str], float] = {}
+    for day in result.days:
+        for entry in day.ga_result.schedule:
+            from_id = str(getattr(entry, "travel_from_id", "") or "")
+            destination_id = str(getattr(entry, "location_id", "") or "")
+            distance_km = max(
+                0.0,
+                float(getattr(entry, "distance_km", 0.0) or 0.0),
+            )
+            minutes = max(
+                0,
+                int(getattr(entry, "travel_minutes", 0) or 0),
+            )
+            if (
+                not from_id
+                or not destination_id
+                or from_id == destination_id
+                or distance_km <= 0
+                or minutes <= 0
+            ):
+                continue
+            pair = (from_id, destination_id)
+            travel_minutes[pair] = minutes
+            travel_distances[pair] = distance_km
+
+    if not travel_minutes:
+        return
+    try:
+        planner._upsert_distance_matrix_db(
+            travel_minutes,
+            travel_distances,
+            vehicle,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Planner] could not persist selected route matrix: %s",
+            exc,
+        )
+
+
+def _run_ga_engine(
+    req: ItineraryPlanRequest,
+    places: list[planner.Place],
+    travel_times: dict,
+    travel_distances: dict,
+    travel_sources: dict,
+    travel_reliability: dict,
+) -> tuple[planner.MultiDayResult, int, ValidationResult]:
+    started_at = time.perf_counter()
+    engine = planner.MultiDayTripPlanner(
+        places=places,
+        num_days=req.num_days,
+        travel_times=travel_times,
+        travel_distances=travel_distances,
+        travel_sources=travel_sources,
+        travel_reliability=travel_reliability,
+        selected_hotel_id=req.selected_hotel_id,
+        hotel_total_cost=req.hotel_total_cost,
+        day_start_time=planner.time_to_minutes(req.daily_start_time),
+        day_end_time=planner.time_to_minutes(req.daily_end_time),
+        population_size=req.population_size,
+        generations=req.generations,
+        mutation_rate=req.mutation_rate,
+        return_to_hotel=req.return_to_hotel,
+        require_goong_edges=req.require_goong,
+        trip_budget_total=(
+            req.trip_budget_total
+            if req.trip_budget_total > 0
+            else req.budget_per_person
+        ),
+        adult_count=req.adult_count,
+        child_count=req.child_count,
+        travel_vehicle=req.travel_vehicle,
+        trip_start_date=req.trip_start_date,
+    )
+    try:
+        result = engine.run(seed=req.seed)
+    except Exception as e:
+        logger.exception("[Planner] GA v1 failed")
+        raise RuntimeError(f"GA v1 planning failed: {str(e)}") from e
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+    validation = FeasibilityValidator().validate(
+        result,
+        _build_places_map(places, req.num_days, _parse_trip_start_date(req.trip_start_date)),
+        trip_budget_total=(
+            req.trip_budget_total
+            if req.trip_budget_total > 0
+            else req.budget_per_person
+        ),
+        hotel_total_cost=req.hotel_total_cost,
+    )
+    return result, elapsed_ms, validation
+
+
+def _run_scheduler_v2_engine(
+    req: ItineraryPlanRequest,
+    places: list[planner.Place],
+    travel_times: dict,
+    travel_distances: dict,
+    travel_sources: dict,
+    travel_reliability: dict,
+    goong_api_key: str,
+) -> tuple[planner.MultiDayResult, int, ValidationResult]:
+    started_at = time.perf_counter()
+    engine = SchedulerV2Planner(
+        SchedulerV2Config(
+            places=places,
+            num_days=req.num_days,
+            travel_times=travel_times,
+            travel_distances=travel_distances,
+            travel_sources=travel_sources,
+            travel_reliability=travel_reliability,
+            selected_hotel_id=req.selected_hotel_id,
+            hotel_total_cost=req.hotel_total_cost,
+            day_start_time=planner.time_to_minutes(req.daily_start_time),
+            day_end_time=planner.time_to_minutes(req.daily_end_time),
+            return_to_hotel=req.return_to_hotel,
+            require_goong_edges=req.require_goong,
+            trip_budget_total=(
+                req.trip_budget_total
+                if req.trip_budget_total > 0
+                else req.budget_per_person
+            ),
+            adult_count=req.adult_count,
+            child_count=req.child_count,
+            travel_vehicle=req.travel_vehicle,
+            trip_start_date=req.trip_start_date,
+            check_in_time=planner.time_to_minutes(req.check_in_time) if req.check_in_time else None,
+        )
+    )
+    try:
+        planner.refresh_travel_matrix_for_day_pools(
+            coords={
+                place.id: (place.longitude, place.latitude)
+                for place in places
+            },
+            day_pools=engine.assignment_result.day_pools,
+            hotel_id=engine.hotel.id,
+            travel_times=travel_times,
+            travel_distances=travel_distances,
+            travel_sources=travel_sources,
+            travel_reliability=travel_reliability,
+            api_key=goong_api_key,
+            vehicle=req.travel_vehicle,
+            cache_path=req.travel_cache_path or planner.TRAVEL_CACHE_PATH,
+            speed_kmh=req.speed_kmh,
+            require_goong=req.require_goong,
+        )
+        result = engine.run(seed=req.seed)
+    except Exception as e:
+        logger.exception("[Planner] scheduler_v2 failed")
+        raise RuntimeError(f"scheduler_v2 planning failed: {str(e)}") from e
+    elapsed_ms = round((time.perf_counter() - started_at) * 1000)
+    validation = FeasibilityValidator().validate(
+        result,
+        _build_places_map(places, req.num_days, _parse_trip_start_date(req.trip_start_date)),
+        trip_budget_total=(
+            req.trip_budget_total
+            if req.trip_budget_total > 0
+            else req.budget_per_person
+        ),
+        hotel_total_cost=req.hotel_total_cost,
+    )
+    return result, elapsed_ms, validation
+
+
+def _build_places_map(
+    places: list[planner.Place],
+    num_days: int,
+    trip_start_date: datetime.date,
+) -> dict:
+    places_map: dict = {place.id: place for place in places}
+    for day_idx in range(num_days):
+        weekday_idx = (trip_start_date.weekday() + day_idx) % 7
+        for place in places:
+            places_map[(day_idx + 1, place.id)] = place.to_poi_for_day(weekday_idx)
+    return places_map
+
+
+def _summarize_result(
+    result: planner.MultiDayResult,
+    elapsed_ms: int,
+    validation: ValidationResult | None,
+) -> dict[str, Any]:
+    days = []
+    for i, day in enumerate(result.days):
+        ga = day.ga_result
+        day_visited = len(day.visited_pois)
+
+        # Pull pool metadata (set by scheduler_v2; GA pools won't have these keys)
+        pool_meta: dict = {}
+        if result.assignment_result and i < len(result.assignment_result.day_pools):
+            pool_meta = result.assignment_result.day_pools[i]
+
+        base_candidates = pool_meta.get("base_candidate_count", len(day.pois))
+        injected_restaurant_candidates = pool_meta.get("injected_restaurant_count", 0)
+        final_candidates = pool_meta.get("final_candidate_count", len(day.pois))
+        day_cluster_center = pool_meta.get("day_cluster_center")  # (lat, lng) or None
+        cafe_filtered_count = pool_meta.get("cafe_filtered_count", 0)
+        injected_reason = pool_meta.get("injected_reason")
+        is_remote_day = pool_meta.get("is_remote_day", False)
+        remote_anchor_name = pool_meta.get("remote_anchor_name")
+        allocation_method = pool_meta.get("allocation_method", "kmeans")
+        day_used_minutes = pool_meta.get("day_used_minutes")
+        day_estimated_distance = pool_meta.get("day_estimated_distance")
+
+        # Diagnostics
+        available_minutes = (
+            ga.total_travel_time + ga.total_visit_time + ga.total_wait_time + ga.idle_time
+        )
+        target_poi_count = max(1, round(available_minutes / 150)) if available_minutes > 0 else 1
+        avg_minutes_per_poi = (available_minutes / max(1, day_visited)) if day_visited > 0 else 0
+        used_minutes = ga.total_travel_time + ga.total_visit_time + ga.total_wait_time
+        unused_minutes = ga.idle_time
+
+        extra_penalty = _day_density_penalty(ga, day_visited)
+
+        # Cluster-distance diagnostics — worst-case distance from cluster centroid
+        # to pool restaurants/cafes (proxy for how far food stops stray from the day route)
+        restaurant_dist_to_cluster = None
+        cafe_dist_to_cluster = None
+        if day_cluster_center and pool_meta:
+            import math as _math
+
+            def _hav(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+                R = 6371.0
+                dlat = _math.radians(lat2 - lat1)
+                dlng = _math.radians(lng2 - lng1)
+                a = (_math.sin(dlat / 2) ** 2
+                     + _math.cos(_math.radians(lat1)) * _math.cos(_math.radians(lat2))
+                     * _math.sin(dlng / 2) ** 2)
+                return 2 * R * _math.atan2(_math.sqrt(a), _math.sqrt(1 - a))
+
+            clat, clng = day_cluster_center
+            r_dists = [
+                _hav(p.latitude, p.longitude, clat, clng)
+                for p in pool_meta.get("restaurants", [])
+            ]
+            c_dists = [
+                _hav(p.latitude, p.longitude, clat, clng)
+                for p in pool_meta.get("attractions", [])
+                if getattr(p, "place_type", None) == "cafe"
+            ]
+            if r_dists:
+                restaurant_dist_to_cluster = round(max(r_dists), 2)
+            if c_dists:
+                cafe_dist_to_cluster = round(max(c_dists), 2)
+
+        days.append(
+            {
+                "day": day.day,
+                # Candidate counts
+                "base_candidates": base_candidates,
+                "injected_restaurant_candidates": injected_restaurant_candidates,
+                "candidates": final_candidates,      # final pool size (backward-compat key)
+                "final_candidates": final_candidates,
+                "cafe_filtered_count": cafe_filtered_count,
+                # Visit counts
+                "visited": day_visited,
+                "restaurants": ga.restaurant_count,
+                # Time
+                "travel_minutes": ga.total_travel_time,
+                "wait_minutes": ga.total_wait_time,
+                "visit_minutes": ga.total_visit_time,
+                "idle_minutes": ga.idle_time,
+                # Diagnostics
+                "available_minutes": available_minutes,
+                "target_poi_count": target_poi_count,
+                "avg_minutes_per_poi": round(avg_minutes_per_poi, 1),
+                "used_minutes": used_minutes,
+                "unused_minutes": unused_minutes,
+                "extra_penalty": extra_penalty,
+                # Cluster / sweep diagnostics
+                "day_cluster_center": (
+                    [round(day_cluster_center[0], 5), round(day_cluster_center[1], 5)]
+                    if day_cluster_center else None
+                ),
+                "restaurant_distance_to_cluster": restaurant_dist_to_cluster,
+                "cafe_distance_to_cluster": cafe_dist_to_cluster,
+                "injected_reason": injected_reason,
+                "allocation_method": allocation_method,
+                "is_remote_day": is_remote_day,
+                "remote_anchor_name": remote_anchor_name,
+                "day_used_minutes": day_used_minutes,
+                "day_estimated_distance": day_estimated_distance,
+                # Finance
+                "distance_km": round(ga.total_distance_km, 2),
+                "fitness": round(ga.fitness, 4),
+                "day_cost": round(ga.total_day_cost),
+                "budget_overage": round(ga.budget_overage),
+                "stopped_reason": ga.stopped_reason,
+                "schedule": [_serialize_entry(entry) for entry in ga.schedule],
+            }
+        )
+    validation_dict = (
+        validation.to_dict()
+        if validation is not None and hasattr(validation, "to_dict")
+        else {"is_feasible": True, "violations": [], "warnings": []}
+    )
+    return {
+        "elapsed_ms": elapsed_ms,
+        "hotel_id": result.hotel.id,
+        "hotel_name": result.hotel.name,
+        "total_visited": sum(len(day.visited_pois) for day in result.days),
+        "total_travel_minutes": sum(day.ga_result.total_travel_time for day in result.days),
+        "total_wait_minutes": sum(day.ga_result.total_wait_time for day in result.days),
+        "total_distance_km": round(sum(day.ga_result.total_distance_km for day in result.days), 2),
+        "total_cost": round(sum(day.ga_result.total_day_cost for day in result.days)),
+        "validation": validation_dict,
+        "days": days,
+    }
+
+
+def _day_density_penalty(ga: Any, visited_count: int) -> int:
+    """Compute density + sparse + distance + travel penalties for one day."""
+    available_minutes = (
+        ga.total_travel_time + ga.total_visit_time + ga.total_wait_time + ga.idle_time
+    )
+    if available_minutes <= 0:
+        return 0
+
+    # Density
+    target_poi_count = max(1, round(available_minutes / 150))
+    density_penalty = abs(visited_count - target_poi_count) * 200
+
+    # Dense-day: avg_minutes_per_poi < 90
+    avg_minutes_per_poi = available_minutes / max(1, visited_count)
+    dense_day_penalty = 500 if avg_minutes_per_poi < 90 else 0
+
+    # Sparse-day
+    unused_minutes = ga.idle_time  # total - used
+    sparse_day_penalty = (
+        600 if (available_minutes >= 720 and visited_count <= 2 and unused_minutes >= 240) else 0
+    )
+
+    # Distance
+    dist_km = ga.total_distance_km
+    distance_penalty = 0
+    if dist_km > 60:
+        distance_penalty += int((dist_km - 60) * 20)
+    if dist_km > 80:
+        distance_penalty += int((dist_km - 80) * 50)
+    if dist_km > 100:
+        distance_penalty += 2000
+
+    # Travel-time
+    t = ga.total_travel_time
+    travel_penalty = 0
+    if t > 180:
+        travel_penalty += (t - 180) * 5
+    if t > 240:
+        travel_penalty += (t - 240) * 10
+    if t > 300:
+        travel_penalty += 2000
+
+    return density_penalty + dense_day_penalty + sparse_day_penalty + distance_penalty + travel_penalty
+
+
+def _score_result(result: planner.MultiDayResult) -> tuple[float, str]:
+    score = 0.0
+    reject_reason = ""
+
+    total_travel_minutes = 0
+    total_wait_minutes = 0
+    total_cost = 0
+    total_budget_limit = 0
+    visited_count = 0
+    total_two_tower_score = 0.0
+    total_extra_penalty = 0
+
+    if hasattr(result, "validation_result") and result.validation_result:
+        if not result.validation_result.is_feasible:
+            reject_reason = "time_feasible == False"
+
+    for day in result.days:
+        ga = day.ga_result
+        day_visited = len(day.visited_pois)
+        total_travel_minutes += ga.total_travel_time
+        total_wait_minutes += ga.total_wait_time
+        total_cost += ga.total_day_cost
+        total_budget_limit += ga.budget_limit
+        visited_count += day_visited
+
+        day_restaurants = 0
+        for entry in ga.schedule:
+            if entry.wait_time > 90:
+                reject_reason = "max_poi_wait > 90"
+            if getattr(entry, "is_restaurant", False) or getattr(entry, "place_type", "") == "restaurant":
+                day_restaurants += 1
+            if not getattr(entry, "is_return_to_hotel", False) and getattr(entry, "place_type", "") != "hotel":
+                total_two_tower_score += getattr(entry, "two_tower_score", 0.0)
+
+        if day_restaurants > 2:
+            reject_reason = "restaurant_count > 2"
+
+        total_extra_penalty += _day_density_penalty(ga, day_visited)
+
+    over_budget_ratio = 0.0
+    if total_budget_limit > 0 and total_cost > total_budget_limit:
+        over_budget_ratio = (total_cost - total_budget_limit) / total_budget_limit
+        if over_budget_ratio > 0.5:
+            reject_reason = "budget_over_ratio > 0.5"
+
+    score = (
+        1000 * total_two_tower_score
+        + 80 * visited_count
+        - 2 * total_travel_minutes
+        - 5 * total_wait_minutes
+        - (total_cost // 10000)
+        - 10000 * max(0, over_budget_ratio)
+        - total_extra_penalty
+    )
+
+    if reject_reason:
+        score -= 100000
+
+    return score, reject_reason
+
+def _winner_hint(ga_result: planner.MultiDayResult, scheduler_result: planner.MultiDayResult) -> str:
+    ga_score, ga_reason = _score_result(ga_result)
+    v2_score, v2_reason = _score_result(scheduler_result)
+    
+    ga_reject = f" (Rejected: {ga_reason})" if ga_reason else ""
+    v2_reject = f" (Rejected: {v2_reason})" if v2_reason else ""
+    
+    if v2_score >= ga_score:
+        return f"winner_by_utility_score: scheduler_v2 (score {v2_score:.1f} vs {ga_score:.1f}){v2_reject}"
+    return f"winner_by_utility_score: ga_v1 (score {ga_score:.1f} vs {v2_score:.1f}){ga_reject}"
+
+
+def _log_result(label: str, result: planner.MultiDayResult, elapsed_ms: int) -> None:
+    logger.info(
+        "[%s] elapsed=%sms hotel=%s days=%s total_visited=%s",
+        label,
+        elapsed_ms,
+        result.hotel.name,
+        result.num_days,
+        sum(len(day.visited_pois) for day in result.days),
+    )
+    for day in result.days:
+        ga = day.ga_result
+        logger.info(
+            "[%s][Day %s] fitness=%.4f candidates=%s visited=%s skipped=%s travel=%s wait=%s idle=%s visit=%s restaurant=%s cost=%s stopped=%s@%s",
+            label,
+            day.day,
+            ga.fitness,
+            len(day.pois),
+            len(day.visited_pois),
+            ga.skipped_count,
+            ga.total_travel_time,
+            ga.total_wait_time,
+            ga.idle_time,
+            ga.total_visit_time,
+            ga.restaurant_count,
+            round(ga.total_day_cost),
+            ga.stopped_reason,
+            ga.generations_run,
+        )
+
+
+def _print_comparison(
+    ga_result: planner.MultiDayResult,
+    scheduler_result: planner.MultiDayResult,
+    comparison: dict[str, Any],
+) -> None:
+    print("\n========== ITINERARY ENGINE COMPARISON ==========")
+    for label, result in (("GA_V1", ga_result), ("SCHEDULER_V2", scheduler_result)):
+        print(f"\n--- {label} ---")
+        total_cost = sum(day.ga_result.total_day_cost for day in result.days)
+        total_limit = sum(day.ga_result.budget_limit for day in result.days)
+        over_budget = max(0, total_cost - total_limit)
+        over_ratio = (over_budget / total_limit) if total_limit > 0 else 0
+        is_feasible = True
+        if hasattr(result, "validation_result") and result.validation_result:
+            is_feasible = result.validation_result.is_feasible
+        score, reason = _score_result(result)
+
+        print(f"Total Cost: {total_cost:,.0f} VND | Budget Limit: {total_limit:,.0f} VND")
+        print(f"Over Budget: {over_budget:,.0f} VND | Over Ratio: {over_ratio:.1%}")
+        print(f"Time Feasible: {is_feasible} | Budget Feasible: {over_ratio <= 0.5}")
+        print(f"Winner Score: {score:,.1f} | Rejected Reason: {reason or 'None'}")
+        
+        for day in result.days:
+            ga = day.ga_result
+            return_time = ga.schedule[-1].arrival_str if ga.schedule else "N/A"
+            print(
+                f"Day {day.day}: visited={len(day.visited_pois)}/{len(day.pois)} "
+                f"restaurant={ga.restaurant_count} return_time={return_time} "
+                f"cost={round(ga.total_day_cost)} fitness={ga.fitness:.2f} "
+                f"stop={ga.stopped_reason}"
+            )
+            for seq, entry in enumerate([e for e in ga.schedule if not getattr(e, "is_return_to_hotel", False)], start=1):
+                print(
+                    f"  {seq:02d}. {entry.service_start_str}-{entry.departure_str} "
+                    f"[{entry.place_type}] {entry.location_name} "
+                    f"move={entry.travel_minutes}m wait={entry.wait_time}m "
+                    f"cost={round(entry.estimated_cost)}"
+                )
+    print(f"\nWinner hint: {comparison.get('winner_hint')}")
+    print("=================================================\n")
 
 
 def _to_planner_place(
@@ -159,6 +700,11 @@ def _to_planner_place(
         default_duration = 45
     if place_type == "hotel":
         default_duration = 0
+    best_time, best_time_source = _normalize_best_time(raw)
+    visit_duration = _normalize_visit_duration(
+        raw.get("visit_duration"),
+        default_duration,
+    )
 
     return planner.Place(
         id=str(raw["id"]),
@@ -171,7 +717,7 @@ def _to_planner_place(
         latitude=float(raw["latitude"]),
         open_time=open_time,
         close_time=close_time,
-        visit_duration=int(raw.get("visit_duration") or default_duration),
+        visit_duration=visit_duration,
         rating=float(raw.get("average_rating") or 0),
         unknown_hours=unknown_hours,
         open_hour=str(raw.get("open_hour") or ""),
@@ -181,7 +727,57 @@ def _to_planner_place(
         estimated_cost=float(raw.get("estimated_cost") or 0),
         price_basis=str(raw.get("price_basis") or "unknown"),
         price_inferred=raw.get("price_inferred"),
+        best_time=best_time,
+        best_time_source=best_time_source,
     )
+
+
+def _normalize_visit_duration(value: Any, default_duration: int) -> int:
+    """Normalize mixed legacy duration values to minutes.
+
+    Most rows store minutes, while legacy rows with values 1-4 represent
+    hours. Normalizing once at the AI boundary keeps every downstream
+    scheduler and persisted itinerary detail consistently minute-based.
+    """
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return default_duration
+    if duration <= 0:
+        return default_duration
+    if duration <= 4:
+        duration *= 60
+    return max(1, int(round(duration)))
+
+
+def _normalize_best_time(raw: dict[str, Any]) -> tuple[str, str]:
+    allowed = {"MORNING", "AFTERNOON", "NIGHT", "ALL_DAY"}
+    value = str(raw.get("best_time") or "").strip().upper()
+    if value in allowed:
+        return value, str(raw.get("best_time_source") or "database")
+
+    type_name = planner.normalize_text(raw.get("type_name") or "")
+    category_name = planner.normalize_text(raw.get("category_name") or "")
+    label = f"{type_name} {category_name}".strip()
+    morning = (
+        "cong trinh ton giao",
+        "thien nhien",
+        "bai bien",
+        "di tich",
+    )
+    afternoon = (
+        "bao tang",
+        "lang nghe",
+        "nong trai",
+    )
+    night = ("pho di bo",)
+    if any(keyword in label for keyword in morning):
+        return "MORNING", "category_fallback"
+    if any(keyword in label for keyword in afternoon):
+        return "AFTERNOON", "category_fallback"
+    if any(keyword in label for keyword in night):
+        return "NIGHT", "category_fallback"
+    return "ALL_DAY", "default_all_day"
 
 
 def _normalize_place_type(raw: dict[str, Any]) -> str:
@@ -245,7 +841,11 @@ def _serialize_result(
     total_ms: int = 0,
     matrix_ms: int = 0,
     ga_ms: int = 0,
+    planner_engine: str = "scheduler_v2",
+    solver_ms: int = 0,
     validation: ValidationResult | None = None,
+    comparison: dict[str, Any] | None = None,
+    travel_source_counts: dict[str, int] | None = None,
 ) -> ItineraryPlanResponse:
     days = [_serialize_day(day) for day in result.days]
     assignment_warnings = (
@@ -258,6 +858,7 @@ def _serialize_result(
         if result.assignment_result is not None
         else []
     )
+    assignment_debug = _serialize_assignment_debug(result)
     validation_result = validation or result.validation_result
     validation_dict = (
         validation_result.to_dict()
@@ -273,13 +874,69 @@ def _serialize_result(
         total_ms=total_ms,
         matrix_ms=matrix_ms,
         ga_ms=ga_ms,
+        planner_engine=planner_engine,
+        solver_ms=solver_ms,
         assignment_day_loads=assignment_day_loads,
         assignment_warnings=assignment_warnings,
+        assignment_debug=assignment_debug,
+        travel_source_counts=travel_source_counts or {},
         validation_is_feasible=bool(validation_dict["is_feasible"]),
         validation_violations=validation_dict["violations"],
         validation_warnings=validation_dict["warnings"],
+        comparison=comparison,
         days=days,
     )
+
+
+def _serialize_assignment_debug(result: planner.MultiDayResult) -> list[dict[str, Any]]:
+    assignment = result.assignment_result
+    if assignment is None:
+        return []
+
+    pools: list[dict[str, Any]] = []
+    for index, pool in enumerate(assignment.day_pools):
+        places: list[dict[str, Any]] = []
+        seen: set[str] = set()
+        for key, default_role in (
+            ("attractions", "attraction"),
+            ("restaurants", "restaurant"),
+        ):
+            for place in pool.get(key, []):
+                place_id = str(place.id)
+                if place_id in seen:
+                    continue
+                seen.add(place_id)
+                places.append(
+                    {
+                        "id": place_id,
+                        "name": str(place.name),
+                        "role": str(getattr(place, "place_type", default_role)),
+                        "latitude": float(place.latitude),
+                        "longitude": float(place.longitude),
+                        "candidate_rank": int(getattr(place, "candidate_rank", 0)),
+                        "retrieval_score": float(
+                            getattr(place, "retrieval_score", 0.0)
+                        ),
+                    }
+                )
+
+        center = pool.get("day_cluster_center")
+        pools.append(
+            {
+                "day": index + 1,
+                "load_minutes": (
+                    assignment.day_loads[index]
+                    if index < len(assignment.day_loads)
+                    else None
+                ),
+                "allocation_method": pool.get("allocation_method"),
+                "cluster_center": (
+                    [float(center[0]), float(center[1])] if center else None
+                ),
+                "places": places,
+            }
+        )
+    return pools
 
 
 def _serialize_day(day_result: planner.DayResult) -> ItineraryDayResponse:
@@ -290,8 +947,10 @@ def _serialize_day(day_result: planner.DayResult) -> ItineraryDayResponse:
         for entry in schedule
         if not entry.is_return_to_hotel
     )
+    best_time_metrics = _best_time_metrics(ga.schedule)
     return ItineraryDayResponse(
         day=day_result.day,
+        candidates=len(day_result.pois),
         visited_count=len(day_result.visited_pois),
         target_visited_count=max(
             planner.POI_TARGET_MIN_PER_DAY,
@@ -315,6 +974,7 @@ def _serialize_day(day_result: planner.DayResult) -> ItineraryDayResponse:
         total_hard_violations=ga.total_hard_violations,
         meal_violations=ga.meal_violations,
         restaurant_count=ga.restaurant_count,
+        **best_time_metrics,
         fitness=round(ga.fitness, 4),
         stopped_reason=f"{ga.stopped_reason}@{ga.generations_run}",
         schedule=schedule,
@@ -331,6 +991,21 @@ def _serialize_entry(entry: planner.ScheduleEntry) -> ScheduleEntryResponse:
         departure_time = planner.minutes_to_time(
             entry.service_start_time + active_duration
         )
+
+    best_time = str(entry.best_time or "ALL_DAY").upper()
+    preferred_window = BEST_TIME_WINDOWS.get(best_time)
+    deviation = 0
+    matched: bool | None = None
+    if (
+        preferred_window is not None
+        and entry.best_time_applicable
+        and not entry.is_return_to_hotel
+    ):
+        matched = preferred_window[0] <= entry.service_start_time <= preferred_window[1]
+        if entry.service_start_time < preferred_window[0]:
+            deviation = preferred_window[0] - entry.service_start_time
+        elif entry.service_start_time > preferred_window[1]:
+            deviation = entry.service_start_time - preferred_window[1]
 
     return ScheduleEntryResponse(
         location_id=entry.location_id,
@@ -352,8 +1027,48 @@ def _serialize_entry(entry: planner.ScheduleEntry) -> ScheduleEntryResponse:
         estimated_cost=round(entry.estimated_cost),
         price_basis=entry.price_basis,
         price_inferred=entry.price_inferred,
+        best_time=best_time,
+        best_time_source=entry.best_time_source,
+        best_time_deviation_minutes=deviation,
+        best_time_matched=matched,
         place_type=entry.place_type,
         is_restaurant=entry.is_restaurant,
         unknown_hours=entry.unknown_hours,
         is_return_to_hotel=entry.is_return_to_hotel,
     )
+
+
+def _best_time_metrics(
+    schedule: list[planner.ScheduleEntry],
+) -> dict[str, int | float]:
+    eligible = 0
+    matched = 0
+    slight = 0
+    large = 0
+    penalty_minutes = 0
+    for entry in schedule:
+        if entry.is_return_to_hotel or not entry.best_time_applicable:
+            continue
+        window = BEST_TIME_WINDOWS.get(str(entry.best_time or "").upper())
+        if window is None:
+            continue
+        eligible += 1
+        start = entry.service_start_time
+        if window[0] <= start <= window[1]:
+            matched += 1
+            continue
+        deviation = window[0] - start if start < window[0] else start - window[1]
+        penalty_minutes += deviation
+        if deviation <= 30:
+            slight += 1
+        else:
+            large += 1
+    return {
+        "best_time_eligible_count": eligible,
+        "best_time_matched_count": matched,
+        "best_time_slight_mismatch_count": slight,
+        "best_time_large_mismatch_count": large,
+        "best_time_match_rate": round(matched / eligible, 4) if eligible else 1.0,
+        "best_time_penalty_minutes": penalty_minutes,
+    }
+

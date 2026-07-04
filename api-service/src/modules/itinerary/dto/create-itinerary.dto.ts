@@ -214,4 +214,5 @@ export class CreateItineraryDto {
   @IsString()
   @MaxLength(255)
   description?: string;
+
 }

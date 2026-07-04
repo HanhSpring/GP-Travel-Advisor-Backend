@@ -33,7 +33,11 @@ from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urljoin
 
-from app.services.itinerary.assignment import AssignmentConfig, AssignmentModule, AssignmentResult
+from app.services.itinerary.assignment import (
+    AssignmentConfig,
+    AssignmentResult,
+    ConstrainedKMeansAssignment,
+)
 
 try:
     from dotenv import load_dotenv
@@ -105,7 +109,10 @@ NON_MEAL_NAME_KEYWORDS = (
     "sinh tố", "spa", "homestay", "villa", "hotel", "shop", "coworking",
     "bar", "club",
 )
-TRAVEL_CACHE_PATH = os.getenv("ITINERARY_TRAVEL_CACHE", os.path.join(DEFAULT_DATA_DIR, "travel_matrix_cache.json"))
+TRAVEL_CACHE_PATH = os.getenv(
+    "ITINERARY_TRAVEL_CACHE",
+    os.path.join(SERVICE_DIR, "data", "travel_matrix_cache.json"),
+)
 LUNCH_START = 11 * 60 + 30
 LUNCH_END = 13 * 60 + 30
 # Infeasibility penalty cho hard constraint an trua.
@@ -128,7 +135,7 @@ MAX_NON_MEAL_WAIT_MINUTES = 90
 UTILITY_TRAVEL_WEIGHT = 0.9
 UTILITY_SCALE = 200
 ALPHA_DEFAULT = 0.7
-GOONG_TRAVEL_SOURCES = {"goong", "goong_cache"}
+GOONG_TRAVEL_SOURCES = {"goong", "goong_cache", "goong_db"}
 # Default sau thuc nghiem tren tap 50 POI co dinh.
 DEFAULT_POPULATION_SIZE = 50
 DEFAULT_MUTATION_RATE = 0.30
@@ -136,7 +143,7 @@ EARLY_STOP_PATIENCE = 30
 TRAVEL_TIME_WEIGHT = 0.1
 WAIT_TIME_WEIGHT = 0.8
 BUDGET_OVERAGE_UNIT_VND = 1_000
-BUDGET_PENALTY_WEIGHT = 3.0
+BUDGET_PENALTY_WEIGHT = 15.0
 # Budget estimate only. This is not an official ride-hailing fare formula.
 # bike is closer to fuel/operating cost; car is a conservative service-car estimate.
 TRANSPORT_COST_PER_KM = {
@@ -280,7 +287,11 @@ def _fetch_goong_distance_batch(
         },
         timeout=10,
     )
-    resp.raise_for_status()
+    if not resp.ok:
+        raise RuntimeError(
+            "Goong HTTP "
+            f"{resp.status_code}: {_safe_console_text(resp.text[:300])}"
+        )
     data = resp.json()
 
     if "rows" not in data:
@@ -295,13 +306,66 @@ def _fetch_goong_distance_batch(
             if from_id == to_id:
                 continue
             if element["status"] == "OK":
-                minutes = max(1, round(element["duration"]["value"] / 60))
+                minutes = max(1, math.ceil(element["duration"]["value"] / 60))
                 distance_km = max(0.0, float(element.get("distance", {}).get("value", 0)) / 1000)
-            else:
-                minutes = 30
-                distance_km = 0.0
-            times[(from_id, to_id)] = minutes
-            distances[(from_id, to_id)] = distance_km
+                times[(from_id, to_id)] = minutes
+                distances[(from_id, to_id)] = distance_km
+    return times, distances
+
+
+def _fetch_goong_distance_batch_resilient(
+    url: str,
+    coords: Dict[str, Tuple[float, float]],
+    origin_batch: List[str],
+    dest_batch: List[str],
+    api_key: str,
+    vehicle: str,
+) -> Tuple[Dict[Tuple[str, str], int], Dict[Tuple[str, str], float]]:
+    """
+    Goong may return NOT_FOUND for a mixed batch even when many individual
+    pairs are valid. Split failed batches recursively until we isolate the
+    problematic pairs and keep as many Goong results as possible.
+    """
+    try:
+        return _fetch_goong_distance_batch(
+            url,
+            coords,
+            origin_batch,
+            dest_batch,
+            api_key,
+            vehicle,
+        )
+    except Exception:
+        if len(origin_batch) == 1 and len(dest_batch) == 1:
+            raise
+
+    if len(origin_batch) >= len(dest_batch) and len(origin_batch) > 1:
+        split_at = max(1, len(origin_batch) // 2)
+        origin_groups = [origin_batch[:split_at], origin_batch[split_at:]]
+        dest_groups = [dest_batch]
+    else:
+        split_at = max(1, len(dest_batch) // 2)
+        origin_groups = [origin_batch]
+        dest_groups = [dest_batch[:split_at], dest_batch[split_at:]]
+
+    times: Dict[Tuple[str, str], int] = {}
+    distances: Dict[Tuple[str, str], float] = {}
+    for origins in origin_groups:
+        if not origins:
+            continue
+        for destinations in dest_groups:
+            if not destinations:
+                continue
+            child_times, child_distances = _fetch_goong_distance_batch_resilient(
+                url,
+                coords,
+                origins,
+                destinations,
+                api_key,
+                vehicle,
+            )
+            times.update(child_times)
+            distances.update(child_distances)
     return times, distances
 
 
@@ -310,7 +374,7 @@ def build_travel_data_goong(
     coords: Dict[str, Tuple[float, float]],
     api_key: str,
     vehicle: str = "car",
-    batch_size: int = 10,
+    batch_size: int = 5,
     max_workers: int = 1,
 ) -> Tuple[Dict[Tuple[str, str], int], Dict[Tuple[str, str], float]]:
     """
@@ -330,7 +394,8 @@ def build_travel_data_goong(
     url = "https://rsapi.goong.io/v2/distancematrix"
     ids = list(coords.keys())
 
-    # Goong dùng thứ tự (lat, lon), trong khi coords lưu (lon, lat)
+    # Goong expects coordinates as "latitude,longitude" while coords are stored
+    # as (longitude, latitude), so swap before sending.
     def to_latlng(place_id: str) -> str:
         lon, lat = coords[place_id]
         return f"{lat},{lon}"
@@ -351,7 +416,7 @@ def build_travel_data_goong(
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = [
                 executor.submit(
-                    _fetch_goong_distance_batch,
+                    _fetch_goong_distance_batch_resilient,
                     url,
                     coords,
                     origin_batch,
@@ -366,7 +431,7 @@ def build_travel_data_goong(
                     batch_times, batch_distances = future.result()
                 except Exception as e:
                     failed_batches += 1
-                    print(f"  [CANH BAO] Mot Goong batch that bai: {e}")
+                    print(f"  [WARNING] One Goong branch failed: {_safe_console_text(e)}")
                     continue
                 times.update(batch_times)
                 distances.update(batch_distances)
@@ -393,12 +458,16 @@ def build_travel_data_goong(
                 },
                 timeout=10,
             )
-            resp.raise_for_status()
+            if not resp.ok:
+                raise RuntimeError(
+                    "Goong HTTP "
+                    f"{resp.status_code}: {_safe_console_text(resp.text[:300])}"
+                )
             data = resp.json()
 
             if "rows" not in data:
                 raise RuntimeError(
-                    f"Goong Distance Matrix API lỗi: {data.get('message', data)}"
+                    f"Goong Distance Matrix API error: {data.get('message', data)}"
                 )
 
             for row_idx, row in enumerate(data["rows"]):
@@ -408,7 +477,7 @@ def build_travel_data_goong(
                     if from_id == to_id:
                         continue
                     if element["status"] == "OK":
-                        minutes = max(1, round(element["duration"]["value"] / 60))
+                        minutes = max(1, math.ceil(element["duration"]["value"] / 60))
                         distance_km = max(0.0, float(element.get("distance", {}).get("value", 0)) / 1000)
                     else:
                         # Không tìm được đường → dùng fallback 30 phút
@@ -416,6 +485,9 @@ def build_travel_data_goong(
                         distance_km = 0.0
                     times[(from_id, to_id)] = minutes
                     distances[(from_id, to_id)] = distance_km
+                    if element["status"] != "OK":
+                        times.pop((from_id, to_id), None)
+                        distances.pop((from_id, to_id), None)
 
             # Tránh vượt rate limit giữa các sub-batch
             time.sleep(0.2)
@@ -561,9 +633,122 @@ def _load_travel_cache(cache_path: str) -> dict:
 
 
 def _save_travel_cache(cache_path: str, cache: dict) -> None:
-    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
-    with open(cache_path, "w", encoding="utf-8") as cache_file:
+    cache_dir = os.path.dirname(cache_path) or "."
+    os.makedirs(cache_dir, exist_ok=True)
+    temp_path = f"{cache_path}.{os.getpid()}.tmp"
+    with open(temp_path, "w", encoding="utf-8") as cache_file:
         json.dump(cache, cache_file, ensure_ascii=False, indent=2)
+        cache_file.flush()
+        os.fsync(cache_file.fileno())
+    os.replace(temp_path, cache_path)
+
+
+def _database_travel_mode(vehicle: str) -> str:
+    return "MOTORBIKE" if str(vehicle).lower() == "bike" else "DRIVING"
+
+
+def _load_distance_matrix_db(
+    place_ids: List[str],
+    vehicle: str,
+) -> Dict[Tuple[str, str], dict]:
+    supabase_url = os.getenv("SUPABASE_URL", "").strip()
+    supabase_key = os.getenv("SUPABASE_KEY", "").strip()
+    if not supabase_url or not supabase_key or not place_ids:
+        return {}
+
+    headers = {
+        "apikey": supabase_key,
+        "Authorization": f"Bearer {supabase_key}",
+        "Accept-Profile": "travel",
+    }
+    rows: Dict[Tuple[str, str], dict] = {}
+    unique_ids = list(dict.fromkeys(place_ids))
+    chunk_size = 30
+    url = supabase_url.rstrip("/") + "/rest/v1/distance_matrix"
+    for origin_start in range(0, len(unique_ids), chunk_size):
+        origins = unique_ids[origin_start:origin_start + chunk_size]
+        for destination_start in range(0, len(unique_ids), chunk_size):
+            destinations = unique_ids[destination_start:destination_start + chunk_size]
+            response = requests.get(
+                url,
+                headers=headers,
+                params={
+                    "select": (
+                        "origin_place_id,destination_place_id,"
+                        "distance_meters,duration_seconds"
+                    ),
+                    "travel_mode": f"eq.{_database_travel_mode(vehicle)}",
+                    "origin_place_id": f"in.({','.join(origins)})",
+                    "destination_place_id": f"in.({','.join(destinations)})",
+                },
+                timeout=10,
+            )
+            if not response.ok:
+                raise RuntimeError(
+                    f"distance_matrix HTTP {response.status_code}: "
+                    f"{_safe_console_text(response.text[:200])}"
+                )
+            for row in response.json():
+                pair = (row["origin_place_id"], row["destination_place_id"])
+                rows[pair] = {
+                    "minutes": max(
+                        1, math.ceil(float(row["duration_seconds"]) / 60)
+                    ),
+                    "distance_km": max(
+                        0.0, float(row["distance_meters"]) / 1000
+                    ),
+                    "distance_source": "goong_db",
+                }
+    return rows
+
+
+def _upsert_distance_matrix_db(
+    pairs: Dict[Tuple[str, str], int],
+    distances: Dict[Tuple[str, str], float],
+    vehicle: str,
+) -> None:
+    supabase_url = os.getenv("SUPABASE_URL", "").strip()
+    supabase_key = os.getenv("SUPABASE_KEY", "").strip()
+    if not supabase_url or not supabase_key or not pairs:
+        return
+
+    payload = [
+        {
+            "origin_place_id": pair[0],
+            "destination_place_id": pair[1],
+            "travel_mode": _database_travel_mode(vehicle),
+            "distance_meters": max(
+                0, round(float(distances.get(pair, 0.0)) * 1000)
+            ),
+            "duration_seconds": max(0, int(minutes) * 60),
+            "updated_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        for pair, minutes in pairs.items()
+        if pair[0] != pair[1] and distances.get(pair, 0) > 0
+    ]
+    if not payload:
+        return
+
+    response = requests.post(
+        supabase_url.rstrip("/") + "/rest/v1/distance_matrix",
+        headers={
+            "apikey": supabase_key,
+            "Authorization": f"Bearer {supabase_key}",
+            "Content-Profile": "travel",
+            "Prefer": "resolution=merge-duplicates,return=minimal",
+            "Content-Type": "application/json",
+        },
+        params={
+            "on_conflict": "origin_place_id,destination_place_id,travel_mode"
+        },
+        json=payload,
+        timeout=15,
+    )
+    if not response.ok:
+        raise RuntimeError(
+            f"distance_matrix upsert HTTP {response.status_code}: "
+            f"{_safe_console_text(response.text[:200])}"
+        )
 
 
 def _append_travel_history(cache_entry: dict, minutes: int) -> None:
@@ -580,6 +765,11 @@ def _append_travel_history(cache_entry: dict, minutes: int) -> None:
         del history[:-100]
 
 
+def _safe_console_text(value: object) -> str:
+    """Return an ASCII-safe string for Windows console/file redirection."""
+    return str(value).encode("ascii", "backslashreplace").decode("ascii")
+
+
 def build_travel_matrix(
     coords: Dict[str, Tuple[float, float]],
     api_key: str = "",
@@ -587,7 +777,7 @@ def build_travel_matrix(
     cache_path: str = TRAVEL_CACHE_PATH,
     speed_kmh: float = 30.0,
     refresh_cache: bool = False,
-    goong_workers: int = 1,
+    goong_workers: int = 2,
     require_goong: bool = False,
 ) -> Tuple[Dict[Tuple[str, str], int], Dict[Tuple[str, str], float], Dict[Tuple[str, str], str], Dict[Tuple[str, str], List[dict]]]:
     """
@@ -601,6 +791,15 @@ def build_travel_matrix(
     reliability: Dict[Tuple[str, str], List[dict]] = {}
     cache = _load_travel_cache(cache_path)
     ids = list(coords.keys())
+    try:
+        database_cache = _load_distance_matrix_db(ids, vehicle)
+        for pair, entry in database_cache.items():
+            cache[f"{vehicle}:{pair[0]}:{pair[1]}"] = entry
+    except Exception as exc:
+        print(
+            "  [WARNING] distance_matrix read failed: "
+            f"{_safe_console_text(exc)}"
+        )
     missing: List[Tuple[str, str]] = []
 
     for from_id in ids:
@@ -611,12 +810,28 @@ def build_travel_matrix(
             cached = cache.get(key)
             if cached and "history" in cached:
                 reliability[(from_id, to_id)] = cached.get("history") or []
-            if cached and "minutes" in cached and not refresh_cache:
+            cached_is_goong = (
+                cached
+                and cached.get("distance_source") in {"goong", "goong_db"}
+            )
+            cache_is_usable = (
+                cached
+                and "minutes" in cached
+                and not refresh_cache
+                and (not api_key or cached_is_goong)
+            )
+            if cache_is_usable:
                 times[(from_id, to_id)] = int(cached["minutes"])
-                if cached.get("distance_source") == "goong" and "distance_km" in cached:
+                if cached_is_goong and "distance_km" in cached:
                     distances[(from_id, to_id)] = float(cached["distance_km"])
                 sources[(from_id, to_id)] = (
-                    "goong_cache" if cached.get("distance_source") == "goong" else "haversine_cache"
+                    cached.get("distance_source")
+                    if cached.get("distance_source") == "goong_db"
+                    else (
+                        "goong_cache"
+                        if cached.get("distance_source") == "goong"
+                        else "haversine_cache"
+                    )
                 )
             else:
                 missing.append((from_id, to_id))
@@ -640,15 +855,24 @@ def build_travel_matrix(
                 cache_entry.update({
                     "minutes": minutes,
                     "distance_km": round(distances.get(pair, 0.0), 3),
-                    "distance_source": "goong" if goong_distances.get(pair, 0) > 0 else "haversine",
+                    "distance_source": "goong",
                 })
                 _append_travel_history(cache_entry, minutes)
                 reliability[pair] = cache_entry.get("history") or []
                 cache[key] = cache_entry
+            try:
+                _upsert_distance_matrix_db(
+                    goong_times, goong_distances, vehicle
+                )
+            except Exception as exc:
+                print(
+                    "  [WARNING] distance_matrix upsert failed: "
+                    f"{_safe_console_text(exc)}"
+                )
             _save_travel_cache(cache_path, cache)
         except Exception as e:
-            print(f"  [CẢNH BÁO] Goong API thất bại: {e}")
-            print("  Chuyển sang Haversine cho các cặp chưa có cache...")
+            print(f"  [WARNING] Goong API failed: {_safe_console_text(e)}")
+            print("  Falling back to Haversine for uncached pairs.")
 
     for pair in distances:
         if pair not in times:
@@ -696,10 +920,22 @@ def refresh_travel_matrix_for_day_pools(
         return 0
 
     cache = _load_travel_cache(cache_path)
+    try:
+        database_cache = _load_distance_matrix_db(list(coords.keys()), vehicle)
+        for pair, entry in database_cache.items():
+            cache[f"{vehicle}:{pair[0]}:{pair[1]}"] = entry
+    except Exception as exc:
+        print(
+            "  [WARNING] distance_matrix read failed: "
+            f"{_safe_console_text(exc)}"
+        )
     refreshed_pairs: set[Tuple[str, str]] = set()
     processed_subsets: set[Tuple[str, ...]] = set()
+    goong_unavailable = False
 
     for pool in day_pools:
+        if goong_unavailable:
+            break
         places = [
             *(pool.get("attractions") or []),
             *(pool.get("restaurants") or []),
@@ -724,11 +960,19 @@ def refresh_travel_matrix_for_day_pools(
                 cached = cache.get(cache_key)
                 if source in GOONG_TRAVEL_SOURCES:
                     continue
-                if cached and cached.get("distance_source") == "goong" and "minutes" in cached:
+                if (
+                    cached
+                    and cached.get("distance_source") in {"goong", "goong_db"}
+                    and "minutes" in cached
+                ):
                     minutes = int(cached["minutes"])
                     travel_times[(from_id, to_id)] = minutes
                     travel_distances[(from_id, to_id)] = float(cached.get("distance_km") or 0.0)
-                    travel_sources[(from_id, to_id)] = "goong_cache"
+                    travel_sources[(from_id, to_id)] = (
+                        "goong_db"
+                        if cached.get("distance_source") == "goong_db"
+                        else "goong_cache"
+                    )
                     travel_reliability[(from_id, to_id)] = cached.get("history") or []
                     continue
                 needs_refresh = True
@@ -737,12 +981,25 @@ def refresh_travel_matrix_for_day_pools(
             continue
 
         subset_coords = {place_id: coords[place_id] for place_id in ids}
-        goong_times, goong_distances = build_travel_data_goong(
-            subset_coords,
-            api_key,
-            vehicle=vehicle,
-            max_workers=1,
-        )
+        try:
+            goong_times, goong_distances = build_travel_data_goong(
+                subset_coords,
+                api_key,
+                vehicle=vehicle,
+                max_workers=1,
+            )
+        except Exception as exc:
+            if require_goong:
+                raise
+            # The matrix already contains Haversine/cache values for every
+            # pair. On 429/timeout, keep those values and stop calling Goong
+            # again during this request.
+            goong_unavailable = True
+            print(
+                "  [WARNING] Goong refresh unavailable; using existing "
+                f"matrix/Haversine values: {_safe_console_text(exc)}"
+            )
+            break
         for pair, minutes in goong_times.items():
             travel_times[pair] = minutes
             if goong_distances.get(pair, 0) > 0:
@@ -763,6 +1020,15 @@ def refresh_travel_matrix_for_day_pools(
             travel_reliability[pair] = cache_entry.get("history") or []
             cache[cache_key] = cache_entry
             refreshed_pairs.add(pair)
+        try:
+            _upsert_distance_matrix_db(
+                goong_times, goong_distances, vehicle
+            )
+        except Exception as exc:
+            print(
+                "  [WARNING] distance_matrix upsert failed: "
+                f"{_safe_console_text(exc)}"
+            )
 
     if refreshed_pairs:
         _save_travel_cache(cache_path, cache)
@@ -1082,6 +1348,8 @@ class POI:
     estimated_cost: float = 0.0
     price_basis: str = "unknown"
     price_inferred: Optional[bool] = None
+    best_time: str = "ALL_DAY"
+    best_time_source: str = "default_all_day"
 
 
 @dataclass
@@ -1124,12 +1392,35 @@ class Place:
     estimated_cost: float = 0.0
     price_basis: str = "unknown"
     price_inferred: Optional[bool] = None
+    best_time: str = "ALL_DAY"
+    best_time_source: str = "default_all_day"
+
+    def _get_normalized_type(self) -> str:
+        normalized = (self.place_type or "").strip().lower()
+        if normalized in {
+            "hotel",
+            "restaurant",
+            "cafe",
+            "entertainment",
+            "attraction",
+        }:
+            return normalized
+
+        # Use name heuristics only for legacy rows without a DB planner role.
+        cafe_keywords = ["cafe", "cà phê", "kem", "chè", "flan"]
+        food_keywords = ["bánh căn", "bún", "lẩu", "ốc", "gỏi", "cơm", "phở", "quán", "nhà hàng", "ăn đêm", "buffet", "nem", "nướng"]
+        name_lower = self.name.lower()
+        if any(kw in name_lower for kw in cafe_keywords):
+            return "cafe"
+        if any(kw in name_lower for kw in food_keywords):
+            return "restaurant"
+        return self.place_type
 
     def to_poi(self) -> "POI":
         return POI(
             id=self.id,
             name=self.name,
-            place_type=self.place_type,
+            place_type=self._get_normalized_type(),
             open_time=self.open_time,
             close_time=self.close_time,
             visit_duration=self.visit_duration,
@@ -1142,6 +1433,8 @@ class Place:
             estimated_cost=self.estimated_cost,
             price_basis=self.price_basis,
             price_inferred=self.price_inferred,
+            best_time=self.best_time,
+            best_time_source=self.best_time_source,
         )
 
     def to_poi_for_day(self, day_idx: int) -> "POI":
@@ -1161,7 +1454,7 @@ class Place:
         return POI(
             id=self.id,
             name=self.name,
-            place_type=self.place_type,
+            place_type=self._get_normalized_type(),
             open_time=open_min,
             close_time=close_min,
             visit_duration=self.visit_duration,
@@ -1174,6 +1467,8 @@ class Place:
             estimated_cost=self.estimated_cost,
             price_basis=self.price_basis,
             price_inferred=self.price_inferred,
+            best_time=self.best_time,
+            best_time_source=self.best_time_source,
         )
 
     def to_hotel(self) -> "Hotel":
@@ -1184,6 +1479,80 @@ class Place:
             self.price_basis or "per_room_per_night",
             self.price_inferred,
         )
+
+
+def select_geographic_hotel(
+    hotels: List[Place],
+    trip_places: List[Place],
+    trip_budget: float = 0.0,
+    hotel_total_cost_fn=None,
+) -> Place:
+    """Choose a hotel in the dominant POI region before considering rank."""
+    if not hotels:
+        raise ValueError("No hotels found in places list.")
+
+    all_candidates = [
+        place
+        for place in trip_places
+        if place.place_type != "hotel"
+        and -90 <= float(place.latitude) <= 90
+        and -180 <= float(place.longitude) <= 180
+    ]
+    primary_candidates = [
+        place
+        for place in all_candidates
+        if place.place_type in {"attraction", "cafe", "entertainment"}
+    ]
+    candidates = primary_candidates or all_candidates
+    if not candidates:
+        return min(hotels, key=lambda hotel: hotel.candidate_rank)
+
+    def distance_km(a: Place, b: Place) -> float:
+        radius_km = 6371.0
+        lat1 = math.radians(float(a.latitude))
+        lat2 = math.radians(float(b.latitude))
+        delta_lat = lat2 - lat1
+        delta_lng = math.radians(float(b.longitude) - float(a.longitude))
+        value = (
+            math.sin(delta_lat / 2) ** 2
+            + math.cos(lat1) * math.cos(lat2) * math.sin(delta_lng / 2) ** 2
+        )
+        return 2 * radius_km * math.atan2(math.sqrt(value), math.sqrt(1 - value))
+
+    def median(values: List[float]) -> float:
+        ordered = sorted(values)
+        middle = len(ordered) // 2
+        if len(ordered) % 2:
+            return ordered[middle]
+        return (ordered[middle - 1] + ordered[middle]) / 2
+
+    def hotel_key(hotel: Place) -> tuple:
+        distances = sorted(distance_km(hotel, place) for place in candidates)
+        nearby_15 = sum(distance <= 15.0 for distance in distances)
+        nearby_35 = sum(distance <= 35.0 for distance in distances)
+        nearest_count = min(12, len(distances))
+        nearest_mean = sum(distances[:nearest_count]) / nearest_count
+        median_distance = median(distances)
+        hotel_cost = (
+            float(hotel_total_cost_fn(hotel))
+            if hotel_total_cost_fn is not None
+            else float(hotel.estimated_cost or 0)
+        )
+        budget_overage = (
+            max(0.0, hotel_cost - trip_budget * 0.40)
+            if trip_budget > 0
+            else 0.0
+        )
+        return (
+            -nearby_15,
+            -nearby_35,
+            round(nearest_mean, 4),
+            round(median_distance, 4),
+            round(budget_overage / BUDGET_OVERAGE_UNIT_VND, 4),
+            int(hotel.candidate_rank),
+        )
+
+    return min(hotels, key=hotel_key)
 
 
 @dataclass
@@ -1222,6 +1591,10 @@ class ScheduleEntry:
     estimated_cost: float = 0.0
     price_basis: str = "unknown"
     price_inferred: Optional[bool] = None
+    two_tower_score: float = 0.0
+    best_time: str = "ALL_DAY"
+    best_time_source: str = "default_all_day"
+    best_time_applicable: bool = False
 
     @property
     def arrival_str(self) -> str:
@@ -1397,15 +1770,11 @@ class TSP_TW_GA:
         base_travel_time: int,
         departure_time: Optional[int],
     ) -> Tuple[int, str]:
-        if base_travel_time <= 0:
-            return 0, "none"
-        historical = self._historical_travel_buffer(from_id, to_id, base_travel_time)
-        if historical is not None:
-            return historical
-        buffer = max(base_travel_time * self.travel_buffer_percent, self.travel_buffer_min)
-        if self.travel_buffer_max >= 0:
-            buffer = min(buffer, self.travel_buffer_max)
-        return round(buffer), "heuristic"
+        # distance_matrix is the single source of truth. Travel time is
+        # rounded once by scheduler_v2 and persisted for the winning route;
+        # adding a hidden buffer here would make solver timestamps disagree
+        # with the API/UI and compound again on later reads.
+        return 0, "matrix"
 
     def _historical_travel_buffer(
         self,
@@ -1449,8 +1818,6 @@ class TSP_TW_GA:
     def _poi_cost(self, poi: POI) -> float:
         if poi.estimated_cost <= 0:
             return 0.0
-        if poi.price_basis == "per_person":
-            return poi.estimated_cost * self.adult_equivalent
         return poi.estimated_cost
 
     def _is_late_entertainment(self, poi: POI) -> bool:
@@ -1591,6 +1958,9 @@ class TSP_TW_GA:
                     estimated_cost=poi_cost,
                     price_basis=poi.price_basis,
                     price_inferred=poi.price_inferred,
+                    best_time=poi.best_time,
+                    best_time_source=poi.best_time_source,
+                    two_tower_score=self._poi_utility(poi) / UTILITY_SCALE,
                 )
             )
             visited_indices.append(poi_idx)
@@ -1905,6 +2275,7 @@ class MultiDayTripPlanner:
         travel_sources: Optional[Dict[Tuple[str, str], str]] = None,
         travel_reliability: Optional[Dict[Tuple[str, str], List[dict]]] = None,
         selected_hotel_id: Optional[str] = None,
+        hotel_total_cost: float = 0.0,
         day_start_time: int = 480,
         day_end_time: int = 1080,
         population_size: int = DEFAULT_POPULATION_SIZE,
@@ -1915,7 +2286,7 @@ class MultiDayTripPlanner:
         travel_buffer_min: int = DEFAULT_TRAVEL_BUFFER_MIN,
         travel_buffer_max: int = DEFAULT_TRAVEL_BUFFER_MAX,
         require_goong_edges: bool = False,
-        budget_per_person: float = 0.0,
+        trip_budget_total: float = 0.0,
         adult_count: int = 1,
         child_count: int = 0,
         travel_vehicle: str = "car",
@@ -1939,15 +2310,14 @@ class MultiDayTripPlanner:
         self.child_count = max(0, int(child_count or 0))
         self.full_people = self.adult_count + self.child_count
         self.adult_equivalent = self.adult_count + self.child_count * CHILD_COST_FACTOR
-        self.rooms = max(1, math.ceil(self.full_people / ROOM_CAPACITY))
-        self.budget_per_person = max(0.0, float(budget_per_person or 0))
-        self.trip_budget = self.budget_per_person * self.full_people
+        self.trip_budget_total = max(0.0, float(trip_budget_total or 0))
+        self.trip_budget = self.trip_budget_total * 0.9
         if selected_hotel_id is not None:
             hotel_place = next((p for p in hotels if p.id == selected_hotel_id), None)
             if hotel_place is None:
                 raise ValueError(f"Hotel '{selected_hotel_id}' not found in places list.")
         else:
-            hotel_place = self._select_hotel(hotels)
+            hotel_place = self._select_hotel(hotels, places)
 
         self.hotel = hotel_place.to_hotel()
         self.travel_times = travel_times
@@ -1974,7 +2344,10 @@ class MultiDayTripPlanner:
         except ValueError:
             self.start_date = datetime.date.today()
         self.hotel_place = hotel_place
-        self.hotel_total_cost = self._hotel_total_cost(hotel_place)
+        self.hotel_total_cost = (
+            max(0.0, float(hotel_total_cost or 0))
+            or self._hotel_total_cost(hotel_place)
+        )
         residual_budget = max(0.0, self.trip_budget - self.hotel_total_cost)
         self.daily_budget = residual_budget / self.num_days if self.num_days > 0 else 0.0
 
@@ -1989,22 +2362,20 @@ class MultiDayTripPlanner:
         self.day_pool = self.assignment_result.day_pools
 
     def _hotel_total_cost(self, hotel: Place) -> float:
-        nightly = hotel.estimated_cost if hotel.estimated_cost > 0 else FALLBACK_HOTEL_COST_PER_NIGHT
+        per_person_nightly = (
+            hotel.estimated_cost
+            if hotel.estimated_cost > 0
+            else FALLBACK_HOTEL_COST_PER_NIGHT / ROOM_CAPACITY
+        )
         nights = max(1, self.num_days - 1)
-        return nightly * nights * self.rooms
+        return per_person_nightly * nights * self.full_people
 
-    def _select_hotel(self, hotels: List[Place]) -> Place:
-        if not hotels:
-            raise ValueError("No hotels found in places list.")
-        if self.trip_budget <= 0:
-            return min(hotels, key=lambda hotel: hotel.candidate_rank)
-        target_hotel_budget = self.trip_budget * 0.40
-        return min(
+    def _select_hotel(self, hotels: List[Place], places: List[Place]) -> Place:
+        return select_geographic_hotel(
             hotels,
-            key=lambda hotel: (
-                max(0.0, self._hotel_total_cost(hotel) - target_hotel_budget) / BUDGET_OVERAGE_UNIT_VND,
-                hotel.candidate_rank,
-            ),
+            places,
+            trip_budget=self.trip_budget,
+            hotel_total_cost_fn=self._hotel_total_cost,
         )
 
     def _new_day_pool(self) -> List[dict]:
@@ -2201,7 +2572,7 @@ class MultiDayTripPlanner:
                 changed = True
 
     def _preallocate_days(self) -> AssignmentResult:
-        assignment = AssignmentModule(
+        assignment = ConstrainedKMeansAssignment(
             AssignmentConfig(
                 num_days=self.num_days,
                 daily_start_time=self.day_start_time,

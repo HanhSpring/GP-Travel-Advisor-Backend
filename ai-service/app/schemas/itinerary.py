@@ -1,3 +1,5 @@
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
@@ -21,6 +23,7 @@ class ItineraryPlaceInput(BaseModel):
     open_hour_compressed: str | None = None
     visit_duration: int | None = None
     average_rating: float | None = None
+    review_count: int | None = None
     retrieval_score: float | None = None
     candidate_rank: int | None = None
     candidate_total: int | None = None
@@ -29,6 +32,8 @@ class ItineraryPlaceInput(BaseModel):
     price_max: float | None = None
     price_basis: str | None = None
     price_inferred: bool | None = None
+    best_time: str | None = None
+    best_time_source: str | None = None
     planner_source: str | None = None
 
 
@@ -40,19 +45,42 @@ class ItineraryPlanRequest(BaseModel):
     trip_start_date: str | None = Field(default=None, pattern=r"^\d{4}-\d{2}-\d{2}$")
     adult_count: int = Field(default=1, ge=1)
     child_count: int = Field(default=0, ge=0)
-    budget_per_person: float = Field(default=0, ge=0)
+    trip_budget_total: float = Field(
+        default=0,
+        ge=0,
+        description="Tổng ngân sách tối đa cho toàn bộ nhóm, đơn vị VND.",
+    )
+    budget_per_person: float = Field(
+        default=0,
+        ge=0,
+        description="Deprecated compatibility field. New clients must send trip_budget_total.",
+    )
     selected_hotel_id: str | None = None
+    hotel_total_cost: float = Field(
+        default=0,
+        ge=0,
+        description="Tổng giá phòng cho toàn bộ kỳ lưu trú, đã được API chọn trước.",
+    )
     return_to_hotel: bool = False
-    use_goong: bool = False
+    use_goong: bool = True
     require_goong: bool = False
     goong_api_key: str = ""
     travel_vehicle: str = Field(default="car", pattern=r"^(car|bike)$")
+    check_in_time: str | None = Field(
+        default=None,
+        pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$",
+        description="Day 1 start time (HH:MM). If after 13:30, lunch is not enforced on day 1.",
+    )
     travel_cache_path: str | None = None
     speed_kmh: float = 30.0
     population_size: int = Field(default=50, ge=2)
     generations: int = Field(default=200, ge=1)
     mutation_rate: float = Field(default=0.30, ge=0, le=1)
     seed: int | None = 42
+    planner_engine: str = Field(
+        default="scheduler_v2",
+        description="Planner engine: scheduler_v2/or_tools or ga_v1/ga.",
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -109,7 +137,7 @@ class ItineraryPlanRequest(BaseModel):
                 "daily_end_time": "21:00",
                 "selected_hotel_id": "hotel-1",
                 "return_to_hotel": False,
-                "use_goong": False,
+                "use_goong": True,
                 "goong_api_key": "",
                 "speed_kmh": 30,
                 "population_size": 20,
@@ -141,6 +169,10 @@ class ScheduleEntryResponse(BaseModel):
     estimated_cost: float = 0
     price_basis: str | None = None
     price_inferred: bool | None = None
+    best_time: str = "ALL_DAY"
+    best_time_source: str = "default_all_day"
+    best_time_deviation_minutes: int = 0
+    best_time_matched: bool | None = None
     place_type: str = "attraction"
     is_restaurant: bool
     unknown_hours: bool
@@ -149,6 +181,7 @@ class ScheduleEntryResponse(BaseModel):
 
 class ItineraryDayResponse(BaseModel):
     day: int
+    candidates: int = 0
     visited_count: int
     target_visited_count: int = 4
     total_travel_minutes: int
@@ -165,6 +198,12 @@ class ItineraryDayResponse(BaseModel):
     total_hard_violations: int = 0
     meal_violations: int = 0
     restaurant_count: int
+    best_time_eligible_count: int = 0
+    best_time_matched_count: int = 0
+    best_time_slight_mismatch_count: int = 0
+    best_time_large_mismatch_count: int = 0
+    best_time_match_rate: float = 1.0
+    best_time_penalty_minutes: int = 0
     fitness: float
     stopped_reason: str
     schedule: list[ScheduleEntryResponse]
@@ -179,9 +218,17 @@ class ItineraryPlanResponse(BaseModel):
     total_ms: int = 0
     matrix_ms: int = 0
     ga_ms: int = 0
+    planner_engine: str = "scheduler_v2"
+    solver_ms: int = 0
     assignment_day_loads: list[int] = Field(default_factory=list)
     assignment_warnings: list[str] = Field(default_factory=list)
+    assignment_debug: list[dict[str, Any]] = Field(
+        default_factory=list,
+        description="Debug-only day pools produced by pre-allocation.",
+    )
+    travel_source_counts: dict[str, int] = Field(default_factory=dict)
     validation_is_feasible: bool = True
     validation_violations: list[dict] = Field(default_factory=list)
     validation_warnings: list[str] = Field(default_factory=list)
+    comparison: dict[str, Any] | None = None
     days: list[ItineraryDayResponse]
