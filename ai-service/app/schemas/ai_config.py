@@ -1,7 +1,9 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 class WeightsResponse(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     algorithm: str
     is_active: bool
     distance_weight: float

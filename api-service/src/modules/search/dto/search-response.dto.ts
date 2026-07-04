@@ -10,7 +10,7 @@ export class AutocompleteItemDto {
   @ApiProperty({ description: "'place' | 'city'" })
   type: string;
 
-  @ApiProperty({ description: 'Ảnh đại diện (rỗng với city)' })
+  @ApiProperty({ description: 'Ảnh đại diện của địa điểm hoặc tỉnh/thành phố' })
   image: string;
 
   @ApiProperty({ description: 'Tên thành phố của địa điểm' })

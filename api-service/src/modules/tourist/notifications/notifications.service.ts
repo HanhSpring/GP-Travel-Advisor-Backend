@@ -183,6 +183,13 @@ export class NotificationsService {
       this.metadataString(base, 'itinerary_detail_id') ??
       base.itinerary_detail_id ??
       null;
+    const shareStatus = this.metadataString(base, 'share_status');
+    const actionType =
+      shareStatus === 'accepted'
+        ? 'itinerary_share_accepted'
+        : shareStatus === 'rejected'
+          ? 'itinerary_share_rejected'
+          : base.action_type ?? null;
 
     return {
       id: base.id,
@@ -196,7 +203,7 @@ export class NotificationsService {
       time_label: this.buildTimeLabel(sentAt),
       icon_key: this.mapIconKey(base.type),
       is_unread: this.isUnreadStatus(link.is_read),
-      action_type: base.action_type ?? null,
+      action_type: actionType,
       action_label: actionLabel,
       target_type: base.target_type ?? null,
       place_id: placeId,

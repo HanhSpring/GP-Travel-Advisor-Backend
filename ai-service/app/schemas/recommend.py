@@ -1,4 +1,4 @@
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field
 
 
 # ---------------------------------------------------------------------------
@@ -19,6 +19,8 @@ class RecommendResponse(BaseModel):
 
 
 class PlaceRecommendationItem(BaseModel):
+    model_config = ConfigDict(protected_namespaces=())
+
     id: str
     name: str | None = None
     city_name: str | None = None

@@ -2,6 +2,12 @@ import { Injectable, InternalServerErrorException } from '@nestjs/common';
 import { supabase } from 'src/config/supabase';
 
 type SearchRow = Record<string, unknown>;
+type CityImageRow = {
+  id?: string | null;
+  name?: string | null;
+  image_url?: string | null;
+  url_image?: string | null;
+};
 
 export interface AutocompleteItem {
   id: string;
@@ -19,8 +25,60 @@ export class SearchService {
     process.env.DEFAULT_PLACE_IMAGE_URL ||
     'https://placehold.co/1080x720?text=No+Image';
 
+  // ── Ranking (rating + số lượt đánh giá) ────────────────────────────────────
+  // Bayesian weighted rating (kiểu IMDb): điểm kéo về mức trung bình PRIOR khi
+  // ít review, tiến dần về rating thật khi review nhiều. Tránh 5.0★/1 review
+  // xếp trên 4.7★/500 review.
+  private static readonly RANK_MIN_REVIEWS = 10; // m: ngưỡng review để rating "đáng tin"
+  private static readonly RANK_PRIOR_RATING = 3.0; // C: rating nền giả định
+
+  private weightedRank(rating: number, reviewCount: number): number {
+    const v = Math.max(0, Number(reviewCount) || 0);
+    const r = Math.max(0, Number(rating) || 0);
+    if (v === 0 && r === 0) return 0;
+    const m = SearchService.RANK_MIN_REVIEWS;
+    const c = SearchService.RANK_PRIOR_RATING;
+    return (v / (v + m)) * r + (m / (v + m)) * c;
+  }
+
+  // Sort ổn định theo weightedRank desc; hòa thì rating desc → reviewCount desc
+  // → giữ thứ tự gốc. Tính rank 1 lần/phần tử nên O(n log n) với n ≤ 2000.
+  private sortByRank<T extends Record<string, unknown>>(items: T[]): T[] {
+    return items
+      .map((item, index) => ({
+        item,
+        index,
+        rank: this.weightedRank(
+          Number(item['rating']) || 0,
+          Number(item['reviewCount']) || 0,
+        ),
+      }))
+      .sort(
+        (a, b) =>
+          b.rank - a.rank ||
+          (Number(b.item['rating']) || 0) - (Number(a.item['rating']) || 0) ||
+          (Number(b.item['reviewCount']) || 0) -
+            (Number(a.item['reviewCount']) || 0) ||
+          a.index - b.index,
+      )
+      .map((entry) => entry.item);
+  }
+
   private asString(value: unknown): string {
     return typeof value === 'string' ? value : '';
+  }
+
+  private resolveOptionalImage(...values: unknown[]): string {
+    for (const value of values) {
+      if (Array.isArray(value)) {
+        const first = value.find(
+          (item) => typeof item === 'string' && item.trim(),
+        );
+        if (first) return (first as string).trim();
+      }
+      if (typeof value === 'string' && value.trim()) return value.trim();
+    }
+    return '';
   }
 
   /**
@@ -91,7 +149,11 @@ export class SearchService {
           this.asString(row['type']).trim().toLowerCase() === 'city'
             ? 'city'
             : 'place';
-        const image = this.asString(row['image']).trim();
+        const image = this.resolveOptionalImage(
+          row['image'],
+          row['image_url'],
+          row['url_image'],
+        );
         return {
           id: this.asString(row['id']),
           name: this.asString(row['name']),
@@ -102,6 +164,18 @@ export class SearchService {
           score: Number(row['score']) || 0,
         };
       });
+      // Re-sort phòng khi DB còn function bản cũ (chưa xếp theo review_count):
+      // score desc → rating desc → giữ thứ tự RPC. City (score 100/50) vẫn trên cùng.
+      placeItems = placeItems
+        .map((item, index) => ({ item, index }))
+        .sort(
+          (a, b) =>
+            b.item.score - a.item.score ||
+            b.item.rating - a.item.rating ||
+            a.index - b.index,
+        )
+        .map((entry) => entry.item);
+      placeItems = await this.attachCityImages(placeItems);
     }
 
     // Map itinerary results (append after places)
@@ -124,25 +198,183 @@ export class SearchService {
   }
 
   private async autocompleteFallback(q: string): Promise<AutocompleteItem[]> {
-    const { data } = await supabase
-      .schema('travel')
-      .from('places')
-      .select('id, name, image_url, average_rating')
-      .eq('is_approved', true)
-      .eq('is_active', true)
-      .ilike('name', `${q}%`)
-      .order('average_rating', { ascending: false })
-      .limit(15);
+    const [cityItems, placeResult] = await Promise.all([
+      this.queryCitySuggestions(q),
+      supabase
+        .schema('travel')
+        .from('places')
+        .select('id, name, image_url, average_rating, review_count')
+        .eq('is_approved', true)
+        .eq('is_active', true)
+        .ilike('name', `${q}%`)
+        .order('average_rating', { ascending: false })
+        .order('review_count', { ascending: false })
+        .limit(15),
+    ]);
 
-    return ((data ?? []) as any[]).map((p) => ({
-      id: String(p.id ?? ''),
-      name: String(p.name ?? ''),
-      type: 'place' as const,
-      image: this.resolveSearchImage(p.image_url),
-      city: '',
-      rating: Number(p.average_rating) || 0,
-      score: 0,
-    }));
+    // score = weighted rank (rating + review_count) để sort nhất quán với RPC.
+    const placeItems = ((placeResult.data ?? []) as any[])
+      .map((p) => ({
+        id: String(p.id ?? ''),
+        name: String(p.name ?? ''),
+        type: 'place' as const,
+        image: this.resolveSearchImage(p.image_url),
+        city: '',
+        rating: Number(p.average_rating) || 0,
+        score: this.weightedRank(
+          Number(p.average_rating) || 0,
+          Number(p.review_count) || 0,
+        ),
+      }))
+      .sort((a, b) => b.score - a.score || b.rating - a.rating);
+
+    return [...cityItems, ...placeItems].slice(0, 15);
+  }
+
+  private mapCitySuggestion(city: CityImageRow, score = 0): AutocompleteItem {
+    const image = this.resolveOptionalImage(city.image_url, city.url_image);
+    return {
+      id: String(city.id ?? ''),
+      name: String(city.name ?? ''),
+      type: 'city',
+      image,
+      city: String(city.name ?? ''),
+      rating: 0,
+      score,
+    };
+  }
+
+  private isMissingImageColumnError(
+    error: { message?: string } | null,
+  ): boolean {
+    const message = error?.message?.toLowerCase() ?? '';
+    return (
+      message.includes('image_url') ||
+      message.includes('url_image') ||
+      message.includes('schema cache')
+    );
+  }
+
+  private async queryCityRowsByPrefix(
+    q: string,
+    limit = 5,
+  ): Promise<CityImageRow[]> {
+    const primary = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name, image_url')
+      .ilike('name', `${q}%`)
+      .order('name', { ascending: true })
+      .limit(limit)
+      .returns<CityImageRow[]>();
+
+    if (!primary.error) return primary.data ?? [];
+    if (!this.isMissingImageColumnError(primary.error)) {
+      console.error('queryCityRowsByPrefix error:', primary.error.message);
+      return [];
+    }
+
+    const fallback = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name, url_image')
+      .ilike('name', `${q}%`)
+      .order('name', { ascending: true })
+      .limit(limit)
+      .returns<CityImageRow[]>();
+
+    if (fallback.error) {
+      console.error(
+        'queryCityRowsByPrefix fallback error:',
+        fallback.error.message,
+      );
+      return [];
+    }
+
+    return fallback.data ?? [];
+  }
+
+  private async queryCityRowsByColumn(
+    column: 'id' | 'name',
+    values: string[],
+  ): Promise<CityImageRow[]> {
+    if (!values.length) return [];
+
+    const primary = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name, image_url')
+      .in(column, values)
+      .returns<CityImageRow[]>();
+
+    if (!primary.error) return primary.data ?? [];
+    if (!this.isMissingImageColumnError(primary.error)) {
+      console.error(
+        `queryCityRowsByColumn.${column} error:`,
+        primary.error.message,
+      );
+      return [];
+    }
+
+    const fallback = await supabase
+      .schema('travel')
+      .from('cities')
+      .select('id, name, url_image')
+      .in(column, values)
+      .returns<CityImageRow[]>();
+
+    if (fallback.error) {
+      console.error(
+        `queryCityRowsByColumn.${column} fallback error:`,
+        fallback.error.message,
+      );
+      return [];
+    }
+
+    return fallback.data ?? [];
+  }
+
+  private async queryCitySuggestions(q: string): Promise<AutocompleteItem[]> {
+    const data = await this.queryCityRowsByPrefix(q, 5);
+    return data.map((city) => this.mapCitySuggestion(city));
+  }
+
+  private async attachCityImages(
+    items: AutocompleteItem[],
+  ): Promise<AutocompleteItem[]> {
+    const missingCityItems = items.filter(
+      (item) => item.type === 'city' && !item.image,
+    );
+    if (!missingCityItems.length) return items;
+
+    const ids = [
+      ...new Set(missingCityItems.map((item) => item.id).filter(Boolean)),
+    ];
+    const names = [
+      ...new Set(missingCityItems.map((item) => item.name).filter(Boolean)),
+    ];
+
+    const [byIdRows, byNameRows] = await Promise.all([
+      this.queryCityRowsByColumn('id', ids),
+      this.queryCityRowsByColumn('name', names),
+    ]);
+
+    const imageById = new Map<string, string>();
+    const imageByName = new Map<string, string>();
+    for (const city of [...byIdRows, ...byNameRows]) {
+      const image = this.resolveOptionalImage(city.image_url, city.url_image);
+      if (!image) continue;
+      if (city.id) imageById.set(String(city.id), image);
+      if (city.name) imageByName.set(String(city.name), image);
+    }
+
+    return items.map((item) => {
+      if (item.type !== 'city' || item.image) return item;
+      return {
+        ...item,
+        image: imageById.get(item.id) ?? imageByName.get(item.name) ?? '',
+      };
+    });
   }
 
   async searchAdvanced(query: string): Promise<SearchRow[]> {
@@ -265,14 +497,18 @@ export class SearchService {
     cityMap: Map<string, string> = new Map(),
   ): Record<string, unknown> {
     const type = this.classifyPlaceType(place);
+    const cityName = cityMap.get(String(place.city_id ?? '')) ?? '';
     const base = {
       id: String(place.id ?? ''),
       name: String(place.name ?? ''),
       imageUrl: this.resolveSearchImage(place.image_url),
       rating: Number(place.average_rating) || 0,
       reviewCount: Number(place.review_count) || 0,
-      address: String(place.address ?? ''),
-      city: cityMap.get(String(place.city_id ?? '')) ?? '',
+      // Kết quả search chỉ hiển thị tỉnh/TP (không load địa chỉ đầy đủ) —
+      // địa chỉ đầy đủ xem ở màn chi tiết địa điểm. Giữ key `address` để
+      // tương thích với mobile đang render trường này.
+      address: cityName,
+      city: cityName,
       placeType: type,
     };
     if (type === 'hotel') {
@@ -389,8 +625,10 @@ export class SearchService {
     return { data: mapped, total: count ?? 0 };
   }
 
+  // Không select `address`: kết quả search chỉ cần tỉnh/TP (map từ city_id),
+  // bỏ cột text dài này giúp giảm payload từ DB và response API.
   private readonly placesSelect =
-    'id, name, address, average_rating, review_count, image_url, city_id, types(id, category_id, categories(id, name))';
+    'id, name, average_rating, review_count, image_url, city_id, types(id, category_id, categories(id, name))';
 
   // Infix search — requires GIN trigram index for speed on large tables.
   private async queryPlaces(q: string, maxRows = 2000): Promise<any[]> {
@@ -402,6 +640,7 @@ export class SearchService {
       .eq('is_active', true)
       .ilike('name', `%${q}%`)
       .order('average_rating', { ascending: false })
+      .order('review_count', { ascending: false })
       .limit(maxRows);
     if (error) console.error('queryPlaces (infix) error:', error.message);
     return error ? [] : (data ?? []);
@@ -417,6 +656,7 @@ export class SearchService {
       .eq('is_active', true)
       .ilike('name', `${q}%`)
       .order('average_rating', { ascending: false })
+      .order('review_count', { ascending: false })
       .limit(maxRows);
     if (error) console.error('queryPlacesPrefix error:', error.message);
     return error ? [] : (data ?? []);
@@ -455,7 +695,11 @@ export class SearchService {
     ]);
     if (!rawPlaces.length) rawPlaces = await this.queryPlacesPrefix(q, 500);
     const cityMap = await this.buildCityMap(rawPlaces);
-    const classified = rawPlaces.map((p) => this.mapPlaceItem(p, cityMap));
+    // Sort mặc định: rating cao + nhiều review lên đầu (weighted rank).
+    // Sort 1 lần trước khi tách loại — filter giữ nguyên thứ tự đã xếp.
+    const classified = this.sortByRank(
+      rawPlaces.map((p) => this.mapPlaceItem(p, cityMap)),
+    );
     const activities = classified.filter((p) => p['placeType'] === 'activity');
     const restaurants = classified.filter(
       (p) => p['placeType'] === 'restaurant',
@@ -478,9 +722,10 @@ export class SearchService {
     let raw = await this.queryPlaces(q, 2000);
     if (!raw.length) raw = await this.queryPlacesPrefix(q, 500);
     const cityMap = await this.buildCityMap(raw);
-    const filtered = raw
-      .map((p) => this.mapPlaceItem(p, cityMap))
-      .filter((p) => p['placeType'] === type);
+    // Sort weighted rank TRƯỚC khi phân trang để thứ tự trang ổn định.
+    const filtered = this.sortByRank(
+      raw.map((p) => this.mapPlaceItem(p, cityMap)),
+    ).filter((p) => p['placeType'] === type);
     const total = filtered.length;
     const offset = (safePage - 1) * safeLimit;
     return {

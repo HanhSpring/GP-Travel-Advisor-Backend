@@ -159,6 +159,7 @@ export interface ExplorePlaceItem {
   review_count: number;
   city: string | null;
   category: string | null;
+  status?: string;
   is_favorite?: boolean;
 }
 
@@ -234,6 +235,37 @@ export class ExploreService implements OnModuleInit {
     const parsed = Number(process.env.EXPLORE_CACHE_TTL_MS ?? '300000');
     if (!Number.isFinite(parsed) || parsed <= 0) return 300000;
     return Math.floor(parsed);
+  }
+
+  private getPlaceOpenStatus(
+    openTime?: string | null,
+    closeTime?: string | null,
+  ): string {
+    const openMinutes = this.parseTimeToMinutes(openTime);
+    const closeMinutes = this.parseTimeToMinutes(closeTime);
+    if (openMinutes == null || closeMinutes == null) {
+      return 'Chưa có giờ mở cửa';
+    }
+
+    const now = new Date(Date.now() + 7 * 60 * 60 * 1000);
+    const currentMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const isOpen =
+      openMinutes === closeMinutes ||
+      (openMinutes < closeMinutes
+        ? currentMinutes >= openMinutes && currentMinutes < closeMinutes
+        : currentMinutes >= openMinutes || currentMinutes < closeMinutes);
+
+    return isOpen ? 'Đang mở cửa' : 'Đã đóng cửa';
+  }
+
+  private parseTimeToMinutes(value?: string | null): number | null {
+    if (!value) return null;
+    const match = value.match(/^(\d{1,2}):(\d{2})/);
+    if (!match) return null;
+    const hour = Number(match[1]);
+    const minute = Number(match[2]);
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+    return hour * 60 + minute;
   }
 
   private getFromCache<T>(key: string): T | null {
@@ -1303,6 +1335,7 @@ export class ExploreService implements OnModuleInit {
           reviewCount: item.review_count || 0,
           price: '0đ',
           address: item.address ?? city.name,
+          status: this.getPlaceOpenStatus(item.open_time, item.close_time),
           starRating: 4,
           priceValue: 0,
           accommodationType: 'hotel',
@@ -1319,7 +1352,7 @@ export class ExploreService implements OnModuleInit {
           rating: Number(item.average_rating) || 0,
           reviewCount: item.review_count || 0,
           address: item.address ?? city.name,
-          status: 'Đang mở cửa',
+          status: this.getPlaceOpenStatus(item.open_time, item.close_time),
           cuisine: 'vietnamese',
           priceLevel: 'mid_range',
           amenities: [] as string[],
@@ -1338,7 +1371,7 @@ export class ExploreService implements OnModuleInit {
         rating: Number(item.average_rating) || 0,
         reviewCount: item.review_count || 0,
         address: item.address ?? city.name,
-        status: 'Đang mở cửa',
+        status: this.getPlaceOpenStatus(item.open_time, item.close_time),
         category: this.mapActivityEntityCategory(categories),
         priceType: 'free',
         district: this.extractCityName(item.cities) ?? city.name,
@@ -1451,7 +1484,7 @@ export class ExploreService implements OnModuleInit {
             .schema('travel')
             .from('places')
             .select(
-              'id, name, city_id, cities(name), average_rating, review_count, image_url',
+              'id, name, city_id, cities(name), average_rating, review_count, image_url, open_time, close_time',
             )
             .eq('is_approved', true)
             .eq('is_active', true)
@@ -1481,6 +1514,7 @@ export class ExploreService implements OnModuleInit {
               review_count: item.review_count || 0,
               city: this.extractCityName(item.cities),
               category: categoryName,
+              status: this.getPlaceOpenStatus(item.open_time, item.close_time),
               is_favorite: favoritePlaceIds.has(item.id),
             })),
             pagination: {
@@ -1511,7 +1545,7 @@ export class ExploreService implements OnModuleInit {
           .schema('travel')
           .from('places')
           .select(
-            'id, name, city_id, cities(name), average_rating, review_count, image_url, type_id, types(id, category_id, categories(id, name))',
+            'id, name, city_id, cities(name), average_rating, review_count, image_url, open_time, close_time, type_id, types(id, category_id, categories(id, name))',
           )
           .eq('is_approved', true)
           .eq('is_active', true)
@@ -1554,6 +1588,7 @@ export class ExploreService implements OnModuleInit {
           review_count: item.review_count || 0,
           city: this.extractCityName(item.cities),
           category: categoryName,
+          status: this.getPlaceOpenStatus(item.open_time, item.close_time),
         }));
 
         this.setCache(fallbackAllKey, allFallbackItems);
@@ -1586,7 +1621,7 @@ export class ExploreService implements OnModuleInit {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, city_id, cities(name), average_rating, review_count, image_url, type_id, types(id, category_id, categories(id, name))',
+        'id, name, city_id, cities(name), average_rating, review_count, image_url, open_time, close_time, type_id, types(id, category_id, categories(id, name))',
         {
           count: 'exact',
         },
@@ -1624,6 +1659,7 @@ export class ExploreService implements OnModuleInit {
       review_count: item.review_count || 0,
       city: this.extractCityName(item.cities),
       category: categoryName,
+      status: this.getPlaceOpenStatus(item.open_time, item.close_time),
       is_favorite: favoritePlaceIds.has(item.id),
     }));
 

@@ -10,6 +10,7 @@ import {
   Delete,
   Query,
   Logger,
+  Res,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -26,6 +27,10 @@ import { CreateItineraryDto } from './dto/create-itinerary.dto';
 import { ItineraryDetailResponseDto } from './dto/itinerary-detail-response.dto';
 import { ItineraryResponseDto } from './dto/itinerary-response.dto';
 import { ToggleVisibilityDto } from './dto/toggle-visibility.dto';
+import { ShareItineraryDto } from './dto/share-itinerary.dto';
+import { RespondItineraryShareDto } from './dto/respond-itinerary-share.dto';
+import { CreateItineraryShareLinkDto } from './dto/create-itinerary-share-link.dto';
+import { RespondItineraryShareLinkDto } from './dto/respond-itinerary-share-link.dto';
 import { EditActivityDto } from './dto/edit-activity.dto';
 import { AddActivityDto } from './dto/add-activity.dto';
 import { UpdateItineraryDto } from './dto/update-itinerary.dto';
@@ -223,6 +228,47 @@ export class ItineraryController {
     };
   }
 
+  @Get('share-link/:token')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Lấy thông tin lời mời chia sẻ lịch trình từ token',
+  })
+  @ApiParam({ name: 'token', description: 'Token trong link chia sẻ' })
+  getShareLinkPreview(@Param('token') token: string) {
+    return this.service.getShareLinkPreview(token);
+  }
+
+  @Get('share/recipients')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Tim tourist de moi chia se lich trinh' })
+  @ApiQuery({ name: 'q', required: true })
+  @ApiQuery({ name: 'senderUserId', required: false })
+  searchShareRecipients(
+    @Query('q') q: string,
+    @Query('senderUserId') senderUserId?: string,
+  ) {
+    return this.service.searchShareRecipients(q, senderUserId);
+  }
+
+  @Get('share/:token')
+  @ApiOperation({
+    summary: 'Mở link chia sẻ lịch trình và chuyển hướng sang app mobile',
+  })
+  @ApiParam({ name: 'token', description: 'Token trong link chia sẻ' })
+  redirectShareLink(@Param('token') token: string, @Res() res: any) {
+    return res.redirect(this.service.buildShareDeepLink(token));
+  }
+
+  @Post('share-link/respond')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Xác nhận hoặc từ chối lời mời chia sẻ lịch trình từ link',
+  })
+  @ApiBody({ type: RespondItineraryShareLinkDto })
+  respondToShareLink(@Body() dto: RespondItineraryShareLinkDto) {
+    return this.service.respondToShareLink(dto);
+  }
+
   @Get(':id')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
@@ -275,6 +321,45 @@ export class ItineraryController {
         : 'Lịch trình đã chuyển về riêng tư',
       success: true,
     };
+  }
+
+  @Post(':id/share')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Gửi lời mời chia sẻ lịch trình bằng email hoặc số điện thoại',
+  })
+  @ApiParam({ name: 'id', description: 'ID lịch trình cần chia sẻ' })
+  @ApiBody({ type: ShareItineraryDto })
+  shareItinerary(@Param('id') id: string, @Body() dto: ShareItineraryDto) {
+    return this.service.shareItinerary(id, dto);
+  }
+
+  @Post(':id/share-link')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Tạo link chia sẻ lịch trình để gửi qua mạng xã hội',
+  })
+  @ApiParam({ name: 'id', description: 'ID lịch trình cần chia sẻ' })
+  @ApiBody({ type: CreateItineraryShareLinkDto })
+  createShareLink(
+    @Param('id') id: string,
+    @Body() dto: CreateItineraryShareLinkDto,
+  ) {
+    return this.service.createShareLink(id, dto);
+  }
+
+  @Post(':id/share/respond')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Xác nhận hoặc từ chối lời mời chia sẻ lịch trình',
+  })
+  @ApiParam({ name: 'id', description: 'ID lịch trình được chia sẻ' })
+  @ApiBody({ type: RespondItineraryShareDto })
+  respondToShare(
+    @Param('id') id: string,
+    @Body() dto: RespondItineraryShareDto,
+  ) {
+    return this.service.respondToShareInvitation(id, dto);
   }
 
   // ════════════════════════════════════════════════════════════════
