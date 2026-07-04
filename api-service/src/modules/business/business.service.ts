@@ -17,6 +17,28 @@ export class BusinessService {
   private supabaseUrl = process.env.SUPABASE_URL || '';
   private supabaseAnonKey = process.env.SUPABASE_KEY || '';
 
+  private normalizeText(value: string): string {
+    return value
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase()
+      .trim();
+  }
+
+  private isAccommodationType(values: Array<string | null | undefined>): boolean {
+    return values
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => this.normalizeText(value))
+      .some((value) =>
+        value.includes('luu tru') ||
+        value.includes('khach san') ||
+        value.includes('hotel') ||
+        value.includes('accommodation') ||
+        value.includes('homestay') ||
+        value.includes('resort'),
+      );
+  }
+
   private async resolvePlaceType(input: {
     typeId?: string;
     typeName?: string;
@@ -181,6 +203,53 @@ export class BusinessService {
     }
   }
 
+  private async addHotelRooms(
+    placeId: string,
+    rooms: Array<{
+      name?: string;
+      room_name?: string;
+      price?: number | string;
+      quantity?: number | string;
+      max_occupancy?: number | string;
+    }>,
+  ) {
+    if (rooms.length === 0) return;
+
+    const rows = rooms
+      .map((room) => {
+        const roomName = (room.name || room.room_name || '').trim();
+        const price = Number(room.price);
+        const quantity = Number(room.quantity ?? room.max_occupancy);
+
+        return {
+          id: randomUUID(),
+          place_id: placeId,
+          name: roomName,
+          price,
+          quantity,
+        };
+      })
+      .filter(
+        (room) =>
+          room.name &&
+          Number.isFinite(room.price) &&
+          room.price > 0 &&
+          Number.isFinite(room.quantity) &&
+          room.quantity > 0,
+      );
+
+    if (rows.length === 0) return;
+
+    const { error } = await supabase
+      .schema('order_sys')
+      .from('hotel_rooms')
+      .insert(rows);
+
+    if (error) {
+      throw new BadRequestException(error.message);
+    }
+  }
+
   private normalizeFoodImageUrls(imageUrl?: string) {
     const trimmedUrl = imageUrl?.trim();
     return trimmedUrl ? [trimmedUrl] : [];
@@ -200,7 +269,7 @@ export class BusinessService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, description, address, email, phone, city_id, cities(name), latitude, longitude, open_time, close_time, image_url, is_approved, is_active, average_rating, review_count, type_id, types(id, name, categories(id, name))',
+        'id, name, description, address, email, phone, city_id, cities(name), latitude, longitude, open_time, close_time, image_url, is_approved, is_active, average_rating, review_count, type_id, estimated_preparation_time, types(id, name, categories(id, name))',
       )
       .eq('id', placeId)
       .maybeSingle();
@@ -275,10 +344,8 @@ export class BusinessService {
     if (longitude !== undefined && longitude !== '')
       updatePayload.longitude = Number(longitude);
 
-    if (typeof dto.isActive === 'boolean')
-      updatePayload.is_active = dto.isActive;
-    if (typeof dto.is_active === 'boolean')
-      updatePayload.is_active = dto.is_active;
+    // is_active is controlled solely by the admin approval flow; vendors cannot set it directly
+    updatePayload.is_active = false;
 
     const imageUrls = dto.imageUrls ?? dto.image_url ?? dto.images;
     if (Array.isArray(imageUrls)) {
@@ -286,6 +353,11 @@ export class BusinessService {
         (url): url is string =>
           typeof url === 'string' && url.trim().length > 0,
       );
+    }
+
+    const prepTime = dto.estimated_preparation_time ?? dto.p_estimated_preparation_time;
+    if (prepTime !== undefined) {
+      updatePayload.estimated_preparation_time = prepTime === null || prepTime === '' ? null : Number(prepTime) || null;
     }
 
     const cityName = typeof dto.city === 'string' ? dto.city.trim() : '';
@@ -328,11 +400,13 @@ export class BusinessService {
       .schema('travel')
       .from('places')
       .update({
+        is_deleted: true,
         is_active: false,
         updated_at: new Date().toISOString(),
       })
       .eq('id', normalizedPlaceId)
       .eq('vendor_id', normalizedVendorId)
+      .or('is_deleted.is.null,is_deleted.eq.false')
       .select('id')
       .maybeSingle();
 
@@ -375,59 +449,54 @@ export class BusinessService {
 
   async getPlaceServicesByType(placeId: string) {
     try {
-      console.log('📍 Fetching services for placeId:', placeId);
-
-      // Step 1: Get all place_services for this place (free services)
       const { data: placeServices, error: psError } = await supabase
         .schema('travel')
         .from('place_services')
         .select('place_id, service_id')
         .eq('place_id', placeId);
 
-      console.log('📊 Place services query - error:', psError);
-      console.log('📊 Place services query - data:', placeServices);
-
       if (psError) {
-        console.error('❌ Error fetching place_services:', psError.message);
         throw new InternalServerErrorException(
-          `Lỗi database: ${psError.message}`,
+          `Loi database: ${psError.message}`,
         );
       }
 
-      // Step 2: Get food items for paid services
       const { data: foodItems, error: foodError } = await supabase
         .schema('order_sys')
         .from('food_items')
         .select('id, name, price, description, image_url')
         .eq('place_id', placeId);
 
-      console.log('🍽️  Food items query - error:', foodError);
-      console.log('🍽️  Food items query - data:', foodItems);
+      if (foodError) {
+        throw new InternalServerErrorException(foodError.message);
+      }
 
-      // Try to get free and paid services
+      const { data: hotelRooms, error: roomError } = await supabase
+        .schema('order_sys')
+        .from('hotel_rooms')
+        .select('id, name, price, quantity')
+        .eq('place_id', placeId);
+
+      if (roomError) {
+        console.error('Hotel rooms query error:', roomError.message);
+      }
+
       const freeServices: any[] = [];
       const paidServices: any[] = [];
 
-      // Process free services from place_services
-      if (
-        placeServices &&
-        Array.isArray(placeServices) &&
-        placeServices.length > 0
-      ) {
+      if (placeServices && Array.isArray(placeServices) && placeServices.length > 0) {
         const serviceIds = placeServices.map((ps: any) => ps.service_id);
-        console.log('🔍 Fetching services with IDs:', serviceIds);
-
-        // Fetch the services with their prices
         const { data: services, error: sError } = await supabase
           .schema('travel')
           .from('services')
           .select('id, name, price')
           .in('id', serviceIds);
 
-        console.log('📊 Services query - error:', sError);
-        console.log('📊 Services query - data:', services);
+        if (sError) {
+          throw new InternalServerErrorException(sError.message);
+        }
 
-        if (!sError && services && Array.isArray(services)) {
+        if (services && Array.isArray(services)) {
           services.forEach((service: any) => {
             const serviceData = {
               id: service.id,
@@ -436,7 +505,6 @@ export class BusinessService {
               price: service.price,
             };
 
-            // Group by whether price is null (free) or has value (paid)
             if (service.price === null || service.price === undefined) {
               freeServices.push(serviceData);
             } else {
@@ -452,41 +520,44 @@ export class BusinessService {
         }
       }
 
-      // Process food items separately (for restaurant menu section)
-      const menuItems: any[] = [];
-      if (foodItems && Array.isArray(foodItems)) {
-        console.log('🍽️  Processing', foodItems.length, 'food items as menu');
-        foodItems.forEach((item: any) => {
-          menuItems.push({
-            id: item.id,
-            name: item.name,
-            description: item.description,
-            price:
-              typeof item.price === 'string'
-                ? parseFloat(item.price)
-                : item.price,
-            image_url: Array.isArray(item.image_url)
-              ? item.image_url[0]
-              : (item.image_url ?? null),
-          });
-        });
-      }
+      const menuItems = (foodItems ?? []).map((item: any) => ({
+        id: item.id,
+        name: item.name,
+        description: item.description,
+        price:
+          typeof item.price === 'string'
+            ? parseFloat(item.price)
+            : item.price,
+        image_url: Array.isArray(item.image_url)
+          ? item.image_url[0]
+          : (item.image_url ?? null),
+      }));
 
-      const result = {
+      const rooms = (roomError ? [] : (hotelRooms ?? [])).map((room: any) => ({
+        id: room.id,
+        name: room.name,
+        price:
+          typeof room.price === 'string'
+            ? parseFloat(room.price)
+            : room.price,
+        quantity:
+          typeof room.quantity === 'string'
+            ? parseInt(room.quantity, 10)
+            : room.quantity,
+      }));
+
+      return {
         freeServices,
         paidServices,
         menuItems,
-        total: freeServices.length + paidServices.length + menuItems.length,
+        rooms,
+        total: freeServices.length + paidServices.length + menuItems.length + rooms.length,
       };
-
-      console.log('✅ Services fetched successfully:', result);
-      return result;
     } catch (error) {
-      console.error('❌ Error in getPlaceServicesByType:', error);
-      throw new InternalServerErrorException('Không thể lấy dữ liệu dịch vụ');
+      console.error('Error in getPlaceServicesByType:', error);
+      throw new InternalServerErrorException('Khong the lay du lieu dich vu');
     }
   }
-
   async getDashboard(vendorId: string) {
     const { data, error } = await supabase
       .schema('travel')
@@ -534,6 +605,11 @@ export class BusinessService {
       categories: Array.isArray(categories) ? categories : [],
     });
     const categoryNames = resolvedType.categoryNames;
+    const isAccommodation = this.isAccommodationType([
+      dto.p_type_name || dto.typeName,
+      ...(Array.isArray(categories) ? categories : []),
+      ...categoryNames,
+    ]);
 
     if (!name) throw new BadRequestException('Thiếu dữ liệu: Tên địa điểm');
     if (!address) throw new BadRequestException('Thiếu dữ liệu: Địa chỉ');
@@ -560,6 +636,10 @@ export class BusinessService {
       menu = [...dto.menu];
     }
 
+    const rooms = Array.isArray(dto.p_rooms || dto.rooms)
+      ? dto.p_rooms || dto.rooms
+      : [];
+
     // Merge với Excel nếu có
     if (file) {
       try {
@@ -570,7 +650,7 @@ export class BusinessService {
       }
     }
 
-    if (menu.length > 0) {
+    if (!isAccommodation && menu.length > 0) {
       this.validateMenu(menu);
     }
 
@@ -603,14 +683,18 @@ export class BusinessService {
         type_id: resolvedType.typeId,
         open_time: dto.p_open_time || '08:00',
         close_time: dto.p_close_time || '22:00',
+        open_hour_compressed: dto.p_open_hour_compressed || null,
         description: dto.p_description || '',
         image_url: images,
         is_approved: null,
-        is_active: true,
+        is_active: false,
         average_rating: 0,
         review_count: 0,
         registered_date: new Date().toISOString().slice(0, 10),
         source: 'business',
+        estimated_preparation_time: (dto.p_estimated_preparation_time ?? dto.estimated_preparation_time) != null
+          ? Number(dto.p_estimated_preparation_time ?? dto.estimated_preparation_time) || null
+          : null,
       })
       .select('id')
       .single();
@@ -628,7 +712,11 @@ export class BusinessService {
     }
 
     await this.addPlaceServices(createdPlaceId, services);
-    await this.addMenuItems(createdPlaceId, menu);
+    if (isAccommodation) {
+      await this.addHotelRooms(createdPlaceId, rooms.length > 0 ? rooms : menu);
+    } else {
+      await this.addMenuItems(createdPlaceId, menu);
+    }
 
     return {
       message: 'Tao thanh cong',
@@ -655,6 +743,7 @@ export class BusinessService {
           : [],
         p_open_time: dto.p_open_time || '08:00',
         p_close_time: dto.p_close_time || '22:00',
+        p_open_hour_compressed: dto.p_open_hour_compressed || null,
         p_description: dto.p_description || '',
       });
 
@@ -704,7 +793,7 @@ export class BusinessService {
         price: Number(price),
         image_url: [],
       })
-      .select('id, name, description, price')
+      .select('id, name, price')
       .single();
 
     if (error) throw new BadRequestException(error.message);
@@ -746,6 +835,66 @@ export class BusinessService {
 
     if (error) throw new BadRequestException(error.message);
     return { message: 'Xóa dịch vụ thành công' };
+  }
+
+  async addSingleHotelRoom(
+    placeId: string,
+    name: string,
+    price: number,
+    quantity: number,
+  ) {
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .from('hotel_rooms')
+      .insert({
+        id: randomUUID(),
+        place_id: placeId,
+        name: name.trim(),
+        price: Number(price),
+        quantity: Number(quantity),
+      })
+      .select('id, name, price, quantity')
+      .single();
+
+    if (error) throw new BadRequestException(error.message);
+    return { message: 'Them phong thanh cong', item: data };
+  }
+
+  async updateSingleHotelRoom(
+    roomId: string,
+    placeId: string,
+    name: string,
+    price: number,
+    quantity: number,
+  ) {
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .from('hotel_rooms')
+      .update({
+        name: name.trim(),
+        price: Number(price),
+        quantity: Number(quantity),
+      })
+      .eq('id', roomId)
+      .eq('place_id', placeId)
+      .select('id')
+      .maybeSingle();
+
+    if (error) throw new BadRequestException(error.message);
+    if (!data) throw new NotFoundException('Khong tim thay phong');
+    return { message: 'Cap nhat phong thanh cong' };
+  }
+
+  async deleteSingleHotelRoom(roomId: string, placeId: string) {
+    const { error } = await supabase
+      .schema('order_sys')
+      .from('hotel_rooms')
+      .delete()
+      .eq('id', roomId)
+      .eq('place_id', placeId);
+
+    if (error) throw new BadRequestException(error.message);
+    return { message: 'Xoa phong thanh cong' };
   }
 
   async addSingleFreeService(placeId: string, name: string) {
@@ -991,3 +1140,4 @@ export class BusinessService {
     };
   }
 }
+
