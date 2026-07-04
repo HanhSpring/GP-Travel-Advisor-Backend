@@ -10,6 +10,7 @@ import {
   Delete,
   Query,
   Logger,
+  Res,
 } from '@nestjs/common';
 import {
   ApiTags,
@@ -227,6 +228,47 @@ export class ItineraryController {
     };
   }
 
+  @Get('share-link/:token')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Lấy thông tin lời mời chia sẻ lịch trình từ token',
+  })
+  @ApiParam({ name: 'token', description: 'Token trong link chia sẻ' })
+  getShareLinkPreview(@Param('token') token: string) {
+    return this.service.getShareLinkPreview(token);
+  }
+
+  @Get('share/recipients')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Tim tourist de moi chia se lich trinh' })
+  @ApiQuery({ name: 'q', required: true })
+  @ApiQuery({ name: 'senderUserId', required: false })
+  searchShareRecipients(
+    @Query('q') q: string,
+    @Query('senderUserId') senderUserId?: string,
+  ) {
+    return this.service.searchShareRecipients(q, senderUserId);
+  }
+
+  @Get('share/:token')
+  @ApiOperation({
+    summary: 'Mở link chia sẻ lịch trình và chuyển hướng sang app mobile',
+  })
+  @ApiParam({ name: 'token', description: 'Token trong link chia sẻ' })
+  redirectShareLink(@Param('token') token: string, @Res() res: any) {
+    return res.redirect(this.service.buildShareDeepLink(token));
+  }
+
+  @Post('share-link/respond')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Xác nhận hoặc từ chối lời mời chia sẻ lịch trình từ link',
+  })
+  @ApiBody({ type: RespondItineraryShareLinkDto })
+  respondToShareLink(@Body() dto: RespondItineraryShareLinkDto) {
+    return this.service.respondToShareLink(dto);
+  }
+
   @Get(':id')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({
@@ -304,26 +346,6 @@ export class ItineraryController {
     @Body() dto: CreateItineraryShareLinkDto,
   ) {
     return this.service.createShareLink(id, dto);
-  }
-
-  @Get('share-link/:token')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Lấy thông tin lời mời chia sẻ lịch trình từ token',
-  })
-  @ApiParam({ name: 'token', description: 'Token trong link chia sẻ' })
-  getShareLinkPreview(@Param('token') token: string) {
-    return this.service.getShareLinkPreview(token);
-  }
-
-  @Post('share-link/respond')
-  @HttpCode(HttpStatus.OK)
-  @ApiOperation({
-    summary: 'Xác nhận hoặc từ chối lời mời chia sẻ lịch trình từ link',
-  })
-  @ApiBody({ type: RespondItineraryShareLinkDto })
-  respondToShareLink(@Body() dto: RespondItineraryShareLinkDto) {
-    return this.service.respondToShareLink(dto);
   }
 
   @Post(':id/share/respond')

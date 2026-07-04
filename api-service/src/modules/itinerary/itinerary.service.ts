@@ -24,6 +24,11 @@ const AI_SERVICE_URL = process.env.AI_SERVICE_URL ?? 'http://localhost:8000';
 const APP_DEEP_LINK_SCHEME =
   process.env.APP_DEEP_LINK_SCHEME ?? 'gptraveladvisor';
 const APP_PLAY_STORE_URL = process.env.APP_PLAY_STORE_URL ?? null;
+const APP_PUBLIC_SHARE_BASE_URL =
+  process.env.APP_PUBLIC_SHARE_BASE_URL ??
+  process.env.API_PUBLIC_URL ??
+  process.env.BASE_URL ??
+  null;
 
 interface ScheduleEntry {
   location_id: string;
@@ -142,7 +147,7 @@ export class ItineraryService {
       .schema('travel')
       .from('itinerary_members')
       .select('itinerary_id')
-      .eq('user_id', userId);
+      .eq('tourist_id', userId);
 
     if (membershipError) {
       this.logger.warn(
@@ -695,6 +700,54 @@ export class ItineraryService {
     };
   }
 
+  async searchShareRecipients(q: string, senderUserId?: string) {
+    const term = (q ?? '').trim();
+    if (term.length < 2) {
+      return { users: [] };
+    }
+
+    const sanitized = term.replace(/[%,]/g, '');
+    if (sanitized.length < 2) {
+      return { users: [] };
+    }
+    const normalizedPhone = sanitized.replace(/[\s.-]/g, '');
+    const conditions = [
+      `full_name.ilike.%${sanitized}%`,
+      `email.ilike.%${sanitized}%`,
+      `phone_number.ilike.%${sanitized}%`,
+      normalizedPhone && normalizedPhone !== sanitized
+        ? `phone_number.ilike.%${normalizedPhone}%`
+        : null,
+    ].filter(Boolean) as string[];
+
+    let query = supabase
+      .schema('public')
+      .from('users')
+      .select('id, full_name, email, phone_number, role')
+      .eq('role', 'TOURIST')
+      .or(conditions.join(','))
+      .order('full_name', { ascending: true })
+      .limit(8);
+
+    if (senderUserId?.trim()) {
+      query = query.neq('id', senderUserId.trim());
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return {
+      users: (data ?? []).map((user: any) => ({
+        id: user.id,
+        fullName: user.full_name,
+        email: user.email,
+        phoneNumber: user.phone_number,
+      })),
+    };
+  }
+
   async createShareLink(itineraryId: string, dto: CreateItineraryShareLinkDto) {
     const itinerary = await this.getShareableItineraryForOwner(
       itineraryId,
@@ -737,6 +790,7 @@ export class ItineraryService {
     }
 
     const deepLink = this.buildShareDeepLink(token);
+    const shareUrl = this.buildPublicShareUrl(token) ?? deepLink;
     return {
       success: true,
       token,
@@ -744,10 +798,11 @@ export class ItineraryService {
       itineraryTitle,
       ownerName: owner.displayName,
       deepLink,
+      shareUrl,
       playStoreUrl: APP_PLAY_STORE_URL,
       message:
         `${owner.displayName} mời bạn tham gia lịch trình "${itineraryTitle}". ` +
-        `Mở link để xác nhận: ${deepLink}`,
+        `Mở link để xác nhận: ${shareUrl}`,
     };
   }
 
@@ -831,8 +886,35 @@ export class ItineraryService {
       string,
       unknown
     >;
+    const currentActionType = (notification as any).action_type;
+    const currentShareStatus =
+      typeof metadata.share_status === 'string'
+        ? metadata.share_status
+        : null;
     if (
-      (notification as any).action_type !== 'respond_itinerary_share' ||
+      (currentShareStatus === 'accepted' ||
+        currentShareStatus === 'rejected' ||
+        currentActionType === 'itinerary_share_accepted' ||
+        currentActionType === 'itinerary_share_rejected') &&
+      metadata.itinerary_id === itineraryId &&
+      metadata.recipient_user_id === dto.userId
+    ) {
+      const finalStatus =
+        currentShareStatus === 'accepted' ||
+        currentActionType === 'itinerary_share_accepted'
+          ? 'accepted'
+          : 'rejected';
+      return {
+        success: true,
+        status: finalStatus,
+        message:
+          finalStatus === 'accepted'
+            ? 'Lời mời chia sẻ lịch trình đã được chấp nhận trước đó'
+            : 'Lời mời chia sẻ lịch trình đã bị từ chối trước đó',
+      };
+    }
+    if (
+      currentActionType !== 'respond_itinerary_share' ||
       metadata.itinerary_id !== itineraryId ||
       metadata.recipient_user_id !== dto.userId
     ) {
@@ -888,18 +970,21 @@ export class ItineraryService {
 
   private async findUserByEmailOrPhone(value: string) {
     const normalized = value.trim();
+    const normalizedPhone = normalized.replace(/[\s.-]/g, '');
     const isEmail = /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(normalized);
     const query = supabase
       .schema('public')
       .from('users')
-      .select('id, full_name, email, phone_number')
+      .select('id, full_name, email, phone_number, role')
+      .eq('role', 'TOURIST')
       .limit(1);
 
+    const phoneCandidates = Array.from(
+      new Set([normalized, normalizedPhone].filter(Boolean)),
+    );
     const { data, error } = isEmail
       ? await query.ilike('email', normalized).maybeSingle()
-      : await query
-          .eq('phone_number', normalized.replace(/[\s.-]/g, ''))
-          .maybeSingle();
+      : await query.in('phone_number', phoneCandidates).maybeSingle();
 
     if (error) {
       throw new InternalServerErrorException(error.message);
@@ -953,8 +1038,16 @@ export class ItineraryService {
     };
   }
 
-  private buildShareDeepLink(token: string) {
+  buildShareDeepLink(token: string) {
     return `${APP_DEEP_LINK_SCHEME}://itinerary-share?token=${encodeURIComponent(
+      token,
+    )}`;
+  }
+
+  buildPublicShareUrl(token: string) {
+    const baseUrl = APP_PUBLIC_SHARE_BASE_URL?.trim();
+    if (!baseUrl) return null;
+    return `${baseUrl.replace(/\/+$/, '')}/itinerary/share/${encodeURIComponent(
       token,
     )}`;
   }
@@ -995,7 +1088,7 @@ export class ItineraryService {
       .from('itinerary_members')
       .select('itinerary_id')
       .eq('itinerary_id', itineraryId)
-      .eq('user_id', userId)
+      .eq('tourist_id', userId)
       .maybeSingle();
 
     if (error) {
@@ -1014,7 +1107,7 @@ export class ItineraryService {
       .from('itinerary_members')
       .insert({
         itinerary_id: itineraryId,
-        user_id: userId,
+        tourist_id: userId,
       });
 
     if (error && error.code !== '23505') {
