@@ -61,7 +61,7 @@ export interface ItineraryPlanPayload {
   generations?: number;
   mutation_rate?: number;
   seed?: number;
-  planner_engine?: 'ga_v1' | 'scheduler_v2' | 'compare';
+  planner_engine?: 'scheduler_v2' | 'ga_v1';
 }
 
 @Injectable()
@@ -95,7 +95,7 @@ export class MlClientService {
     } catch (error) {
       const msg = error?.response?.data?.detail ?? error?.message ?? 'unknown';
       this.logger.error(`encodeQuery failed: ${msg}`);
-      throw new Error(`AI Service is unavailable: ${msg}`);
+      throw new Error(`Itinerary planning failed: ${msg}`);
     }
   }
 

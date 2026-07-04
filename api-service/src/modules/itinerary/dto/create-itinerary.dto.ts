@@ -215,14 +215,4 @@ export class CreateItineraryDto {
   @MaxLength(255)
   description?: string;
 
-  @ApiPropertyOptional({
-    enum: ['ga_v1', 'scheduler_v2', 'compare'],
-    default: 'compare',
-    description:
-      'Thuật toán lên lịch: ga_v1 (GA) | scheduler_v2 (OR-Tools) | compare (cả hai, lưu 2 lịch trình)',
-    example: 'compare',
-  })
-  @IsOptional()
-  @IsString()
-  plannerEngine?: 'ga_v1' | 'scheduler_v2' | 'compare';
 }

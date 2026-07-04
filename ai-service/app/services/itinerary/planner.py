@@ -931,8 +931,11 @@ def refresh_travel_matrix_for_day_pools(
         )
     refreshed_pairs: set[Tuple[str, str]] = set()
     processed_subsets: set[Tuple[str, ...]] = set()
+    goong_unavailable = False
 
     for pool in day_pools:
+        if goong_unavailable:
+            break
         places = [
             *(pool.get("attractions") or []),
             *(pool.get("restaurants") or []),
@@ -978,12 +981,25 @@ def refresh_travel_matrix_for_day_pools(
             continue
 
         subset_coords = {place_id: coords[place_id] for place_id in ids}
-        goong_times, goong_distances = build_travel_data_goong(
-            subset_coords,
-            api_key,
-            vehicle=vehicle,
-            max_workers=1,
-        )
+        try:
+            goong_times, goong_distances = build_travel_data_goong(
+                subset_coords,
+                api_key,
+                vehicle=vehicle,
+                max_workers=1,
+            )
+        except Exception as exc:
+            if require_goong:
+                raise
+            # The matrix already contains Haversine/cache values for every
+            # pair. On 429/timeout, keep those values and stop calling Goong
+            # again during this request.
+            goong_unavailable = True
+            print(
+                "  [WARNING] Goong refresh unavailable; using existing "
+                f"matrix/Haversine values: {_safe_console_text(exc)}"
+            )
+            break
         for pair, minutes in goong_times.items():
             travel_times[pair] = minutes
             if goong_distances.get(pair, 0) > 0:
@@ -1754,15 +1770,11 @@ class TSP_TW_GA:
         base_travel_time: int,
         departure_time: Optional[int],
     ) -> Tuple[int, str]:
-        if base_travel_time <= 0:
-            return 0, "none"
-        historical = self._historical_travel_buffer(from_id, to_id, base_travel_time)
-        if historical is not None:
-            return historical
-        buffer = max(base_travel_time * self.travel_buffer_percent, self.travel_buffer_min)
-        if self.travel_buffer_max >= 0:
-            buffer = min(buffer, self.travel_buffer_max)
-        return round(buffer), "heuristic"
+        # distance_matrix is the single source of truth. Travel time is
+        # rounded once by scheduler_v2 and persisted for the winning route;
+        # adding a hidden buffer here would make solver timestamps disagree
+        # with the API/UI and compound again on later reads.
+        return 0, "matrix"
 
     def _historical_travel_buffer(
         self,

@@ -24,6 +24,17 @@ logger = logging.getLogger(__name__)
 FOOD_CATEGORY_ID = "97029cfb-069b-4dba-a152-dfb3d36634d3"
 
 
+def _normalize_planner_engine(value: str | None) -> str:
+    normalized = (value or "scheduler_v2").strip().lower()
+    if normalized in {"scheduler_v2", "or_tools"}:
+        return "scheduler_v2"
+    if normalized in {"ga_v1", "ga"}:
+        return "ga_v1"
+    raise ValueError(
+        "planner_engine must be one of: scheduler_v2, or_tools, ga_v1, ga."
+    )
+
+
 def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
     started_at = time.perf_counter()
     trip_start_date = _parse_trip_start_date(req.trip_start_date)
@@ -61,16 +72,14 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
     else:
         logger.info("[Planner] No Goong config. Using Haversine fallback (speed=%.1f km/h)", req.speed_kmh)
 
-    engine_name = (req.planner_engine or "ga_v1").strip().lower()
-    if engine_name not in {"ga_v1", "scheduler_v2", "compare"}:
-        raise ValueError("planner_engine must be one of: ga_v1, scheduler_v2, compare.")
+    engine_name = _normalize_planner_engine(req.planner_engine)
 
     matrix_started_at = time.perf_counter()
     try:
-        # Scheduler v2 first builds a cheap complete matrix from cache/Haversine
-        # for clustering, then refreshes only the smaller per-day route pools
-        # from Goong after assignment.
-        initial_matrix_key = "" if engine_name in {"scheduler_v2", "compare"} else goong_key
+        # Never call Goong for the O(N^2) candidate matrix. All engines start
+        # from DB cache/Haversine; scheduler_v2 refreshes only its much smaller
+        # per-day pools after assignment.
+        initial_matrix_key = ""
         travel_times, travel_distances, travel_sources, travel_reliability = planner.build_travel_matrix(
             coords,
             api_key=initial_matrix_key,
@@ -84,50 +93,21 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
         raise RuntimeError(f"Travel matrix calculation failed: {str(e)}") from e
 
     matrix_ms = round((time.perf_counter() - matrix_started_at) * 1000)
-    comparison = None
-    if engine_name == "compare":
-        ga_result, ga_ms, ga_validation = _run_ga_engine(
-            req, places, travel_times, travel_distances, travel_sources, travel_reliability
+    result, ga_ms, scheduler_ms, validation, response_engine = (
+        _dispatch_planner_engine(
+            engine_name,
+            req,
+            places,
+            travel_times,
+            travel_distances,
+            travel_sources,
+            travel_reliability,
+            goong_key,
         )
-        scheduler_result, scheduler_ms, scheduler_validation = _run_scheduler_v2_engine(
-            req, places, travel_times, travel_distances, travel_sources,
-            travel_reliability, goong_key
-        )
-        ga_result.validation_result = ga_validation
-        scheduler_result.validation_result = scheduler_validation
-        comparison = {
-            "engines": {
-                "ga_v1": _summarize_result(ga_result, ga_ms, ga_validation),
-                "scheduler_v2": _summarize_result(scheduler_result, scheduler_ms, scheduler_validation),
-            },
-            "winner_hint": _winner_hint(ga_result, scheduler_result),
-        }
-        _log_result("GA_V1", ga_result, ga_ms)
-        _log_result("SCHEDULER_V2", scheduler_result, scheduler_ms)
-        try:
-            _print_comparison(ga_result, scheduler_result, comparison)
-        except UnicodeEncodeError as exc:
-            logger.warning("[Planner] skipped comparison console print due to encoding: %s", exc)
-        result = scheduler_result
-        validation = scheduler_validation
-        response_engine = "compare:scheduler_v2"
-    elif engine_name == "scheduler_v2":
-        result, scheduler_ms, validation = _run_scheduler_v2_engine(
-            req, places, travel_times, travel_distances, travel_sources,
-            travel_reliability, goong_key
-        )
-        result.validation_result = validation
-        ga_ms = 0
-        response_engine = "scheduler_v2"
-        _log_result("SCHEDULER_V2", result, scheduler_ms)
-    else:
-        result, ga_ms, validation = _run_ga_engine(
-            req, places, travel_times, travel_distances, travel_sources, travel_reliability
-        )
-        result.validation_result = validation
-        scheduler_ms = ga_ms
-        response_engine = "ga_v1"
-        _log_result("GA_V1", result, ga_ms)
+    )
+    result.validation_result = validation
+    _persist_selected_route_matrix(result, req.travel_vehicle)
+    _log_result(response_engine.upper(), result, ga_ms or scheduler_ms)
     total_ms = round((time.perf_counter() - started_at) * 1000)
 
     logger.info(
@@ -153,12 +133,97 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
         planner_engine=response_engine,
         solver_ms=scheduler_ms,
         validation=validation,
-        comparison=comparison,
+        comparison=None,
         travel_source_counts={
             source: sum(1 for value in travel_sources.values() if value == source)
             for source in sorted(set(travel_sources.values()))
         },
     )
+
+
+def _dispatch_planner_engine(
+    engine_name: str,
+    req: ItineraryPlanRequest,
+    places: list[planner.Place],
+    travel_times: dict,
+    travel_distances: dict,
+    travel_sources: dict,
+    travel_reliability: dict,
+    goong_api_key: str,
+) -> tuple[planner.MultiDayResult, int, int, ValidationResult, str]:
+    """Run exactly one planner engine for the request."""
+    if engine_name == "ga_v1":
+        result, ga_ms, validation = _run_ga_engine(
+            req,
+            places,
+            travel_times,
+            travel_distances,
+            travel_sources,
+            travel_reliability,
+        )
+        return result, ga_ms, 0, validation, "ga_v1"
+
+    result, solver_ms, validation = _run_scheduler_v2_engine(
+        req,
+        places,
+        travel_times,
+        travel_distances,
+        travel_sources,
+        travel_reliability,
+        goong_api_key,
+    )
+    return result, 0, solver_ms, validation, "scheduler_v2"
+
+
+def _persist_selected_route_matrix(
+    result: planner.MultiDayResult,
+    vehicle: str,
+) -> None:
+    """Persist the exact rounded legs used by the winning schedule.
+
+    This keeps itinerary timestamps, subsequent solver runs, and API/UI
+    reconstruction on the same travel-time and distance values without adding
+    travel snapshot columns to itinerary_details.
+    """
+    travel_minutes: dict[tuple[str, str], int] = {}
+    travel_distances: dict[tuple[str, str], float] = {}
+    for day in result.days:
+        for entry in day.ga_result.schedule:
+            from_id = str(getattr(entry, "travel_from_id", "") or "")
+            destination_id = str(getattr(entry, "location_id", "") or "")
+            distance_km = max(
+                0.0,
+                float(getattr(entry, "distance_km", 0.0) or 0.0),
+            )
+            minutes = max(
+                0,
+                int(getattr(entry, "travel_minutes", 0) or 0),
+            )
+            if (
+                not from_id
+                or not destination_id
+                or from_id == destination_id
+                or distance_km <= 0
+                or minutes <= 0
+            ):
+                continue
+            pair = (from_id, destination_id)
+            travel_minutes[pair] = minutes
+            travel_distances[pair] = distance_km
+
+    if not travel_minutes:
+        return
+    try:
+        planner._upsert_distance_matrix_db(
+            travel_minutes,
+            travel_distances,
+            vehicle,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[Planner] could not persist selected route matrix: %s",
+            exc,
+        )
 
 
 def _run_ga_engine(
@@ -636,6 +701,10 @@ def _to_planner_place(
     if place_type == "hotel":
         default_duration = 0
     best_time, best_time_source = _normalize_best_time(raw)
+    visit_duration = _normalize_visit_duration(
+        raw.get("visit_duration"),
+        default_duration,
+    )
 
     return planner.Place(
         id=str(raw["id"]),
@@ -648,7 +717,7 @@ def _to_planner_place(
         latitude=float(raw["latitude"]),
         open_time=open_time,
         close_time=close_time,
-        visit_duration=int(raw.get("visit_duration") or default_duration),
+        visit_duration=visit_duration,
         rating=float(raw.get("average_rating") or 0),
         unknown_hours=unknown_hours,
         open_hour=str(raw.get("open_hour") or ""),
@@ -661,6 +730,24 @@ def _to_planner_place(
         best_time=best_time,
         best_time_source=best_time_source,
     )
+
+
+def _normalize_visit_duration(value: Any, default_duration: int) -> int:
+    """Normalize mixed legacy duration values to minutes.
+
+    Most rows store minutes, while legacy rows with values 1-4 represent
+    hours. Normalizing once at the AI boundary keeps every downstream
+    scheduler and persisted itinerary detail consistently minute-based.
+    """
+    try:
+        duration = float(value)
+    except (TypeError, ValueError):
+        return default_duration
+    if duration <= 0:
+        return default_duration
+    if duration <= 4:
+        duration *= 60
+    return max(1, int(round(duration)))
 
 
 def _normalize_best_time(raw: dict[str, Any]) -> tuple[str, str]:
@@ -754,7 +841,7 @@ def _serialize_result(
     total_ms: int = 0,
     matrix_ms: int = 0,
     ga_ms: int = 0,
-    planner_engine: str = "ga_v1",
+    planner_engine: str = "scheduler_v2",
     solver_ms: int = 0,
     validation: ValidationResult | None = None,
     comparison: dict[str, Any] | None = None,

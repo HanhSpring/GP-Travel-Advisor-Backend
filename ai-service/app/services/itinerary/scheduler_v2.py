@@ -37,8 +37,11 @@ MEAL_MIN_GAP_MINUTES = 210
 ENTERTAINMENT_EARLIEST_START = 13 * 60
 LATE_ENTERTAINMENT_EARLIEST_START = 18 * 60
 ENTERTAINMENT_EARLY_PENALTY_PER_MIN = 4
-IDLE_TIME_PENALTY_PER_MIN = 2
+IDLE_TIME_PENALTY_PER_MIN = 6
 HEAD_IDLE_TIME_PENALTY_PER_MIN = 4
+SKIPPED_POI_PENALTY = 150
+TAIL_IDLE_GRACE_MINUTES = 120
+TAIL_IDLE_EXCESS_PENALTY_PER_MIN = 12
 BEST_TIME_WINDOWS = {
     "MORNING": (7 * 60, 11 * 60 + 30),
     "AFTERNOON": (13 * 60, 17 * 60 + 30),
@@ -140,6 +143,10 @@ class SchedulerV2Planner:
         self.travel_reliability = config.travel_reliability or {}
         self.day_start_time = config.day_start_time
         self.day_end_time = config.day_end_time
+        self.max_solve_seconds_per_day = max(
+            0.5,
+            float(config.max_solve_seconds_per_day),
+        )
         self.return_to_hotel = config.return_to_hotel
         self.require_goong_edges = config.require_goong_edges
         self.travel_vehicle = (
@@ -383,6 +390,22 @@ class SchedulerV2Planner:
         is_day_1 = day_number == 1
         return self._solve_day_with_fallback(day_number, pois, is_day_1)
 
+    def _calculate_target_bounds(
+        self,
+        candidate_count: int,
+        day_start: int,
+    ) -> Tuple[int, int]:
+        if candidate_count <= 0:
+            return 0, 0
+        available_minutes = max(1, self.day_end_time - day_start)
+        target_max = min(
+            candidate_count,
+            max(1, self.target_pois_per_day),
+        )
+        target_by_time = max(2, available_minutes // 150)
+        target_min = min(candidate_count, target_max, target_by_time)
+        return target_min, target_max
+
     # ────────────────────────────────────────────────────────────────────
     # FALLBACK CHAIN
     # ────────────────────────────────────────────────────────────────────
@@ -393,13 +416,7 @@ class SchedulerV2Planner:
         pois: List[planner.POI],
         is_day_1: bool,
     ) -> planner.GAResult:
-        """
-        Solve with fallback chain:
-          1. Strict lunch window + hard budget
-          2. Relaxed lunch window (±30 min) + hard budget
-          3. Super-relaxed lunch window + hard budget
-          4. Greedy fallback
-        """
+        """Solve one day while relaxing only constraints that caused failure."""
         # PRE-PRUNING
         pruned_pois = []
         for p in pois:
@@ -425,37 +442,50 @@ class SchedulerV2Planner:
             enforce_lunch_base = True
 
         lunch_win = (planner.LUNCH_START, planner.LUNCH_END)
+        day_start = (
+            self.config.check_in_time
+            if is_day_1 and self.config.check_in_time is not None
+            else self.day_start_time
+        )
+        initial_target_min, _ = self._calculate_target_bounds(
+            len(pois),
+            day_start,
+        )
 
-        # ── Attempt 1: strict lunch ──
+        # Preserve lunch semantics while the dynamic target is feasible.
         if enforce_lunch_base:
             result = self._solve_day_core(
                 day_number, pois, is_day_1,
-                enforce_lunch=True, lunch_window=lunch_win, budget_tolerance_ratio=0.00
+                enforce_lunch=True, lunch_window=lunch_win,
+                budget_tolerance_ratio=0.00,
+                target_min=initial_target_min,
             )
             if result is not None:
                 return result
 
-            # ── Attempt 2: relaxed lunch ±30 min ──
             relaxed = (lunch_win[0] - 30, lunch_win[1] + 30)
+            for target_min in range(initial_target_min, 0, -1):
+                result = self._solve_day_core(
+                    day_number, pois, is_day_1,
+                    enforce_lunch=True, lunch_window=relaxed,
+                    budget_tolerance_ratio=0.00,
+                    target_min=target_min,
+                )
+                if result is not None:
+                    return result
+
+        # target_min is the new hard constraint. Lower it smoothly before
+        # falling back to greedy so sparse, remote, or low-budget days survive.
+        for target_min in range(initial_target_min, 0, -1):
             result = self._solve_day_core(
                 day_number, pois, is_day_1,
-                enforce_lunch=True, lunch_window=relaxed, budget_tolerance_ratio=0.00
+                enforce_lunch=False, lunch_window=None,
+                budget_tolerance_ratio=0.00,
+                target_min=target_min,
             )
             if result is not None:
                 return result
 
-            # ── Attempt 3: super relaxed lunch (10:00 - 15:00) ──
-            super_relaxed = (10 * 60, 15 * 60)
-            result = self._solve_day_core(
-                day_number, pois, is_day_1,
-                enforce_lunch=True, lunch_window=super_relaxed, budget_tolerance_ratio=0.00
-            )
-            if result is not None:
-                return result
-
-
-
-        # ── Attempt 5: greedy fallback ──
         return self._greedy_fallback(day_number, pois, is_day_1)
 
     # ────────────────────────────────────────────────────────────────────
@@ -470,6 +500,7 @@ class SchedulerV2Planner:
         enforce_lunch: bool,
         lunch_window: Optional[Tuple[int, int]],
         budget_tolerance_ratio: float = 0.10,
+        target_min: Optional[int] = None,
     ) -> Optional[planner.GAResult]:
         """
         Build & solve CP-SAT model.  Returns None if INFEASIBLE.
@@ -501,10 +532,12 @@ class SchedulerV2Planner:
 
         if is_day_1:
             return self._build_day1_model(
-                pois, helper, day_start, enforce_lunch, lunch_window, budget_tolerance_ratio
+                pois, helper, day_start, enforce_lunch, lunch_window,
+                budget_tolerance_ratio, target_min
             )
         return self._build_circuit_model(
-            day_number, pois, helper, day_start, enforce_lunch, lunch_window, budget_tolerance_ratio
+            day_number, pois, helper, day_start, enforce_lunch, lunch_window,
+            budget_tolerance_ratio, target_min
         )
 
     # ────────────────────────────────────────────────────────────────────
@@ -519,6 +552,7 @@ class SchedulerV2Planner:
         enforce_lunch: bool,
         lunch_window: Optional[Tuple[int, int]],
         budget_tolerance_ratio: float,
+        target_min: Optional[int],
     ) -> Optional[planner.GAResult]:
         """
         Node layout:
@@ -637,9 +671,9 @@ class SchedulerV2Planner:
                 wait[j] == start_var[j] - arrival[j]
             ).OnlyEnforceIf(selected[j])
             
-            # Hard limit wait time
-            max_wait_allowed = 45 if poi.place_type == "restaurant" else 90
-            model.Add(wait[j] <= max_wait_allowed).OnlyEnforceIf(selected[j])
+            # Keep the timeline continuous. A selected POI must be reachable
+            # exactly when its visit starts; no implicit waiting is inserted.
+            model.Add(wait[j] == 0).OnlyEnforceIf(selected[j])
             model.Add(
                 depart[j] == start_var[j] + max(0, int(poi.visit_duration))
             ).OnlyEnforceIf(selected[j])
@@ -666,7 +700,7 @@ class SchedulerV2Planner:
         for (i, j), var in arc_vars.items():
             if i == VSTART and 1 <= j <= n:
                 model.Add(
-                    arrival[j] >= day_start + travel_minutes[(VSTART, j)]
+                    arrival[j] == day_start + travel_minutes[(VSTART, j)]
                 ).OnlyEnforceIf(var)
             elif 1 <= i <= n and j == HOTEL:
                 model.Add(
@@ -674,7 +708,7 @@ class SchedulerV2Planner:
                 ).OnlyEnforceIf(var)
             elif 1 <= i <= n and 1 <= j <= n:
                 model.Add(
-                    arrival[j] >= depart[i]
+                    arrival[j] == depart[i]
                     + travel_minutes.get((i, j), 30)
                 ).OnlyEnforceIf(var)
 
@@ -697,10 +731,16 @@ class SchedulerV2Planner:
             model.Add(sum(selected[i] for i in cafe_nodes) <= 1)
 
         # ── Max/Min POIs ──
-        target_max = min(n, max(1, self.target_pois_per_day))
-        target_min = 1
+        dynamic_target_min, target_max = self._calculate_target_bounds(
+            n,
+            day_start,
+        )
+        effective_target_min = (
+            dynamic_target_min if target_min is None else target_min
+        )
+        effective_target_min = min(target_max, max(1, effective_target_min))
         model.Add(sum(selected.values()) <= target_max)
-        model.Add(sum(selected.values()) >= target_min)
+        model.Add(sum(selected.values()) >= effective_target_min)
 
         # ── Objective ──
         self._add_objective(
@@ -712,7 +752,7 @@ class SchedulerV2Planner:
 
         # ── Solve ──
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 1.5
+        solver.parameters.max_time_in_seconds = self.max_solve_seconds_per_day
         solver.parameters.num_search_workers = 8
         status = solver.Solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -751,6 +791,7 @@ class SchedulerV2Planner:
         enforce_lunch: bool,
         lunch_window: Optional[Tuple[int, int]],
         budget_tolerance_ratio: float,
+        target_min: Optional[int],
     ) -> Optional[planner.GAResult]:
         """
         Node layout:
@@ -830,9 +871,9 @@ class SchedulerV2Planner:
                 wait[j] == start_var[j] - arrival[j]
             ).OnlyEnforceIf(selected[j])
             
-            # Hard limit wait time
-            max_wait_allowed = 45 if poi.place_type == "restaurant" else 90
-            model.Add(wait[j] <= max_wait_allowed).OnlyEnforceIf(selected[j])
+            # Keep the timeline continuous. Opening and meal windows must be
+            # satisfied through route selection/order rather than waiting.
+            model.Add(wait[j] == 0).OnlyEnforceIf(selected[j])
             model.Add(
                 depart[j] == start_var[j] + max(0, int(poi.visit_duration))
             ).OnlyEnforceIf(selected[j])
@@ -860,7 +901,7 @@ class SchedulerV2Planner:
             travel = travel_minutes[(i, j)]
             if i == 0 and j != 0:
                 model.Add(
-                    arrival[j] >= day_start + travel
+                    arrival[j] == day_start + travel
                 ).OnlyEnforceIf(var)
             elif i != 0 and j == 0:
                 model.Add(
@@ -868,7 +909,7 @@ class SchedulerV2Planner:
                 ).OnlyEnforceIf(var)
             elif i != 0 and j != 0:
                 model.Add(
-                    arrival[j] >= depart[i] + travel
+                    arrival[j] == depart[i] + travel
                 ).OnlyEnforceIf(var)
 
         model.Add(return_time <= self.day_end_time)
@@ -890,10 +931,16 @@ class SchedulerV2Planner:
             model.Add(sum(selected[i] for i in cafe_nodes) <= 1)
 
         # ── Max/Min POIs ──
-        target_max = min(n, max(1, self.target_pois_per_day))
-        target_min = 1
+        dynamic_target_min, target_max = self._calculate_target_bounds(
+            n,
+            day_start,
+        )
+        effective_target_min = (
+            dynamic_target_min if target_min is None else target_min
+        )
+        effective_target_min = min(target_max, max(1, effective_target_min))
         model.Add(sum(selected.values()) <= target_max)
-        model.Add(sum(selected.values()) >= target_min)
+        model.Add(sum(selected.values()) >= effective_target_min)
 
         # ── Objective ──
         self._add_objective(
@@ -905,7 +952,7 @@ class SchedulerV2Planner:
 
         # ── Solve ──
         solver = cp_model.CpSolver()
-        solver.parameters.max_time_in_seconds = 1.5
+        solver.parameters.max_time_in_seconds = self.max_solve_seconds_per_day
         solver.parameters.num_search_workers = 8
         status = solver.Solve(model)
         if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
@@ -1005,7 +1052,7 @@ class SchedulerV2Planner:
             utility_terms.append(effective_reward * selected[i])
             wait_terms.append(wait[i] * 30)
             # Reduced skipped weight (80) to match winner scoring and let density penalty steer count
-            skipped_terms.append(80 * selected[i].Not())
+            skipped_terms.append(SKIPPED_POI_PENALTY * selected[i].Not())
             activity_cost_terms.append(int(round(poi_cost)) * selected[i])
 
             preferred_window = preferred_time_window(
@@ -1168,6 +1215,13 @@ class SchedulerV2Planner:
         idle_tail = model.NewIntVar(0, 24 * 60, "idle_tail")
         model.Add(idle_tail == self.day_end_time - return_time)
         idle_penalty_term = idle_tail * IDLE_TIME_PENALTY_PER_MIN
+        idle_tail_excess = model.NewIntVar(0, 24 * 60, "idle_tail_excess")
+        model.Add(
+            idle_tail_excess >= idle_tail - TAIL_IDLE_GRACE_MINUTES
+        )
+        idle_excess_penalty_term = (
+            idle_tail_excess * TAIL_IDLE_EXCESS_PENALTY_PER_MIN
+        )
 
         # Penalize an unnecessarily late first stop. Previously only the idle
         # tail was penalized, so a route could start at lunch and still finish
@@ -1200,6 +1254,7 @@ class SchedulerV2Planner:
             + distance_penalty_term
             + travel_penalty_term
             + idle_penalty_term
+            + idle_excess_penalty_term
             + sum(head_idle_terms)
         )
 

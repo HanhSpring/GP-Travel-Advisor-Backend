@@ -78,8 +78,8 @@ class ItineraryPlanRequest(BaseModel):
     mutation_rate: float = Field(default=0.30, ge=0, le=1)
     seed: int | None = 42
     planner_engine: str = Field(
-        default="ga_v1",
-        description="ga_v1 | scheduler_v2 | compare. compare is intended for preview/debug only.",
+        default="scheduler_v2",
+        description="Planner engine: scheduler_v2/or_tools or ga_v1/ga.",
     )
 
     model_config = {
@@ -218,7 +218,7 @@ class ItineraryPlanResponse(BaseModel):
     total_ms: int = 0
     matrix_ms: int = 0
     ga_ms: int = 0
-    planner_engine: str = "ga_v1"
+    planner_engine: str = "scheduler_v2"
     solver_ms: int = 0
     assignment_day_loads: list[int] = Field(default_factory=list)
     assignment_warnings: list[str] = Field(default_factory=list)

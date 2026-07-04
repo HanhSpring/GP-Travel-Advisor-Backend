@@ -28,6 +28,7 @@ import {
   DEFAULT_TWO_TOWER_RUNTIME_CONFIG,
   TwoTowerRuntimeConfig,
 } from './two-tower-config.types';
+import { PlannerEngine } from '../../config/planner-engine';
 interface HotelSelection {
   hotelId: string;
   hotelTotalCost: number;
@@ -281,7 +282,7 @@ export class RecommendationService {
   async planItinerary(
     dto: CreateItineraryDto,
     topK = 60,
-    plannerEngine: 'ga_v1' | 'scheduler_v2' | 'compare' = 'ga_v1',
+    plannerEngine: PlannerEngine = 'scheduler_v2',
   ): Promise<unknown> {
     const numDays = this.calcNumDays(dto.startDate, dto.endDate);
     const runStartedAt = Date.now();
@@ -1158,7 +1159,7 @@ export class RecommendationService {
         solver: plan.solver_ms ?? null,
         backendTotal: args.timings.backendTotalMs,
       },
-      plannerEngine: plan.planner_engine ?? 'ga_v1',
+      plannerEngine: plan.planner_engine ?? 'scheduler_v2',
       travelSourceCounts: plan.travel_source_counts ?? {},
       hotel: {
         id: plan.hotel_id ?? null,
