@@ -49,6 +49,7 @@ interface PlaceDetailRow {
   vendor_id: string | null;
   registered_date: string | null;
   types: TypeRow | TypeRow[] | null;
+  estimated_preparation_time: number | null;
 }
 
 interface UserRow {
@@ -270,7 +271,7 @@ export class AdminPlacesService {
   }
 
   private onlyVisiblePlaces<T>(query: T): T {
-    return (query as any).or('is_active.is.null,is_active.eq.true') as T;
+    return (query as any).or('is_deleted.is.null,is_deleted.eq.false') as T;
   }
 
   private normalizeFoodImageUrls(imageUrl?: string) {
@@ -616,6 +617,9 @@ export class AdminPlacesService {
         registered_date: now.toISOString().slice(0, 10),
         source:
           sourceMode === 'vendor' ? 'admin_created_for_business' : 'admin',
+              estimated_preparation_time: (dto.p_estimated_preparation_time ?? dto.estimated_preparation_time) != null
+          ? Number(dto.p_estimated_preparation_time ?? dto.estimated_preparation_time) || null
+          : null,
       })
       .select('id')
       .single<{ id: string }>();
@@ -896,10 +900,10 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, image_url, name, description, address, email, phone, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, types(id, name, categories(id, name))',
+        'id, image_url, name, description, address, email, phone, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, estimated_preparation_time, types(id, name, categories(id, name))',
       )
       .eq('id', id)
-      .or('is_active.is.null,is_active.eq.true')
+      .or('is_deleted.is.null,is_deleted.eq.false')
       .maybeSingle<PlaceDetailRow>();
 
     if (placeError || !place) {
@@ -921,7 +925,7 @@ export class AdminPlacesService {
             .from('places')
             .select('id', { count: 'estimated', head: true })
             .eq('vendor_id', place.vendor_id)
-            .or('is_active.is.null,is_active.eq.true')
+            .or('is_deleted.is.null,is_deleted.eq.false')
         : Promise.resolve({ count: 0, error: null }),
     ]);
 
@@ -962,6 +966,7 @@ export class AdminPlacesService {
           }
         : null,
       images: this.normalizeImageUrls(place.image_url),
+      estimated_preparation_time: place.estimated_preparation_time ?? null,
     };
   }
 
@@ -988,7 +993,7 @@ export class AdminPlacesService {
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
-      .update({ is_approved: true, updated_at: new Date().toISOString() })
+      .update({ is_approved: true, is_active: true, updated_at: new Date().toISOString() })
       .eq('id', id)
       .select('id, name, is_approved')
       .single<{ id: string; name: string; is_approved: boolean }>();
@@ -1034,7 +1039,7 @@ export class AdminPlacesService {
         updated_at: new Date().toISOString(),
       })
       .eq('id', id)
-      .or('is_active.is.null,is_active.eq.true')
+      .or('is_deleted.is.null,is_deleted.eq.false')
       .select('id, latitude, longitude')
       .maybeSingle<{ id: string; latitude: number; longitude: number }>();
 
@@ -1060,9 +1065,9 @@ export class AdminPlacesService {
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
-      .update({ is_active: false, updated_at: new Date().toISOString() })
+      .update({ is_deleted: true, is_active: false, updated_at: new Date().toISOString() })
       .eq('id', id)
-      .or('is_active.is.null,is_active.eq.true')
+      .or('is_deleted.is.null,is_deleted.eq.false')
       .select('id')
       .maybeSingle<{ id: string }>();
 

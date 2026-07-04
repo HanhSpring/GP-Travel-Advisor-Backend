@@ -306,12 +306,12 @@ export class RecommendationService {
     const detailsMs = Date.now() - detailsStartedAt;
     if (!details.length) {
       throw new NotFoundException(
-        'No place details found for itinerary planning',
+        `Thành phố ${retrieval.destination_name} hiện chưa có đủ dữ liệu địa điểm để tạo lịch trình. Vui lòng chọn thành phố khác.`,
       );
     }
     if (!details.some((place) => place.place_type === 'hotel')) {
       throw new NotFoundException(
-        'No real hotel/accommodation candidate found for itinerary planning',
+        `Thành phố ${retrieval.destination_name} hiện chưa có dữ liệu khách sạn/nơi lưu trú. Vui lòng chọn thành phố khác.`,
       );
     }
 

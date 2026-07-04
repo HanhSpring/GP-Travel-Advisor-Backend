@@ -57,9 +57,11 @@ async def optimize_itinerary(request: OptimizeRequest) -> OptimizeResponse:
         f"visit_date={request.visit_date}, "
         f"số hoạt động={len(request.activities)}"
     )
+    from starlette.concurrency import run_in_threadpool
 
     try:
-        optimized_activities, reorder_notes, total_transit = optimize_day_schedule(
+        optimized_activities, reorder_notes, total_transit = await run_in_threadpool(
+            optimize_day_schedule,
             activities=request.activities,
             day_start_time=request.day_start_time,
             day_end_time=request.day_end_time,
