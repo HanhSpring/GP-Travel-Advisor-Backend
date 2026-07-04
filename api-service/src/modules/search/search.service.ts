@@ -492,12 +492,104 @@ export class SearchService {
     return this.defaultPlaceImageUrl;
   }
 
+  private parseTimeToMinutes(value?: string | null): number | null {
+    if (!value) return null;
+    const match = value.match(/^(\d{1,2}):(\d{2})/);
+    if (!match) return null;
+    const hour = Number(match[1]);
+    const minute = Number(match[2]);
+    if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+    return hour * 60 + minute;
+  }
+
+  private isOpenAt(
+    currentMinutes: number,
+    openMinutes: number,
+    closeMinutes: number,
+  ): boolean {
+    return (
+      openMinutes === closeMinutes ||
+      (openMinutes < closeMinutes
+        ? currentMinutes >= openMinutes && currentMinutes < closeMinutes
+        : currentMinutes >= openMinutes || currentMinutes < closeMinutes)
+    );
+  }
+
+  private getOpenStatusFromCompressed(
+    openHourCompressed?: string | null,
+  ): string | null {
+    if (!openHourCompressed || !openHourCompressed.trim()) return null;
+
+    let parsed: Record<string, unknown>;
+    try {
+      parsed = JSON.parse(openHourCompressed) as Record<string, unknown>;
+    } catch {
+      return null;
+    }
+    if (!parsed || Object.keys(parsed).length === 0) return null;
+
+    const weekdays = [
+      'Sunday',
+      'Monday',
+      'Tuesday',
+      'Wednesday',
+      'Thursday',
+      'Friday',
+      'Saturday',
+    ];
+    const now = new Date(Date.now() + 7 * 60 * 60 * 1000);
+    const currentMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+    const todayRanges = parsed[weekdays[now.getUTCDay()]];
+
+    if (!Array.isArray(todayRanges) || todayRanges.length === 0) {
+      return 'Đã đóng cửa';
+    }
+
+    let hasValidRange = false;
+    for (const range of todayRanges) {
+      if (!Array.isArray(range) || range.length < 2) continue;
+      const open = this.parseTimeToMinutes(String(range[0]));
+      const close = this.parseTimeToMinutes(String(range[1]));
+      if (open == null || close == null) continue;
+      hasValidRange = true;
+      if (this.isOpenAt(currentMinutes, open, close)) return 'Đang mở cửa';
+    }
+
+    return hasValidRange ? 'Đã đóng cửa' : null;
+  }
+
+  private getPlaceOpenStatus(place: any): string {
+    const compressedStatus = this.getOpenStatusFromCompressed(
+      typeof place.open_hour_compressed === 'string'
+        ? place.open_hour_compressed
+        : null,
+    );
+    if (compressedStatus !== null) return compressedStatus;
+
+    const openMinutes = this.parseTimeToMinutes(
+      typeof place.open_time === 'string' ? place.open_time : null,
+    );
+    const closeMinutes = this.parseTimeToMinutes(
+      typeof place.close_time === 'string' ? place.close_time : null,
+    );
+    if (openMinutes == null || closeMinutes == null) {
+      return 'Chưa có giờ mở cửa';
+    }
+
+    const now = new Date(Date.now() + 7 * 60 * 60 * 1000);
+    const currentMinutes = now.getUTCHours() * 60 + now.getUTCMinutes();
+    return this.isOpenAt(currentMinutes, openMinutes, closeMinutes)
+      ? 'Đang mở cửa'
+      : 'Đã đóng cửa';
+  }
+
   private mapPlaceItem(
     place: any,
     cityMap: Map<string, string> = new Map(),
   ): Record<string, unknown> {
     const type = this.classifyPlaceType(place);
     const cityName = cityMap.get(String(place.city_id ?? '')) ?? '';
+    const status = this.getPlaceOpenStatus(place);
     const base = {
       id: String(place.id ?? ''),
       name: String(place.name ?? ''),
@@ -510,13 +602,15 @@ export class SearchService {
       address: cityName,
       city: cityName,
       placeType: type,
+      status,
     };
     if (type === 'hotel') {
+      const priceValue = Number(place.price) || 0;
       return {
         ...base,
-        price: 'Liên hệ',
+        price: priceValue > 0 ? `${priceValue}đ` : 'Liên hệ',
         starRating: 4,
-        priceValue: 0,
+        priceValue,
         accommodationType: 'hotel',
         amenities: [],
       };
@@ -524,7 +618,6 @@ export class SearchService {
     if (type === 'restaurant') {
       return {
         ...base,
-        status: 'Đang mở cửa',
         cuisine: 'vietnamese',
         priceLevel: 'mid_range',
         amenities: [],
@@ -539,7 +632,6 @@ export class SearchService {
     const catName = cats[0]?.name ?? '';
     return {
       ...base,
-      status: 'Đang mở cửa',
       category: catName,
       priceType: 'free',
       district: '',
@@ -628,7 +720,7 @@ export class SearchService {
   // Không select `address`: kết quả search chỉ cần tỉnh/TP (map từ city_id),
   // bỏ cột text dài này giúp giảm payload từ DB và response API.
   private readonly placesSelect =
-    'id, name, average_rating, review_count, image_url, city_id, types(id, category_id, categories(id, name))';
+    'id, name, average_rating, review_count, image_url, city_id, open_time, close_time, open_hour_compressed, price, types(id, category_id, categories(id, name))';
 
   // Infix search — requires GIN trigram index for speed on large tables.
   private async queryPlaces(q: string, maxRows = 2000): Promise<any[]> {
