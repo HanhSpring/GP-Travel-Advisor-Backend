@@ -9,6 +9,6 @@ import { TwoTowerConfigService } from './two-tower-config.service';
   imports: [HttpModule],
   controllers: [RecommendationController],
   providers: [RecommendationService, MlClientService, TwoTowerConfigService],
-  exports: [RecommendationService],
+  exports: [RecommendationService, TwoTowerConfigService],
 })
 export class RecommendationModule {}

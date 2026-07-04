@@ -13,6 +13,25 @@ export interface EncodeQueryPayload {
   history_biz: string[];
 }
 
+export interface SessionRerankCandidate {
+  place_id: string;
+  place_name: string;
+  address: string | null;
+  image_url: string | null;
+  category: string;
+  cosine_score: number;
+  average_rating?: number | null;
+  is_top20_visited?: boolean;
+}
+
+export interface SessionRerankedCandidate extends SessionRerankCandidate {
+  predict_ranking?: number | null;
+  historical_cf_score?: number;
+  session_score?: number;
+  popularity_score?: number;
+  is_cold_start?: boolean;
+}
+
 export interface ItineraryPlanPayload {
   places: Array<{
     id: string;
@@ -96,6 +115,35 @@ export class MlClientService {
       const msg = error?.response?.data?.detail ?? error?.message ?? 'unknown';
       this.logger.error(`encodeQuery failed: ${msg}`);
       throw new Error(`Itinerary planning failed: ${msg}`);
+    }
+  }
+
+  /**
+   * Session-Aware CF rerank — gọi SAU diversifyTopK, TRƯỚC khi map response DTO.
+   * Graceful degrade: lỗi/timeout → trả nguyên candidates gốc, không throw,
+   * để NestJS luôn giữ được thứ tự Two-Tower nếu ai-service không sẵn sàng.
+   */
+  async sessionRerank(
+    userId: string,
+    candidates: SessionRerankCandidate[],
+  ): Promise<SessionRerankedCandidate[]> {
+    const url = `${this.aiServiceUrl}/recommend/itinerary/session-rerank`;
+    try {
+      const response: { data: { candidates: SessionRerankedCandidate[] } } =
+        await firstValueFrom(
+          this.http.post<{ candidates: SessionRerankedCandidate[] }>(
+            url,
+            { user_id: userId, candidates },
+            { timeout: 3000, headers: { Connection: 'close' } },
+          ),
+        );
+      return response.data.candidates;
+    } catch (error) {
+      const msg = error?.response?.data?.detail ?? error?.message ?? 'unknown';
+      this.logger.warn(
+        `sessionRerank failed, giữ nguyên thứ tự Two-Tower: ${msg}`,
+      );
+      return candidates;
     }
   }
 

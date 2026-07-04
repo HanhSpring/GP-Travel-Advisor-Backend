@@ -13,6 +13,7 @@ def load_all_models():
     _load_two_tower()
     _load_content_based()
     _load_collaborative()
+    _load_session_cf_reranker()
     _load_review_classifier()
     _load_hybrid_recommender()
     logger.info("✅ All models loaded successfully")
@@ -135,6 +136,31 @@ def _load_collaborative():
         logger.info("Loaded: Collaborative Filtering")
     else:
         logger.warning("Collaborative Filtering weights not found — skipping")
+
+
+def _load_session_cf_reranker():
+    try:
+        from app.core.config import settings
+        from app.models.session_cf_reranker import SessionCfReranker
+
+        try:
+            from supabase import create_client
+            supabase_client = create_client(settings.supabase_url, settings.supabase_key)
+        except Exception as e:
+            logger.warning(
+                "Không tạo được Supabase client cho SessionCfReranker "
+                "(live session sẽ bỏ qua): %s", e
+            )
+            supabase_client = None
+
+        engine = SessionCfReranker(settings.session_cf_artifact_dir, supabase_client)
+        if engine.load():
+            _models["session_cf_reranker"] = engine
+            logger.info("Loaded: Session-Aware CF Reranker")
+        else:
+            logger.warning("Session-Aware CF Reranker artifacts not found — skipping")
+    except Exception as e:
+        logger.warning(f"Session-Aware CF Reranker load failed: {e}")
 
 
 def _load_review_classifier():

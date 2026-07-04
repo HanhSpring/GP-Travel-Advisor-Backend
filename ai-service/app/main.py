@@ -14,9 +14,10 @@ logger = get_logger(__name__)
 async def lifespan(app: FastAPI):
     logger.info("🚀 Starting AI Service — loading models...")
     load_all_models()
-    from app.services import ai_config_service
+    from app.services import ai_config_service, session_cf_config_service
     ai_config_service.sync_engine_from_db()
-    
+    session_cf_config_service.sync_engine_from_db()
+
     if settings.goong_api_key:
         logger.info("✅ Goong Maps API configured for itinerary routing")
     else:

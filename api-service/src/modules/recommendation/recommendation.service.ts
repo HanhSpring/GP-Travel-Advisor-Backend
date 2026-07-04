@@ -1,9 +1,12 @@
 import {
+  Inject,
   Injectable,
   Logger,
   NotFoundException,
   ServiceUnavailableException,
 } from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import type { Cache } from 'cache-manager';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { supabase } from '../../config/supabase';
@@ -40,12 +43,215 @@ interface HotelSelection {
   budgetRelaxed: boolean;
 }
 
+export interface UserHistory {
+  types: string[];
+  vibes: string[];
+  bizIds: string[];
+}
+
+const MAX_HISTORY_LEN = 30; // phải khớp ModelConfig.MAX_HISTORY_LEN bên FastAPI
+const HISTORY_CACHE_TTL_MS = 5 * 60 * 1000; // 5 phút — history đổi chậm hơn nhiều so với 1 request
+
+type PriceBasis = 'per_person' | 'per_room_per_night' | 'per_group' | 'unknown';
+
+interface PriceInfo {
+  estimatedCost: number | null;
+  min: number | null;
+  max: number | null;
+  avg: number | null;
+  basis: PriceBasis;
+  inferred: boolean | null;
+  itemCount: number;
+  rawItems: Array<{ name?: string; price: number }>;
+}
+
 @Injectable()
 export class RecommendationService {
   private readonly logger = new Logger(RecommendationService.name);
   private readonly foodCategoryId = '97029cfb-069b-4dba-a152-dfb3d36634d3';
 
-  constructor(private readonly mlClient: MlClientService) {}
+  constructor(
+    private readonly mlClient: MlClientService,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
+  ) {}
+
+  /**
+   * Lấy lịch sử tương tác gần nhất của user (activity_logs) để đưa vào Two-Tower
+   * query embedding (history_types/history_vibes/history_biz). Cache 5 phút/user
+   * vì history đổi chậm hơn nhiều so với vòng đời 1 request.
+   */
+  async getUserHistory(userId: string): Promise<UserHistory> {
+    const cacheKey = `user_history:${userId}`;
+    const cached = await this.cache.get<UserHistory>(cacheKey);
+    if (cached) return cached;
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('activity_logs')
+      .select('place_id, action_type, created_at, places(type_id, vibes, types(name))')
+      .eq('tourist_id', userId)
+      .not('place_id', 'is', null)
+      .order('created_at', { ascending: false })
+      .limit(MAX_HISTORY_LEN);
+
+    if (error || !data || data.length === 0) {
+      // Cold-start thật (không có lịch sử) — history rỗng là input HỢP LỆ cho QueryTower
+      const empty: UserHistory = { types: [], vibes: [], bizIds: [] };
+      await this.cache.set(cacheKey, empty, HISTORY_CACHE_TTL_MS);
+      return empty;
+    }
+
+    const history = this.mapActivityLogsToHistory(data);
+    await this.cache.set(cacheKey, history, HISTORY_CACHE_TTL_MS);
+    return history;
+  }
+
+  /**
+   * "Cold-start ở tầng nghiệp vụ": user chưa từng tạo lịch trình nào.
+   * Dùng count(itineraries) thay vì count(activity_logs) vì đây là hành động
+   * có chủ đích cao nhất (đã thật sự lên kế hoạch), ít nhiễu hơn "đã từng click/view".
+   */
+  async isNewUser(userId: string): Promise<boolean> {
+    const cacheKey = `is_new_user:${userId}`;
+    const cached = await this.cache.get<boolean>(cacheKey);
+    if (cached !== undefined) return cached;
+
+    const { count } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id', { count: 'exact', head: true })
+      .eq('creator_id', userId);
+
+    const isNew = (count ?? 0) === 0;
+    await this.cache.set(cacheKey, isNew, HISTORY_CACHE_TTL_MS);
+    return isNew;
+  }
+
+  private mapActivityLogsToHistory(rows: any[]): UserHistory {
+    const bizIds: string[] = [];
+    const types = new Set<string>();
+    const vibes = new Set<string>();
+
+    for (const row of rows) {
+      if (row.place_id) bizIds.push(row.place_id);
+
+      const place = Array.isArray(row.places) ? row.places[0] : row.places;
+      if (!place) continue;
+
+      const typeRel = Array.isArray(place.types) ? place.types[0] : place.types;
+      if (typeRel?.name) types.add(typeRel.name);
+
+      if (Array.isArray(place.vibes)) {
+        for (const vibe of place.vibes) {
+          if (vibe) vibes.add(vibe);
+        }
+      }
+    }
+
+    return {
+      types: Array.from(types).slice(0, MAX_HISTORY_LEN),
+      vibes: Array.from(vibes).slice(0, MAX_HISTORY_LEN),
+      bizIds: bizIds.slice(0, MAX_HISTORY_LEN),
+    };
+  }
+
+  private static readonly TOP20_CACHE_PREFIX = 'place_popularity:top20:';
+  private static readonly TOP20_CACHE_TTL_MS = 20 * 60 * 1000; // 20 phút
+
+  /**
+   * Top-20 THẬT theo đúng category (place_id) — dùng lại ĐÚNG RPC
+   * `get_place_popularity_stats` mà dashboard admin gọi cho chart "Top 20 địa điểm
+   * được ghé thăm nhiều nhất theo danh mục" (admin-dashboard.service.ts), với
+   * p_limit=20 giống hệt dashboard — KHÔNG quét toàn bộ địa điểm, chỉ lấy đúng 20
+   * cái admin đang thấy cho từng category. 1 candidate chỉ được coi là "phổ biến"
+   * nếu nằm trong đúng 20 địa điểm này của category của nó (boost rời rạc, không
+   * còn tính liên tục theo số lượt ghé nữa).
+   */
+  private async getTop20PlaceIdsByCategory(categoryName: string): Promise<Set<string>> {
+    const cacheKey = `${RecommendationService.TOP20_CACHE_PREFIX}${categoryName}`;
+    const cached = await this.cache.get<Set<string>>(cacheKey);
+    if (cached) return cached;
+
+    const { data, error } = await supabase.rpc('get_place_popularity_stats', {
+      p_limit: 20,
+      p_mode: 'top',
+      p_category_name: categoryName,
+    });
+
+    if (error || !data) {
+      this.logger.warn(
+        `getTop20PlaceIdsByCategory("${categoryName}") lỗi, dùng set rỗng: ${error?.message}`,
+      );
+      return new Set();
+    }
+
+    const ids = new Set<string>((data as any[]).map((row) => String(row.place_id)));
+    await this.cache.set(cacheKey, ids, RecommendationService.TOP20_CACHE_TTL_MS);
+    return ids;
+  }
+
+  /**
+   * average_rating (chất lượng, phụ) + is_top20_visited (độ phổ biến thật theo
+   * ĐÚNG category, chính) cho _popularity_score() của SessionCfReranker. Category
+   * dùng để tra Top-20 là `travel.categories.name` THẬT (qua places.type_id ->
+   * types.category_id -> categories.name) — KHÔNG phải nhãn nội bộ attraction/
+   * restaurant/cafe/... của Two-Tower, nên phải join riêng, không tái dùng
+   * candidate.category có sẵn.
+   */
+  private async fetchPopularityMeta(
+    placeIds: string[],
+  ): Promise<Map<string, { average_rating: number | null; is_top20_visited: boolean }>> {
+    const meta = new Map<
+      string,
+      { average_rating: number | null; is_top20_visited: boolean }
+    >();
+    if (placeIds.length === 0) return meta;
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, average_rating, types(categories(name))')
+      .in('id', placeIds);
+
+    if (error || !data) {
+      this.logger.warn(`fetchPopularityMeta lỗi, dùng null cho toàn bộ: ${error?.message}`);
+      return meta;
+    }
+
+    const rows = data as any[];
+    const categoryByPlaceId = new Map<string, string | null>();
+    for (const row of rows) {
+      const typeData = Array.isArray(row.types) ? row.types[0] : row.types;
+      const categoryData = Array.isArray(typeData?.categories)
+        ? typeData.categories[0]
+        : typeData?.categories;
+      categoryByPlaceId.set(row.id, categoryData?.name ?? null);
+    }
+
+    const distinctCategories = Array.from(
+      new Set(
+        Array.from(categoryByPlaceId.values()).filter(
+          (name): name is string => !!name,
+        ),
+      ),
+    );
+    const top20Sets = await Promise.all(
+      distinctCategories.map((name) => this.getTop20PlaceIdsByCategory(name)),
+    );
+    const top20ByCategory = new Map(
+      distinctCategories.map((name, i) => [name, top20Sets[i]]),
+    );
+
+    for (const row of rows) {
+      const categoryName = categoryByPlaceId.get(row.id) ?? null;
+      const top20Set = categoryName ? top20ByCategory.get(categoryName) : undefined;
+      meta.set(row.id, {
+        average_rating: row.average_rating != null ? Number(row.average_rating) : null,
+        is_top20_visited: top20Set ? top20Set.has(row.id) : false,
+      });
+    }
+    return meta;
+  }
 
   /**
    * Two-Tower retrieval pipeline (khớp notebook retrieve_diverse_topk):
@@ -98,6 +304,10 @@ export class RecommendationService {
       'multi-intent late fusion retrieval',
     );
 
+    // History không đổi giữa các intent trong cùng 1 request — fetch MỘT LẦN,
+    // tránh N query trùng lặp (N = số intent, tối đa runtimeConfig.maxIntents).
+    const userHistory = await this.getUserHistory(dto.userId);
+
     const allPools = await Promise.all(
       intents.map((intent) =>
         this.retrieveCandidatesForSingleIntent({
@@ -108,6 +318,7 @@ export class RecommendationService {
           intentVibe,
           numDays: earlyNumDays,
           config: runtimeConfig,
+          userHistory,
         }),
       ),
     );
@@ -127,102 +338,37 @@ export class RecommendationService {
     );
     this.logger.debug(`final=${earlyDiversePool.length}`);
 
-    return {
-      destination_name: cityName,
-      city_id: dto.destinationLocationId,
-      total_candidates: earlyDiversePool.length,
-      candidates: earlyDiversePool.map((candidate) => ({
+    const popularityMeta = await this.fetchPopularityMeta(
+      earlyDiversePool.map((candidate) => candidate.place_id),
+    );
+
+    const rerankedPool = await this.mlClient.sessionRerank(
+      dto.userId,
+      earlyDiversePool.map((candidate) => ({
         place_id: candidate.place_id,
         place_name: candidate.place_name,
         address: candidate.address,
         image_url: candidate.image_url,
         category: candidate.category,
         cosine_score: candidate.score,
-        predict_ranking: null,
+        average_rating: popularityMeta.get(candidate.place_id)?.average_rating ?? null,
+        is_top20_visited: popularityMeta.get(candidate.place_id)?.is_top20_visited ?? false,
       })),
-    };
-
-    // ── 2. Encode query via FastAPI Two-Tower ─────────────────────────────────
-    let embedding: number[];
-    try {
-      embedding = await this.mlClient.encodeQuery({
-        user_id: dto.userId,
-        city: cityName,
-        trip_intent: dto.tripIntent,
-        intent_vibe: '',
-        history_types: [],
-        history_vibes: [],
-        history_biz: [],
-      });
-    } catch (err: any) {
-      const detail = err?.message ?? String(err);
-      throw new ServiceUnavailableException(`AI Service lỗi: ${detail}`);
-    }
-
-    // ── 3. Tính số ngày ───────────────────────────────────────────────────────
-    const numDays = this.calcNumDays(dto.startDate, dto.endDate);
-
-    // ── 4. Stratified slot fetch — mỗi slot 1 RPC call (song song) ───────────
-    //    Slot filter TRƯỚC, ANN trong pool đó → đảm bảo đa dạng như notebook
-    const fetchPlan = getStratifiedFetchPlan(
-      dto.tripIntent,
-      numDays,
-      dto.dailyStartTime,
-      dto.dailyEndTime,
     );
-    const poolChunks = await Promise.all(
-      fetchPlan.map(({ slotType, limit, travelType }) =>
-        this.fetchBySlot(
-          embedding,
-          dto.destinationLocationId,
-          slotType,
-          limit,
-          travelType,
-        ),
-      ),
-    );
-
-    // ── 5. Gộp + deduplicate ──────────────────────────────────────────────────
-    const seenIds = new Set<string>();
-    const pool: PlaceCandidate[] = [];
-    for (const chunk of poolChunks) {
-      for (const c of chunk) {
-        if (!seenIds.has(c.place_id)) {
-          seenIds.add(c.place_id);
-          pool.push(c);
-        }
-      }
-    }
-
-    this.logger.debug(
-      `Pool: ${pool.length} places (${fetchPlan.map((p) => `${p.slotType}:${p.limit}`).join(', ')})`,
-    );
-
-    // ── 6. Diversity-aware top-K (phase 2 fill nếu 1 slot thiếu) ─────────────
-    const diversePool = diversifyTopK(
-      pool,
-      numDays,
-      dto.tripIntent,
-      topK,
-      fetchPlan,
-    );
-
-    // ── 7. Map → response DTO ─────────────────────────────────────────────────
-    const candidates: CandidatePlaceDto[] = diversePool.map((c) => ({
-      place_id: c.place_id,
-      place_name: c.place_name,
-      address: c.address,
-      image_url: c.image_url,
-      category: c.category,
-      cosine_score: c.score,
-      predict_ranking: null,
-    }));
 
     return {
       destination_name: cityName,
       city_id: dto.destinationLocationId,
-      total_candidates: candidates.length,
-      candidates,
+      total_candidates: rerankedPool.length,
+      candidates: rerankedPool.map((candidate) => ({
+        place_id: candidate.place_id,
+        place_name: candidate.place_name,
+        address: candidate.address,
+        image_url: candidate.image_url,
+        category: candidate.category,
+        cosine_score: candidate.cosine_score,
+        predict_ranking: candidate.predict_ranking ?? null,
+      })),
     };
   }
 
@@ -234,8 +380,18 @@ export class RecommendationService {
     intentVibe: string;
     numDays: number;
     config: TwoTowerRuntimeConfig;
+    userHistory: UserHistory;
   }): Promise<PlaceCandidate[]> {
-    const { dto, cityId, cityName, intent, intentVibe, numDays, config } = args;
+    const {
+      dto,
+      cityId,
+      cityName,
+      intent,
+      intentVibe,
+      numDays,
+      config,
+      userHistory,
+    } = args;
 
     let embedding: number[];
     try {
@@ -244,9 +400,9 @@ export class RecommendationService {
         city: cityName,
         trip_intent: intent,
         intent_vibe: intentVibe,
-        history_types: [],
-        history_vibes: [],
-        history_biz: [],
+        history_types: userHistory.types,
+        history_vibes: userHistory.vibes,
+        history_biz: userHistory.bizIds,
       });
     } catch (err: any) {
       const detail = err?.message ?? String(err);
@@ -283,6 +439,7 @@ export class RecommendationService {
     dto: CreateItineraryDto,
     topK = 60,
     plannerEngine: PlannerEngine = 'scheduler_v2',
+    config: TwoTowerRuntimeConfig = DEFAULT_TWO_TOWER_RUNTIME_CONFIG,
   ): Promise<unknown> {
     const numDays = this.calcNumDays(dto.startDate, dto.endDate);
     const runStartedAt = Date.now();
@@ -298,7 +455,7 @@ export class RecommendationService {
       dto.dailyEndTime,
     );
     const retrievalStartedAt = Date.now();
-    const retrieval = await this.retrieveCandidates(dto, topK);
+    const retrieval = await this.retrieveCandidates(dto, topK, config);
     const retrievalMs = Date.now() - retrievalStartedAt;
     const plannerCandidates = retrieval.candidates;
     const detailsStartedAt = Date.now();
@@ -550,7 +707,7 @@ export class RecommendationService {
       .schema('travel')
       .from('places')
       .select(
-        'id,name,longitude,latitude,open_hour_compressed,source,type_id,slot_type,visit_duration,average_rating,review_count,price,price_inferred,best_time,types(name,categories(id,name))',
+        'id,name,longitude,latitude,open_hour_compressed,source,type_id,visit_duration,average_rating,review_count,price,price_inferred,best_time,types(name,slot_type,categories(id,name))',
       )
       .in('id', ids);
 
@@ -570,8 +727,9 @@ export class RecommendationService {
           : typeData?.categories;
         const categoryId = categoryData?.id ?? null;
         const categoryName = categoryData?.name ?? null;
+        // slot_type giờ lấy từ travel.types.slot_type (không còn ở travel.places nữa)
         const candidateCategory = normalizeCategory(
-          row.slot_type ?? candidate?.category ?? '',
+          typeData?.slot_type ?? candidate?.category ?? '',
           typeData?.name ?? '',
         );
         const placeType = this.resolvePlannerPlaceType(

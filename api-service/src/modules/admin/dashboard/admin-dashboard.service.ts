@@ -98,6 +98,14 @@ export class DashboardService {
     });
   }
 
+  // ─── Xóa toàn bộ cache (dùng khi cần dữ liệu mới ngay, vd: demo) ────
+  clearCache(): void {
+    this._placesCache.clear();
+    this._chartCache.clear();
+    this._interactionCache = null;
+    this._statsCache = null;
+  }
+
   // ─── Active Users Chart ──────────────────────────────────────────────
   async getActiveUsersChart(
     month?: number,
@@ -173,14 +181,16 @@ export class DashboardService {
   async getPopularPlacesChart(
     limit = 20,
     mode: 'top' | 'flop' = 'top',
+    categoryName?: string,
   ): Promise<PopularPlaceStats[]> {
-    const cacheKey = `places:${mode}:${limit}`;
+    const cacheKey = `places:${mode}:${limit}:${categoryName ?? 'all'}`;
     const cached = this.getCachedPlaces(cacheKey);
     if (cached) return cached;
 
     const { data, error } = (await supabase.rpc('get_place_popularity_stats', {
       p_limit: limit,
       p_mode: mode,
+      p_category_name: categoryName ?? null,
     })) as {
       data: Array<{
         place_id: unknown;

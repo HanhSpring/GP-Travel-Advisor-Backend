@@ -1,10 +1,13 @@
 from fastapi import APIRouter, HTTPException, Query
+from app.api.deps import get_model
 from app.schemas.recommend import (
     RecommendRequest,
     RecommendResponse,
     PlaceRecommendationsResponse,
     EncodeQueryRequest,
     EncodeQueryResponse,
+    SessionRerankRequest,
+    SessionRerankResponse,
 )
 from app.services import recommend_service
 
@@ -52,6 +55,25 @@ def place_recommendations(
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     return {"place_id": place_id, "count": len(items), "items": items}
+
+
+@router.post(
+    "/itinerary/session-rerank",
+    response_model=SessionRerankResponse,
+    summary="Rerank Two-Tower Top-100 candidates bằng Session-Aware CF (session-based)",
+)
+def session_rerank(req: SessionRerankRequest):
+    """Rerank candidates từ Two-Tower diversifyTopK bằng session-aware CF.
+
+    Graceful degrade: nếu engine chưa đăng ký hoặc chưa load được artifact
+    (ready=False), trả nguyên candidates gốc — KHÔNG lỗi, để NestJS luôn nhận
+    được response hợp lệ và giữ nguyên thứ tự Two-Tower."""
+    candidates = [c.model_dump() for c in req.candidates]
+    engine = get_model("session_cf_reranker")
+    if engine is None or not engine.ready:
+        return {"candidates": candidates}
+    reranked = engine.rerank(req.user_id, candidates)
+    return {"candidates": reranked}
 
 
 @router.post("/encode-query", response_model=EncodeQueryResponse)
