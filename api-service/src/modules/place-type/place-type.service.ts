@@ -8,7 +8,7 @@ export class PlaceTypesService {
     let query = supabase
       .schema('travel')
       .from('types')
-      .select('id, name')
+      .select('id, name, categories(id, name)')
       .order('name', { ascending: true });
 
     if (searchKeyword?.trim()) {
@@ -23,6 +23,14 @@ export class PlaceTypesService {
       );
     }
 
-    return data as PlaceType[];
+    return ((data ?? []) as any[]).map((row) => {
+      const cat = Array.isArray(row.categories) ? row.categories[0] : row.categories;
+      return {
+        id: row.id,
+        name: row.name,
+        category_id: cat?.id ?? null,
+        category_name: cat?.name ?? null,
+      } as PlaceType;
+    });
   }
 }

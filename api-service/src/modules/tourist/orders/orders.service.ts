@@ -224,7 +224,6 @@ export class OrdersService {
     totalAmount: number;
     items: Array<{ name: string; quantity: number; total_price: number }>;
     confirmUrl: string;
-    completeUrl: string;
     cancelUrl: string;
   }): string {
     const formatCurrency = (value: number) =>
@@ -247,10 +246,9 @@ export class OrdersService {
         <p>Vui lòng chọn thao tác xử lý đơn:</p>
         <p>
           <a href="${params.confirmUrl}" style="display:inline-block;background:#2563eb;color:white;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:700">Xác nhận đơn</a>
-          <a href="${params.completeUrl}" style="display:inline-block;background:#10b981;color:white;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:700;margin-left:8px">Hoàn thành</a>
           <a href="${params.cancelUrl}" style="display:inline-block;background:#ef4444;color:white;padding:10px 14px;border-radius:8px;text-decoration:none;font-weight:700;margin-left:8px">Hủy đơn</a>
         </p>
-        <p style="color:#64748b;font-size:13px">Link có hiệu lực trong 3 ngày. Trang quản lý đối tác chỉ hiển thị trạng thái sau khi nhà hàng thao tác qua email.</p>
+        <p style="color:#64748b;font-size:13px">Link có hiệu lực trong 3 ngày.</p>
       </div>
     `;
   }
@@ -285,7 +283,6 @@ export class OrdersService {
         html: this.getOrderActionEmailHtml({
           ...params,
           confirmUrl: this.getActionUrl(token, 'confirm'),
-          completeUrl: this.getActionUrl(token, 'complete'),
           cancelUrl: this.getActionUrl(token, 'cancel'),
         }),
       },
@@ -302,9 +299,8 @@ export class OrdersService {
 
   private getTargetStatus(
     action: string,
-  ): 'processing' | 'completed' | 'cancelled' {
+  ): 'processing' | 'cancelled' {
     if (action === 'confirm') return 'processing';
-    if (action === 'complete') return 'completed';
     if (action === 'cancel') return 'cancelled';
     throw new BadRequestException('Thao tác xử lý đơn không hợp lệ');
   }
@@ -330,9 +326,9 @@ export class OrdersService {
     const { data: order, error: orderError } = await supabase
       .schema('order_sys')
       .from('orders')
-      .select('id, status')
+      .select('id, status, place_id')
       .eq('id', orderId)
-      .maybeSingle<{ id: string; status: string }>();
+      .maybeSingle<{ id: string; status: string; place_id: string | null }>();
 
     if (orderError) {
       throw new InternalServerErrorException(orderError.message);
@@ -351,10 +347,23 @@ export class OrdersService {
       };
     }
 
+    const updatePayload: Record<string, unknown> = { status: targetStatus };
+
+    if (targetStatus === 'processing') {
+      const now = new Date();
+      updatePayload.confirmed_at = now.toISOString();
+      const prepMinutes = await this.getEstimatedPrepTime(orderId, order.place_id);
+      if (prepMinutes) {
+        updatePayload.auto_complete_at = new Date(
+          now.getTime() + prepMinutes * 60 * 1000,
+        ).toISOString();
+      }
+    }
+
     const { data, error } = await supabase
       .schema('order_sys')
       .from('orders')
-      .update({ status: targetStatus })
+      .update(updatePayload)
       .eq('id', order.id)
       .select('id, status')
       .single<{ id: string; status: string }>();
@@ -369,6 +378,52 @@ export class OrdersService {
       status: data.status,
       message: 'Cập nhật trạng thái đơn hàng thành công',
     };
+  }
+
+  private async getEstimatedPrepTime(
+    orderId: string,
+    placeId: string | null,
+  ): Promise<number | null> {
+    // Try via place_id stored on the order (available after migration)
+    if (placeId) {
+      const { data } = await supabase
+        .schema('travel')
+        .from('places')
+        .select('estimated_preparation_time')
+        .eq('id', placeId)
+        .maybeSingle<{ estimated_preparation_time: number | null }>();
+      if (data?.estimated_preparation_time) return data.estimated_preparation_time;
+    }
+
+    // Fallback: join through order_items → food_items → places
+    const { data: items } = await supabase
+      .schema('order_sys')
+      .from('order_items')
+      .select('food_item_id')
+      .eq('order_id', orderId)
+      .limit(1);
+
+    const foodItemId = (items as Array<{ food_item_id: string }> | null)?.[0]
+      ?.food_item_id;
+    if (!foodItemId) return null;
+
+    const { data: foodItem } = await supabase
+      .schema('order_sys')
+      .from('food_items')
+      .select('place_id')
+      .eq('id', foodItemId)
+      .maybeSingle<{ place_id: string }>();
+
+    if (!foodItem?.place_id) return null;
+
+    const { data: place } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('estimated_preparation_time')
+      .eq('id', foodItem.place_id)
+      .maybeSingle<{ estimated_preparation_time: number | null }>();
+
+    return place?.estimated_preparation_time ?? null;
   }
 
   private extractCityName(
@@ -633,9 +688,9 @@ export class OrdersService {
     const { data: place, error: placeError } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, name')
+      .select('id, name, estimated_preparation_time')
       .eq('id', placeId)
-      .maybeSingle<{ id: string; name: string }>();
+      .maybeSingle<{ id: string; name: string; estimated_preparation_time: number | null }>();
 
     if (placeError) {
       throw new InternalServerErrorException(placeError.message);
@@ -710,6 +765,7 @@ export class OrdersService {
         notes: payload.notes ?? null,
         tourist_id: payload.tourist_id,
         itinerary_detail_id: payload.itinerary_detail_id ?? null,
+        place_id: placeId,
       },
       {
         id: orderId,
@@ -717,6 +773,7 @@ export class OrdersService {
         total_amount: totalAmount,
         status: 'pending',
         tourist_id: payload.tourist_id,
+        place_id: placeId,
       },
       {
         id: orderId,

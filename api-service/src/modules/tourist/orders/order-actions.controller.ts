@@ -14,7 +14,7 @@ export class OrderActionsController {
   @ApiQuery({
     name: 'action',
     required: true,
-    description: 'confirm | complete | cancel',
+    description: 'confirm | cancel',
   })
   handleAction(@Param('token') token: string, @Query('action') action: string) {
     return this.service.handleOrderEmailAction(token, action);

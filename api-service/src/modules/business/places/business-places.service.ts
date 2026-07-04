@@ -126,7 +126,7 @@ export class BusinessPlacesService {
         { count: 'exact' },
       )
       .eq('vendor_id', resolvedVendorId)
-      .or('is_active.is.null,is_active.eq.true');
+      .or('is_deleted.is.null,is_deleted.eq.false');
 
     if (status === 'pending') {
       query = query.is('is_approved', null);

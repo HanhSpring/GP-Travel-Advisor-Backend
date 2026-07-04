@@ -140,10 +140,12 @@ export class BusinessController {
       categories: this.parseFlexible(body.p_categories || body.categories),
       services: this.parseFlexible(body.p_services || body.services),
       menu: this.parseFlexible(body.p_menu || body.menu),
+      rooms: this.parseFlexible(body.p_rooms || body.rooms),
 
       // 👉 BỔ SUNG CÁC DÒNG DƯỚI ĐÂY ĐỂ TRUYỀN DỮ LIỆU SANG SERVICE
       p_open_time: body.p_open_time || body.openTime,
       p_close_time: body.p_close_time || body.closeTime,
+      p_open_hour_compressed: body.p_open_hour_compressed || body.openHourCompressed || body.open_hour_compressed,
       p_description: body.p_description || body.description,
       p_images: this.parseFlexible(body.p_images || body.images),
     };
@@ -242,6 +244,39 @@ export class BusinessController {
   }
 
   // ── Free service CRUD ───────────────────────────────────────────────────────
+
+  @Post('hotel-room')
+  @ApiOperation({ summary: 'Them phong cho dia diem luu tru' })
+  addHotelRoom(@Body() body: any) {
+    return this.businessService.addSingleHotelRoom(
+      body.placeId,
+      body.name,
+      Number(body.price ?? 0),
+      Number(body.quantity ?? body.max_occupancy ?? 0),
+    );
+  }
+
+  @Put('hotel-room')
+  @ApiOperation({ summary: 'Cap nhat phong luu tru' })
+  updateHotelRoom(@Body() body: any) {
+    return this.businessService.updateSingleHotelRoom(
+      body.roomId ?? body.id,
+      body.placeId,
+      body.name,
+      Number(body.price ?? 0),
+      Number(body.quantity ?? body.max_occupancy ?? 0),
+    );
+  }
+
+  @Delete('hotel-room')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({ summary: 'Xoa phong luu tru' })
+  deleteHotelRoom(@Body() body: any) {
+    return this.businessService.deleteSingleHotelRoom(
+      body.roomId ?? body.id,
+      body.placeId,
+    );
+  }
 
   @Post('free-service')
   @ApiOperation({ summary: 'Thêm tiện ích miễn phí cho địa điểm' })
