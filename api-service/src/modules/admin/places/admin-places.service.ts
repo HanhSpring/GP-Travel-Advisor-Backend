@@ -441,6 +441,75 @@ export class AdminPlacesService {
     }
   }
 
+  private normalizeText(value: string): string {
+    return value
+      .normalize('NFD')
+      .replace(/[̀-ͯ]/g, '')
+      .toLowerCase()
+      .trim();
+  }
+
+  private isAccommodationType(values: Array<string | null | undefined>): boolean {
+    return values
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => this.normalizeText(value))
+      .some((value) =>
+        value.includes('luu tru') ||
+        value.includes('khach san') ||
+        value.includes('hotel') ||
+        value.includes('accommodation') ||
+        value.includes('homestay') ||
+        value.includes('resort'),
+      );
+  }
+
+  private async addHotelRooms(
+    placeId: string,
+    rooms: Array<{
+      name?: string;
+      room_name?: string;
+      price?: number | string;
+      quantity?: number | string;
+      max_occupancy?: number | string;
+    }>,
+  ) {
+    if (rooms.length === 0) return;
+
+    const rows = rooms
+      .map((room) => {
+        const roomName = (room.name || room.room_name || '').trim();
+        const price = Number(room.price);
+        const quantity = Number(room.quantity ?? room.max_occupancy);
+
+        return {
+          id: randomUUID(),
+          place_id: placeId,
+          name: roomName,
+          price,
+          quantity,
+        };
+      })
+      .filter(
+        (room) =>
+          room.name &&
+          Number.isFinite(room.price) &&
+          room.price > 0 &&
+          Number.isFinite(room.quantity) &&
+          room.quantity > 0,
+      );
+
+    if (rows.length === 0) return;
+
+    const { error } = await supabase
+      .schema('order_sys')
+      .from('hotel_rooms')
+      .insert(rows);
+
+    if (error) {
+      throw new BadRequestException(error.message);
+    }
+  }
+
   private async countPlaces(
     status: PlaceStatus = 'all',
     registeredFrom?: string,
@@ -545,6 +614,9 @@ export class AdminPlacesService {
     const menu = Array.isArray(dto.p_menu || dto.menu)
       ? dto.p_menu || dto.menu
       : [];
+    const rooms = Array.isArray(dto.p_rooms || dto.rooms)
+      ? dto.p_rooms || dto.rooms
+      : [];
     const images = Array.isArray(dto.p_images || dto.images)
       ? dto.p_images || dto.images
       : [];
@@ -569,15 +641,6 @@ export class AdminPlacesService {
       throw new BadRequestException('Vui long chon doi tac quan ly dia diem');
     }
 
-    if (menu.length > 0) {
-      for (const item of menu) {
-        if (!item.name) throw new BadRequestException('Thieu ten mon');
-        if (!item.price || Number(item.price) <= 0) {
-          throw new BadRequestException(`Gia sai: ${item.name}`);
-        }
-      }
-    }
-
     const resolvedType = await this.resolvePlaceTypeForCreate({
       typeId: dto.p_type_id || dto.typeId,
       typeName: dto.p_type_name || dto.typeName,
@@ -586,6 +649,21 @@ export class AdminPlacesService {
 
     if (!resolvedType.typeId) {
       throw new BadRequestException('Loai hinh kinh doanh khong hop le');
+    }
+
+    const isAccommodation = this.isAccommodationType([
+      dto.p_type_name || dto.typeName,
+      ...categories,
+      ...resolvedType.categoryNames,
+    ]);
+
+    if (!isAccommodation && menu.length > 0) {
+      for (const item of menu) {
+        if (!item.name) throw new BadRequestException('Thieu ten mon');
+        if (!item.price || Number(item.price) <= 0) {
+          throw new BadRequestException(`Gia sai: ${item.name}`);
+        }
+      }
     }
 
     const cityId = await this.resolveCityIdForCreate(city);
@@ -608,6 +686,8 @@ export class AdminPlacesService {
         type_id: resolvedType.typeId,
         open_time: dto.p_open_time || dto.openTime || '08:00',
         close_time: dto.p_close_time || dto.closeTime || '22:00',
+        open_hour_compressed:
+          dto.p_open_hour_compressed || dto.open_hour_compressed || null,
         description: dto.p_description || dto.description || '',
         image_url: images,
         is_approved: true,
@@ -631,7 +711,11 @@ export class AdminPlacesService {
     }
 
     await this.addPlaceServices(createdPlace.id, services);
-    await this.addMenuItems(createdPlace.id, menu);
+    if (isAccommodation) {
+      await this.addHotelRooms(createdPlace.id, rooms.length > 0 ? rooms : menu);
+    } else {
+      await this.addMenuItems(createdPlace.id, menu);
+    }
 
     return {
       message: 'Tao dia diem thanh cong',
