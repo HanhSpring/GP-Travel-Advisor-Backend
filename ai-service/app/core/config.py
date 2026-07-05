@@ -53,6 +53,9 @@ class Settings(BaseSettings):
     reco_artifact_dir: str = "recommender_artifacts"
     reco_data_dir: str = "data"
 
+    # Session-Aware CF Reranker local path (artifact riêng, không đè lên reco_artifact_dir của Ngọc)
+    session_cf_artifact_dir: str = "artifacts_session_cf"
+
     # Cloudflare R2
     r2_endpoint_url: str = ""
     r2_access_key_id: str = ""

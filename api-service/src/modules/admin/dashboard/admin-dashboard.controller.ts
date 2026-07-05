@@ -2,7 +2,9 @@ import {
   Controller,
   Get,
   Header,
+  HttpCode,
   ParseIntPipe,
+  Post,
   Query,
   UseGuards,
 } from '@nestjs/common';
@@ -42,11 +44,13 @@ export class DashboardController {
   async getPopularPlaces(
     @Query('limit', new ParseIntPipe({ optional: true })) limit?: number,
     @Query('mode') mode?: string,
+    @Query('categoryName') categoryName?: string,
   ) {
     const validMode: 'top' | 'flop' = mode === 'flop' ? 'flop' : 'top';
     const stats = await this.dashboardService.getPopularPlacesChart(
       limit ?? 20,
       validMode,
+      categoryName?.trim() || undefined,
     );
 
     return {
@@ -86,6 +90,21 @@ export class DashboardController {
       statusCode: 200,
       message: 'Lấy dữ liệu thánh công',
       data: data,
+    };
+  }
+
+  @Post('refresh-cache')
+  @HttpCode(200)
+  @ApiOperation({
+    summary: 'Xóa toàn bộ cache dashboard để lấy dữ liệu mới nhất ngay lập tức',
+    description:
+      'Dùng khi cần đảm bảo dữ liệu mới nhất (vd: trước buổi demo), tránh phải chờ TTL cache hoặc restart backend',
+  })
+  refreshCache() {
+    this.dashboardService.clearCache();
+    return {
+      statusCode: 200,
+      message: 'Đã xóa cache dashboard, dữ liệu sẽ được tải mới ở lần gọi tiếp theo',
     };
   }
 }

@@ -2,6 +2,7 @@ import './config/load-env';
 import { Module } from '@nestjs/common';
 import { ConfigModule } from '@nestjs/config';
 import { EventEmitterModule } from '@nestjs/event-emitter';
+import { CacheModule } from '@nestjs/cache-manager';
 
 import { ActivityModule } from './modules/activity/activity.module';
 import { SearchModule } from './modules/search/search.module';
@@ -59,6 +60,7 @@ import { RecommendationModule } from './modules/recommendation/recommendation.mo
 @Module({
   imports: [
     ConfigModule.forRoot({ isGlobal: true }),
+    CacheModule.register({ isGlobal: true, ttl: 60_000, max: 500 }),
     EventEmitterModule.forRoot(),
     ActivityModule,
     SearchModule,

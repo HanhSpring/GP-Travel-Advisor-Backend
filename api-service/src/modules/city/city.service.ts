@@ -4,18 +4,14 @@ import { City } from './entity/city.entity';
 
 @Injectable()
 export class CitiesService {
-  async findAll(searchKeyword?: string): Promise<City[]> {
-    let query = supabase
-      .schema('travel')
-      .from('cities')
-      .select('id, name')
-      .order('name', { ascending: true });
-
-    if (searchKeyword?.trim()) {
-      query = query.ilike('name', `%${searchKeyword.trim()}%`);
-    }
-
-    const { data, error } = await query;
+  async findAll(
+    searchKeyword?: string,
+    destinationOnly?: boolean,
+  ): Promise<City[]> {
+    const { data, error } = await supabase.rpc('get_cities_for_plan_trip', {
+      p_keyword: searchKeyword?.trim() || null,
+      p_destination_only: !!destinationOnly,
+    });
 
     if (error) {
       throw new InternalServerErrorException(

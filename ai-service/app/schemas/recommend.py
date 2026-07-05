@@ -71,3 +71,31 @@ class EncodeQueryRequest(BaseModel):
 class EncodeQueryResponse(BaseModel):
     embedding: list[float] = Field(..., description="256-dim L2-normalized query vector")
     dim: int = 256
+
+
+# ---------------------------------------------------------------------------
+# Session-Aware CF Reranker (Two-Tower Top-100 -> Top-N)
+# ---------------------------------------------------------------------------
+
+class SessionRerankCandidate(BaseModel):
+    """Candidate đến từ diversifyTopK (NestJS). Cho phép field lạ đi qua nguyên vẹn
+    (extra="allow") vì NestJS có thể gửi kèm metadata khác mà SessionCfReranker
+    không cần biết trước, nhưng vẫn phải trả lại nguyên vẹn khi graceful-degrade."""
+
+    model_config = ConfigDict(extra="allow")
+
+    place_id: str
+    cosine_score: float = 0.0
+    category: str | None = None
+    average_rating: float | None = None
+    is_top20_visited: bool | None = None
+    is_admin_featured: bool | None = None
+
+
+class SessionRerankRequest(BaseModel):
+    user_id: str | None = Field(default=None, description="Supabase UUID; None nếu khách chưa đăng nhập")
+    candidates: list[SessionRerankCandidate]
+
+
+class SessionRerankResponse(BaseModel):
+    candidates: list[dict]

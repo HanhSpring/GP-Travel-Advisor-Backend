@@ -23,6 +23,7 @@ import {
 } from '@nestjs/swagger';
 import { ItineraryService } from './itinerary.service';
 import { RecommendationService } from '../recommendation/recommendation.service';
+import { TwoTowerConfigService } from '../recommendation/two-tower-config.service';
 import { GetItinerariesDto } from './dto/get-itineraries.dto';
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
 import { ItineraryDetailResponseDto } from './dto/itinerary-detail-response.dto';
@@ -57,6 +58,7 @@ export class ItineraryController {
   constructor(
     private readonly service: ItineraryService,
     private readonly recommendationService: RecommendationService,
+    private readonly twoTowerConfig: TwoTowerConfigService,
     configService: ConfigService,
   ) {
     const configuredValue = configService.get<string>(
@@ -130,7 +132,8 @@ export class ItineraryController {
     @Query('top_k') topK?: string,
   ): Promise<TwoTowerRetrievalResponseDto> {
     const k = topK ? Math.min(parseInt(topK, 10) || 100, 200) : 100;
-    return this.recommendationService.retrieveCandidates(body, k);
+    const config = await this.twoTowerConfig.getConfig();
+    return this.recommendationService.retrieveCandidates(body, k, config);
   }
 
   @Post('plan')
@@ -183,10 +186,12 @@ export class ItineraryController {
 
     const planStartedAt = Date.now();
     const plannerEngine = this.plannerEngine;
+    const config = await this.twoTowerConfig.getConfig();
     let plan: any = await this.recommendationService.planItinerary(
       body,
       k,
       plannerEngine,
+      config,
     );
     this.logPlanSummary(plan as any, plannerEngine);
     if (plan?.validation_is_feasible === false) {
@@ -200,6 +205,7 @@ export class ItineraryController {
             unconstrainedBody,
             k,
             plannerEngine,
+            config,
           );
         if (unconstrainedPlan?.validation_is_feasible !== false) {
           const calculatedCost = this.service.calculatePlanEstimatedCost(
@@ -295,10 +301,12 @@ export class ItineraryController {
       : this.calcRetrievalTopK(requestedDays);
 
     const plannerEngine = this.plannerEngine;
+    const config = await this.twoTowerConfig.getConfig();
     const plan = await this.recommendationService.planItinerary(
       body,
       k,
       plannerEngine,
+      config,
     );
     const executionTimeMs = Date.now() - startedAt;
     this.logPlanSummary(plan as any, plannerEngine);

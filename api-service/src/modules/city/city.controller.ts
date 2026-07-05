@@ -14,13 +14,15 @@ export class CitiesController {
   @ApiOperation({
     summary: 'Lấy danh sách hoặc tìm kiếm thành phố',
     description:
-      'Trả về danh sách các thành phố. Truyền thêm query "search" để tìm kiếm theo tên, phục vụ cho việc chọn điểm khởi hành và điểm đến.',
+      'Trả về danh sách các thành phố. Truyền thêm query "search" để tìm kiếm theo tên. ' +
+      'Điểm khởi hành có thể tìm trên toàn bộ thành phố; điểm đến cần truyền "destinationOnly=true" ' +
+      'để chỉ nhận về các tỉnh/thành mà app đang hỗ trợ lên lịch trình.',
   })
   @ApiOkResponse({
     description: 'Lấy danh sách thành phố thành công.',
     type: [City],
   })
   async getCities(@Query() query: GetCitiesQueryDto): Promise<City[]> {
-    return this.citiesService.findAll(query.search);
+    return this.citiesService.findAll(query.search, query.destinationOnly);
   }
 }
