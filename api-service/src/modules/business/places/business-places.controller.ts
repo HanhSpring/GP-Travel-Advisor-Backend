@@ -28,6 +28,12 @@ export class BusinessPlacesController {
     required: false,
     description: 'default | popular | newest',
   })
+  @ApiQuery({
+    name: 'fields',
+    required: false,
+    description:
+      'full (default) | basic — basic skips category/rating enrichment for callers that only need id/name/city',
+  })
   @ApiResponse({ status: 200, type: BusinessPlaceListResponseDto })
   getPlaces(
     @Query('vendor_id') vendorId: string,
@@ -36,6 +42,7 @@ export class BusinessPlacesController {
     @Query('status') status?: 'all' | 'pending' | 'approved' | 'rejected',
     @Query('search') search?: string,
     @Query('sort') sort?: 'default' | 'popular' | 'newest',
+    @Query('fields') fields?: 'full' | 'basic',
   ) {
     return this.service.getPlaces(
       vendorId,
@@ -44,6 +51,7 @@ export class BusinessPlacesController {
       status ?? 'all',
       search,
       sort ?? 'default',
+      fields ?? 'full',
     );
   }
 }

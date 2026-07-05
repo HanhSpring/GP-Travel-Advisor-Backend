@@ -38,14 +38,27 @@ interface TypeRow {
 
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
 type PlaceSort = 'default' | 'popular' | 'newest';
+type PlaceFields = 'full' | 'basic';
+
+const VENDOR_ID_CACHE_TTL_MS = 5 * 60 * 1000;
 
 @Injectable()
 export class BusinessPlacesService {
+  private readonly vendorIdCache = new Map<
+    string,
+    { resolvedId: string; expiresAt: number }
+  >();
+
   private async resolveVendorId(vendorId: string): Promise<string> {
     const normalizedVendorId = vendorId?.trim();
 
     if (!normalizedVendorId) {
       throw new BadRequestException('vendor_id is required');
+    }
+
+    const cached = this.vendorIdCache.get(normalizedVendorId);
+    if (cached && cached.expiresAt > Date.now()) {
+      return cached.resolvedId;
     }
 
     // If caller already sends business id used by travel.places.vendor_id, keep it.
@@ -61,23 +74,30 @@ export class BusinessPlacesService {
       throw new InternalServerErrorException(existingPlaceError.message);
     }
 
-    if ((existingPlaceRows ?? []).length > 0) {
-      return normalizedVendorId;
+    let resolvedId = normalizedVendorId;
+
+    if ((existingPlaceRows ?? []).length === 0) {
+      // Fallback: validate against public.businesses.id.
+      const { data: businessRow, error: businessError } = await supabase
+        .schema('public')
+        .from('businesses')
+        .select('id')
+        .eq('id', normalizedVendorId)
+        .maybeSingle<BusinessRow>();
+
+      if (businessError) {
+        throw new InternalServerErrorException(businessError.message);
+      }
+
+      resolvedId = businessRow?.id ?? normalizedVendorId;
     }
 
-    // Fallback: validate against public.businesses.id.
-    const { data: businessRow, error: businessError } = await supabase
-      .schema('public')
-      .from('businesses')
-      .select('id')
-      .eq('id', normalizedVendorId)
-      .maybeSingle<BusinessRow>();
+    this.vendorIdCache.set(normalizedVendorId, {
+      resolvedId,
+      expiresAt: Date.now() + VENDOR_ID_CACHE_TTL_MS,
+    });
 
-    if (businessError) {
-      throw new InternalServerErrorException(businessError.message);
-    }
-
-    return businessRow?.id ?? normalizedVendorId;
+    return resolvedId;
   }
 
   private mapStatus(
@@ -101,6 +121,7 @@ export class BusinessPlacesService {
     status: PlaceStatus = 'all',
     search?: string,
     sort: PlaceSort = 'default',
+    fields: PlaceFields = 'full',
   ) {
     const resolvedVendorId = await this.resolveVendorId(vendorId);
 
@@ -165,57 +186,72 @@ export class BusinessPlacesService {
           .filter((value): value is string => Boolean(value)),
       ),
     ];
+    const placeIds = placeRows.map((item) => item.id);
+
+    // 'basic' mode is for callers that only need id/name/city (e.g. building
+    // a filter dropdown) — skip the category and live-rating enrichment
+    // entirely instead of paying for two extra Supabase round-trips per page.
+    const needsEnrichment = fields !== 'basic';
+
+    // These two lookups are independent of each other, so fire them in
+    // parallel instead of awaiting one after the other.
+    const [typesData, reviewRows] = needsEnrichment
+      ? await Promise.all([
+          typeIds.length > 0
+            ? supabase
+                .schema('travel')
+                .from('types')
+                .select('id, name, categories(name)')
+                .in('id', typeIds)
+                .then(({ data: rows, error: typesError }) => {
+                  if (typesError) {
+                    throw new InternalServerErrorException(
+                      typesError.message,
+                    );
+                  }
+                  return rows;
+                })
+            : Promise.resolve(null),
+          placeIds.length > 0
+            ? supabase
+                .schema('review_ai')
+                .from('reviews')
+                .select('place_id, rating')
+                .in('place_id', placeIds)
+                .then(({ data: rows }) => rows)
+            : Promise.resolve(null),
+        ])
+      : [null, null];
+
     const categoryNameByTypeId = new Map<string, string>();
-
-    if (typeIds.length > 0) {
-      const { data: typesData, error: typesError } = await supabase
-        .schema('travel')
-        .from('types')
-        .select('id, name, categories(name)')
-        .in('id', typeIds);
-
-      if (typesError) {
-        throw new InternalServerErrorException(typesError.message);
-      }
-
-      for (const type of (typesData ?? []) as TypeRow[]) {
-        const category = Array.isArray(type.categories)
-          ? type.categories[0]
-          : type.categories;
-        categoryNameByTypeId.set(type.id, category?.name || type.name);
-      }
+    for (const type of (typesData ?? []) as TypeRow[]) {
+      const category = Array.isArray(type.categories)
+        ? type.categories[0]
+        : type.categories;
+      categoryNameByTypeId.set(type.id, category?.name || type.name);
     }
 
     // Compute real-time ratings from review_ai.reviews (places.average_rating is not auto-updated)
-    const placeIds = placeRows.map((item) => item.id);
     const liveRatingByPlaceId = new Map<
       string,
       { average: number; count: number }
     >();
-    if (placeIds.length > 0) {
-      const { data: reviewRows } = await supabase
-        .schema('review_ai')
-        .from('reviews')
-        .select('place_id, rating')
-        .in('place_id', placeIds);
-
-      if (reviewRows && reviewRows.length > 0) {
-        const groups: Record<string, number[]> = {};
-        for (const row of reviewRows as {
-          place_id: string;
-          rating: number;
-        }[]) {
-          if (!groups[row.place_id]) groups[row.place_id] = [];
-          groups[row.place_id].push(row.rating);
-        }
-        for (const [placeId, ratings] of Object.entries(groups)) {
-          const count = ratings.length;
-          const avg =
-            count > 0
-              ? Number((ratings.reduce((a, b) => a + b, 0) / count).toFixed(1))
-              : 0;
-          liveRatingByPlaceId.set(placeId, { average: avg, count });
-        }
+    if (reviewRows && reviewRows.length > 0) {
+      const groups: Record<string, number[]> = {};
+      for (const row of reviewRows as {
+        place_id: string;
+        rating: number;
+      }[]) {
+        if (!groups[row.place_id]) groups[row.place_id] = [];
+        groups[row.place_id].push(row.rating);
+      }
+      for (const [placeId, ratings] of Object.entries(groups)) {
+        const count = ratings.length;
+        const avg =
+          count > 0
+            ? Number((ratings.reduce((a, b) => a + b, 0) / count).toFixed(1))
+            : 0;
+        liveRatingByPlaceId.set(placeId, { average: avg, count });
       }
     }
 
