@@ -13,12 +13,19 @@
   - Thêm endpoint `GET /itinerary/share-link/:token`.
   - Thêm endpoint `POST /itinerary/share-link/respond`.
   - Bổ sung danh sách lịch trình được chia sẻ vào `GET /itinerary/my-itineraries`.
+  - Bổ sung `creatorId`, `isOwner` và danh sách `members` (họ tên + avatar) vào `GET /itinerary/:id`.
+  - `GET /itinerary/share-link/:token` nhận thêm query `userId`, trả `isOwner` và `alreadyMember` để mobile load đúng trạng thái tham gia.
+  - Accept qua link social sẽ đồng bộ các notification mời trực tiếp đang chờ của user đó sang `accepted`.
+  - Respond từ notification khi user đã là thành viên (đã tham gia qua link) cũng tự đồng bộ sang `accepted`.
 
 - Mobile itinerary:
   - Dời nút chia sẻ khỏi màn chi tiết lịch trình.
   - Thêm nút chia sẻ vào màn tóm tắt lịch trình.
-  - Bottom sheet chia sẻ cho phép nhập email hoặc số điện thoại và gửi lời mời.
-  - Bottom sheet chia sẻ có thêm phần tạo/copy link và mở nhanh Facebook, Zalo, TikTok.
+  - Nút chia sẻ chỉ hiển thị với chủ lịch trình và khi status là `pending` hoặc `ongoing`.
+  - Màn tóm tắt hiển thị dãy avatar xếp chồng của tất cả thành viên trong header (chủ lịch trình đứng đầu).
+  - Member được chia sẻ chỉ có quyền xem: ẩn nút sửa tên, switch công khai, chế độ chỉnh sửa và nút chia sẻ.
+  - Bottom sheet chia sẻ: nhập email/số điện thoại/họ tên rồi bấm nút tìm kiếm mới hiển thị kết quả; kết quả chỉ hiện họ tên.
+  - Bottom sheet chia sẻ có thêm phần tạo link social với 2 nút `Sao chép` và `Chia sẻ` (có hiệu ứng hover).
   - Nối flow qua datasource, repository, usecase và cubit của itinerary.
 
 - Mobile notifications:
@@ -30,6 +37,7 @@
   - Android khai báo intent-filter cho scheme `gptraveladvisor`.
   - iOS khai báo URL scheme `gptraveladvisor`.
   - Khi mở link, app gọi API preview và hiện dialog xác nhận/từ chối.
+  - Ràng buộc đăng nhập: bấm link khi chưa đăng nhập thì app giữ link lại, nhắc đăng nhập; đăng nhập xong mới hiện dialog lời mời.
 
 ## Logic backend
 
@@ -162,10 +170,35 @@ Luồng xử lý:
 
 1. Backend tìm invitation theo token trong `notifications.metadata.share_token`.
 2. Preview trả tên chủ lịch trình, tên lịch trình, itinerary id và trạng thái token.
-3. Nếu người bấm link chính là chủ lịch trình thì trả lỗi.
-4. Nếu `action = accept`, insert vào `travel.itinerary_members`.
-5. Nếu `action = reject`, không ghi member.
-6. Token social vẫn giữ `active` để nhiều người có thể tham gia bằng cùng link.
+3. Preview nhận thêm query `userId` (tùy chọn): trả `isOwner = true` nếu người bấm link là chủ lịch trình, `alreadyMember = true` nếu đã có trong `travel.itinerary_members` — mobile dựa vào đây để không hiện lại dialog mời.
+4. Nếu người bấm link chính là chủ lịch trình thì respond trả lỗi.
+5. Nếu `action = accept`:
+   - Insert vào `travel.itinerary_members` (đã là member thì bỏ qua, response trả `alreadyMember = true` kèm message "Bạn đã tham gia lịch trình này trước đó").
+   - Đồng bộ trạng thái: các notification mời trực tiếp (`action_type = respond_itinerary_share`) đang chờ của chính user đó cho lịch trình đó được chuyển sang `itinerary_share_accepted` + `share_status = accepted` (kèm `responded_via = share_link`), đánh dấu đã đọc — nhờ đó màn thông báo load đúng trạng thái đã tham gia, không hiện lại nút xác nhận/từ chối.
+6. Nếu `action = reject`, không ghi member; lời mời trực tiếp (nếu có) vẫn giữ nguyên để user có thể phản hồi sau.
+7. Token social vẫn giữ `active` để nhiều người có thể tham gia bằng cùng link.
+
+Chiều ngược lại (đã tham gia qua link → bấm nút trong thông báo):
+
+1. `POST /itinerary/:id/share/respond` kiểm tra `travel.itinerary_members` trước khi xử lý action.
+2. Nếu user đã là thành viên: bỏ qua action, đồng bộ notification sang `accepted` và trả message "Bạn đã tham gia lịch trình này trước đó".
+3. Mobile sau khi respond sẽ re-fetch chi tiết notification nên trạng thái hiển thị luôn khớp với backend.
+
+### Thành viên trong chi tiết lịch trình
+
+Endpoint hiện có:
+
+```http
+GET /itinerary/:id?tourist_id=:touristId
+```
+
+Logic mới:
+
+1. Đọc `creator_id` của lịch trình, trả về `creatorId`.
+2. `isOwner = tourist_id === creator_id` (thiếu `tourist_id` thì `isOwner = false`).
+3. Query `travel.itinerary_members` theo `itinerary_id`, join `public.users` để lấy `full_name`, `avatar_url`.
+4. Trả về `members`: mảng `{ id, fullName, avatarUrl, isOwner }`, chủ lịch trình đứng đầu.
+5. Lỗi khi load members không làm hỏng response chi tiết (fallback mảng rỗng).
 
 ### Load lịch trình được chia sẻ
 
@@ -189,22 +222,26 @@ Logic mới:
 
 ### Màn tóm tắt lịch trình
 
-- Nút share mới nằm trong app bar của `ItinerarySummaryScreen`.
+- Nút share nằm trong app bar của `ItinerarySummaryScreen`, chỉ hiển thị khi:
+  - Người xem là chủ lịch trình (`isOwner = true`), và
+  - Status của lịch trình là `PENDING` hoặc `ONGOING`. Các trạng thái khác (completed, uncompleted...) không hiện nút chia sẻ.
+- Header màn tóm tắt hiển thị dãy avatar xếp chồng của tất cả thành viên (tối đa 5 avatar, dư thì hiện `+N`), kèm số lượng thành viên. Avatar lấy từ `members` trong response chi tiết; thiếu ảnh thì hiện chữ cái đầu của họ tên.
+- Phân quyền trên màn tóm tắt và màn chi tiết:
+  - Chủ lịch trình: đầy đủ chức năng như cũ.
+  - Member được chia sẻ: chỉ xem. Ẩn nút sửa tên lịch trình, switch công khai/riêng tư, nút chia sẻ và nút vào chế độ chỉnh sửa ở màn chi tiết.
 - Khi bấm share:
   1. Mở bottom sheet.
-  2. Người dùng nhập email hoặc số điện thoại.
-  3. App gọi `ItineraryCubit.shareItinerary`.
-  4. Cubit gọi usecase, repository, datasource.
-  5. Datasource gọi `POST /itinerary/:id/share`.
+  2. Người dùng nhập email, số điện thoại hoặc họ tên rồi bấm nút tìm kiếm (không tự tìm khi đang gõ).
+  3. App gọi `GET /itinerary/share/recipients` và hiển thị kết quả; mỗi kết quả chỉ hiện họ tên (không lộ email/số điện thoại).
+  4. Người dùng chọn một người trong danh sách rồi bấm `Chia sẻ`.
+  5. App gọi `ItineraryCubit.shareItinerary` → usecase → repository → datasource → `POST /itinerary/:id/share`.
   6. Thành công thì hiện snackbar đã gửi lời mời.
   7. Thất bại thì hiện lỗi ngay dưới input.
 - Phần link social:
-  1. Người dùng bấm Copy/Facebook/Zalo/TikTok.
+  1. Người dùng bấm `Sao chép` hoặc `Chia sẻ` (2 nút có hiệu ứng hover khi rê chuột).
   2. App gọi `ItineraryCubit.createShareLink`.
   3. Datasource gọi `POST /itinerary/:id/share-link`.
-  4. App copy nội dung lời mời vào clipboard.
-  5. Với Facebook/Zalo, app mở URL share tương ứng nếu hệ điều hành hỗ trợ.
-  6. Với TikTok, do TikTok không có web share URL chuẩn cho text/link, app copy lời mời và thử mở app TikTok bằng scheme `tiktok://`.
+  4. Nút `Sao chép` copy nội dung lời mời vào clipboard; nút `Chia sẻ` mở share sheet của hệ điều hành.
 
 ### Deep link lời mời
 
@@ -217,10 +254,22 @@ gptraveladvisor://itinerary-share?token=<share_token>
 - Khi app đã cài trên máy:
   1. OS mở app bằng scheme `gptraveladvisor`.
   2. `main.dart` chuyển link vào `NotificationNavigationService.handleItineraryShareLink`.
-  3. Service gọi `GET /itinerary/share-link/:token`.
-  4. App hiện dialog: `Bạn đã được {tên chủ lịch trình} mời tham gia lịch trình {tên lịch trình}...`
-  5. Nếu chấp nhận, app gọi `POST /itinerary/share-link/respond` với `action = accept`.
-  6. Sau khi accept, app mở màn tóm tắt lịch trình.
+  3. Service kiểm tra đăng nhập bằng `AuthUtils.getCurrentUserId()` trước khi xử lý.
+  4. Nếu **chưa đăng nhập** (kể cả đang đứng ở màn đăng nhập):
+     - Link được lưu vào `_pendingItineraryShareUri` trong `NotificationNavigationService`.
+     - App hiện snackbar: `Vui lòng đăng nhập để mở lời mời tham gia lịch trình. Lời mời sẽ hiển thị ngay sau khi bạn đăng nhập.`
+     - Khi đăng nhập thành công, `MainShell` mount và gọi `NotificationNavigationService.processPendingItineraryShareLink()` — link đang chờ được xử lý tiếp và dialog lời mời hiện ra (mọi luồng đăng nhập/khôi phục session đều đi qua `MainShell` nên không sót trường hợp nào).
+  5. Nếu **đã đăng nhập**, service gọi `GET /itinerary/share-link/:token?userId=<user hiện tại>`.
+  6. Kiểm tra trạng thái tham gia từ preview trước khi hiện dialog:
+     - `isOwner = true` → hiện snackbar "Bạn là chủ lịch trình này nên không cần tham gia bằng link mời." và mở thẳng màn tóm tắt.
+     - `alreadyMember = true` (đã tham gia trước đó, dù bằng deep link hay lời mời trực tiếp) → hiện snackbar "Bạn đã tham gia lịch trình này rồi." và mở thẳng màn tóm tắt, không hiện lại dialog mời.
+  7. Chưa tham gia thì app hiện dialog: `Bạn đã được {tên chủ lịch trình} mời tham gia lịch trình {tên lịch trình}...`
+  8. Nếu chấp nhận, app gọi `POST /itinerary/share-link/respond` với `action = accept`; snackbar dùng message backend trả về (phân biệt "đã xác nhận tham gia" và "đã tham gia trước đó").
+  9. Sau khi accept, app mở màn tóm tắt lịch trình.
+
+- File đã chỉnh cho ràng buộc đăng nhập:
+  - `lib/core/services/notification_navigation_service.dart`: thêm `_pendingItineraryShareUri`, kiểm tra đăng nhập ở đầu `handleItineraryShareLink`, thêm hàm `processPendingItineraryShareLink()`.
+  - `lib/core/navigation/main_shell.dart`: gọi `processPendingItineraryShareLink()` trong `initState` (post-frame) để hiện lời mời ngay sau khi đăng nhập xong.
 
 - Nếu app chưa cài:
   - Custom scheme không tự fallback sang CH Play.
@@ -229,8 +278,8 @@ gptraveladvisor://itinerary-share?token=<share_token>
 
 ### Màn chi tiết lịch trình
 
-- Đã bỏ nút share khỏi floating buttons.
-- Đã xóa share sheet mock dùng danh sách user giả.
+- Đã bỏ hẳn nút share khỏi floating buttons (chia sẻ chỉ còn ở màn tóm tắt).
+- Đã xóa share sheet mock dùng danh sách user giả cùng callback `onShareTap`.
 - Các chức năng khác trong detail giữ nguyên.
 
 ### Màn chi tiết thông báo

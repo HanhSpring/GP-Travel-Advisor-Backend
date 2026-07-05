@@ -75,8 +75,7 @@ export class ItineraryController {
   @Get('hotels/:placeId/rooms')
   @ApiOperation({
     summary: 'Lấy danh sách phòng và giá của một khách sạn',
-    description:
-      'Đọc danh sách phòng theo place_id từ order_sys.hotel_rooms.',
+    description: 'Đọc danh sách phòng theo place_id từ order_sys.hotel_rooms.',
   })
   @ApiParam({
     name: 'placeId',
@@ -203,10 +202,12 @@ export class ItineraryController {
             plannerEngine,
           );
         if (unconstrainedPlan?.validation_is_feasible !== false) {
-          const calculatedCost =
-            this.service.calculatePlanEstimatedCost(unconstrainedPlan as any);
-          const recommendedBudget =
-            this.service.calculateRecommendedBudget(unconstrainedPlan as any);
+          const calculatedCost = this.service.calculatePlanEstimatedCost(
+            unconstrainedPlan as any,
+          );
+          const recommendedBudget = this.service.calculateRecommendedBudget(
+            unconstrainedPlan as any,
+          );
           const participantCount = Math.max(
             1,
             Number(body.adultCount ?? 0) + Number(body.childCount ?? 0),
@@ -329,8 +330,17 @@ export class ItineraryController {
     summary: 'Lấy thông tin lời mời chia sẻ lịch trình từ token',
   })
   @ApiParam({ name: 'token', description: 'Token trong link chia sẻ' })
-  getShareLinkPreview(@Param('token') token: string) {
-    return this.service.getShareLinkPreview(token);
+  @ApiQuery({
+    name: 'userId',
+    required: false,
+    description:
+      'ID người bấm link, dùng kiểm tra đã là thành viên/chủ lịch trình chưa',
+  })
+  getShareLinkPreview(
+    @Param('token') token: string,
+    @Query('userId') userId?: string,
+  ) {
+    return this.service.getShareLinkPreview(token, userId);
   }
 
   @Get('share/recipients')

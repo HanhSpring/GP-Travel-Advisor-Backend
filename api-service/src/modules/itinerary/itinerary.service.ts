@@ -862,9 +862,29 @@ export class ItineraryService {
     };
   }
 
-  async getShareLinkPreview(token: string) {
+  async getShareLinkPreview(token: string, userId?: string) {
     const invitation = await this.findShareLinkInvitation(token);
     const metadata = invitation.metadata;
+    const itineraryId = String(metadata.itinerary_id ?? '');
+    const senderUserId = String(metadata.sender_user_id ?? '');
+
+    // Cho mobile biết người bấm link là chủ lịch trình hay đã là thành viên
+    // để hiển thị đúng trạng thái thay vì hiện lại dialog mời.
+    const viewerId = userId?.trim() ?? '';
+    const isOwner = Boolean(
+      viewerId && senderUserId && viewerId === senderUserId,
+    );
+    let alreadyMember = false;
+    if (viewerId && itineraryId && !isOwner) {
+      try {
+        alreadyMember = await this.isItineraryMember(itineraryId, viewerId);
+      } catch (err) {
+        this.logger.warn(
+          `getShareLinkPreview member check failed itinerary=${itineraryId} user=${viewerId}: ${String(err)}`,
+        );
+      }
+    }
+
     return {
       success: true,
       token,
@@ -872,6 +892,8 @@ export class ItineraryService {
       itineraryTitle: metadata.itinerary_title ?? 'lịch trình',
       ownerName: metadata.sender_name ?? 'Chủ lịch trình',
       status: metadata.share_status ?? 'active',
+      isOwner,
+      alreadyMember,
     };
   }
 
@@ -891,18 +913,106 @@ export class ItineraryService {
     }
 
     if (dto.action === 'accept') {
+      const wasMember = await this.isItineraryMember(itineraryId, dto.userId);
       await this.addItineraryMember(itineraryId, dto.userId);
+      // Đồng bộ trạng thái: nếu user cũng nhận lời mời trực tiếp đang chờ
+      // cho lịch trình này thì đánh dấu đã chấp nhận để thông báo không
+      // hiện lại nút xác nhận/từ chối.
+      await this.markDirectShareInvitationsAccepted(itineraryId, dto.userId);
+
+      return {
+        success: true,
+        status: 'accepted',
+        itineraryId,
+        alreadyMember: wasMember,
+        message: wasMember
+          ? 'Bạn đã tham gia lịch trình này trước đó'
+          : 'Đã xác nhận tham gia lịch trình',
+      };
     }
 
     return {
       success: true,
-      status: dto.action === 'accept' ? 'accepted' : 'rejected',
+      status: 'rejected',
       itineraryId,
-      message:
-        dto.action === 'accept'
-          ? 'Đã xác nhận tham gia lịch trình'
-          : 'Đã từ chối lời mời tham gia lịch trình',
+      alreadyMember: false,
+      message: 'Đã từ chối lời mời tham gia lịch trình',
     };
+  }
+
+  /**
+   * Khi user tham gia lịch trình qua link social, các notification mời
+   * trực tiếp (action_type = respond_itinerary_share) đang chờ của chính
+   * user đó cho lịch trình đó được chuyển sang accepted để màn thông báo
+   * load đúng trạng thái. Lỗi ở đây không được làm hỏng flow tham gia.
+   */
+  private async markDirectShareInvitationsAccepted(
+    itineraryId: string,
+    userId: string,
+  ) {
+    try {
+      const { data: invitations, error } = await supabase
+        .schema('public')
+        .from('notifications')
+        .select('id, metadata')
+        .eq('action_type', 'respond_itinerary_share')
+        .filter('metadata->>itinerary_id', 'eq', itineraryId)
+        .filter('metadata->>recipient_user_id', 'eq', userId);
+
+      if (error) {
+        this.logger.warn(
+          `markDirectShareInvitationsAccepted query failed itinerary=${itineraryId} user=${userId}: ${error.message}`,
+        );
+        return;
+      }
+      if (!invitations || invitations.length === 0) {
+        return;
+      }
+
+      const respondedAt = new Date().toISOString();
+      for (const invitation of invitations) {
+        const metadata = ((invitation as any).metadata ?? {}) as Record<
+          string,
+          unknown
+        >;
+        const [notificationUpdate, linkUpdate] = await Promise.all([
+          supabase
+            .schema('public')
+            .from('notifications')
+            .update({
+              action_type: 'itinerary_share_accepted',
+              metadata: {
+                ...metadata,
+                share_status: 'accepted',
+                responded_at: respondedAt,
+                responded_via: 'share_link',
+              },
+            })
+            .eq('id', (invitation as any).id),
+          supabase
+            .schema('public')
+            .from('users_notifications')
+            .update({ is_read: true, read_at: respondedAt })
+            .eq('user_id', userId)
+            .eq('notification_id', (invitation as any).id),
+        ]);
+
+        if (notificationUpdate.error) {
+          this.logger.warn(
+            `markDirectShareInvitationsAccepted notification update failed id=${(invitation as any).id}: ${notificationUpdate.error.message}`,
+          );
+        }
+        if (linkUpdate.error) {
+          this.logger.warn(
+            `markDirectShareInvitationsAccepted link update failed id=${(invitation as any).id}: ${linkUpdate.error.message}`,
+          );
+        }
+      }
+    } catch (err) {
+      this.logger.warn(
+        `markDirectShareInvitationsAccepted failed itinerary=${itineraryId} user=${userId}: ${String(err)}`,
+      );
+    }
   }
 
   async respondToShareInvitation(
@@ -944,9 +1054,7 @@ export class ItineraryService {
     >;
     const currentActionType = (notification as any).action_type;
     const currentShareStatus =
-      typeof metadata.share_status === 'string'
-        ? metadata.share_status
-        : null;
+      typeof metadata.share_status === 'string' ? metadata.share_status : null;
     if (
       (currentShareStatus === 'accepted' ||
         currentShareStatus === 'rejected' ||
@@ -975,6 +1083,18 @@ export class ItineraryService {
       metadata.recipient_user_id !== dto.userId
     ) {
       throw new BadRequestException('Lời mời chia sẻ không hợp lệ');
+    }
+
+    // User đã là thành viên (ví dụ đã tham gia qua link social trước đó):
+    // đồng bộ notification sang accepted bất kể action để trạng thái luôn đúng.
+    const alreadyMember = await this.isItineraryMember(itineraryId, dto.userId);
+    if (alreadyMember) {
+      await this.markDirectShareInvitationsAccepted(itineraryId, dto.userId);
+      return {
+        success: true,
+        status: 'accepted',
+        message: 'Bạn đã tham gia lịch trình này trước đó',
+      };
     }
 
     if (dto.action === 'accept') {
@@ -2388,10 +2508,7 @@ export class ItineraryService {
     const participantCount = Math.max(1, adultCount + childCount);
     const daysMap = new Map<string, any[]>();
     for (const detail of details || []) {
-      if (
-        detail.detail_type === 'HOTEL' ||
-        this.isStartPointDetail(detail)
-      ) {
+      if (detail.detail_type === 'HOTEL' || this.isStartPointDetail(detail)) {
         continue;
       }
       const dateStr = detail.visit_date;
@@ -2417,17 +2534,18 @@ export class ItineraryService {
       // Day 1 starts directly from the first scheduled activity. From day 2
       // onward the hotel is shown as the day's departure point, but its cost
       // remains exclusively in the trip-level accommodation breakdown.
-      const displayRows = hotelDetail && index > 0
-        ? [
-            {
-              ...hotelDetail,
-              visit_date: dateStr,
-              estimated_cost: 0,
-              place: placesById.get(hotelDetail.place_id) ?? null,
-            },
-            ...activitiesRaw,
-          ]
-        : activitiesRaw;
+      const displayRows =
+        hotelDetail && index > 0
+          ? [
+              {
+                ...hotelDetail,
+                visit_date: dateStr,
+                estimated_cost: 0,
+                place: placesById.get(hotelDetail.place_id) ?? null,
+              },
+              ...activitiesRaw,
+            ]
+          : activitiesRaw;
 
       const activities = displayRows.map((act, actIndex) => {
         const place = act.place;
@@ -2458,17 +2576,11 @@ export class ItineraryService {
         // Do not synthesize a wait activity from legacy timestamp gaps.
         // Scheduler v2 enforces wait = 0 for newly generated itineraries.
         const waitMinutes = 0;
-        const groupEstimatedCost = Math.max(
-          0,
-          Number(act.estimated_cost ?? 0),
-        );
+        const groupEstimatedCost = Math.max(0, Number(act.estimated_cost ?? 0));
         const perPersonEstimatedCost = Math.round(
           groupEstimatedCost / participantCount,
         );
-        const groupTransportCost = Math.max(
-          0,
-          Number(act.transport_cost ?? 0),
-        );
+        const groupTransportCost = Math.max(0, Number(act.transport_cost ?? 0));
         const perPersonTransportCost = Math.round(
           groupTransportCost / participantCount,
         );
@@ -2483,7 +2595,9 @@ export class ItineraryService {
               waitMinutes > 0
                 ? `${this.formatDuration(waitMinutes)} chờ`
                 : null,
-            ].filter((value): value is string => Boolean(value)).join(' • ')
+            ]
+              .filter((value): value is string => Boolean(value))
+              .join(' • ')
           : null;
 
         const typeData = Array.isArray(place?.types)
@@ -2650,6 +2764,11 @@ export class ItineraryService {
     const isFavorite = touristId
       ? await this.checkFavoriteItinerary(touristId, id)
       : false;
+    const creatorId: string | null = itinerary.creator_id ?? null;
+    const isOwner = Boolean(
+      touristId?.trim() && creatorId && touristId.trim() === creatorId,
+    );
+    const members = await this.getItineraryMemberProfiles(id, creatorId);
 
     let diffDays = 1;
     try {
@@ -2716,6 +2835,11 @@ export class ItineraryService {
       title: itinerary.description || 'Chi tiết lịch trình',
       tripIntent: itinerary.trip_intent ?? null,
       trip_intent: itinerary.trip_intent ?? null,
+      creatorId,
+      creator_id: creatorId,
+      isOwner,
+      is_owner: isOwner,
+      members,
       dateRangeLabel: `${startStr} - ${endStr}`,
       status: (itinerary.status || 'pending').toUpperCase(),
       trackingActive: itinerary.tracking_active === true,
@@ -2726,9 +2850,7 @@ export class ItineraryService {
       totalBudget: estimatedTripCost,
       groupEstimatedCost: estimatedTripCost,
       group_estimated_cost: estimatedTripCost,
-      perPersonEstimatedCost: Math.round(
-        estimatedTripCost / participantCount,
-      ),
+      perPersonEstimatedCost: Math.round(estimatedTripCost / participantCount),
       per_person_estimated_cost: Math.round(
         estimatedTripCost / participantCount,
       ),
@@ -2796,6 +2918,92 @@ export class ItineraryService {
     }
 
     return Boolean(data);
+  }
+
+  /**
+   * Lấy danh sách thành viên của lịch trình (gồm cả chủ lịch trình) kèm
+   * họ tên và avatar để mobile hiển thị ở màn tóm tắt. Lỗi ở đây không
+   * được làm hỏng response chi tiết nên luôn fallback về mảng rỗng.
+   */
+  private async getItineraryMemberProfiles(
+    itineraryId: string,
+    creatorId: string | null,
+  ): Promise<
+    Array<{
+      id: string;
+      fullName: string;
+      avatarUrl: string;
+      isOwner: boolean;
+    }>
+  > {
+    try {
+      const { data: memberRows, error: memberError } = await supabase
+        .schema('travel')
+        .from('itinerary_members')
+        .select('tourist_id')
+        .eq('itinerary_id', itineraryId);
+
+      if (memberError) {
+        this.logger.warn(
+          `getItineraryMemberProfiles members query failed itinerary=${itineraryId}: ${memberError.message}`,
+        );
+        return [];
+      }
+
+      const memberIds: string[] = [];
+      if (creatorId) {
+        memberIds.push(creatorId);
+      }
+      for (const row of memberRows ?? []) {
+        const touristId = (row as any).tourist_id;
+        if (
+          typeof touristId === 'string' &&
+          touristId.length > 0 &&
+          !memberIds.includes(touristId)
+        ) {
+          memberIds.push(touristId);
+        }
+      }
+      if (memberIds.length === 0) {
+        return [];
+      }
+
+      const { data: users, error: userError } = await supabase
+        .schema('public')
+        .from('users')
+        .select('id, full_name, avatar_url')
+        .in('id', memberIds);
+
+      if (userError) {
+        this.logger.warn(
+          `getItineraryMemberProfiles users query failed itinerary=${itineraryId}: ${userError.message}`,
+        );
+        return [];
+      }
+
+      const usersById = new Map<string, any>();
+      for (const user of users ?? []) {
+        usersById.set((user as any).id, user);
+      }
+
+      // Giữ nguyên thứ tự: chủ lịch trình đứng đầu, sau đó tới các member.
+      return memberIds
+        .filter((memberId) => usersById.has(memberId))
+        .map((memberId) => {
+          const user = usersById.get(memberId);
+          return {
+            id: memberId,
+            fullName: ((user.full_name ?? '') as string).trim(),
+            avatarUrl: ((user.avatar_url ?? '') as string).trim(),
+            isOwner: creatorId != null && memberId === creatorId,
+          };
+        });
+    } catch (err) {
+      this.logger.warn(
+        `getItineraryMemberProfiles failed itinerary=${itineraryId}: ${String(err)}`,
+      );
+      return [];
+    }
   }
 
   /**
@@ -3198,9 +3406,7 @@ export class ItineraryService {
     }
     return Math.max(
       0,
-      toParts[0] * 60 +
-        toParts[1] -
-        (fromParts[0] * 60 + fromParts[1]),
+      toParts[0] * 60 + toParts[1] - (fromParts[0] * 60 + fromParts[1]),
     );
   }
 
@@ -3260,7 +3466,9 @@ export class ItineraryService {
         .in('destination_place_id', destinationIds);
 
       if (error) {
-        this.logger.warn(`Distance matrix fallback unavailable: ${error.message}`);
+        this.logger.warn(
+          `Distance matrix fallback unavailable: ${error.message}`,
+        );
         return;
       }
 
@@ -3279,10 +3487,7 @@ export class ItineraryService {
           matrixMode,
         );
         for (const row of goongRows) {
-          matrix.set(
-            `${row.origin_place_id}:${row.destination_place_id}`,
-            row,
-          );
+          matrix.set(`${row.origin_place_id}:${row.destination_place_id}`, row);
         }
       }
 
@@ -3301,13 +3506,12 @@ export class ItineraryService {
           );
         }
         if (Number(leg.destination.transport_cost ?? 0) <= 0) {
-          leg.destination.transport_cost =
-            this.estimateSelfDriveTransportCost(
-              leg.destination.travel_distance_km,
-              matrixMode === 'MOTORBIKE'
-                ? TransportMode.MOTORBIKE
-                : TransportMode.CAR,
-            );
+          leg.destination.transport_cost = this.estimateSelfDriveTransportCost(
+            leg.destination.travel_distance_km,
+            matrixMode === 'MOTORBIKE'
+              ? TransportMode.MOTORBIKE
+              : TransportMode.CAR,
+          );
         }
       }
     } catch (error) {
@@ -3315,7 +3519,9 @@ export class ItineraryService {
     }
   }
 
-  private normalizeMatrixTravelMode(mode?: string | null): 'DRIVING' | 'MOTORBIKE' {
+  private normalizeMatrixTravelMode(
+    mode?: string | null,
+  ): 'DRIVING' | 'MOTORBIKE' {
     return (mode ?? '').toUpperCase() === TransportMode.MOTORBIKE
       ? 'MOTORBIKE'
       : 'DRIVING';
@@ -3339,7 +3545,9 @@ export class ItineraryService {
       .select('id, latitude, longitude')
       .in('id', placeIds);
     if (error) {
-      this.logger.warn(`Cannot load coordinates for Goong fallback: ${error.message}`);
+      this.logger.warn(
+        `Cannot load coordinates for Goong fallback: ${error.message}`,
+      );
       return [];
     }
 
@@ -3414,10 +3622,7 @@ export class ItineraryService {
           destination_place_id: leg.destination.place_id,
           travel_mode: travelMode,
           distance_meters: Math.round(distanceKm * 1000),
-          duration_seconds: Math.max(
-            60,
-            Math.ceil((distanceKm / 30) * 3600),
-          ),
+          duration_seconds: Math.max(60, Math.ceil((distanceKm / 30) * 3600)),
         });
       }
     }
@@ -3430,7 +3635,9 @@ export class ItineraryService {
           onConflict: 'origin_place_id,destination_place_id,travel_mode',
         });
       if (upsertError) {
-        this.logger.warn(`Cannot cache Goong distance matrix: ${upsertError.message}`);
+        this.logger.warn(
+          `Cannot cache Goong distance matrix: ${upsertError.message}`,
+        );
       }
     }
     return rows;
