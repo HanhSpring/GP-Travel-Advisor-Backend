@@ -299,10 +299,13 @@ export class ItineraryService {
       return stats;
     }
 
+    // itinerary_details KHÔNG có cột status — trạng thái "đã ghé" nằm ở
+    // tracking.geofence_visits (giống getItineraryDetail). Ở đây chỉ lấy
+    // tổng số điểm + ảnh, còn visited đếm qua query thứ hai bên dưới.
     const { data, error } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('itinerary_id, status, places(image_url)')
+      .select('itinerary_id, places(image_url)')
       .in('itinerary_id', itineraryIds);
 
     if (error) {
@@ -315,9 +318,6 @@ export class ItineraryService {
       const current = stats.get(itineraryId);
       if (!current) continue;
       current.totalLocations += 1;
-      if ((row as any).status === 'visited') {
-        current.visitedLocations += 1;
-      }
       const place = Array.isArray((row as any).places)
         ? (row as any).places[0]
         : (row as any).places;
@@ -329,6 +329,35 @@ export class ItineraryService {
       ) {
         current.placeImages.push(imageUrl);
       }
+    }
+
+    const { data: visits, error: visitsError } = await supabase
+      .schema('tracking')
+      .from('geofence_visits')
+      .select('itinerary_id, itinerary_detail_id, status')
+      .in('itinerary_id', itineraryIds)
+      .eq('status', 'visited');
+
+    if (visitsError) {
+      this.logger.warn(
+        `Cannot load shared itinerary visit stats: ${visitsError.message}`,
+      );
+      return stats;
+    }
+
+    // Một điểm có thể có nhiều bản ghi visit (PK geofence_id + detail_id,
+    // nhiều ngày) → đếm theo detail_id duy nhất.
+    const visitedDetailIds = new Map<string, Set<string>>();
+    for (const v of visits ?? []) {
+      const itineraryId = (v as any).itinerary_id;
+      if (!stats.has(itineraryId)) continue;
+      const set = visitedDetailIds.get(itineraryId) ?? new Set<string>();
+      set.add((v as any).itinerary_detail_id);
+      visitedDetailIds.set(itineraryId, set);
+    }
+    for (const [itineraryId, detailIds] of visitedDetailIds) {
+      const current = stats.get(itineraryId);
+      if (current) current.visitedLocations = detailIds.size;
     }
 
     return stats;
