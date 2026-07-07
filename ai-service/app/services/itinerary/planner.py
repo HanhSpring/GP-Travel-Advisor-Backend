@@ -1913,7 +1913,7 @@ class TSP_TW_GA:
                 if poi.unknown_hours:
                     candidate_soft_penalty += 30
                 wait = max(wait, LUNCH_START - arrival)
-                if not poi.unknown_hours and arrival + wait > LUNCH_END:
+                if not poi.unknown_hours and arrival + wait + poi.visit_duration > LUNCH_END:
                     continue
                 service_start = arrival + wait
 

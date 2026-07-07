@@ -127,15 +127,14 @@ def optimize_day_schedule(
         cat = (act.category or "").lower()
         if "chợ đêm" in cat or "phố đi bộ" in cat:
             model.Add(arrival[i] >= 17 * 60 + 30) # >= 17:30
-        elif any(c in cat for c in ["chùa", "đền", "nhà thờ", "bãi biển", "vườn hoa", "sinh thái"]):
-            model.Add(departure[i] <= 18 * 60) # <= 18:00
-            
+
         # Ràng buộc giờ ăn trưa
-        if act.is_restaurant and act.original_arrival_time:
-            orig = time_to_minutes(act.original_arrival_time)
-            if 11 * 60 <= orig <= 14 * 60:
+        if act.is_restaurant:
+            if act.is_locked and act.locked_arrive_time:
+                pass
+            else:
                 model.Add(arrival[i] >= 11 * 60 + 30)
-                model.Add(arrival[i] <= 13 * 60 + 30)
+                model.Add(departure[i] <= 13 * 60 + 30)
                 
     arrival[START_NODE] = model.NewIntVar(start_min, end_min, 'start')
     departure[START_NODE] = arrival[START_NODE]
@@ -155,45 +154,67 @@ def optimize_day_schedule(
                 model.Add(arrival[j] >= departure[i] + t).OnlyEnforceIf(edge_vars[(i, j)])
                 
     # 4. Giữ nguyên thứ tự tương đối cho các điểm cũ
-    # Điểm "trước 18h" (chùa/đền/vườn hoa/...) giữ thứ tự chặt với nhau.
-    # Điểm "linh hoạt" (không bắt buộc trước 18h, không khóa giờ) được phép
-    # dịch ra buổi tối để nhường slot sáng/chiều cho điểm mới trước 18h.
     def _is_morning_constrained(act: ActivityInput) -> bool:
+        cl = time_to_minutes(act.close_time)
+        if cl <= 18 * 60 + 30: # Nếu đóng cửa sớm (<= 18:30) thì bắt buộc đi ban ngày
+            return True
         cat = (act.category or "").lower()
-        return any(c in cat for c in ["chùa", "đền", "nhà thờ", "bãi biển", "vườn hoa", "sinh thái"])
+        return any(c in cat for c in ["chùa", "đền", "nhà thờ"])
 
     has_new_morning_activity = any(
         act.is_new and _is_morning_constrained(act) for act in activities
     )
 
+    penalty_terms = []
+    
     existing_indices = [i for i, act in enumerate(activities) if not act.is_new]
-    for idx in range(len(existing_indices) - 1):
-        idx1 = existing_indices[idx]
-        idx2 = existing_indices[idx + 1]
-        act1 = activities[idx1]
+    lunch_indices = [i for i, act in enumerate(activities) if act.is_restaurant]
+    lunch_idx = lunch_indices[0] if lunch_indices else None
+
+    # Ràng buộc thứ tự tương đối của tất cả các điểm KHÔNG phải ăn trưa
+    non_lunch_existing = [i for i in existing_indices if i != lunch_idx]
+    for idx in range(len(non_lunch_existing) - 1):
+        idx1 = non_lunch_existing[idx]
+        idx2 = non_lunch_existing[idx + 1]
         act2 = activities[idx2]
 
-        # Nếu đang thêm một điểm buổi sáng mới và act2 là điểm linh hoạt (không bị ràng
-        # buộc trước 18h, không khóa giờ) → cho phép act2 dịch ra tối, không ép thứ tự
+        # Nếu đang thêm một điểm buổi sáng mới và act2 là điểm linh hoạt
         if has_new_morning_activity and not act2.is_locked and not _is_morning_constrained(act2):
             continue
 
         model.Add(arrival[idx1] < arrival[idx2])
         
+    is_pushed_after_lunch_vars = {}
+    if lunch_idx is not None and lunch_idx in existing_indices:
+        morning_existing = [i for i in existing_indices if i < lunch_idx]
+        afternoon_existing = [i for i in existing_indices if i > lunch_idx]
+        
+        for i in afternoon_existing:
+            model.Add(arrival[i] > arrival[lunch_idx])
+            
+        for i in morning_existing:
+            b_after = model.NewBoolVar(f'pushed_after_{i}')
+            is_pushed_after_lunch_vars[i] = b_after
+            
+            # Lưu ý: Các điểm vẫn phải tuân thủ giờ mở cửa (đã xử lý ở phần 2. Time Variables)
+            model.Add(arrival[i] >= departure[lunch_idx]).OnlyEnforceIf(b_after)
+            model.Add(arrival[i] < arrival[lunch_idx]).OnlyEnforceIf(b_after.Not())
+            
+            penalty_terms.append(b_after * 5000)
+            
     # 5. Objective
     travel_time_terms = []
     for (i, j), lit in edge_vars.items():
         if i < n and j < n:
             travel_time_terms.append(lit * transit_matrix[(i, j)])
             
-    penalty_terms = []
     if allow_reduce_time:
         for i in range(n):
             if not activities[i].is_locked:
                 max_dur = activities[i].duration_minutes
                 red = model.NewIntVar(0, max_dur, f'red_{i}')
                 model.Add(red == max_dur - duration[i])
-                penalty_terms.append(red * 10) # Phạt nhẹ hơn (10) để ưu tiên giữ nguyên thời gian tham quan nếu có thể, nhưng sẵn sàng giảm nếu vi phạm lịch
+                penalty_terms.append(red * 10) # Phạt nhẹ hơn (10) để ưu tiên giữ nguyên thời gian
                 
     model.Minimize(sum(travel_time_terms) + sum(penalty_terms))
     
@@ -214,6 +235,10 @@ def optimize_day_schedule(
     current = START_NODE
     seq_order = 1
     
+    lunch_arrival_val = None
+    if lunch_idx is not None:
+        lunch_arrival_val = solver.Value(arrival[lunch_idx])
+    
     while True:
         next_node = None
         for j in range(num_nodes):
@@ -231,7 +256,14 @@ def optimize_day_schedule(
         dep_val = solver.Value(departure[i])
         
         if dur_val < act.duration_minutes:
-            reorder_notes.append(f"Giảm thời gian tham quan tại '{act.place_id}' từ {act.duration_minutes} xuống {dur_val} phút.")
+            if lunch_arrival_val is not None and arr_val < lunch_arrival_val:
+                reorder_notes.append(f"Giảm thời gian tham quan tại '{act.place_id}' từ {act.duration_minutes} xuống {dur_val} phút để kịp lịch trình ăn trưa.")
+            else:
+                reorder_notes.append(f"Giảm thời gian tham quan tại '{act.place_id}' từ {act.duration_minutes} xuống {dur_val} phút.")
+                
+        if i in is_pushed_after_lunch_vars:
+            if solver.Value(is_pushed_after_lunch_vars[i]):
+                reorder_notes.append(f"Dời '{act.place_id}' xuống sau giờ ăn trưa do lịch trình buổi sáng quá chật.")
             
         optimized_activities.append(OptimizedActivity(
             id=act.id,

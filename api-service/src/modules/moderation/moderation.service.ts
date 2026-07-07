@@ -1,12 +1,30 @@
 import { Injectable, Logger } from '@nestjs/common';
 import OpenAI from 'openai';
 
-import { extractFrameFromVideo } from './video-extractor';
+import { extractFramesFromVideo } from './video-extractor';
+
+export type MediaViolation = {
+  url: string;
+  mediaType: 'image' | 'video';
+  categories: string[];
+};
 
 export type ModerationResult = {
   status: 'approved' | 'violation';
   violations: string[];
+  textViolations: string[];
+  mediaViolations: string[];
+  mediaViolationDetails: MediaViolation[];
 };
+
+export function isVideoUrl(url: string): boolean {
+  const lowerUrl = url.toLowerCase();
+  return (
+    lowerUrl.endsWith('.mp4') ||
+    lowerUrl.endsWith('.mov') ||
+    lowerUrl.endsWith('.avi')
+  );
+}
 
 @Injectable()
 export class ModerationService {
@@ -19,18 +37,15 @@ export class ModerationService {
       if (!apiKey) {
         throw new Error('OPENAI_API_KEY is not set');
       }
-      this._openai = new OpenAI({ apiKey });
+      // Timeout so a slow/hanging OpenAI call can't stall the whole moderation
+      // pipeline — falls through to the "manual review" branch instead.
+      this._openai = new OpenAI({ apiKey, timeout: 15000, maxRetries: 1 });
     }
     return this._openai;
   }
 
   private isVideo(url: string): boolean {
-    const lowerUrl = url.toLowerCase();
-    return (
-      lowerUrl.endsWith('.mp4') ||
-      lowerUrl.endsWith('.mov') ||
-      lowerUrl.endsWith('.avi')
-    );
+    return isVideoUrl(url);
   }
 
   async moderateReview(
@@ -39,79 +54,138 @@ export class ModerationService {
     videos: string[] = [],
   ): Promise<ModerationResult> {
     const textToAnalyze = content || '';
-    const allMediaUrls = [...images, ...videos];
+    const allMediaUrls = [...images, ...videos].filter(Boolean);
 
     // --- STEP 1: Internal rules (business-specific, fast, no API cost) ---
     const internalViolations = this.checkInternalRules(textToAnalyze);
     if (internalViolations.length > 0) {
-      return { status: 'violation', violations: internalViolations };
-    }
-
-    // --- STEP 2: OpenAI omni-moderation-latest (primary AI check, supports Vietnamese) ---
-    let openaiApiOk = false;
-    const openaiViolations: string[] = [];
-    try {
-      const inputs: any[] = [];
-      if (textToAnalyze.trim()) {
-        inputs.push({ type: 'text', text: textToAnalyze });
-      }
-
-      for (const url of allMediaUrls) {
-        if (!url) continue;
-        if (this.isVideo(url)) {
-          try {
-            const frameBase64 = await extractFrameFromVideo(url);
-            inputs.push({ type: 'image_url', image_url: { url: frameBase64 } });
-          } catch (err) {
-            this.logger.warn(`Could not extract frame from video: ${url}`, err);
-          }
-        } else {
-          inputs.push({ type: 'image_url', image_url: { url } });
-        }
-      }
-
-      if (inputs.length > 0) {
-        const response = await this.openai.moderations.create({
-          model: 'omni-moderation-latest',
-          input: inputs,
-        });
-
-        openaiApiOk = true;
-
-        // Each input item returns its own result — check ALL of them
-        for (const result of response.results) {
-          if (result.flagged) {
-            const flagged = Object.entries(result.categories)
-              .filter(([, isFlagged]) => isFlagged)
-              .map(([category]) => category);
-            openaiViolations.push(...flagged);
-          }
-        }
-      } else {
-        // Nothing to check — treat as clean
-        openaiApiOk = true;
-      }
-    } catch (error) {
-      this.logger.error(
-        'OpenAI Moderation API error — will keep review as pending',
-        error,
-      );
-    }
-
-    if (openaiViolations.length > 0) {
-      return { status: 'violation', violations: openaiViolations };
-    }
-
-    // If OpenAI API failed (network/quota/etc.), return violation to trigger manual review
-    // rather than silently approving potentially bad content
-    if (!openaiApiOk && (textToAnalyze.trim() || allMediaUrls.length > 0)) {
       return {
         status: 'violation',
-        violations: ['OpenAI API không phản hồi — cần kiểm duyệt thủ công'],
+        violations: internalViolations,
+        textViolations: internalViolations,
+        mediaViolations: [],
+        mediaViolationDetails: allMediaUrls.map(url => ({
+          url,
+          mediaType: this.isVideo(url) ? 'video' : 'image',
+          categories: []
+        })),
       };
     }
 
-    return { status: 'approved', violations: [] };
+    // --- STEP 2: OpenAI omni-moderation-latest (primary AI check, supports Vietnamese) ---
+    // OpenAI's moderation endpoint allows only ONE image per request (a text
+    // item plus one image is fine, but 2+ images in the same call are
+    // rejected with "too_many_images"). So: one call for the text, and one
+    // call PER media item (image, or extracted video frame) — all fired
+    // concurrently instead of sequentially, which is what actually gives the
+    // speedup without hitting that limit.
+    const textViolations: string[] = [];
+    const mediaViolations: string[] = [];
+    const mediaViolationDetails: MediaViolation[] = [];
+    let textCallFailed = false;
+    let mediaCallFailed = false;
+
+    const extractFlagged = (result: { flagged: boolean; categories: object }): string[] =>
+      Object.entries(result.categories as Record<string, boolean>)
+        .filter(([, isFlagged]) => isFlagged)
+        .map(([category]) => category);
+
+    const textPromise = textToAnalyze.trim()
+      ? this.openai.moderations
+          .create({
+            model: 'omni-moderation-latest',
+            input: [{ type: 'text', text: textToAnalyze }],
+          })
+          .then((response) => {
+            for (const result of response.results) {
+              if (result.flagged) textViolations.push(...extractFlagged(result));
+            }
+          })
+          .catch((error) => {
+            this.logger.error('OpenAI Moderation API error (text)', error);
+            textCallFailed = true;
+          })
+      : Promise.resolve();
+
+    const mediaPromises = allMediaUrls.map(async (url) => {
+      const mediaType: 'image' | 'video' = this.isVideo(url) ? 'video' : 'image';
+      let imageUrls: string[] = [];
+      if (mediaType === 'video') {
+        try {
+          imageUrls = await extractFramesFromVideo(url);
+        } catch (err) {
+          this.logger.warn(`Could not extract frames from video: ${url}`, err);
+          mediaCallFailed = true;
+          return;
+        }
+      } else {
+        imageUrls = [url];
+      }
+
+      try {
+        let isFlagged = false;
+        const allCategories = new Set<string>();
+
+        const checks = imageUrls.map(async (imgUrl) => {
+          const response = await this.openai.moderations.create({
+            model: 'omni-moderation-latest',
+            input: [{ type: 'image_url', image_url: { url: imgUrl } }],
+          });
+          for (const result of response.results) {
+            if (result.flagged) {
+              isFlagged = true;
+              extractFlagged(result).forEach(c => allCategories.add(c));
+            }
+          }
+        });
+
+        await Promise.all(checks);
+
+        if (isFlagged) {
+          const flaggedCategories = Array.from(allCategories);
+          mediaViolations.push(...flaggedCategories);
+          mediaViolationDetails.push({ url, mediaType, categories: flaggedCategories });
+        } else {
+          mediaViolationDetails.push({ url, mediaType, categories: [] });
+        }
+      } catch (error) {
+        this.logger.error(`OpenAI Moderation API error (media: ${url})`, error);
+        mediaCallFailed = true;
+      }
+    });
+
+    await Promise.all([textPromise, ...mediaPromises]);
+
+    if (textViolations.length > 0 || mediaViolations.length > 0) {
+      return {
+        status: 'violation',
+        violations: [...textViolations, ...mediaViolations],
+        textViolations,
+        mediaViolations,
+        mediaViolationDetails,
+      };
+    }
+
+    // If a call failed (network/quota/etc.), return violation to trigger manual
+    // review rather than silently approving potentially bad content
+    if (textCallFailed || mediaCallFailed) {
+      const reason = 'OpenAI API không phản hồi — cần kiểm duyệt thủ công';
+      return {
+        status: 'violation',
+        violations: [reason],
+        textViolations: textCallFailed ? [reason] : [],
+        mediaViolations: mediaCallFailed ? [reason] : [],
+        mediaViolationDetails: [],
+      };
+    }
+
+    return {
+      status: 'approved',
+      violations: [],
+      textViolations: [],
+      mediaViolations: [],
+      mediaViolationDetails: [],
+    };
   }
 
   private checkInternalRules(text: string): string[] {
