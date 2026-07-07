@@ -57,6 +57,9 @@ async def optimize_itinerary(request: OptimizeRequest) -> OptimizeResponse:
         f"visit_date={request.visit_date}, "
         f"số hoạt động={len(request.activities)}"
     )
+    with open("payload_debug.json", "w", encoding="utf-8") as f:
+        f.write(request.model_dump_json(indent=2))
+
     from starlette.concurrency import run_in_threadpool
 
     try:

@@ -867,6 +867,7 @@ export class NotificationsService {
     title: string,
     content: string,
     type: string,
+    metadata?: Record<string, unknown> | null,
   ): Promise<void> {
     const { data: notification, error: notifError } = await supabase
       .schema('public')
@@ -876,6 +877,7 @@ export class NotificationsService {
         content,
         type,
         is_global: false,
+        metadata: metadata ?? null,
       })
       .select('id')
       .single();

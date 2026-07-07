@@ -1843,7 +1843,7 @@ export class ItineraryService {
         places:place_id (
           id,
           city_id,
-          category_id,
+          type_id,
           latitude,
           longitude
         )
@@ -1861,6 +1861,16 @@ export class ItineraryService {
 
     const currentPlace = (current as any).places;
 
+    // ─── Lấy tourist_id từ itinerary ──────────────────────────────────
+    const { data: itineraryInfo } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('tourist_id')
+      .eq('id', itineraryId)
+      .single();
+    
+    const userId = itineraryInfo?.tourist_id;
+
     // ─── Bước 2: Lấy tất cả place_id đã có trong lịch trình (để loại trừ) ─
     const { data: existingDetails } = await supabase
       .schema('travel')
@@ -1870,35 +1880,88 @@ export class ItineraryService {
 
     const excludedPlaceIds = (existingDetails ?? []).map(
       (d: any) => d.place_id,
-    );
+    ).filter(Boolean);
 
-    // ─── Bước 3: Tìm địa điểm cùng danh mục, cùng thành phố, chưa có trong lịch trình ─
-    const { data: suggestions, error: suggestErr } = await supabase
-      .schema('travel')
-      .from('places')
-      .select(
-        `
-        id,
-        name,
-        address,
-        image_url,
-        average_rating,
-        estimated_cost,
-        latitude,
-        longitude,
-        categories:category_id (name)
-      `,
-      )
-      .eq('city_id', currentPlace.city_id)
-      .eq('category_id', currentPlace.category_id)
-      .not('id', 'in', `(${excludedPlaceIds.join(',')})`)
-      .order('average_rating', { ascending: false })
-      .limit(8);
+    // ─── Bước 3: Gọi AI Service lấy danh sách gợi ý ────────────────────────────
+    let aiPlaceIds: string[] = [];
+    try {
+      const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://127.0.0.1:8000';
+      const url = userId 
+        ? `${AI_SERVICE_URL}/recommend/places/${currentPlace.id}/recommendations?user_id=${userId}&k=20`
+        : `${AI_SERVICE_URL}/recommend/places/${currentPlace.id}/recommendations?k=20`;
+        
+      const response = await axios.get(url, { timeout: 8000 });
+      const items = response.data?.items || [];
+      aiPlaceIds = items.map((item: any) => item.id);
+    } catch (err: any) {
+      console.warn(`[ItineraryService] Call AI recommend failed, fallback to DB:`, err.message);
+    }
 
-    if (suggestErr) {
-      console.error('[ItineraryService] getSuggestions error:', suggestErr);
-      // Trả về mảng rỗng thay vì ném lỗi để UX mượt hơn
-      return { suggestions: [] };
+    let suggestions: any[] = [];
+    const selectQuery = `
+      id,
+      name,
+      address,
+      image_url,
+      average_rating,
+      estimated_cost,
+      latitude,
+      longitude,
+      types (name, categories (id, name))
+    `;
+
+    if (aiPlaceIds.length > 0) {
+      const filteredIds = aiPlaceIds.filter(id => !excludedPlaceIds.includes(id));
+      
+      if (filteredIds.length > 0) {
+        const { data: aiPlaces, error: aiErr } = await supabase
+          .schema('travel')
+          .from('places')
+          .select(selectQuery)
+          .in('id', filteredIds);
+          
+        if (!aiErr && aiPlaces) {
+          // Tính toán khoảng cách và sắp xếp
+          suggestions = aiPlaces.map(p => {
+            const dist = (currentPlace.latitude && currentPlace.longitude && p.latitude && p.longitude)
+              ? this._haversineKm(currentPlace.latitude, currentPlace.longitude, p.latitude, p.longitude)
+              : 999999;
+            return { ...p, distanceKm: dist };
+          }).sort((a, b) => a.distanceKm - b.distanceKm).slice(0, 10);
+        }
+      }
+    }
+
+    // ─── Fallback: Nếu AI không trả về hoặc lỗi, dùng logic cũ ───────
+    if (suggestions.length === 0) {
+      let query = supabase
+        .schema('travel')
+        .from('places')
+        .select(selectQuery)
+        .eq('city_id', currentPlace.city_id)
+        .eq('type_id', currentPlace.type_id);
+
+      if (excludedPlaceIds.length > 0) {
+        query = query.not('id', 'in', `(${excludedPlaceIds.join(',')})`);
+      }
+
+      const { data: fallbackData, error: suggestErr } = await query
+        .order('average_rating', { ascending: false })
+        .limit(20);
+
+      if (suggestErr) {
+        console.error('[ItineraryService] getSuggestions fallback error:', suggestErr);
+        return { suggestions: [] };
+      }
+      
+      if (fallbackData) {
+        suggestions = fallbackData.map(p => {
+          const dist = (currentPlace.latitude && currentPlace.longitude && p.latitude && p.longitude)
+            ? this._haversineKm(currentPlace.latitude, currentPlace.longitude, p.latitude, p.longitude)
+            : 999999;
+          return { ...p, distanceKm: dist };
+        }).sort((a, b) => a.distanceKm - b.distanceKm).slice(0, 10);
+      }
     }
 
     // ─── Bước 4: Format kết quả với ước tính khoảng cách ────────
@@ -1913,7 +1976,7 @@ export class ItineraryService {
       return {
         id: p.id,
         name: p.name,
-        category: p.categories?.name ?? 'Khác',
+        category: this.extractCategoryName(p) ?? 'Khác',
         address: p.address,
         imageUrl: p.image_url,
         rating: p.average_rating ?? 0,
@@ -1993,7 +2056,7 @@ export class ItineraryService {
           longitude,
           open_time,
           close_time,
-          categories:category_id (name)
+          types (name, categories (id, name))
         )
       `,
       )
@@ -2025,8 +2088,8 @@ export class ItineraryService {
             open_time: a.places?.open_time ?? '07:00',
             close_time: a.places?.close_time ?? '22:00',
             estimated_cost: a.estimated_cost ?? 0,
-            category: a.places?.categories?.name ?? null,
-            is_restaurant: this.isRestaurant(a.places?.categories?.name),
+            category: this.extractCategoryName(a.places) ?? null,
+            is_restaurant: this.isRestaurant(this.extractCategoryName(a.places), a.locked_arrive_time || a.arrival_time),
             original_arrival_time: a.arrival_time,
             is_new: newActivityId ? a.id === newActivityId : false,
           })),
@@ -2106,7 +2169,7 @@ export class ItineraryService {
           review_count,
           latitude,
           longitude,
-          categories:category_id (name)
+          types (name, categories (id, name))
         )
       `,
       )
@@ -2180,7 +2243,7 @@ export class ItineraryService {
           sequenceOrder: a.sequence_order ?? 0,
           rating: a.places?.average_rating ?? 0,
           reviewCount: a.places?.review_count ?? 0,
-          category: a.places?.categories?.name ?? null,
+          category: this.extractCategoryName(a.places) ?? null,
           transportInfo,
         };
       }),
@@ -2290,8 +2353,31 @@ export class ItineraryService {
     const { data: currentActs } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('id')
+      .select('id, arrival_time')
       .eq('itinerary_id', id);
+
+    const currentActMap = new Map<string, string>();
+    if (currentActs) {
+      currentActs.forEach((a) => {
+        if (a.arrival_time) {
+          currentActMap.set(a.id, a.arrival_time);
+        }
+      });
+    }
+
+    const incomingPlaceIds = allActivities.map((a) => a.placeId).filter(Boolean);
+    const { data: placesData } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, types(categories(name))')
+      .in('id', incomingPlaceIds);
+      
+    const categoryMap = new Map<string, string | null>();
+    if (placesData) {
+      placesData.forEach((p: any) => {
+        categoryMap.set(p.id, this.extractCategoryName(p));
+      });
+    }
 
     const incomingIds = allActivities.map((a) => a.id);
     const toDelete = (currentActs || []).filter(
@@ -2333,6 +2419,17 @@ export class ItineraryService {
           };
           if (act.placeId) {
             updatePayload.place_id = act.placeId;
+            const category = categoryMap.get(act.placeId);
+            
+            // Check if it's currently a restaurant OR if it was previously considered a lunch place
+            const oldArrivalTime = currentActMap.get(act.id);
+            const isRest = this.isRestaurant(category, act.startTime) || 
+                           (oldArrivalTime ? this.isRestaurant(category, oldArrivalTime) : false);
+                           
+            if (isRest && (startMin < 11 * 60 + 30 || startMin > 13 * 60 + 30)) {
+              updatePayload.is_locked = true;
+              updatePayload.locked_arrive_time = act.startTime;
+            }
           }
 
           const { error } = await supabase
@@ -3116,10 +3213,9 @@ export class ItineraryService {
     return DEFAULT;
   }
 
-  private isRestaurant(category: string | null | undefined): boolean {
-    if (!category) return false;
-    const lower = category.toLowerCase();
-    return (
+  private isRestaurant(category: string | null | undefined, arrivalTimeStr?: string | null): boolean {
+    const lower = category ? category.toLowerCase() : '';
+    const isFoodPlace = (
       lower.includes('nhà hàng') ||
       lower.includes('quán ăn') ||
       lower.includes('nhà ăn') ||
@@ -3127,8 +3223,62 @@ export class ItineraryService {
       lower.includes('cafe') ||
       lower.includes('cà phê') ||
       lower.includes('quán bar') ||
-      lower.includes('bar')
+      lower.includes('bar') ||
+      lower.includes('ẩm thực') ||
+      lower.includes('trà') ||
+      lower.includes('lẩu') ||
+      lower.includes('lẫu') ||
+      lower.includes('đồ uống') ||
+      lower.includes('thức uống') ||
+      lower.includes('ăn vặt') ||
+      lower.includes('bbq') ||
+      lower.includes('buffet') ||
+      lower.includes('nước') ||
+      lower.includes('giải khát')
     );
+
+    if (arrivalTimeStr) {
+      try {
+        const [h, m] = arrivalTimeStr.split(':').map(Number);
+        const mins = h * 60 + (m || 0);
+        // Chỉ áp dụng khung giờ cho các địa điểm thực sự là ăn uống
+        // Không tự động đoán tất cả mọi thứ lúc 11:30 là nhà hàng!
+
+        // Còn nếu nó là địa điểm ăn uống nhưng bị đẩy ra ngoài khung 10h - 15h thì không tính là bữa trưa.
+        if (isFoodPlace) {
+          if (mins < 600 || mins > 900) {
+            return false;
+          }
+          return true;
+        }
+      } catch (e) {
+        // Ignore parse errors
+      }
+    }
+
+    return isFoodPlace;
+  }
+
+  private extractCategoryName(places: any): string | null {
+    if (!places) return null;
+    let result = '';
+    
+    if (places.categories?.name) {
+      result += places.categories.name + ' ';
+    }
+    
+    const typeData = places.types;
+    if (typeData) {
+      const catData = Array.isArray(typeData.categories) ? typeData.categories[0] : typeData.categories;
+      if (catData?.name) {
+        result += catData.name + ' ';
+      }
+      if (typeData.name) {
+        result += typeData.name + ' ';
+      }
+    }
+    
+    return result.trim() || null;
   }
   async optimizeDayRoute(
     activities: any[],
@@ -3164,7 +3314,7 @@ export class ItineraryService {
           );
 
           const dayEndStr = this.trimTime(dailyEndTime) || '22:00';
-          if (this.toMinutes(dayEndStr) > this.toMinutes(close_time)) {
+          if (this.toMinutes(close_time) > this.toMinutes(dayEndStr)) {
             close_time = dayEndStr;
           }
 
@@ -3180,7 +3330,7 @@ export class ItineraryService {
             close_time,
             estimated_cost: a.price ?? 0,
             category: a.category ?? null,
-            is_restaurant: this.isRestaurant(a.category),
+            is_restaurant: this.isRestaurant(a.category, a.lockedArriveTime || a.startTime),
             original_arrival_time: a.startTime ?? null,
             // Flutter đánh dấu activity mới bằng isNew: true → optimizer chèn vào vị trí tối ưu
             is_new: a.isNew ?? false,
