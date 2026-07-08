@@ -591,12 +591,23 @@ export class AdminReviewsService {
         userName = userData.full_name;
       }
 
-      // Count reviews by user
-      const { count: reviewCount = 0 } = await supabase
-        .schema('review_ai')
-        .from('reviews')
-        .select('id', { count: 'exact' })
-        .eq('tourist_id', review.tourist_id);
+      // Count reviews and violations by user
+      const [reviewCountResult, violationCountResult] = await Promise.all([
+        supabase
+          .schema('review_ai')
+          .from('reviews')
+          .select('id', { count: 'exact', head: true })
+          .eq('tourist_id', review.tourist_id),
+        supabase
+          .schema('review_ai')
+          .from('reviews')
+          .select('id', { count: 'exact', head: true })
+          .eq('tourist_id', review.tourist_id)
+          .eq('status', 'violation'),
+      ]);
+
+      if (reviewCountResult.error) throw reviewCountResult.error;
+      if (violationCountResult.error) throw violationCountResult.error;
 
       // Get review content (optional: not every review has row in review_contents)
       const { data: contentData } = (await supabase
@@ -615,8 +626,8 @@ export class AdminReviewsService {
         user: {
           id: review.tourist_id,
           name: userName,
-          review_count: reviewCount || 0,
-          report_count: 0,
+          review_count: reviewCountResult.count ?? 0,
+          report_count: violationCountResult.count ?? 0,
         },
         place: {
           id: review.place_id,
