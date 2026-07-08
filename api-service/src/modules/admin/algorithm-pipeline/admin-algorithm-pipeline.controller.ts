@@ -2,6 +2,7 @@ import { Body, Controller, Get, Patch, Post, Query } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { AdminAlgorithmPipelineService } from './admin-algorithm-pipeline.service';
 import {
+  PipelineHistoryQueryDto,
   PipelineRunRequestDto,
   UpdateReviewFilterScheduleDto,
 } from './dto/pipeline-run.dto';
@@ -21,9 +22,28 @@ export class AdminAlgorithmPipelineController {
 
   @Get('history')
   @ApiOperation({ summary: 'Lấy lịch sử các lần chạy pipeline' })
-  async getPipelineHistory(@Query('limit') limit?: string) {
-    const limitNum = limit ? parseInt(limit, 10) : 20;
-    return this.service.getPipelineHistory(limitNum);
+  async getPipelineHistory(
+    @Query('page') page?: string,
+    @Query('pageSize') pageSize?: string,
+    @Query('limit') limit?: string,
+    @Query('algorithm') algorithm?: string,
+    @Query('date') date?: string,
+  ) {
+    const parseOptionalNumber = (value?: string) => {
+      if (!value) {
+        return undefined;
+      }
+      const parsed = parseInt(value, 10);
+      return Number.isFinite(parsed) ? parsed : undefined;
+    };
+    const query: PipelineHistoryQueryDto = {
+      page: parseOptionalNumber(page),
+      pageSize: parseOptionalNumber(pageSize),
+      limit: parseOptionalNumber(limit),
+      algorithm,
+      date,
+    };
+    return this.service.getPipelineHistory(query);
   }
 
   @Get('review-filter/schedule')
