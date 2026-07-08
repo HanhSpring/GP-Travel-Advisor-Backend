@@ -33,6 +33,7 @@ interface PlaceRow {
   types:
     | {
         id: string;
+        name: string | null;
         category_id: string | null;
         categories:
           | { id: string; name: string }
@@ -41,6 +42,7 @@ interface PlaceRow {
       }
     | {
         id: string;
+        name: string | null;
         category_id: string | null;
         categories:
           | { id: string; name: string }
@@ -69,6 +71,8 @@ interface ReviewRow {
   tourist_id: string;
   rating: number;
   created_at: string;
+  provider: string | null;
+  status: string;
 }
 
 interface RatingRow {
@@ -84,6 +88,40 @@ interface UserRow {
 interface ReviewContentRow {
   review_id: string;
   content: string | null;
+  expiration_date: string | null;
+}
+
+interface FoodItemRow {
+  id: string;
+  name: string | null;
+  description: string | null;
+  price: number | string | null;
+  image_url: unknown;
+  category: string | null;
+  is_active: boolean | null;
+}
+
+interface PageInfo {
+  page: number;
+  limit: number;
+  total: number;
+  pages: number;
+}
+
+interface ReviewPageResult {
+  list: Array<{
+    id: string;
+    user_name: string;
+    rating: number;
+    content: string;
+    created_at: string;
+    provider: string | null;
+    status: string;
+    time_ago: string;
+  }>;
+  breakdown: Record<number, number>;
+  average: number;
+  total: number;
 }
 
 @Injectable()
@@ -98,6 +136,7 @@ export class PlacesService {
   private readonly emptyContents: Array<{
     review_id: string;
     content: string | null;
+    expiration_date: string | null;
   }> = [];
 
   constructor(private readonly recommendations: RecommendationsService) {}
@@ -135,40 +174,287 @@ export class PlacesService {
     return [];
   }
 
+  private extractTypeName(
+    typeData:
+      | {
+          name: string | null;
+          category_id: string | null;
+          categories:
+            | { id: string; name: string }
+            | { id: string; name: string }[]
+            | null;
+        }
+      | {
+          name: string | null;
+          category_id: string | null;
+          categories:
+            | { id: string; name: string }
+            | { id: string; name: string }[]
+            | null;
+        }[]
+      | null,
+  ): string | null {
+    if (!typeData) {
+      return null;
+    }
+
+    const type = Array.isArray(typeData) ? typeData[0] : typeData;
+    return type?.name ?? null;
+  }
+
+  private isHiddenReviewContent(content?: ReviewContentRow | undefined) {
+    if (!content?.expiration_date) {
+      return false;
+    }
+
+    return new Date(content.expiration_date).getTime() < Date.now();
+  }
+
+  private extractReviewContentText(content?: ReviewContentRow | undefined) {
+    return content?.content ?? '';
+  }
+
+  private formatReviewAge(createdAt: string): string {
+    const created = new Date(createdAt);
+    if (Number.isNaN(created.getTime())) {
+      return 'Vừa xong';
+    }
+
+    const diffDays = Math.floor(
+      (Date.now() - created.getTime()) / (1000 * 60 * 60 * 24),
+    );
+
+    if (diffDays <= 0) {
+      return 'Vừa xong';
+    }
+
+    if (diffDays < 30) {
+      return `${diffDays} ngày trước`;
+    }
+
+    if (diffDays < 365) {
+      return `${Math.max(1, Math.floor(diffDays / 30))} tháng trước`;
+    }
+
+    return `${Math.max(1, Math.floor(diffDays / 365))} năm trước`;
+  }
+
+  private getProviderLabel(provider?: string | null): string | null {
+    if (!provider) {
+      return null;
+    }
+
+    const normalized = provider.trim().toLowerCase();
+    if (normalized === 'foody') {
+      return 'Foody';
+    }
+    if (normalized === 'agoda') {
+      return 'Agoda';
+    }
+
+    return provider;
+  }
+
+  private createPagination(
+    page: number,
+    limit: number,
+    total: number,
+  ): PageInfo {
+    return {
+      page,
+      limit,
+      total,
+      pages: total > 0 ? Math.ceil(total / limit) : 0,
+    };
+  }
+
+  private mapFoodItem(item: FoodItemRow) {
+    return {
+      id: item.id,
+      name: item.name ?? '',
+      description: item.description ?? '',
+      price: Number(item.price) || 0,
+      image_url: this.resolveFoodImage(item.image_url, item.id),
+      category: item.category ?? null,
+    };
+  }
+
+  private resolveFoodImage(imageUrl?: unknown, seed?: string): string {
+    if (typeof imageUrl === 'string' && imageUrl.trim()) {
+      return imageUrl.trim();
+    }
+
+    if (Array.isArray(imageUrl)) {
+      const first = imageUrl.find(
+        (item): item is string =>
+          typeof item === 'string' && item.trim().length > 0,
+      );
+      if (first) {
+        return first.trim();
+      }
+    }
+
+    return `https://placehold.co/200x200?text=${encodeURIComponent(seed ?? 'Food')}`;
+  }
+
+  private async fetchPlaceReviews(
+    placeId: string,
+    touristId?: string,
+    ratingFilter?: number,
+  ) {
+    let reviewsQuery = supabase
+      .schema('review_ai')
+      .from('reviews')
+      .select('id, tourist_id, rating, created_at, provider, status')
+      .eq('place_id', placeId)
+      .order('created_at', { ascending: false });
+
+    if (touristId) {
+      reviewsQuery = reviewsQuery.or(
+        `status.eq.approved,and(tourist_id.eq.${touristId},status.eq.pending)`,
+      );
+    } else {
+      reviewsQuery = reviewsQuery.eq('status', 'approved');
+    }
+
+    const { data: reviews, error: reviewsError } = await reviewsQuery;
+    if (reviewsError) {
+      throw new InternalServerErrorException(reviewsError.message);
+    }
+
+    const typedReviews = (reviews ?? []) as ReviewRow[];
+    const reviewIds = typedReviews.map((item) => item.id);
+    const userIds = typedReviews.map((item) => item.tourist_id).filter(Boolean);
+
+    const [usersResult, contentsResult] = await Promise.all([
+      userIds.length
+        ? supabase
+            .schema('public')
+            .from('users')
+            .select('id, full_name')
+            .in('id', userIds)
+        : Promise.resolve({ data: this.emptyUsers, error: null }),
+      reviewIds.length
+        ? supabase
+            .schema('review_ai')
+            .from('review_contents')
+            .select('review_id, content, expiration_date')
+            .in('review_id', reviewIds)
+        : Promise.resolve({ data: this.emptyContents, error: null }),
+    ]);
+
+    if (usersResult.error) {
+      throw new InternalServerErrorException(usersResult.error.message);
+    }
+    if (contentsResult.error) {
+      throw new InternalServerErrorException(contentsResult.error.message);
+    }
+
+    const users = (usersResult.data ?? this.emptyUsers) as UserRow[];
+    const contents = (contentsResult.data ??
+      this.emptyContents) as ReviewContentRow[];
+    const contentMap = new Map(contents.map((item) => [item.review_id, item]));
+
+    const hiddenReviewIds = typedReviews
+      .filter((review) => this.isHiddenReviewContent(contentMap.get(review.id)))
+      .map((review) => review.id);
+
+    if (hiddenReviewIds.length > 0) {
+      const { error: hideReviewsError } = await supabase
+        .schema('review_ai')
+        .from('reviews')
+        .update({ status: 'hidden' })
+        .in('id', hiddenReviewIds);
+
+      if (hideReviewsError) {
+        throw new InternalServerErrorException(hideReviewsError.message);
+      }
+    }
+
+    const visibleReviews = typedReviews.filter((review) => {
+      const content = contentMap.get(review.id);
+      return !this.isHiddenReviewContent(content);
+    });
+
+    const breakdown: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
+    let ratingTotal = 0;
+
+    const list = visibleReviews.map((review) => {
+      const user = users.find((item) => item.id === review.tourist_id);
+      const content = contentMap.get(review.id);
+      const visibleContent = this.extractReviewContentText(content);
+      const normalizedRating = Math.min(
+        5,
+        Math.max(1, Math.round(Number(review.rating) || 0)),
+      );
+
+      breakdown[normalizedRating] += 1;
+      ratingTotal += Number(review.rating) || 0;
+
+      return {
+        id: review.id,
+        user_name: user?.full_name ?? 'Ẩn danh',
+        rating: Number(review.rating) || 0,
+        content: visibleContent,
+        created_at: review.created_at,
+        provider: review.provider,
+        status: review.status,
+        time_ago: this.formatReviewAge(review.created_at),
+      };
+    });
+    const filteredList =
+      ratingFilter && ratingFilter >= 1 && ratingFilter <= 5
+        ? list.filter(
+            (review) =>
+              Math.min(5, Math.max(1, Math.round(Number(review.rating) || 0))) ===
+              ratingFilter,
+          )
+        : list;
+
+    return {
+      list: filteredList,
+      breakdown,
+      average: visibleReviews.length > 0 ? ratingTotal / visibleReviews.length : 0,
+      total: filteredList.length,
+    } satisfies ReviewPageResult;
+  }
+
+  private async fetchPlaceFoodItems(placeId: string) {
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .from('food_items')
+      .select(
+        'id, name, description, price, place_id, image_url, category, is_active',
+      )
+      .eq('place_id', placeId)
+      .or('is_active.is.null,is_active.eq.true')
+      .order('name', { ascending: true });
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    return ((data ?? []) as FoodItemRow[]).map((item) =>
+      this.mapFoodItem(item),
+    );
+  }
+
   async getPlaceDetail(placeId: string, touristId?: string) {
     const numericUserId =
       touristId && /^\d+$/.test(touristId) ? Number(touristId) : null;
 
     // ── Group 1: fire all independent queries in parallel ────────────────────
-    const [
-      placeResult,
-      ratingRowsResult,
-      reviewsResult,
-      recommended,
-      isFavorite,
-    ] = await Promise.all([
+    const [placeResult, recommended, isFavorite] = await Promise.all([
       supabase
         .schema('travel')
         .from('places')
         .select(
-          '*, cities(name), type_id, types(id, category_id, categories(id, name))',
+          '*, cities(name), type_id, types(id, name, category_id, categories(id, name))',
         )
         .eq('id', placeId)
         .eq('is_approved', true)
         .eq('is_active', true)
         .maybeSingle<PlaceRow>(),
-      supabase
-        .schema('review_ai')
-        .from('reviews')
-        .select('rating')
-        .eq('place_id', placeId),
-      supabase
-        .schema('review_ai')
-        .from('reviews')
-        .select('id, tourist_id, rating, created_at')
-        .eq('place_id', placeId)
-        .order('created_at', { ascending: false })
-        .limit(10),
       this.recommendations.getRecommendedPlaceIds(placeId, {
         userId: numericUserId,
       }),
@@ -183,77 +469,13 @@ export class PlacesService {
     if (!placeResult.data) {
       throw new NotFoundException('Place not found');
     }
-    if (ratingRowsResult.error) {
-      throw new InternalServerErrorException(ratingRowsResult.error.message);
-    }
-    if (reviewsResult.error) {
-      throw new InternalServerErrorException(reviewsResult.error.message);
-    }
-
-    let ratingQuery = supabase
-      .schema('review_ai')
-      .from('reviews')
-      .select('rating')
-      .eq('place_id', placeId);
-
-    if (touristId) {
-      ratingQuery = ratingQuery.or(
-        `status.eq.approved,and(tourist_id.eq.${touristId},status.eq.pending)`,
-      );
-    } else {
-      ratingQuery = ratingQuery.eq('status', 'approved');
-    }
-
-    const { data: ratingRows, error: ratingRowsError } = await ratingQuery;
-
-    if (ratingRowsError) {
-      throw new InternalServerErrorException(ratingRowsError.message);
-    }
-
-    let reviewsQuery = supabase
-      .schema('review_ai')
-      .from('reviews')
-      .select('id, tourist_id, rating, created_at')
-      .eq('place_id', placeId)
-      .order('created_at', { ascending: false })
-      .limit(10);
-
-    if (touristId) {
-      reviewsQuery = reviewsQuery.or(
-        `status.eq.approved,and(tourist_id.eq.${touristId},status.eq.pending)`,
-      );
-    } else {
-      reviewsQuery = reviewsQuery.eq('status', 'approved');
-    }
-
-    const { data: reviews, error: reviewsError } = await reviewsQuery;
-
-    if (reviewsError) {
-      throw new InternalServerErrorException(reviewsError.message);
-    }
 
     const place = placeResult.data;
-    const typedReviews = (reviews ?? []) as ReviewRow[];
-    const userIds = typedReviews.map((item) => item.tourist_id).filter(Boolean);
-    const reviewIds = typedReviews.map((item) => item.id);
-
     // ── Group 2: queries that depend on group-1 results ──────────────────────
-    const [usersResult, contentsResult, vendorResult, relatedPlaces] =
+    const [reviewPage, foodItems, vendorResult, relatedPlaces] =
       await Promise.all([
-        userIds.length
-          ? supabase
-              .schema('public')
-              .from('users')
-              .select('id, full_name')
-              .in('id', userIds)
-          : Promise.resolve({ data: this.emptyUsers, error: null }),
-        reviewIds.length
-          ? supabase
-              .schema('review_ai')
-              .from('review_contents')
-              .select('review_id, content')
-              .in('review_id', reviewIds)
-          : Promise.resolve({ data: this.emptyContents, error: null }),
+        this.fetchPlaceReviews(placeId, touristId),
+        this.fetchPlaceFoodItems(placeId),
         place.vendor_id
           ? supabase
               .schema('public')
@@ -265,49 +487,16 @@ export class PlacesService {
         this.enrichRelatedPlaces(recommended, placeId, place.city_id),
       ]);
 
-    if (usersResult.error) {
-      throw new InternalServerErrorException(usersResult.error.message);
-    }
-    if (contentsResult.error) {
-      throw new InternalServerErrorException(contentsResult.error.message);
-    }
     if (vendorResult.error) {
       throw new InternalServerErrorException(vendorResult.error.message);
     }
 
-    const users = (usersResult.data ?? this.emptyUsers) as UserRow[];
-    const contents = (contentsResult.data ??
-      this.emptyContents) as ReviewContentRow[];
     const vendor = vendorResult.data;
 
-    const reviewList = typedReviews.map((review) => {
-      const user = users.find((item) => item.id === review.tourist_id);
-      const content = contents.find((item) => item.review_id === review.id);
-      return {
-        id: review.id,
-        user_name: user?.full_name ?? 'Ẩn danh',
-        rating: review.rating,
-        content: content?.content ?? '',
-        created_at: review.created_at,
-      };
-    });
-
-    const breakdown: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
-    ((ratingRows as RatingRow[] | null) ?? []).forEach((item) => {
-      if (item.rating >= 1 && item.rating <= 5) breakdown[item.rating] += 1;
-    });
-
-    // Extract category from type relationship
-    let categoryList: string[] = [];
-    const typeData = Array.isArray(place.types)
-      ? place.types?.[0]
-      : place.types;
-    if (typeData) {
-      const categoryData = Array.isArray(typeData.categories)
-        ? typeData.categories?.[0]
-        : typeData.categories;
-      if (categoryData?.name) categoryList = [categoryData.name];
-    }
+    const typeName = this.extractTypeName(place.types);
+    const visibleReviews = reviewPage.list;
+    const placeAverageRating = Number(place.average_rating) || 0;
+    const placeReviewCount = place.review_count || 0;
 
     const cityName = this.extractCityName(place.cities);
     const vibes = this.extractVibes(place.vibes);
@@ -318,11 +507,12 @@ export class PlacesService {
       address: place.address,
       city: cityName ?? '',
       district: this.extractDistrict(place.address ?? null),
-      rating: Number(place.average_rating) || 0,
-      review_count: place.review_count || 0,
+      rating: placeAverageRating,
+      review_count: placeReviewCount,
+      type_name: typeName,
       is_favorite: isFavorite,
       image_url: this.resolvePlaceImage(place.image_url),
-      categories: categoryList,
+      categories: typeName ? [typeName] : [],
       vibes,
       images: this.buildGallery(place.image_url),
       description: place.description,
@@ -331,15 +521,91 @@ export class PlacesService {
       open_hour_compressed: place.open_hour_compressed,
       is_open_now: this.isOpenNowFromCompressed(place.open_hour_compressed),
       phone: vendor?.phone_number ?? null,
+      food_items: foodItems.slice(0, 5),
       reviews: {
-        average: Number(place.average_rating) || 0,
-        total: place.review_count || 0,
-        breakdown,
-        list: reviewList,
+        average: placeAverageRating,
+        total: placeReviewCount,
+        breakdown: reviewPage.breakdown,
+        list: visibleReviews.slice(0, 3),
       },
       latitude: place.latitude,
       longitude: place.longitude,
       related_places: relatedPlaces,
+    };
+  }
+
+  async getPlaceFoodItems(placeId: string, page = 1, limit = 10) {
+    const { data: place, error: placeError } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, name, average_rating, review_count')
+      .eq('id', placeId)
+      .maybeSingle<{
+        id: string;
+        name: string;
+        average_rating: number;
+        review_count: number;
+      }>();
+
+    if (placeError) {
+      throw new InternalServerErrorException(placeError.message);
+    }
+    if (!place) {
+      throw new NotFoundException('Place not found');
+    }
+
+    const allItems = await this.fetchPlaceFoodItems(placeId);
+    const total = allItems.length;
+    const offset = Math.max(0, (page - 1) * limit);
+    const items = allItems.slice(offset, offset + limit);
+
+    return {
+      place,
+      items,
+      pagination: this.createPagination(page, limit, total),
+    };
+  }
+
+  async getPlaceReviews(
+    placeId: string,
+    touristId?: string,
+    page = 1,
+    limit = 10,
+    rating?: number,
+  ) {
+    const { data: place, error: placeError } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, name, average_rating, review_count')
+      .eq('id', placeId)
+      .maybeSingle<{
+        id: string;
+        name: string;
+        average_rating: number;
+        review_count: number;
+      }>();
+
+    if (placeError) {
+      throw new InternalServerErrorException(placeError.message);
+    }
+    if (!place) {
+      throw new NotFoundException('Place not found');
+    }
+
+    const reviewPage = await this.fetchPlaceReviews(placeId, touristId, rating);
+    const total = reviewPage.total;
+    const offset = Math.max(0, (page - 1) * limit);
+    const list = reviewPage.list.slice(offset, offset + limit);
+
+    return {
+      place,
+      reviews: {
+        average: Number(place.average_rating) || 0,
+        total: place.review_count || 0,
+        breakdown: reviewPage.breakdown,
+        list,
+        pagination: this.createPagination(page, limit, total),
+      },
     };
   }
 
@@ -371,7 +637,7 @@ export class PlacesService {
         .schema('travel')
         .from('places')
         .select(
-          'id, name, city_id, cities(name), average_rating, review_count, image_url, vibes, type_id, types(id, category_id, categories(id, name))',
+          'id, name, city_id, cities(name), average_rating, review_count, image_url, vibes, type_id, types(id, name, category_id, categories(id, name))',
         )
         .eq('is_approved', true)
         .eq('is_active', true)
@@ -400,7 +666,7 @@ export class PlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, city_id, cities(name), average_rating, review_count, image_url, vibes, type_id, types(id, category_id, categories(id, name))',
+        'id, name, city_id, cities(name), average_rating, review_count, image_url, vibes, type_id, types(id, name, category_id, categories(id, name))',
       )
       .eq('is_approved', true)
       .eq('is_active', true)

@@ -4,6 +4,31 @@ import { createClient } from '@supabase/supabase-js';
 import { ModerationService } from './moderation.service';
 import { NotificationsService } from '../tourist/notifications/notifications.service';
 
+export interface ReviewSubmittedPayload {
+  reviewIds?: string[];
+  itineraryReviewId?: string;
+}
+
+const CATEGORY_LABELS_VI: Record<string, string> = {
+  sexual: 'Nội dung khiêu dâm',
+  'sexual/minors': 'Nội dung khiêu dâm liên quan trẻ em',
+  harassment: 'Quấy rối',
+  'harassment/threatening': 'Quấy rối kèm đe dọa',
+  hate: 'Thù ghét / phân biệt',
+  'hate/threatening': 'Thù ghét kèm đe dọa',
+  illicit: 'Nội dung phi pháp',
+  'illicit/violent': 'Nội dung phi pháp kèm bạo lực',
+  'self-harm': 'Tự gây hại',
+  'self-harm/intent': 'Ý định tự gây hại',
+  'self-harm/instructions': 'Hướng dẫn tự gây hại',
+  violence: 'Bạo lực',
+  'violence/graphic': 'Bạo lực, hình ảnh phản cảm',
+};
+
+function translateCategories(categories: string[]): string[] {
+  return categories.map((c) => CATEGORY_LABELS_VI[c] ?? c);
+}
+
 @Injectable()
 export class ReviewModerationCronService {
   private readonly logger = new Logger(ReviewModerationCronService.name);
@@ -44,80 +69,97 @@ export class ReviewModerationCronService {
       return;
     }
 
-    for (const review of pendingReviews) {
-      try {
-        const content = review.content || '';
-        const url_image = review.url_image || [];
+    // Process reviews in parallel (bounded concurrency) instead of one at a
+    // time — a burst of reviews submitted together no longer serializes
+    // through OpenAI one-by-one.
+    const CONCURRENCY = 5;
+    for (let i = 0; i < pendingReviews.length; i += CONCURRENCY) {
+      const chunk = pendingReviews.slice(i, i + CONCURRENCY);
+      await Promise.all(
+        chunk.map((review) => this.moderateSingleReview(tableName, review)),
+      );
+    }
+  }
 
-        let finalStatus = 'approved';
-        let violationReason = '';
+  private async moderateSingleReview(
+    tableName: 'reviews' | 'itinerary_reviews',
+    review: any,
+  ) {
+    try {
+      const content =
+        review.overall_content || review.content || review.comment || '';
 
-        // 1. Check Text
-        if (content) {
-          const textResult = await this.moderationService.moderateReview(
-            content,
-            [],
-          );
-          if (textResult.status === 'violation') {
-            finalStatus = 'violation';
-            violationReason = `Nội dung văn bản: ${textResult.violations.join(', ')}`;
-          }
+      const url_image = review.url_image || [];
+
+      // Single combined call checks text + media together (one OpenAI round-trip)
+      const result = await this.moderationService.moderateReview(
+        content || null,
+        url_image,
+      );
+
+      const finalStatus = result.status;
+      let violationReason = '';
+      if (finalStatus === 'violation') {
+        if (result.textViolations.length > 0) {
+          violationReason = `Nội dung văn bản: ${result.textViolations.join(', ')}`;
+        } else {
+          violationReason = `Hình ảnh/Video vi phạm tiêu chuẩn cộng đồng`;
         }
-
-        // 2. Check Media if text is fine
-        if (finalStatus === 'approved' && url_image.length > 0) {
-          const mediaResult = await this.moderationService.moderateReview(
-            null,
-            url_image,
-          );
-          if (mediaResult.status === 'violation') {
-            finalStatus = 'violation';
-            violationReason = `Hình ảnh/Video vi phạm tiêu chuẩn cộng đồng`;
-          }
-        }
-
-        // 3. Update Status
-        const updatePayload: any = { status: finalStatus };
-        if (finalStatus === 'violation') {
-          updatePayload.violation_reason = violationReason;
-        }
-
-        const { error: updateError } = await this.supabase
-          .schema('review_ai')
-          .from(tableName)
-          .update(updatePayload)
-          .eq('id', review.id);
-
-        if (updateError) {
-          this.logger.error(
-            `Error updating ${tableName} ID ${review.id}:`,
-            updateError,
-          );
-          continue;
-        }
-
-        // 4. Send Notification if violated
-        if (finalStatus === 'violation' && review.tourist_id) {
-          let notifContent = `Đánh giá của bạn vi phạm tiêu chuẩn cộng đồng`;
-          if (violationReason.includes('Nội dung văn bản')) {
-            // "trích xuất nội dung vi phạm" -> give a short snippet of their text
-            const snippet =
-              content.length > 50 ? content.substring(0, 50) + '...' : content;
-            notifContent = `Đánh giá của bạn vi phạm tiêu chuẩn cộng đồng: "${snippet}"`;
-          } else {
-            notifContent = `Hình ảnh/Video trong đánh giá của bạn vi phạm tiêu chuẩn cộng đồng`;
-          }
-
-          await this.notificationsService.sendNotification(
-            review.tourist_id,
-            'Đánh giá bị từ chối',
-            notifContent,
-            'system',
-          );
-        }
-      } catch (err) {
-        this.logger.error(`Error processing review ID ${review.id}:`, err);
       }
+
+      // Update Status
+      const updatePayload: any = { status: finalStatus };
+      if (finalStatus === 'violation') {
+        updatePayload.violation_reason = violationReason;
+      }
+
+      const { error: updateError } = await this.supabase
+        .schema('review_ai')
+        .from(tableName)
+        .update(updatePayload)
+        .eq('id', review.id);
+
+      if (updateError) {
+        this.logger.error(
+          `Error updating ${tableName} ID ${review.id}:`,
+          updateError,
+        );
+        return;
+      }
+
+      // Send Notification if violated
+      if (finalStatus === 'violation' && review.tourist_id) {
+        let notifContent = `Đánh giá của bạn vi phạm tiêu chuẩn cộng đồng`;
+        let metadata: Record<string, unknown> | undefined;
+
+        if (violationReason.includes('Nội dung văn bản')) {
+          notifContent = `Đánh giá của bạn vi phạm tiêu chuẩn cộng đồng: "${content}"`;
+        } else {
+          notifContent = `Hình ảnh/Video trong đánh giá của bạn vi phạm tiêu chuẩn cộng đồng`;
+        }
+
+        // Attach the specific violating image(s)/video(s) + category so the
+        // notification detail view can show/highlight them.
+        if (result.mediaViolationDetails.length > 0) {
+          metadata = {
+            violation_media: result.mediaViolationDetails.map((v) => ({
+              url: v.url,
+              media_type: v.mediaType,
+              categories: translateCategories(v.categories),
+            })),
+          };
+        }
+
+        await this.notificationsService.sendNotification(
+          review.tourist_id,
+          'Đánh giá bị từ chối',
+          notifContent,
+          'system',
+          metadata,
+        );
+      }
+    } catch (err) {
+      this.logger.error(`Error processing review ID ${review.id}:`, err);
     }
   }
 }

@@ -14,7 +14,7 @@ interface ReviewRow {
   rating: number;
   created_at: string;
   review_type: string;
-  status: 'pending' | 'approved' | 'violation';
+  status: 'pending' | 'approved' | 'violation' | 'hidden';
   violation_reason?: string | null;
 }
 
@@ -32,7 +32,11 @@ interface ReviewContentData {
   main_topic: string | null;
   processing_status?: string | null;
   time_label?: string | null;
+  expiration_date?: string | null;
 }
+
+type ReviewStatus = 'pending' | 'approved' | 'violation' | 'hidden';
+type ReviewTimeLabel = 'short-term' | 'long-term';
 
 type ReviewSort = 'newest' | 'oldest' | 'highest_rating' | 'lowest_rating';
 type ReviewClassification =
@@ -46,6 +50,11 @@ type ReviewDateSent =
   | 'yesterday'
   | 'last_7_days'
   | 'last_30_days';
+
+interface SearchScopeIds {
+  touristIds: string[];
+  placeIds: string[];
+}
 
 @Injectable()
 export class AdminReviewsService {
@@ -89,13 +98,80 @@ export class AdminReviewsService {
     return null;
   }
 
+  private formatPostgrestIn(values: string[]): string {
+    return `(${values.map((value) => `"${value.replace(/"/g, '\\"')}"`).join(',')})`;
+  }
+
+  private async getLocationSearchScopeIds(
+    search?: string,
+  ): Promise<SearchScopeIds | null> {
+    const normalizedSearch = this.normalizeForSearch(search);
+    const rawSearch = search?.trim();
+
+    if (!normalizedSearch || !rawSearch) {
+      return null;
+    }
+
+    const searchPattern = `%${rawSearch}%`;
+    const [usersRes, placesRes] = await Promise.all([
+      supabase
+        .schema('public')
+        .from('users')
+        .select('id, full_name')
+        .ilike('full_name', searchPattern),
+      supabase
+        .schema('travel')
+        .from('places')
+        .select('id, name')
+        .ilike('name', searchPattern),
+    ]);
+
+    if (usersRes.error) throw usersRes.error;
+    if (placesRes.error) throw placesRes.error;
+
+    const touristIds = (usersRes.data ?? [])
+      .filter((item) =>
+        this.normalizeForSearch((item as { full_name?: string | null }).full_name).includes(
+          normalizedSearch,
+        ),
+      )
+      .map((item) => (item as { id: string }).id)
+      .filter(Boolean);
+
+    const placeIds = (placesRes.data ?? [])
+      .filter((item) =>
+        this.normalizeForSearch((item as { name?: string | null }).name).includes(
+          normalizedSearch,
+        ),
+      )
+      .map((item) => (item as { id: string }).id)
+      .filter(Boolean);
+
+    if (touristIds.length === 0 && placeIds.length === 0) {
+      return {
+        touristIds,
+        placeIds,
+      };
+    }
+
+    return {
+      touristIds,
+      placeIds,
+    };
+  }
+
   private async getSummaryStats(): Promise<{
     total_reviews: number;
     pending_count: number;
     approved_count: number;
     violation_count: number;
   }> {
-    const [pendingRes, approvedRes, violationRes] = await Promise.all([
+    const [totalRes, pendingRes, approvedRes, violationRes] = await Promise.all([
+      supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('*', { count: 'exact', head: true })
+        .in('status', ['pending', 'approved', 'violation', 'hidden']),
       supabase
         .schema('review_ai')
         .from('reviews')
@@ -118,7 +194,7 @@ export class AdminReviewsService {
     const violation = violationRes.count ?? 0;
 
     return {
-      total_reviews: pending + approved + violation,
+      total_reviews: totalRes.count ?? pending + approved + violation,
       pending_count: pending,
       approved_count: approved,
       violation_count: violation,
@@ -193,6 +269,20 @@ export class AdminReviewsService {
         }
       }
 
+      const searchScope = await this.getLocationSearchScopeIds(search);
+
+      if (
+        searchScope &&
+        searchScope.touristIds.length === 0 &&
+        searchScope.placeIds.length === 0
+      ) {
+        return {
+          data: [],
+          pagination: { total: 0, page, limit, total_pages: 0 },
+          summary: await summaryPromise,
+        };
+      }
+
       // Build main paginated query
       let query = supabase
         .schema('review_ai')
@@ -202,7 +292,10 @@ export class AdminReviewsService {
           { count: 'exact' },
         );
 
-      if (status && ['pending', 'approved', 'violation'].includes(status)) {
+      if (
+        status &&
+        ['pending', 'approved', 'violation', 'hidden'].includes(status)
+      ) {
         query = query.eq('status', status);
       }
 
@@ -274,6 +367,21 @@ export class AdminReviewsService {
         query = query.in('id', classificationReviewIds);
       }
 
+      if (searchScope) {
+        const searchFilters: string[] = [];
+        if (searchScope.touristIds.length > 0) {
+          searchFilters.push(
+            `tourist_id.in.${this.formatPostgrestIn(searchScope.touristIds)}`,
+          );
+        }
+        if (searchScope.placeIds.length > 0) {
+          searchFilters.push(
+            `place_id.in.${this.formatPostgrestIn(searchScope.placeIds)}`,
+          );
+        }
+        query = query.or(searchFilters.join(','));
+      }
+
       switch (sort) {
         case 'highest_rating':
           query = query.order('rating', { ascending: false });
@@ -289,12 +397,7 @@ export class AdminReviewsService {
           query = query.order('created_at', { ascending: false });
       }
 
-      const normalizedSearch = this.normalizeForSearch(search);
-      const usesClientSearch = Boolean(normalizedSearch);
-
-      if (!usesClientSearch) {
-        query = query.range(offset, offset + limit - 1);
-      }
+      query = query.range(offset, offset + limit - 1);
 
       // Wave 1: main query + summary in parallel
       const [{ data, error, count }, summary] = await Promise.all([
@@ -346,6 +449,11 @@ export class AdminReviewsService {
             .select('review_id, main_topic, content, time_label')
             .in('review_id', reviewIds),
         ]);
+
+      if (placesRes.error) throw placesRes.error;
+      if (usersRes.error) throw usersRes.error;
+      if (touristReviewsRes.error) throw touristReviewsRes.error;
+      if (contentsRes.error) throw contentsRes.error;
 
       // Build O(1) lookup maps
       const placeMap = new Map<string, { name: string; address: string }>();
@@ -411,6 +519,7 @@ export class AdminReviewsService {
           place_name: place?.name || 'Unknown Place',
           place_address: place?.address || '',
           rating: review.rating,
+          review_type: review.review_type,
           review_content: content?.content ?? null,
           main_topic: content?.main_topic ?? null,
           time_label: content?.time_label ?? null,
@@ -420,31 +529,13 @@ export class AdminReviewsService {
         };
       });
 
-      const filteredReviews = usesClientSearch
-        ? reviewsList.filter((review) => {
-            const searchableText = [
-              review.reviewer_name,
-              review.place_name,
-              review.review_content,
-            ]
-              .map((item) => this.normalizeForSearch(item))
-              .join(' ');
-            return searchableText.includes(normalizedSearch);
-          })
-        : reviewsList;
-
-      const total = usesClientSearch ? filteredReviews.length : (count ?? 0);
-      const pagedReviews = usesClientSearch
-        ? filteredReviews.slice(offset, offset + limit)
-        : filteredReviews;
-
       return {
-        data: pagedReviews,
+        data: reviewsList,
         pagination: {
-          total,
+          total: count ?? 0,
           page,
           limit,
-          total_pages: Math.ceil(total / limit),
+          total_pages: Math.ceil((count ?? 0) / limit),
         },
         summary,
       };
@@ -463,7 +554,7 @@ export class AdminReviewsService {
         .schema('review_ai')
         .from('reviews')
         .select(
-          'id, tourist_id, place_id, rating, created_at, status, violation_reason',
+          'id, tourist_id, place_id, rating, created_at, review_type, status, violation_reason',
         )
         .eq('id', reviewId)
         .single();
@@ -500,12 +591,23 @@ export class AdminReviewsService {
         userName = userData.full_name;
       }
 
-      // Count reviews by user
-      const { count: reviewCount = 0 } = await supabase
-        .schema('review_ai')
-        .from('reviews')
-        .select('id', { count: 'exact' })
-        .eq('tourist_id', review.tourist_id);
+      // Count reviews and violations by user
+      const [reviewCountResult, violationCountResult] = await Promise.all([
+        supabase
+          .schema('review_ai')
+          .from('reviews')
+          .select('id', { count: 'exact', head: true })
+          .eq('tourist_id', review.tourist_id),
+        supabase
+          .schema('review_ai')
+          .from('reviews')
+          .select('id', { count: 'exact', head: true })
+          .eq('tourist_id', review.tourist_id)
+          .eq('status', 'violation'),
+      ]);
+
+      if (reviewCountResult.error) throw reviewCountResult.error;
+      if (violationCountResult.error) throw violationCountResult.error;
 
       // Get review content (optional: not every review has row in review_contents)
       const { data: contentData } = (await supabase
@@ -524,8 +626,8 @@ export class AdminReviewsService {
         user: {
           id: review.tourist_id,
           name: userName,
-          review_count: reviewCount || 0,
-          report_count: 0,
+          review_count: reviewCountResult.count ?? 0,
+          report_count: violationCountResult.count ?? 0,
         },
         place: {
           id: review.place_id,
@@ -533,6 +635,7 @@ export class AdminReviewsService {
           address: placeAddress,
         },
         rating: review.rating,
+        review_type: review.review_type,
         main_topic: mainTopic,
         time_label: timeLabel,
         review_content: reviewContent,
@@ -579,6 +682,143 @@ export class AdminReviewsService {
     } catch (error) {
       console.error('Error updating review status:', error);
       throw new InternalServerErrorException('Failed to update review status');
+    }
+  }
+
+  private async getTtlHours(mainTopic: string): Promise<number> {
+    const { data: algorithm, error: algorithmError } = await supabase
+      .schema('ai_config')
+      .from('algorithms')
+      .select('id')
+      .eq('name', 'review_filter')
+      .maybeSingle();
+
+    if (algorithmError) throw algorithmError;
+    if (!algorithm?.id) {
+      throw new BadRequestException('Review filter algorithm is not configured');
+    }
+
+    const { data: parameter, error: parameterError } = await supabase
+      .schema('ai_config')
+      .from('algorithm_parameters')
+      .select('current_value')
+      .eq('algorithm_id', algorithm.id)
+      .eq('parameter_name', `ttl_hours.${mainTopic}`)
+      .maybeSingle();
+
+    if (parameterError) throw parameterError;
+
+    const ttlHours = Number(parameter?.current_value);
+    if (!Number.isFinite(ttlHours) || ttlHours <= 0) {
+      throw new BadRequestException(`TTL is not configured for topic ${mainTopic}`);
+    }
+
+    return ttlHours;
+  }
+
+  async updateReviewTimeLabel(
+    reviewId: string,
+    timeLabel: ReviewTimeLabel,
+  ): Promise<{ success: boolean; message: string; status?: ReviewStatus }> {
+    if (!reviewId) throw new BadRequestException('Review ID is required');
+
+    try {
+      const { data: review, error: reviewError } = await supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('id, created_at, review_type, status')
+        .eq('id', reviewId)
+        .single();
+
+      if (reviewError) throw reviewError;
+      if (!review) throw new BadRequestException('Review not found');
+      if ((review as ReviewRow).review_type !== 'with_content') {
+        throw new BadRequestException(
+          'Only reviews with content can be classified',
+        );
+      }
+
+      const { data: content, error: contentError } = await supabase
+        .schema('review_ai')
+        .from('review_contents')
+        .select('main_topic, expiration_date')
+        .eq('review_id', reviewId)
+        .maybeSingle();
+
+      if (contentError) throw contentError;
+      if (!content) throw new BadRequestException('Review content not found');
+
+      const contentRow = content as ReviewContentData;
+      if (!contentRow.main_topic) {
+        throw new BadRequestException('Review main topic is required');
+      }
+
+      if (timeLabel === 'short-term') {
+        const ttlHours = await this.getTtlHours(contentRow.main_topic);
+        const createdAt = new Date((review as ReviewRow).created_at);
+        if (Number.isNaN(createdAt.getTime())) {
+          throw new BadRequestException('Review created_at is invalid');
+        }
+        const expirationDate = new Date(
+          createdAt.getTime() + ttlHours * 60 * 60 * 1000,
+        ).toISOString();
+
+        const { error: updateContentError } = await supabase
+          .schema('review_ai')
+          .from('review_contents')
+          .update({
+            time_label: 'short-term',
+            expiration_date: expirationDate,
+          })
+          .eq('review_id', reviewId);
+
+        if (updateContentError) throw updateContentError;
+
+        return {
+          success: true,
+          message: 'Review time label updated successfully',
+          status: (review as ReviewRow).status,
+        };
+      }
+
+      const shouldApprove =
+        contentRow.expiration_date &&
+        new Date(contentRow.expiration_date).getTime() <= Date.now();
+
+      const { error: updateContentError } = await supabase
+        .schema('review_ai')
+        .from('review_contents')
+        .update({
+          time_label: 'long-term',
+          expiration_date: null,
+        })
+        .eq('review_id', reviewId);
+
+      if (updateContentError) throw updateContentError;
+
+      if (shouldApprove) {
+        const { error: updateReviewError } = await supabase
+          .schema('review_ai')
+          .from('reviews')
+          .update({ status: 'approved' })
+          .eq('id', reviewId);
+
+        if (updateReviewError) throw updateReviewError;
+      }
+
+      return {
+        success: true,
+        message: 'Review time label updated successfully',
+        status: shouldApprove ? 'approved' : (review as ReviewRow).status,
+      };
+    } catch (error) {
+      if (error instanceof BadRequestException) {
+        throw error;
+      }
+      console.error('Error updating review time label:', error);
+      throw new InternalServerErrorException(
+        'Failed to update review time label',
+      );
     }
   }
 }

@@ -15,6 +15,93 @@ export class ReviewItemDto {
 
   @ApiProperty()
   created_at: string;
+
+  @ApiProperty({ required: false, nullable: true })
+  provider?: string | null;
+
+  @ApiProperty()
+  status: string;
+
+  @ApiProperty({ required: false, nullable: true })
+  time_ago?: string | null;
+}
+
+export class PlaceFoodItemDto {
+  @ApiProperty()
+  id: string;
+
+  @ApiProperty()
+  name: string;
+
+  @ApiProperty({ required: false, nullable: true })
+  description?: string | null;
+
+  @ApiProperty()
+  price: number;
+
+  @ApiProperty({ required: false, nullable: true })
+  image_url?: string | null;
+
+  @ApiProperty({ required: false, nullable: true })
+  category?: string | null;
+}
+
+export class PaginationDto {
+  @ApiProperty()
+  page: number;
+
+  @ApiProperty()
+  limit: number;
+
+  @ApiProperty()
+  total: number;
+
+  @ApiProperty()
+  pages: number;
+}
+
+export class PlaceReviewListDto {
+  @ApiProperty()
+  average: number;
+
+  @ApiProperty()
+  total: number;
+
+  @ApiProperty({ type: Object })
+  breakdown: Record<number, number>;
+
+  @ApiProperty({ type: [ReviewItemDto] })
+  list: ReviewItemDto[];
+
+  @ApiProperty({ required: false, nullable: true, type: PaginationDto })
+  pagination?: PaginationDto;
+}
+
+export class PlaceSummaryDto {
+  @ApiProperty()
+  id: string;
+
+  @ApiProperty()
+  name: string;
+}
+
+export class PlaceFoodItemsResponseDto {
+  @ApiProperty({ type: PlaceSummaryDto })
+  place: PlaceSummaryDto;
+
+  @ApiProperty({ type: [PlaceFoodItemDto] })
+  items: PlaceFoodItemDto[];
+
+  @ApiProperty({ type: PaginationDto })
+  pagination: PaginationDto;
+}
+
+export class PlaceReviewsResponseDto {
+  @ApiProperty({ type: PlaceSummaryDto })
+  place: PlaceSummaryDto;
+
+  @ApiProperty({ type: PlaceReviewListDto })
+  reviews: PlaceReviewListDto;
 }
 
 export class RelatedPlaceDto {
@@ -62,6 +149,9 @@ export class PlaceDetailResponseDto {
   @ApiProperty()
   review_count: number;
 
+  @ApiProperty({ required: false, nullable: true })
+  type_name?: string | null;
+
   @ApiProperty()
   is_favorite: boolean;
 
@@ -95,13 +185,11 @@ export class PlaceDetailResponseDto {
   @ApiProperty({ required: false, nullable: true })
   phone?: string | null;
 
+  @ApiProperty({ type: [PlaceFoodItemDto] })
+  food_items: PlaceFoodItemDto[];
+
   @ApiProperty()
-  reviews: {
-    average: number;
-    total: number;
-    breakdown: Record<number, number>;
-    list: ReviewItemDto[];
-  };
+  reviews: PlaceReviewListDto;
 
   @ApiProperty({ type: [RelatedPlaceDto] })
   related_places: RelatedPlaceDto[];

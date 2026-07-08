@@ -43,6 +43,9 @@ export class AdminReviewDetailDto {
   @ApiProperty()
   rating: number;
 
+  @ApiProperty()
+  review_type: string;
+
   @ApiProperty({ nullable: true, type: String })
   main_topic: string | null;
 
@@ -55,8 +58,8 @@ export class AdminReviewDetailDto {
   @ApiProperty({ type: [AdminReviewImageDto] })
   images: AdminReviewImageDto[];
 
-  @ApiProperty({ enum: ['pending', 'approved', 'violation'] })
-  status: 'pending' | 'approved' | 'violation';
+  @ApiProperty({ enum: ['pending', 'approved', 'violation', 'hidden'] })
+  status: 'pending' | 'approved' | 'violation' | 'hidden';
 
   @ApiProperty({ nullable: true, type: String })
   violation_reason: string | null;

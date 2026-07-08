@@ -28,6 +28,9 @@ export class AdminReviewListItemDto {
   @ApiProperty()
   rating: number;
 
+  @ApiProperty()
+  review_type: string;
+
   @ApiProperty({ nullable: true, type: String })
   review_content: string | null;
 
@@ -37,8 +40,8 @@ export class AdminReviewListItemDto {
   @ApiProperty({ nullable: true, type: String })
   time_label: string | null;
 
-  @ApiProperty({ enum: ['pending', 'approved', 'violation'] })
-  status: 'pending' | 'approved' | 'violation';
+  @ApiProperty({ enum: ['pending', 'approved', 'violation', 'hidden'] })
+  status: 'pending' | 'approved' | 'violation' | 'hidden';
 
   @ApiProperty()
   created_at: string;

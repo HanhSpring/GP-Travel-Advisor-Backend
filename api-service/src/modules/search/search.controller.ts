@@ -59,7 +59,8 @@ export class SearchController {
     @Query('radius') radius?: number,
     @Query('q') q?: string,
   ) {
-    const ids = excludeIds ? excludeIds.split(',').filter(Boolean) : [];
+    const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    const ids = excludeIds ? excludeIds.split(',').filter(id => Boolean(id) && uuidRegex.test(id)) : [];
     return this.service.getNearbyPlaces(
       Number(lat),
       Number(lng),

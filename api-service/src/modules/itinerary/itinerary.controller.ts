@@ -609,8 +609,8 @@ export class ItineraryController {
   @ApiOperation({
     summary: 'Lấy danh sách gợi ý địa điểm thay thế',
     description:
-      'Trả về tối đa 8 địa điểm cùng danh mục, cùng thành phố, ' +
-      'chưa có trong lịch trình, sắp xếp theo điểm đánh giá.',
+      'Trả về tối đa 10 địa điểm cùng danh mục, cùng thành phố, ' +
+      'chưa có trong lịch trình, sắp xếp theo khoảng cách.',
   })
   @ApiParam({ name: 'itineraryId', description: 'ID lịch trình' })
   @ApiParam({

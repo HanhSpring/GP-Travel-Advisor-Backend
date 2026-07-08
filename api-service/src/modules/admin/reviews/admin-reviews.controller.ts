@@ -12,6 +12,7 @@ import { AdminReviewsService } from './admin-reviews.service';
 import { AdminReviewListResponseDto } from './dto/admin-review-list.dto';
 import { AdminReviewDetailDto } from './dto/admin-review-detail.dto';
 import { AdminReviewActionDto } from './dto/admin-review-action.dto';
+import { AdminReviewTimeLabelDto } from './dto/admin-review-time-label.dto';
 
 @ApiTags('Admin - Reviews')
 @Controller('admin/reviews')
@@ -31,7 +32,7 @@ export class AdminReviewsController {
   @ApiQuery({
     name: 'status',
     required: false,
-    enum: ['pending', 'approved', 'violation'],
+    enum: ['pending', 'approved', 'violation', 'hidden'],
   })
   @ApiQuery({
     name: 'sort',
@@ -153,5 +154,18 @@ export class AdminReviewsController {
     @Body() dto: AdminReviewActionDto,
   ) {
     return this.service.updateReviewStatus(id, dto.status, dto.reason);
+  }
+
+  @Put(':id/time-label')
+  @ApiOperation({ summary: 'Update review content time label' })
+  @ApiResponse({
+    status: 200,
+    description: 'Review time label updated successfully',
+  })
+  async updateReviewTimeLabel(
+    @Param('id') id: string,
+    @Body() dto: AdminReviewTimeLabelDto,
+  ) {
+    return this.service.updateReviewTimeLabel(id, dto.time_label);
   }
 }
