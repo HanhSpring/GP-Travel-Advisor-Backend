@@ -97,6 +97,17 @@ export interface PipelineHistoryItemDto {
 export interface PipelineHistoryResponseDto {
   history: PipelineHistoryItemDto[];
   total: number;
+  page: number;
+  pageSize: number;
+  totalPages: number;
+}
+
+export interface PipelineHistoryQueryDto {
+  page?: number;
+  pageSize?: number;
+  limit?: number;
+  algorithm?: string;
+  date?: string;
 }
 
 export type ReviewFilterScheduleFrequency = 'daily' | 'weekly' | 'monthly';

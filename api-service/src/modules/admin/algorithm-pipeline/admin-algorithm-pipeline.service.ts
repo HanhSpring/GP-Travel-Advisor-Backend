@@ -7,6 +7,7 @@ import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
 import { supabase } from '../../../config/supabase';
 import {
+  PipelineHistoryQueryDto,
   PipelineHistoryItemDto,
   PipelineHistoryResponseDto,
   PipelineRunRequestDto,
@@ -98,17 +99,55 @@ export class AdminAlgorithmPipelineService {
     }
   }
 
-  async getPipelineHistory(limit = 20): Promise<PipelineHistoryResponseDto> {
-    const safeLimit = Math.min(Math.max(limit || 20, 1), 100);
+  async getPipelineHistory(
+    query: PipelineHistoryQueryDto | number = {},
+  ): Promise<PipelineHistoryResponseDto> {
+    const normalizedQuery =
+      typeof query === 'number' ? { limit: query } : query;
+    const safePageSize = Math.min(
+      Math.max(normalizedQuery.pageSize ?? normalizedQuery.limit ?? 10, 1),
+      100,
+    );
+    const safePage = Math.max(normalizedQuery.page ?? 1, 1);
+    const from = (safePage - 1) * safePageSize;
+    const to = from + safePageSize - 1;
     try {
-      const { data, error, count } = await supabase
+      let algorithmId: string | null | undefined;
+      if (normalizedQuery.algorithm) {
+        algorithmId = await this.findAlgorithmIdByName(
+          normalizedQuery.algorithm,
+        );
+        if (algorithmId === '') {
+          return {
+            history: [],
+            total: 0,
+            page: safePage,
+            pageSize: safePageSize,
+            totalPages: 0,
+          };
+        }
+      }
+
+      let request = supabase
         .schema('ai_config')
         .from('algorithm_logs')
         .select('id,algorithm_id,status,action,details,created_at', {
           count: 'exact',
         })
-        .order('created_at', { ascending: false })
-        .limit(safeLimit);
+        .order('created_at', { ascending: false });
+
+      if (algorithmId) {
+        request = request.eq('algorithm_id', algorithmId);
+      }
+
+      const dateRange = this.localDateToUtcRange(normalizedQuery.date);
+      if (dateRange) {
+        request = request
+          .gte('created_at', dateRange.start)
+          .lt('created_at', dateRange.end);
+      }
+
+      const { data, error, count } = await request.range(from, to);
 
       if (error) {
         throw error;
@@ -121,13 +160,24 @@ export class AdminAlgorithmPipelineService {
           .filter((id): id is string => Boolean(id)),
       );
 
+      const total = count ?? rows.length;
+
       return {
         history: rows.map((row) => this.toHistoryItem(row, algorithmMap)),
-        total: count ?? rows.length,
+        total,
+        page: safePage,
+        pageSize: safePageSize,
+        totalPages: Math.ceil(total / safePageSize),
       };
     } catch (error) {
       this.logger.warn(`Không lấy được lịch sử pipeline: ${error.message}`);
-      return { history: [], total: 0 };
+      return {
+        history: [],
+        total: 0,
+        page: safePage,
+        pageSize: safePageSize,
+        totalPages: 0,
+      };
     }
   }
 
@@ -502,12 +552,63 @@ export class AdminAlgorithmPipelineService {
     );
   }
 
+  private async findAlgorithmIdByName(name: string): Promise<string | null> {
+    const normalizedName = name.trim();
+    if (!normalizedName || normalizedName === 'all') {
+      return null;
+    }
+
+    const { data, error } = await supabase
+      .schema('ai_config')
+      .from('algorithms')
+      .select('id,name')
+      .eq('name', normalizedName)
+      .maybeSingle();
+
+    if (error) {
+      this.logger.warn(
+        `Could not load algorithm filter ${normalizedName}: ${error.message}`,
+      );
+      return null;
+    }
+
+    return data ? (data as AlgorithmRow).id : '';
+  }
+
+  private localDateToUtcRange(
+    date: string | undefined,
+  ): { start: string; end: string } | null {
+    if (!date || !/^\d{4}-\d{2}-\d{2}$/.test(date)) {
+      return null;
+    }
+
+    const [year, month, day] = date.split('-').map(Number);
+    const start = Date.UTC(year, month - 1, day) - 7 * 60 * 60 * 1000;
+    const end = start + 24 * 60 * 60 * 1000;
+
+    return {
+      start: new Date(start).toISOString(),
+      end: new Date(end).toISOString(),
+    };
+  }
+
+  private normalizeUtcTimestamp(value: string | null | undefined): string {
+    if (!value) {
+      return '';
+    }
+    if (/[zZ]$|[+-]\d{2}:\d{2}$/.test(value)) {
+      return value;
+    }
+    return `${value}Z`;
+  }
+
   private toHistoryItem(
     row: AlgorithmLogRow,
     algorithmMap: Map<string, AlgorithmRow>,
   ): PipelineHistoryItemDto {
     const details = this.parseDetails(row.details);
     const success = row.status !== 'failed';
+    const createdAt = this.normalizeUtcTimestamp(row.created_at);
 
     return {
       run_id: this.detailString(details, 'run_id') || row.id,
@@ -518,9 +619,9 @@ export class AdminAlgorithmPipelineService {
       status: row.status,
       action: row.action,
       details,
-      started_at: this.detailString(details, 'started_at') || row.created_at,
+      started_at: this.detailString(details, 'started_at') || createdAt,
       completed_at:
-        this.detailString(details, 'completed_at') || row.created_at,
+        this.detailString(details, 'completed_at') || createdAt,
       total_reviews: this.detailNumber(details, 'total_reviews'),
       contents_processed: this.detailNumber(details, 'contents_processed'),
       conflicts_detected: this.detailNumber(details, 'conflicts_detected'),
@@ -528,7 +629,7 @@ export class AdminAlgorithmPipelineService {
       duration_seconds: this.detailNumber(details, 'duration_seconds'),
       success,
       error: this.detailString(details, 'error') || null,
-      created_at: row.created_at,
+      created_at: createdAt,
     };
   }
 
