@@ -1,0 +1,18 @@
+{
+  "global_mean": 3.6572394792185534,
+  "n_factors": 28,
+  "model_type": "foody_mixed_funk_svd",
+  "n_users": 29,
+  "n_items": 287,
+  "trained_at": "2026-07-08T17:27:44.320367+00:00",
+  "foody_data_fusion": {
+    "method": "Collective Matrix Factorization (Singh & Gordon, KDD 2008) \u2014 \u0111\u1ed3ng ph\u00e2n r\u00e3 ma tr\u1eadn persona v\u00e0 ma tr\u1eadn rating Foody th\u00f4, chia s\u1ebb Q/b_i qua tr\u1ee5c item UUID chung, KH\u00d4NG chia s\u1ebb P/b_u.",
+    "source_file": "D:\\6.TotNghiep\\project\\train\\foody_reviews_filtered.jsonl",
+    "foody_weight": 0.4,
+    "foody_weight_rationale": "= BETA_IMPLICIT (Hu, Koren & Volinsky 2008 confidence weighting) tr\u1eeb khi truy\u1ec1n --foody-weight kh\u00e1c",
+    "n_foody_rows_used": 2914,
+    "n_foody_users": 2351,
+    "n_items_foody_covers": 155,
+    "foody_users_excluded_from_export": true
+  }
+}

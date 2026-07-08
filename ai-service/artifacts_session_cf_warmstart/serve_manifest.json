@@ -1,0 +1,17 @@
+{
+  "global_mean": 2.2202544508988824,
+  "n_factors": 16,
+  "model_type": "warmstart_funk_svd",
+  "n_users": 29,
+  "n_items": 266,
+  "trained_at": "2026-07-08T17:17:29.640231+00:00",
+  "warm_start": {
+    "method": "CST-style: init + regularize item factor v\u1ec1 Q ngu\u1ed3n (Pan et al., AAAI 2010)",
+    "source": "recommender_artifacts (Funk-SVD Foody c\u1ee7a Ng\u1ecdc \u2014 HybridRecommender)",
+    "source_n_users": 73289,
+    "source_n_items": 29844,
+    "transferred": "item_factors (Q) ONLY \u2014 b_i/b_u/P kh\u00f4ng chuy\u1ec3n (bias g\u1eafn v\u1edbi t\u1eadp user ngu\u1ed3n)",
+    "n_items_warm": 118,
+    "n_items_total": 266
+  }
+}

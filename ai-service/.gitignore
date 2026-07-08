@@ -25,5 +25,11 @@ recommender_artifacts/
 # Pipeline output
 output/
 
+# Demo persona seed manifest — chứa UUID user thật, không commit (docs/create-data/03)
+scripts/seed_demo_personas_manifest.json
+
+# Session-Aware CF Reranker trained artifacts (docs/create-data)
+artifacts_session_cf/
+
 # PhoBERT model
 app/models/phobert_timelabel/
