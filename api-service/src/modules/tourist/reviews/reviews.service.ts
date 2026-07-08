@@ -157,14 +157,25 @@ export class ReviewsService {
       ? await supabase
           .schema('review_ai')
           .from('review_contents')
-          .select('review_id, content')
+          .select('review_id, content, time_label, expiration_date')
           .in('review_id', reviewIds)
       : { data: [], error: null };
     if (contentError)
       throw new InternalServerErrorException(contentError.message);
-    const contentMap = new Map<string, string | null>();
+    const contentMap = new Map<
+      string,
+      {
+        content: string | null;
+        time_label: string | null;
+        expiration_date: string | null;
+      }
+    >();
     for (const item of reviewContents ?? []) {
-      contentMap.set(item.review_id as string, item.content as string | null);
+      contentMap.set(item.review_id as string, {
+        content: item.content as string | null,
+        time_label: item.time_label as string | null,
+        expiration_date: item.expiration_date as string | null,
+      });
     }
 
     const reviewedItineraries = itineraryReviews
@@ -216,10 +227,13 @@ export class ReviewsService {
                   this.normalizeMediaUrls(place?.image_url)[0] ?? null,
                 visit_date: detail?.visit_date ?? null,
                 rating: Number(placeReview.rating),
-                content: contentMap.get(placeReview.id) ?? null,
+                content: contentMap.get(placeReview.id)?.content ?? null,
                 tags: placeReview.tags ?? [],
                 media_urls: this.normalizeMediaUrls(placeReview.url_image),
                 status: placeReview.status ?? null,
+                time_label: contentMap.get(placeReview.id)?.time_label ?? null,
+                expiration_date:
+                  contentMap.get(placeReview.id)?.expiration_date ?? null,
                 reviewed_at: placeReview.created_at ?? null,
               };
             }),
@@ -282,10 +296,12 @@ export class ReviewsService {
         destination: itineraryMap.get(review.itinerary_id)?.destination ?? null,
         image_url: this.normalizeMediaUrls(place?.image_url)[0] ?? null,
         rating: Number(review.rating),
-        content: contentMap.get(review.id) ?? null,
+        content: contentMap.get(review.id)?.content ?? null,
         tags: review.tags ?? [],
         media_urls: this.normalizeMediaUrls(review.url_image),
         review_status: review.status ?? null,
+        time_label: contentMap.get(review.id)?.time_label ?? null,
+        expiration_date: contentMap.get(review.id)?.expiration_date ?? null,
         itinerary_status: itineraryMap.get(review.itinerary_id)?.status ?? null,
         reviewed_at: review.created_at,
         start_date: null,

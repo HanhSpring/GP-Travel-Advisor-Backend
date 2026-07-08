@@ -39,18 +39,21 @@ export class PlacesController {
   @ApiQuery({ name: 'tourist_id', required: false, type: String })
   @ApiQuery({ name: 'page', required: false, type: Number })
   @ApiQuery({ name: 'limit', required: false, type: Number })
+  @ApiQuery({ name: 'rating', required: false, type: Number })
   @ApiOkResponse({ type: PlaceReviewsResponseDto })
   getPlaceReviews(
     @Param('id') id: string,
     @Query('tourist_id') touristId?: string,
     @Query('page') page?: string,
     @Query('limit') limit?: string,
+    @Query('rating') rating?: string,
   ): Promise<PlaceReviewsResponseDto> {
     return this.service.getPlaceReviews(
       id,
       touristId,
       page ? parseInt(page, 10) : 1,
       limit ? parseInt(limit, 10) : 10,
+      rating ? parseInt(rating, 10) : undefined,
     );
   }
 
