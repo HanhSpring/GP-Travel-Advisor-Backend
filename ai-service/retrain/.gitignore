@@ -1,0 +1,6 @@
+output/
+backups/
+logs/
+state/
+.env.retrain
+__pycache__/
