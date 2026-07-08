@@ -108,85 +108,6 @@ export class AdminItineraryReviewsService {
     return count ?? 0;
   }
 
-  private async buildSearchReviewIds(
-    search?: string,
-  ): Promise<string[] | null> {
-    const normalizedSearch = this.normalizeForSearch(search);
-
-    if (!normalizedSearch) {
-      return null;
-    }
-
-    const simpleSearch = search?.trim() ?? '';
-    if (!simpleSearch) {
-      return null;
-    }
-
-    const [usersResult, itinerariesResult] = await Promise.all([
-      supabase
-        .schema('public')
-        .from('users')
-        .select('id')
-        .ilike('full_name', `%${simpleSearch}%`),
-      supabase
-        .schema('travel')
-        .from('itineraries')
-        .select('id')
-        .ilike('destination', `%${simpleSearch}%`),
-    ]);
-
-    if (usersResult.error) {
-      throw new InternalServerErrorException(usersResult.error.message);
-    }
-
-    if (itinerariesResult.error) {
-      throw new InternalServerErrorException(itinerariesResult.error.message);
-    }
-
-    const reviewIds = new Set<string>();
-
-    const userIds = (usersResult.data ?? [])
-      .map((item) => (item as UserRow).id)
-      .filter(Boolean);
-    if (userIds.length > 0) {
-      const { data, error } = await supabase
-        .schema('review_ai')
-        .from('itinerary_reviews')
-        .select('id')
-        .in('tourist_id', userIds);
-
-      if (error) {
-        throw new InternalServerErrorException(error.message);
-      }
-
-      for (const item of data ?? []) {
-        reviewIds.add((item as { id: string }).id);
-      }
-    }
-
-    const itineraryIds = (itinerariesResult.data ?? [])
-      .map((item) => (item as ItineraryRow).id)
-      .filter(Boolean);
-
-    if (itineraryIds.length > 0) {
-      const { data, error } = await supabase
-        .schema('review_ai')
-        .from('itinerary_reviews')
-        .select('id')
-        .in('itinerary_id', itineraryIds);
-
-      if (error) {
-        throw new InternalServerErrorException(error.message);
-      }
-
-      for (const item of data ?? []) {
-        reviewIds.add((item as { id: string }).id);
-      }
-    }
-
-    return Array.from(reviewIds);
-  }
-
   async getReviews(
     page: number = 1,
     limit: number = 10,
@@ -206,6 +127,8 @@ export class AdminItineraryReviewsService {
     }
 
     const offset = (page - 1) * limit;
+    const normalizedSearch = this.normalizeForSearch(search);
+    const usesClientSearch = Boolean(normalizedSearch);
 
     const [totalReviews, pendingCount, approvedCount, violationCount] =
       await Promise.all([
@@ -319,19 +242,6 @@ export class AdminItineraryReviewsService {
           .lt('created_at', nextDate.toISOString());
       }
 
-      const searchIds = await this.buildSearchReviewIds(search);
-      if (searchIds !== null) {
-        if (searchIds.length === 0) {
-          return {
-            data: [],
-            pagination: { total: 0, page, limit, total_pages: 0 },
-            summary,
-          };
-        }
-
-        query = query.in('id', searchIds);
-      }
-
       switch (sort) {
         case 'highest_rating':
           query = query.order('rating', { ascending: false });
@@ -347,10 +257,11 @@ export class AdminItineraryReviewsService {
           query = query.order('created_at', { ascending: false });
       }
 
-      const { data, error, count } = await query.range(
-        offset,
-        offset + limit - 1,
-      );
+      if (!usesClientSearch) {
+        query = query.range(offset, offset + limit - 1);
+      }
+
+      const { data, error, count } = await query;
 
       if (error && error.code !== 'PGRST116') {
         throw error;
@@ -439,13 +350,30 @@ export class AdminItineraryReviewsService {
         }),
       );
 
+      const filteredRows = usesClientSearch
+        ? dataRows.filter((review) => {
+            const searchableText = [
+              review.reviewer_name,
+              review.itinerary_name,
+            ]
+              .map((item) => this.normalizeForSearch(item))
+              .join(' ');
+            return searchableText.includes(normalizedSearch);
+          })
+        : dataRows;
+
+      const total = usesClientSearch ? filteredRows.length : (count ?? 0);
+      const pagedRows = usesClientSearch
+        ? filteredRows.slice(offset, offset + limit)
+        : filteredRows;
+
       return {
-        data: dataRows,
+        data: pagedRows,
         pagination: {
-          total: count ?? 0,
+          total,
           page,
           limit,
-          total_pages: Math.ceil((count ?? 0) / limit),
+          total_pages: Math.ceil(total / limit),
         },
         summary,
       };
