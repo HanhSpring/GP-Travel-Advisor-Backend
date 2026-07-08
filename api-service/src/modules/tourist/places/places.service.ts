@@ -297,7 +297,11 @@ export class PlacesService {
     return `https://placehold.co/200x200?text=${encodeURIComponent(seed ?? 'Food')}`;
   }
 
-  private async fetchPlaceReviews(placeId: string, touristId?: string) {
+  private async fetchPlaceReviews(
+    placeId: string,
+    touristId?: string,
+    ratingFilter?: number,
+  ) {
     let reviewsQuery = supabase
       .schema('review_ai')
       .from('reviews')
@@ -367,7 +371,7 @@ export class PlacesService {
       }
     }
 
-    const filteredReviews = typedReviews.filter((review) => {
+    const visibleReviews = typedReviews.filter((review) => {
       const content = contentMap.get(review.id);
       return !this.isHiddenReviewContent(content);
     });
@@ -375,7 +379,7 @@ export class PlacesService {
     const breakdown: Record<number, number> = { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 };
     let ratingTotal = 0;
 
-    const list = filteredReviews.map((review) => {
+    const list = visibleReviews.map((review) => {
       const user = users.find((item) => item.id === review.tourist_id);
       const content = contentMap.get(review.id);
       const visibleContent = this.extractReviewContentText(content);
@@ -398,13 +402,20 @@ export class PlacesService {
         time_ago: this.formatReviewAge(review.created_at),
       };
     });
+    const filteredList =
+      ratingFilter && ratingFilter >= 1 && ratingFilter <= 5
+        ? list.filter(
+            (review) =>
+              Math.min(5, Math.max(1, Math.round(Number(review.rating) || 0))) ===
+              ratingFilter,
+          )
+        : list;
 
     return {
-      list,
+      list: filteredList,
       breakdown,
-      average:
-        filteredReviews.length > 0 ? ratingTotal / filteredReviews.length : 0,
-      total: filteredReviews.length,
+      average: visibleReviews.length > 0 ? ratingTotal / visibleReviews.length : 0,
+      total: filteredList.length,
     } satisfies ReviewPageResult;
   }
 
@@ -560,6 +571,7 @@ export class PlacesService {
     touristId?: string,
     page = 1,
     limit = 10,
+    rating?: number,
   ) {
     const { data: place, error: placeError } = await supabase
       .schema('travel')
@@ -580,7 +592,7 @@ export class PlacesService {
       throw new NotFoundException('Place not found');
     }
 
-    const reviewPage = await this.fetchPlaceReviews(placeId, touristId);
+    const reviewPage = await this.fetchPlaceReviews(placeId, touristId, rating);
     const total = reviewPage.total;
     const offset = Math.max(0, (page - 1) * limit);
     const list = reviewPage.list.slice(offset, offset + limit);
