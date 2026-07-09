@@ -63,20 +63,13 @@ def _fetch_all(query_builder_factory) -> list[dict]:
 
 # ────────────────────────────── Places ──────────────────────────────
 
-def export_places(sb) -> pd.DataFrame:
-    print("[export] Đang kéo travel.places từ Supabase...")
-    rows = _fetch_all(
-        lambda: sb.schema("travel")
-        .table("places")
-        .select(
-            "id, name, latitude, longitude, vibes, description, "
-            "cities(name), types(name, categories(name))"
-        )
-        .eq("is_approved", True)
-        .eq("is_active", True)
-    )
-    print(f"[export]   {len(rows)} địa điểm")
+PLACES_SELECT = (
+    "id, name, latitude, longitude, vibes, description, updated_at, "
+    "is_approved, is_active, cities(name), types(name, categories(name))"
+)
 
+
+def _place_rows_to_df(rows: list[dict]) -> pd.DataFrame:
     records = []
     for r in rows:
         cities = r.get("cities") or {}
@@ -98,11 +91,66 @@ def export_places(sb) -> pd.DataFrame:
                 "district_old": r.get("district_old") or "",
                 "travel_type": r.get("travel_type") or "",
                 "description": r.get("description") or "",
+                # Cột vận hành để export incremental.
+                "updated_at": r.get("updated_at") or "",
+                "is_approved": bool(r.get("is_approved")),
+                "is_active": bool(r.get("is_active")),
             }
         )
+    if not records:
+        return pd.DataFrame()
+    return pd.DataFrame.from_records(records)
 
-    places = pd.DataFrame.from_records(records)
-    places = places[places["id"].astype(bool)].drop_duplicates("id")
+
+def _active_approved_places(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return df
+    df = df[df["id"].astype(str).str.len() > 0].drop_duplicates("id", keep="last")
+    if {"is_approved", "is_active"}.issubset(df.columns):
+        df = df[df["is_approved"].astype(bool) & df["is_active"].astype(bool)]
+    return df.reset_index(drop=True)
+
+
+def export_places(sb) -> pd.DataFrame:
+    out = OUTPUT_DATA_DIR / "Places.csv"
+    cached = None
+    watermark = ""
+    if out.exists():
+        cached = pd.read_csv(out, encoding="utf-8-sig", low_memory=False)
+        cached.columns = [c.strip() for c in cached.columns]
+        if "updated_at" in cached.columns and not cached.empty:
+            watermark = str(cached["updated_at"].fillna("").max() or "")
+
+    if cached is not None and watermark:
+        print(f"[export] Đang kéo travel.places thay đổi sau {watermark}...")
+        rows = _fetch_all(
+            lambda: sb.schema("travel")
+            .table("places")
+            .select(PLACES_SELECT)
+            .gt("updated_at", watermark)
+        )
+        print(f"[export]   {len(rows)} địa điểm thay đổi")
+        changed = _place_rows_to_df(rows)
+        if changed.empty:
+            places = _active_approved_places(cached)
+        else:
+            places = pd.concat(
+                [cached[~cached["id"].astype(str).isin(changed["id"].astype(str))], changed],
+                ignore_index=True,
+            )
+            places = _active_approved_places(places)
+    else:
+        print("[export] Đang kéo full travel.places từ Supabase...")
+        rows = _fetch_all(
+            lambda: sb.schema("travel")
+            .table("places")
+            .select(PLACES_SELECT)
+            .eq("is_approved", True)
+            .eq("is_active", True)
+        )
+        print(f"[export]   {len(rows)} địa điểm")
+        places = _active_approved_places(_place_rows_to_df(rows))
+
     out = OUTPUT_DATA_DIR / "Places.csv"
     places.to_csv(out, index=False, encoding="utf-8-sig")
     print(f"[export]   → {out} ({len(places)} dòng)")
