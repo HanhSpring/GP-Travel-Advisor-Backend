@@ -67,6 +67,22 @@ PLACES_SELECT = (
     "id, name, latitude, longitude, vibes, description, updated_at, "
     "is_approved, is_active, cities(name), types(name, categories(name))"
 )
+PLACES_CHANGE_SELECT = "id, updated_at, is_approved, is_active"
+
+
+def _fetch_places_by_ids(sb, ids: list[str]) -> list[dict]:
+    rows: list[dict] = []
+    for i in range(0, len(ids), PAGE_SIZE):
+        chunk = ids[i : i + PAGE_SIZE]
+        resp = (
+            sb.schema("travel")
+            .table("places")
+            .select(PLACES_SELECT)
+            .in_("id", chunk)
+            .execute()
+        )
+        rows.extend(resp.data or [])
+    return rows
 
 
 def _place_rows_to_df(rows: list[dict]) -> pd.DataFrame:
@@ -123,12 +139,21 @@ def export_places(sb) -> pd.DataFrame:
 
     if cached is not None and watermark:
         print(f"[export] Đang kéo travel.places thay đổi sau {watermark}...")
-        rows = _fetch_all(
-            lambda: sb.schema("travel")
-            .table("places")
-            .select(PLACES_SELECT)
-            .gt("updated_at", watermark)
-        )
+        try:
+            changed_refs = _fetch_all(
+                lambda: sb.schema("travel")
+                .table("places")
+                .select(PLACES_CHANGE_SELECT)
+                .gt("updated_at", watermark)
+            )
+            changed_ids = [str(r.get("id", "")).strip() for r in changed_refs if r.get("id")]
+            rows = _fetch_places_by_ids(sb, changed_ids) if changed_ids else []
+        except Exception as exc:
+            print(
+                "[export] ⚠ Không kéo được delta travel.places "
+                f"({type(exc).__name__}: {exc}) — dùng Places.csv cache hiện có."
+            )
+            rows = []
         print(f"[export]   {len(rows)} địa điểm thay đổi")
         changed = _place_rows_to_df(rows)
         if changed.empty:
