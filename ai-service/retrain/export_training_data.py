@@ -21,7 +21,7 @@ from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from scipy.sparse import csr_matrix, save_npz
+from scipy.sparse import csr_matrix, load_npz, save_npz
 
 from pipeline_config import (
     OUTPUT_DATA_DIR,
@@ -131,6 +131,46 @@ def _load_foody_jsonl(path: Path) -> list[tuple[int, str, float]]:
     return triples
 
 
+def _load_base_rating_matrix(base_dir: Path) -> list[tuple[int, str, float]]:
+    """Ratings lịch sử đã có sẵn: rating_matrix_foody.npz + users/items csv."""
+    candidates = [
+        (
+            base_dir / "rating_matrix_foody.npz",
+            base_dir / "rating_matrix_foody_users.csv",
+            base_dir / "rating_matrix_foody_items.csv",
+        ),
+        (
+            base_dir / "rating_matrix.npz",
+            base_dir / "rating_matrix_users.csv",
+            base_dir / "rating_matrix_items.csv",
+        ),
+    ]
+    matrix_path = users_path = items_path = None
+    for m, u, i in candidates:
+        if m.exists() and u.exists() and i.exists():
+            matrix_path, users_path, items_path = m, u, i
+            break
+    if not matrix_path:
+        print(f"[export] ⚠ Không thấy bộ rating matrix trong {base_dir}")
+        return []
+
+    mat = load_npz(matrix_path).astype(np.float32).tocoo()
+    users = pd.read_csv(users_path, encoding="utf-8-sig").iloc[:, 0].astype(int).values
+    items = (
+        pd.read_csv(items_path, encoding="utf-8-sig").iloc[:, 0]
+        .astype(str).str.strip().values
+    )
+    triples = [
+        (int(users[r]), str(items[c]), float(v))
+        for r, c, v in zip(mat.row, mat.col, mat.data)
+    ]
+    print(
+        f"[export]   {len(triples)} ratings lịch sử từ {matrix_path.name} "
+        f"({len(users)} users × {len(items)} items)"
+    )
+    return triples
+
+
 def _load_tourist_map() -> dict[str, int]:
     if not TOURIST_MAP_FILE.exists():
         return {}
@@ -151,6 +191,7 @@ def export_db_reviews(sb) -> tuple[list[tuple[int, str, float]], int, str]:
         lambda: sb.schema("review_ai")
         .table("reviews")
         .select("tourist_id, place_id, rating, created_at")
+        .filter("tourist_id", "not.is", "null")
         .order("created_at")
     )
     print(f"[export]   {len(rows)} review thật")
@@ -232,7 +273,8 @@ def main() -> dict:
     sb = _client(cfg)
 
     places = export_places(sb)
-    foody = _load_foody_jsonl(Path(cfg["foody_ratings_jsonl"]))
+    base_matrix = _load_base_rating_matrix(Path(cfg["base_rating_matrix_dir"]))
+    foody = base_matrix or _load_foody_jsonl(Path(cfg["foody_ratings_jsonl"]))
     db_triples, db_review_count, max_created = export_db_reviews(sb)
     n_users, n_items, nnz = build_rating_matrix(
         foody + db_triples, set(places["id"].values)

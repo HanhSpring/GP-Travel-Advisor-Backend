@@ -75,6 +75,11 @@ def load_env() -> dict:
                 / "foody_two_tower_training_data_with_place_id.jsonl"
             ),
         ),
+        # Bộ rating matrix lịch sử đã có sẵn (ưu tiên hơn JSONL nếu tồn tại).
+        "base_rating_matrix_dir": os.environ.get(
+            "RETRAIN_BASE_RATING_MATRIX_DIR",
+            str(AI_SERVICE_DIR.parent.parent / "Recommendation_System"),
+        ),
         # Lệnh restart ai-service sau khi deploy (tùy chọn, vd lệnh pm2/nssm/taskkill)
         "restart_cmd": os.environ.get("RETRAIN_RESTART_CMD", ""),
         # Ngưỡng chấp nhận RMSE mới so với bản cũ (mặc định xấu hơn tối đa 2%)
