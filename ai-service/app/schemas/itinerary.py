@@ -81,6 +81,15 @@ class ItineraryPlanRequest(BaseModel):
         default="scheduler_v2",
         description="Planner engine: scheduler_v2/or_tools or ga_v1/ga.",
     )
+    region_day_allocations: list[dict[str, Any]] | None = Field(
+        default=None,
+        description=(
+            "Result of the region-allocation wizard: [{place_ids, days}, ...] "
+            "— how many days the user assigned to each detected geo-region. "
+            "When present, forces those exact day-pools instead of running "
+            "automatic geo-clustering/capacity-balancing."
+        ),
+    )
 
     model_config = {
         "json_schema_extra": {
@@ -232,3 +241,29 @@ class ItineraryPlanResponse(BaseModel):
     validation_warnings: list[str] = Field(default_factory=list)
     comparison: dict[str, Any] | None = None
     days: list[ItineraryDayResponse]
+
+
+class RegionDetectionRequest(BaseModel):
+    """Lightweight request for the region-allocation wizard's first step —
+    macro-cluster detection only, no hotel/budget/GA fields needed."""
+
+    places: list[ItineraryPlaceInput]
+    num_days: int = Field(..., ge=1)
+    daily_start_time: str = Field(default="08:00", pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$")
+    daily_end_time: str = Field(default="21:00", pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$")
+
+
+class RegionInfo(BaseModel):
+    region_name: str
+    place_ids: list[str]
+    place_names: list[str]
+    max_days: int
+    total_visit_minutes: int
+    travel_minutes_from_central: int
+    is_remote: bool
+
+
+class RegionDetectionResponse(BaseModel):
+    regions: list[RegionInfo]
+    estimated_total_days: int
+    num_days: int

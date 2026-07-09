@@ -10,9 +10,13 @@ from app.schemas.itinerary import (
     ItineraryDayResponse,
     ItineraryPlanRequest,
     ItineraryPlanResponse,
+    RegionDetectionRequest,
+    RegionDetectionResponse,
     ScheduleEntryResponse,
 )
 from app.services.itinerary import planner
+from app.services.itinerary.assignment import AssignmentConfig
+from app.services.itinerary.geo_clustering import GeoClusteringAssignment
 from app.services.itinerary.scheduler_v2 import (
     BEST_TIME_WINDOWS,
     SchedulerV2Config,
@@ -22,6 +26,20 @@ from app.services.itinerary.validator import FeasibilityValidator, ValidationRes
 
 logger = logging.getLogger(__name__)
 FOOD_CATEGORY_ID = "97029cfb-069b-4dba-a152-dfb3d36634d3"
+
+
+def _resolve_trip_budget_total(req: ItineraryPlanRequest) -> float:
+    """Resolve the whole-trip budget the 90% cap should be computed against.
+
+    ``budget_per_person`` is a deprecated compatibility field expressed
+    per-person; using it as-is (as the old inline ternary did) silently
+    treats it as if it were already a trip total, undercounting the real
+    budget for any group larger than one person.
+    """
+    if req.trip_budget_total > 0:
+        return req.trip_budget_total
+    headcount = max(1, req.adult_count + req.child_count)
+    return req.budget_per_person * headcount
 
 
 def _normalize_planner_engine(value: str | None) -> str:
@@ -141,6 +159,27 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
     )
 
 
+def detect_regions_only(req: RegionDetectionRequest) -> RegionDetectionResponse:
+    """Region-allocation wizard, step 1: cheap macro-cluster detection with
+    no hotel, no travel matrix, no CP-SAT — just DBSCAN + cost math."""
+    places = [
+        _to_planner_place(item.model_dump(), day_idx=0, start_date=None)
+        for item in req.places
+    ]
+    assignment = GeoClusteringAssignment(
+        AssignmentConfig(
+            num_days=req.num_days,
+            daily_start_time=planner.time_to_minutes(req.daily_start_time),
+            daily_end_time=planner.time_to_minutes(req.daily_end_time),
+            trip_intent="",
+            hotel=None,
+        ),
+        travel_matrix={},
+    )
+    result = assignment.detect_regions(places, req.num_days)
+    return RegionDetectionResponse(**result)
+
+
 def _dispatch_planner_engine(
     engine_name: str,
     req: ItineraryPlanRequest,
@@ -251,11 +290,7 @@ def _run_ga_engine(
         mutation_rate=req.mutation_rate,
         return_to_hotel=req.return_to_hotel,
         require_goong_edges=req.require_goong,
-        trip_budget_total=(
-            req.trip_budget_total
-            if req.trip_budget_total > 0
-            else req.budget_per_person
-        ),
+        trip_budget_total=_resolve_trip_budget_total(req),
         adult_count=req.adult_count,
         child_count=req.child_count,
         travel_vehicle=req.travel_vehicle,
@@ -270,11 +305,7 @@ def _run_ga_engine(
     validation = FeasibilityValidator().validate(
         result,
         _build_places_map(places, req.num_days, _parse_trip_start_date(req.trip_start_date)),
-        trip_budget_total=(
-            req.trip_budget_total
-            if req.trip_budget_total > 0
-            else req.budget_per_person
-        ),
+        trip_budget_total=_resolve_trip_budget_total(req),
         hotel_total_cost=req.hotel_total_cost,
     )
     return result, elapsed_ms, validation
@@ -304,16 +335,13 @@ def _run_scheduler_v2_engine(
             day_end_time=planner.time_to_minutes(req.daily_end_time),
             return_to_hotel=req.return_to_hotel,
             require_goong_edges=req.require_goong,
-            trip_budget_total=(
-                req.trip_budget_total
-                if req.trip_budget_total > 0
-                else req.budget_per_person
-            ),
+            trip_budget_total=_resolve_trip_budget_total(req),
             adult_count=req.adult_count,
             child_count=req.child_count,
             travel_vehicle=req.travel_vehicle,
             trip_start_date=req.trip_start_date,
             check_in_time=planner.time_to_minutes(req.check_in_time) if req.check_in_time else None,
+            region_day_allocations=req.region_day_allocations,
         )
     )
     try:
@@ -342,11 +370,7 @@ def _run_scheduler_v2_engine(
     validation = FeasibilityValidator().validate(
         result,
         _build_places_map(places, req.num_days, _parse_trip_start_date(req.trip_start_date)),
-        trip_budget_total=(
-            req.trip_budget_total
-            if req.trip_budget_total > 0
-            else req.budget_per_person
-        ),
+        trip_budget_total=_resolve_trip_budget_total(req),
         hotel_total_cost=req.hotel_total_cost,
     )
     return result, elapsed_ms, validation

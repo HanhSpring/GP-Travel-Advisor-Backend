@@ -74,5 +74,11 @@ class Settings(BaseSettings):
     # Goong Maps API (empty = Haversine fallback)
     goong_api_key: str = ""
 
+    # Debug-only: dump a Leaflet HTML map per geo-clustering pipeline stage
+    # (HDBSCAN raw clusters -> noise/region merge -> K-Means day-split ->
+    # weekday matching) into api-service's shared debug-log folder. Off by
+    # default — purely a developer tool, never needed for normal planning.
+    enable_clustering_debug_viz: bool = False
+
 
 settings = Settings()

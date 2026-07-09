@@ -187,6 +187,35 @@ export class ItineraryController {
     const planStartedAt = Date.now();
     const plannerEngine = this.plannerEngine;
     const config = await this.twoTowerConfig.getConfig();
+
+    // Region-allocation wizard, step 1: always runs before the first real
+    // plan attempt — cheap macro-cluster detection, no hotel/CP-SAT. Once
+    // the client resubmits with `regionAllocations`, skip straight to
+    // planning below.
+    if (!body.regionAllocations?.length) {
+      const detection = await this.recommendationService.detectRegions(
+        body,
+        k,
+        config,
+      );
+      throw new UnprocessableEntityException({
+        code: 'REGION_ALLOCATION_REQUIRED',
+        message:
+          'Hệ thống đã nhận diện được các vùng địa lý trong lịch trình của bạn.',
+        numDays: detection.num_days,
+        estimatedTotalDays: detection.estimated_total_days,
+        regions: detection.regions.map((region) => ({
+          regionName: region.region_name,
+          placeIds: region.place_ids,
+          placeNames: region.place_names,
+          maxDays: region.max_days,
+          totalVisitMinutes: region.total_visit_minutes,
+          travelMinutesFromCentral: region.travel_minutes_from_central,
+          isRemote: region.is_remote,
+        })),
+      });
+    }
+
     let plan: any = await this.recommendationService.planItinerary(
       body,
       k,
@@ -207,7 +236,10 @@ export class ItineraryController {
             plannerEngine,
             config,
           );
-        if (unconstrainedPlan?.validation_is_feasible !== false) {
+        if (
+          unconstrainedPlan?.validation_is_feasible !== false &&
+          !body.proceedWithOverBudget
+        ) {
           const calculatedCost = this.service.calculatePlanEstimatedCost(
             unconstrainedPlan as any,
           );
@@ -230,11 +262,17 @@ export class ItineraryController {
             costScope: 'TOTAL_GROUP',
           });
         }
+        // Either the unconstrained plan is feasible and the user already
+        // confirmed proceeding over budget (no extra AI call needed beyond
+        // the one above), or it's still infeasible even without a budget
+        // cap — in both cases this is the "least bad" plan available.
         plan = unconstrainedPlan;
       }
     }
     const planTimeMs = Date.now() - planStartedAt;
-    this.assertPlanFeasible(plan, plannerEngine);
+    if (!body.proceedWithOverBudget) {
+      this.assertPlanFeasible(plan, plannerEngine);
+    }
 
     const persistStartedAt = Date.now();
     const created = await this.service.createGeneratedItinerary(

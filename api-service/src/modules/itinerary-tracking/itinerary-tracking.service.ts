@@ -9,6 +9,7 @@ import { randomUUID } from 'crypto';
 import { supabase } from '../../config/supabase';
 import { ACTIVITY_LOG_EVENT } from '../activity/activity.listener';
 import { PushNotificationService } from '../tourist/notifications/push-notification.service';
+import { IncurredCostsService } from '../itinerary/incurred-costs.service';
 import {
   buildCirclePolygonEWKT,
   clampGeofenceRadius,
@@ -101,6 +102,7 @@ export class ItineraryTrackingService {
   constructor(
     private readonly eventEmitter: EventEmitter2,
     private readonly pushService: PushNotificationService,
+    private readonly incurredCostsService: IncurredCostsService,
   ) {}
 
   // ───────────────────────── Helpers ─────────────────────────
@@ -1126,6 +1128,18 @@ export class ItineraryTrackingService {
       itineraryStatus = 'ongoing';
     }
 
+    const wasCompleted = (itinerary.status ?? '').toLowerCase() === 'completed';
+    if (!wasCompleted && itineraryStatus === 'completed') {
+      // Không chặn response nếu tổng hợp chi phí/gửi thông báo lỗi — đây là
+      // hiệu ứng phụ, không phải điều kiện thành công của endDay().
+      void this.notifyItineraryCompleted(dto.itineraryId).catch((e) => {
+        console.warn(
+          '[ItineraryTracking] notifyItineraryCompleted thất bại:',
+          (e as Error).message,
+        );
+      });
+    }
+
     const { nextDayAlarmAt } = this.nextDayInfo(nextDayDate);
 
     return {
@@ -1144,6 +1158,102 @@ export class ItineraryTrackingService {
         ? `Đã kết thúc ngày ${date}. Đặt lịch đăng ký lại geofence cho ngày ${nextDayDate}.`
         : `Đã kết thúc ngày cuối ${date}. Lịch trình hoàn thành.`,
     };
+  }
+
+  /**
+   * Lịch trình vừa chuyển sang "completed" lần đầu: tổng hợp "mỗi người phải
+   * trả tổng bao nhiêu" (mục 1.7, qua IncurredCostsService — không có khái
+   * niệm nợ/hoàn tiền, chỉ là tổng chi phí mỗi người gánh) và gửi thông báo
+   * cho toàn bộ thành viên. Theo đúng mẫu thông báo đã chốt trong mục 1.7.
+   */
+  private async notifyItineraryCompleted(itineraryId: string): Promise<void> {
+    const { data: itinerary, error } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, description, destination')
+      .eq('id', itineraryId)
+      .maybeSingle();
+    if (error || !itinerary) return;
+
+    const breakdown =
+      await this.incurredCostsService.computeCostBreakdown(itineraryId);
+    const itineraryTitle =
+      (itinerary as any).description ||
+      (itinerary as any).destination ||
+      'chuyến đi';
+    const owner = breakdown.memberTotals.find((m) => m.isOwner);
+    const otherMembers = breakdown.memberTotals.filter((m) => !m.isOwner);
+    const formatter = new Intl.NumberFormat('vi-VN');
+    const memberNames = otherMembers
+      .map((m) => m.fullName || 'thành viên')
+      .join(', ');
+    const content =
+      otherMembers.length > 0
+        ? `Bạn vừa hoàn thành lịch trình "${itineraryTitle}" với chi phí ${formatter.format(breakdown.totalCost)}đ cùng chủ lịch trình ${owner?.fullName || ''} và các thành viên ${memberNames}.`
+        : `Bạn vừa hoàn thành lịch trình "${itineraryTitle}" với chi phí ${formatter.format(breakdown.totalCost)}đ.`;
+
+    const nowIso = new Date().toISOString();
+    for (const member of breakdown.memberTotals) {
+      try {
+        const notificationId = randomUUID();
+        const { error: nErr } = await supabase
+          .schema('public')
+          .from('notifications')
+          .insert({
+            id: notificationId,
+            title: 'Lịch trình đã hoàn thành',
+            content,
+            type: 'itinerary_completed',
+            is_global: false,
+            action_type: 'open_itinerary_summary',
+            target_type: 'itinerary',
+            metadata: {
+              action_label: 'Xem tổng kết chi phí',
+              itinerary_id: itineraryId,
+              your_total: member.total,
+              total_cost: breakdown.totalCost,
+            },
+            created_at: nowIso,
+          });
+        if (nErr) throw nErr;
+
+        const { error: uErr } = await supabase
+          .schema('public')
+          .from('users_notifications')
+          .insert({
+            id: randomUUID(),
+            user_id: member.userId,
+            notification_id: notificationId,
+            is_read: false,
+            sent_at: nowIso,
+          });
+        if (uErr) throw uErr;
+
+        const { data: userRow } = await supabase
+          .schema('public')
+          .from('users')
+          .select('fcm_token')
+          .eq('id', member.userId)
+          .maybeSingle<{ fcm_token: string | null }>();
+        if (userRow?.fcm_token) {
+          void this.pushService.sendPush(
+            userRow.fcm_token,
+            'Lịch trình đã hoàn thành',
+            content,
+            {
+              notification_id: notificationId,
+              type: 'itinerary_completed',
+              itinerary_id: itineraryId,
+            },
+          );
+        }
+      } catch (e) {
+        console.warn(
+          `[ItineraryTracking] Gửi thông báo hoàn thành thất bại (user=${member.userId}):`,
+          (e as Error).message,
+        );
+      }
+    }
   }
 
   // ───────────────────────── Internal ─────────────────────────

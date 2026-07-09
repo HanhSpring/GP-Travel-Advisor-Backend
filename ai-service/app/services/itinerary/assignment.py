@@ -12,6 +12,11 @@ POI_TARGET_TIME_SLICE_MINUTES = 90
 POI_TARGET_MAX_PER_DAY = 10
 MEAL_DURATION_MINUTES = 75
 MAX_RESTAURANT_OPTIONS_PER_DAY = 2
+# Cafes are injected via their own greedy nearest-cluster pass (separate from
+# restaurants, separate from attraction K-Means) — cap at 1/day so a dense
+# cafe cluster near a day's centroid can't stack multiple cafe stops onto the
+# same day (e.g. "6 cups of milk tea in one day").
+MAX_CAFE_OPTIONS_PER_DAY = 1
 REBALANCE_MAX_ITERATIONS = 48
 BACKUP_NONMEAL_PER_DAY = 2
 CANDIDATE_POOL_LOAD_RATIO = 1.25
@@ -65,6 +70,10 @@ class AssignmentConfig:
         return max(1, min(MAX_RESTAURANT_OPTIONS_PER_DAY, self.meal_slots_per_day))
 
     @property
+    def cafe_option_limit(self) -> int:
+        return MAX_CAFE_OPTIONS_PER_DAY
+
+    @property
     def primary_daily_effective(self) -> int:
         reserve = MEAL_DURATION_MINUTES + (30 if self.meal_slots_per_day > 1 else 0)
         return max(120, self.daily_effective - reserve)
@@ -75,6 +84,7 @@ class AssignmentResult:
     day_pools: list[dict[str, list[Any]]]
     day_loads: list[int]
     warnings: list[str] = field(default_factory=list)
+    dropped_points: list[Any] = field(default_factory=list)
 
 
 class ConstrainedKMeansAssignment:

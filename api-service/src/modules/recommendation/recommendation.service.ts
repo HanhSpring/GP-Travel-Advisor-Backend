@@ -10,8 +10,15 @@ import type { Cache } from 'cache-manager';
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { supabase } from '../../config/supabase';
-import { ItineraryPlanPayload, MlClientService } from './ml-client.service';
-import { CreateItineraryDto } from '../itinerary/dto/create-itinerary.dto';
+import {
+  ItineraryPlanPayload,
+  MlClientService,
+  RegionDetectionResult,
+} from './ml-client.service';
+import {
+  CreateItineraryDto,
+  RegionAllocationDto,
+} from '../itinerary/dto/create-itinerary.dto';
 import {
   TwoTowerRetrievalResponseDto,
   CandidatePlaceDto,
@@ -32,6 +39,7 @@ import {
   TwoTowerRuntimeConfig,
 } from './two-tower-config.types';
 import { PlannerEngine } from '../../config/planner-engine';
+import { TripCostConfigService } from './trip-cost-config.service';
 interface HotelSelection {
   hotelId: string;
   hotelTotalCost: number;
@@ -39,7 +47,10 @@ interface HotelSelection {
   groupNightlyCost: number;
   fullPeople: number;
   nights: number;
+  /** Average distance (km) to the densest confirmed region's POIs — lower is better. */
   score: number;
+  /** Two-tower retrieval rank — only used to break ties on `score`. */
+  candidateRank: number;
   budgetRelaxed: boolean;
 }
 
@@ -73,6 +84,7 @@ export class RecommendationService {
   constructor(
     private readonly mlClient: MlClientService,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
+    private readonly tripCostConfig: TripCostConfigService,
   ) {}
 
   /**
@@ -435,6 +447,38 @@ export class RecommendationService {
     return pool;
   }
 
+  /**
+   * Region-allocation wizard, step 1: retrieves the same candidate pool
+   * `planItinerary` would, but skips hotel selection entirely (no hotel
+   * exists yet) and asks ai-service for cheap macro-cluster detection only.
+   */
+  async detectRegions(
+    dto: CreateItineraryDto,
+    topK = 60,
+    config: TwoTowerRuntimeConfig = DEFAULT_TWO_TOWER_RUNTIME_CONFIG,
+  ): Promise<RegionDetectionResult> {
+    const numDays = this.calcNumDays(dto.startDate, dto.endDate);
+    const tripCostConfig = await this.tripCostConfig.getConfig();
+    const retrieval = await this.retrieveCandidates(dto, topK, config);
+    const details = await this.fetchPlannerPlaceDetails(
+      retrieval.candidates,
+      dto.adultCount,
+      dto.childCount ?? 0,
+      tripCostConfig.childPriceRatio,
+    );
+    if (!details.length) {
+      throw new NotFoundException(
+        'No place details found for itinerary planning',
+      );
+    }
+    return this.mlClient.detectRegions({
+      places: details,
+      num_days: numDays,
+      daily_start_time: dto.dailyStartTime,
+      daily_end_time: dto.dailyEndTime,
+    });
+  }
+
   async planItinerary(
     dto: CreateItineraryDto,
     topK = 60,
@@ -454,16 +498,36 @@ export class RecommendationService {
       dto.dailyStartTime,
       dto.dailyEndTime,
     );
+    const tripCostConfig = await this.tripCostConfig.getConfig();
     const retrievalStartedAt = Date.now();
     const retrieval = await this.retrieveCandidates(dto, topK, config);
     const retrievalMs = Date.now() - retrievalStartedAt;
     const plannerCandidates = retrieval.candidates;
     const detailsStartedAt = Date.now();
-    const details = await this.fetchPlannerPlaceDetails(
+    let details = await this.fetchPlannerPlaceDetails(
       plannerCandidates,
       dto.adultCount,
       dto.childCount ?? 0,
+      tripCostConfig.childPriceRatio,
     );
+    if (dto.regionAllocations?.length) {
+      // User has confirmed the region-allocation wizard (see
+      // REGION_ALLOCATION_REQUIRED) — drop attraction/cafe/entertainment
+      // candidates from regions the user assigned 0 days to. Hotels and
+      // restaurants are never part of the region wizard, so leave them
+      // untouched here.
+      const keptPlaceIds = new Set(
+        dto.regionAllocations
+          .filter((allocation) => allocation.days > 0)
+          .flatMap((allocation) => allocation.placeIds),
+      );
+      const regionScopedTypes = new Set(['attraction', 'cafe', 'entertainment']);
+      details = details.filter(
+        (place) =>
+          !regionScopedTypes.has(place.place_type ?? '') ||
+          keptPlaceIds.has(place.id),
+      );
+    }
     const detailsMs = Date.now() - detailsStartedAt;
     if (!details.length) {
       throw new NotFoundException(
@@ -508,9 +572,12 @@ export class RecommendationService {
 
     const hotelSelection = this.selectHotelByEstimatedPrice(
       details,
-      dto.adultCount + (dto.childCount ?? 0),
+      dto.adultCount,
+      dto.childCount ?? 0,
       Math.max(1, numDays - 1),
       Number(dto.budget ?? 0),
+      tripCostConfig.childPriceRatio,
+      dto.regionAllocations ?? [],
     );
     const selectedHotel = details.find(
       (place) => place.id === hotelSelection.hotelId,
@@ -522,7 +589,9 @@ export class RecommendationService {
       `Selected hotel ${hotelSelection.hotelId}: ` +
         `price/person/night=${hotelSelection.pricePerPersonPerNight}, ` +
         `people=${hotelSelection.fullPeople}, nights=${hotelSelection.nights}, ` +
-        `cost=${hotelSelection.hotelTotalCost}, relaxed=${hotelSelection.budgetRelaxed}`,
+        `cost=${hotelSelection.hotelTotalCost}, relaxed=${hotelSelection.budgetRelaxed}, ` +
+        `avgDistanceKmToDenseCluster=${hotelSelection.score.toFixed(2)}, ` +
+        `candidateRank=${hotelSelection.candidateRank}`,
     );
 
     const payload: ItineraryPlanPayload = {
@@ -546,6 +615,14 @@ export class RecommendationService {
       mutation_rate: 0.3,
       seed: 42,
       planner_engine: plannerEngine,
+      region_day_allocations: dto.regionAllocations?.length
+        ? dto.regionAllocations
+            .filter((allocation) => allocation.days > 0)
+            .map((allocation) => ({
+              place_ids: allocation.placeIds,
+              days: allocation.days,
+            }))
+        : undefined,
     };
 
     try {
@@ -565,7 +642,10 @@ export class RecommendationService {
                 full_people: hotelSelection.fullPeople,
                 nights: hotelSelection.nights,
                 budget_relaxed: hotelSelection.budgetRelaxed,
-                score: Number(hotelSelection.score.toFixed(6)),
+                avg_distance_km_to_dense_cluster: Number(
+                  hotelSelection.score.toFixed(3),
+                ),
+                candidate_rank: hotelSelection.candidateRank,
               },
             }
           : plan;
@@ -576,6 +656,7 @@ export class RecommendationService {
         retrieval,
         details,
         plan: enrichedPlan,
+        childPriceRatio: tripCostConfig.childPriceRatio,
         candidateBuilder: {
           availableMinutes: plannerTargets.availableMinutes,
           dailyQuota: plannerTargets.dailyQuota,
@@ -692,6 +773,7 @@ export class RecommendationService {
     candidates: CandidatePlaceDto[],
     adultCount: number,
     childCount: number,
+    childPriceRatio: number,
   ): Promise<ItineraryPlanPayload['places']> {
     const candidateById = new Map(
       candidates.map((candidate, index) => [
@@ -702,12 +784,12 @@ export class RecommendationService {
     const ids = candidates.map((candidate) => candidate.place_id);
     const payingPeople =
       Math.max(0, Number(adultCount) || 0) +
-      Math.max(0, Number(childCount) || 0) * 0.5;
+      Math.max(0, Number(childCount) || 0) * childPriceRatio;
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
       .select(
-        'id,name,longitude,latitude,open_hour_compressed,source,type_id,visit_duration,average_rating,review_count,price,price_inferred,best_time,types(name,slot_type,categories(id,name))',
+        'id,name,longitude,latitude,open_hour_compressed,source,type_id,slot_type,visit_duration,average_rating,review_count,price,price_inferred,best_time,types(name,categories(id,name))',
       )
       .in('id', ids);
 
@@ -727,9 +809,9 @@ export class RecommendationService {
           : typeData?.categories;
         const categoryId = categoryData?.id ?? null;
         const categoryName = categoryData?.name ?? null;
-        // slot_type giờ lấy từ travel.types.slot_type (không còn ở travel.places nữa)
+        // slot_type lấy trực tiếp từ travel.places.slot_type
         const candidateCategory = normalizeCategory(
-          typeData?.slot_type ?? candidate?.category ?? '',
+          row.slot_type ?? candidate?.category ?? '',
           typeData?.name ?? '',
         );
         const placeType = this.resolvePlannerPlaceType(
@@ -806,16 +888,72 @@ export class RecommendationService {
 
   private selectHotelByEstimatedPrice(
     places: ItineraryPlanPayload['places'],
-    totalGuests: number,
+    adultCount: number,
+    childCount: number,
     nights: number,
     tripBudgetTotal: number,
+    childPriceRatio: number,
+    regionAllocations: RegionAllocationDto[] = [],
   ): HotelSelection {
     const hotels = places.filter((place) => place.place_type === 'hotel');
-    const fullPeople = Math.max(1, Math.trunc(totalGuests));
-    const stayNights = Math.max(1, Math.trunc(nights));
-    const centroid = this.candidateCentroid(
-      places.filter((place) => place.place_type !== 'hotel'),
+    const safeAdults = Math.max(0, Math.trunc(adultCount));
+    const safeChildren = Math.max(0, Math.trunc(childCount));
+    // fullPeople is the real, unweighted guest count (for display/logging).
+    // payingGuests is the child-discount-weighted headcount used for money —
+    // it must stay fractional (e.g. 2 adults + 1 child * 0.7 = 2.7) since
+    // truncating it before multiplying silently drops part of the real cost.
+    const fullPeople = Math.max(1, safeAdults + safeChildren);
+    const payingGuests = Math.max(
+      0.01,
+      safeAdults + safeChildren * childPriceRatio,
     );
+    const stayNights = Math.max(1, Math.trunc(nights));
+
+    // (a) Geographic centrality: minimize average distance to the POIs in
+    // the densest tourist-attraction cluster. detect_regions() (HDBSCAN)
+    // already labeled the largest cluster "Vùng Trung Tâm" before the
+    // region-allocation wizard ran, and each wizard allocation preserves its
+    // region's original placeIds grouping — so the confirmed allocation with
+    // the most placeIds IS that same densest cluster. No need to re-derive
+    // density here.
+    const activeAllocations = regionAllocations.filter(
+      (allocation) => allocation.days > 0,
+    );
+    const densePlaceIds = activeAllocations.length
+      ? new Set(
+          activeAllocations.reduce((largest, current) =>
+            current.placeIds.length > largest.placeIds.length
+              ? current
+              : largest,
+          ).placeIds,
+        )
+      : null;
+    const denseClusterPlaces = densePlaceIds
+      ? places.filter((place) => densePlaceIds.has(place.id))
+      : places.filter((place) =>
+          ['attraction', 'cafe', 'entertainment'].includes(
+            place.place_type ?? '',
+          ),
+        );
+
+    const avgDistanceToDenseCluster = (
+      hotel: ItineraryPlanPayload['places'][number],
+    ): number => {
+      if (!denseClusterPlaces.length) return 0;
+      const total = denseClusterPlaces.reduce(
+        (sum, place) =>
+          sum +
+          this.haversineKm(
+            Number(hotel.latitude),
+            Number(hotel.longitude),
+            Number(place.latitude),
+            Number(place.longitude),
+          ),
+        0,
+      );
+      return total / denseClusterPlaces.length;
+    };
+
     const candidates: HotelSelection[] = [];
     for (const hotel of hotels) {
       const pricePerPersonPerNight = Math.max(
@@ -823,41 +961,16 @@ export class RecommendationService {
         Math.round(Number(hotel.estimated_cost ?? 0)),
       );
       if (pricePerPersonPerNight <= 0) continue;
-      const groupNightlyCost = pricePerPersonPerNight * fullPeople;
+      const groupNightlyCost = Math.round(
+        pricePerPersonPerNight * payingGuests,
+      );
       const hotelTotalCost = groupNightlyCost * stayNights;
 
-      const twoTowerScore = this.clamp01(
-        Number(hotel.retrieval_score ?? 0),
-      );
-      const ratingScore = this.clamp01(
-        Number(hotel.average_rating ?? 0) / 5,
-      );
-      const distanceKm = centroid
-        ? this.haversineKm(
-            Number(hotel.latitude),
-            Number(hotel.longitude),
-            centroid.latitude,
-            centroid.longitude,
-          )
-        : 0;
-      const locationScore =
-        distanceKm <= 3
-          ? 1
-          : distanceKm <= 7
-            ? 0.8
-            : distanceKm <= 15
-              ? 0.5
-              : 0.2;
-      const hotelBudgetCap = tripBudgetTotal * 0.45;
-      const priceScore =
-        hotelBudgetCap > 0
-          ? 1 - Math.min(1, hotelTotalCost / hotelBudgetCap)
-          : 0.5;
-      const score =
-        0.45 * twoTowerScore +
-        0.2 * ratingScore +
-        0.2 * locationScore +
-        0.15 * priceScore;
+      // (b) Budget safety: room price must not exceed 40% of the total trip
+      // budget. Prefer hotels within that cap; only fall back to an
+      // over-cap hotel below if literally none qualify (budget too small
+      // for any real option), rather than failing the whole itinerary.
+      const hotelBudgetCap = tripBudgetTotal * 0.4;
 
       candidates.push({
         hotelId: hotel.id,
@@ -866,7 +979,8 @@ export class RecommendationService {
         hotelTotalCost,
         fullPeople,
         nights: stayNights,
-        score,
+        score: avgDistanceToDenseCluster(hotel),
+        candidateRank: Number(hotel.candidate_rank ?? Number.MAX_SAFE_INTEGER),
         budgetRelaxed: hotelBudgetCap > 0 && hotelTotalCost > hotelBudgetCap,
       });
     }
@@ -881,30 +995,15 @@ export class RecommendationService {
       (candidate) => !candidate.budgetRelaxed,
     );
     const pool = withinBudget.length ? withinBudget : candidates;
-    return [...pool].sort(
-      (left, right) =>
-        right.score - left.score ||
-        left.hotelTotalCost - right.hotelTotalCost,
-    )[0];
-  }
 
-  private candidateCentroid(
-    places: ItineraryPlanPayload['places'],
-  ): { latitude: number; longitude: number } | null {
-    const valid = places.filter(
-      (place) =>
-        Number.isFinite(Number(place.latitude)) &&
-        Number.isFinite(Number(place.longitude)),
-    );
-    if (!valid.length) return null;
-    return {
-      latitude:
-        valid.reduce((sum, place) => sum + Number(place.latitude), 0) /
-        valid.length,
-      longitude:
-        valid.reduce((sum, place) => sum + Number(place.longitude), 0) /
-        valid.length,
-    };
+    // (c) Suggestion score (candidate_rank / two-tower retrieval rank) only
+    // breaks ties when two hotels are essentially equidistant (<50m apart)
+    // from the dense cluster.
+    return [...pool].sort((left, right) => {
+      const distanceDiff = left.score - right.score;
+      if (Math.abs(distanceDiff) >= 0.05) return distanceDiff;
+      return left.candidateRank - right.candidateRank;
+    })[0];
   }
 
   private haversineKm(
@@ -922,10 +1021,6 @@ export class RecommendationService {
         Math.cos(radians(lat2)) *
         Math.sin(deltaLng / 2) ** 2;
     return 6371 * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
-  }
-
-  private clamp01(value: number): number {
-    return Math.min(1, Math.max(0, Number.isFinite(value) ? value : 0));
   }
 
   private resolvePlannerPlaceType(
@@ -1144,11 +1239,13 @@ export class RecommendationService {
     numDays: number,
     days: any[],
     details: ItineraryPlanPayload['places'],
-    hotelId?: string | null,
+    hotelId: string | null | undefined,
+    childPriceRatio: number,
   ): Record<string, any> {
     const adults = Number(dto.adultCount ?? 0);
     const children = Number(dto.childCount ?? 0);
     const fullPeople = adults + children;
+    const payingGuests = adults + children * childPriceRatio;
     const nights = Math.max(1, numDays - 1);
     const scheduleEntries = days.flatMap((day: any) =>
       Array.isArray(day.schedule) ? day.schedule : [],
@@ -1180,7 +1277,7 @@ export class RecommendationService {
       Math.round(Number(hotelDetail?.estimated_cost ?? 0)),
     );
     const hotel = Math.round(
-      hotelPerPersonPerNight * Math.max(1, fullPeople) * nights,
+      hotelPerPersonPerNight * Math.max(0.01, payingGuests) * nights,
     );
     if (hotelDetail?.estimated_cost == null) {
       confidence.missing += 1;
@@ -1225,6 +1322,7 @@ export class RecommendationService {
     retrieval: TwoTowerRetrievalResponseDto;
     details: ItineraryPlanPayload['places'];
     plan: unknown;
+    childPriceRatio: number;
     candidateBuilder?: {
       availableMinutes: number;
       dailyQuota: Record<string, number>;
@@ -1340,6 +1438,7 @@ export class RecommendationService {
         days,
         args.details,
         plan.hotel_id ?? null,
+        args.childPriceRatio,
       ),
       days: days.map((day: any) => ({
         day: day.day,

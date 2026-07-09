@@ -6,6 +6,18 @@ import {
   DEFAULT_TWO_TOWER_RUNTIME_CONFIG,
   TwoTowerRuntimeConfig,
 } from './two-tower-config.types';
+import { TripCostConfigService } from './trip-cost-config.service';
+
+function createTripCostConfigMock(): TripCostConfigService {
+  return {
+    getConfig: jest.fn().mockResolvedValue({
+      childPriceRatio: 0.7,
+      transportCostPerKm: { motorbike: 3000, car: 15000, taxi: 18000, truck: 20000 },
+      transportCostPerKmDefault: 10000,
+    }),
+    invalidateCache: jest.fn(),
+  } as unknown as TripCostConfigService;
+}
 
 jest.mock('../../config/supabase', () => ({
   supabase: {
@@ -62,7 +74,11 @@ describe('RecommendationService.getUserHistory', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     cache = createCacheMock();
-    service = new RecommendationService({} as MlClientService, cache as any);
+    service = new RecommendationService(
+      {} as MlClientService,
+      cache as any,
+      createTripCostConfigMock(),
+    );
   });
 
   it('trả history rỗng cho user cold-start (không có activity_logs nào)', async () => {
@@ -174,7 +190,11 @@ describe('RecommendationService.getTop20PlaceIdsByCategory / fetchPopularityMeta
   beforeEach(() => {
     jest.clearAllMocks();
     cache = createCacheMock();
-    service = new RecommendationService({} as MlClientService, cache as any);
+    service = new RecommendationService(
+      {} as MlClientService,
+      cache as any,
+      createTripCostConfigMock(),
+    );
   });
 
   it('getTop20PlaceIdsByCategory gọi ĐÚNG RPC get_place_popularity_stats với p_limit=20 + p_category_name (khớp dashboard)', async () => {
@@ -301,7 +321,11 @@ describe('RecommendationService.planItinerary — nối config xuống retrieveC
     jest.clearAllMocks();
     cache = createCacheMock();
     mlClient = { planItinerary: jest.fn().mockResolvedValue({ days: [] }) };
-    service = new RecommendationService(mlClient as any, cache as any);
+    service = new RecommendationService(
+      mlClient as any,
+      cache as any,
+      createTripCostConfigMock(),
+    );
 
     jest.spyOn(service, 'retrieveCandidates').mockResolvedValue({
       destination_name: 'Đà Lạt',

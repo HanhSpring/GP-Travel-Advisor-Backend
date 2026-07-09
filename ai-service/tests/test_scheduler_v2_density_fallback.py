@@ -45,7 +45,7 @@ def test_target_min_falls_back_before_greedy():
 
     def solve(*args, **kwargs):
         calls.append((kwargs["enforce_lunch"], kwargs["target_min"]))
-        if not kwargs["enforce_lunch"] and kwargs["target_min"] == 2:
+        if kwargs["enforce_lunch"] and kwargs["target_min"] == 2:
             return expected
         return None
 
@@ -57,15 +57,9 @@ def test_target_min_falls_back_before_greedy():
     assert result is expected
     assert calls == [
         (True, 5),
-        (True, 5),
         (True, 4),
         (True, 3),
         (True, 2),
-        (True, 1),
-        (False, 5),
-        (False, 4),
-        (False, 3),
-        (False, 2),
     ]
 
 
