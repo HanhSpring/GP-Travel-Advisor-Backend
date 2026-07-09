@@ -31,7 +31,9 @@ from pipeline_config import (
     load_env,
 )
 
-PAGE_SIZE = 1000
+# Supabase/PostgREST can timeout on large nested travel.places exports. The
+# retrain job runs offline, so prefer smaller pages and a narrow column set.
+PAGE_SIZE = 100
 
 
 def _client(cfg):
@@ -66,10 +68,12 @@ def export_places(sb) -> pd.DataFrame:
     rows = _fetch_all(
         lambda: sb.schema("travel")
         .table("places")
-        .select("*, cities(name), types(name, categories(name))")
+        .select(
+            "id, name, latitude, longitude, vibes, description, "
+            "cities(name), types(name, categories(name))"
+        )
         .eq("is_approved", True)
         .eq("is_active", True)
-        .order("id")
     )
     print(f"[export]   {len(rows)} địa điểm")
 
