@@ -18,6 +18,7 @@ Khác biệt có chủ đích so với notebook:
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import pickle
 import random
@@ -39,6 +40,10 @@ EMBED_FIELDS = [
 ]
 TOP_K_CB = 50
 DEFAULT_SVD_PARAMS = {"n_factors": 32, "n_epochs": 20, "lr_all": 0.005, "reg_all": 0.1}
+CB_EMB_FILE = "content_embeddings_foody_rich.npy"
+CB_EMB_META_FILE = "content_embedding_meta_foody_rich.csv"
+CB_LOOKUP_FILE = "cb_lookup_foody_rich.pkl"
+EMB_MODEL_FILE = "embedding_model_foody_rich.txt"
 
 
 def _normalize_city_name(value) -> str:
@@ -88,18 +93,84 @@ def build_content_text(places: pd.DataFrame) -> list[str]:
     return [" - ".join([p for p in parts if p]) for parts in zip(*arrays)]
 
 
+def _content_hash(text: str) -> str:
+    return hashlib.sha1(text.encode("utf-8")).hexdigest()
+
+
+def _load_cached_embeddings() -> dict[str, tuple[str, np.ndarray]]:
+    emb_path = OUTPUT_ARTIFACT_DIR / CB_EMB_FILE
+    meta_path = OUTPUT_ARTIFACT_DIR / CB_EMB_META_FILE
+    model_path = OUTPUT_ARTIFACT_DIR / EMB_MODEL_FILE
+    if not (emb_path.exists() and meta_path.exists() and model_path.exists()):
+        return {}
+    if model_path.read_text(encoding="utf-8").strip() != EMBED_MODEL_NAME:
+        print("[train] Cache embedding dùng model khác -> bỏ qua cache.")
+        return {}
+
+    meta = pd.read_csv(meta_path, encoding="utf-8-sig")
+    if not {"id", "content_hash"}.issubset(meta.columns):
+        print("[train] Cache embedding meta thiếu cột -> bỏ qua cache.")
+        return {}
+
+    cached = np.load(emb_path).astype(np.float32)
+    if len(meta) != cached.shape[0]:
+        print("[train] Cache embedding không khớp meta -> bỏ qua cache.")
+        return {}
+
+    ids = meta["id"].astype(str).str.strip().values
+    hashes = meta["content_hash"].astype(str).values
+    return {pid: (h, cached[i]) for i, (pid, h) in enumerate(zip(ids, hashes))}
+
+
 def train_content_based(places: pd.DataFrame) -> np.ndarray:
     from sentence_transformers import SentenceTransformer
 
     content_text = build_content_text(places)
-    print(f"[train] Encode embedding CB bằng {EMBED_MODEL_NAME}...")
-    model = SentenceTransformer(EMBED_MODEL_NAME)
-    embeddings = model.encode(
-        content_text, batch_size=32, show_progress_bar=True, normalize_embeddings=True
-    ).astype(np.float32)
+    all_ids = places["id"].astype(str).str.strip().values
+    content_hashes = [_content_hash(text) for text in content_text]
+
+    cached = _load_cached_embeddings()
+    reused = 0
+    missing_idx: list[int] = []
+    missing_text: list[str] = []
+    cached_vectors: dict[int, np.ndarray] = {}
+
+    for i, (pid, h) in enumerate(zip(all_ids, content_hashes)):
+        hit = cached.get(str(pid))
+        if hit and hit[0] == h:
+            cached_vectors[i] = hit[1]
+            reused += 1
+        else:
+            missing_idx.append(i)
+            missing_text.append(content_text[i])
+
+    print(
+        f"[train] Embedding cache: reuse={reused}, encode_new_or_changed={len(missing_idx)}"
+    )
+
+    new_embeddings = None
+    if missing_idx:
+        print(f"[train] Encode embedding CB bằng {EMBED_MODEL_NAME}...")
+        model = SentenceTransformer(EMBED_MODEL_NAME)
+        new_embeddings = model.encode(
+            missing_text, batch_size=64, show_progress_bar=True, normalize_embeddings=True
+        ).astype(np.float32)
+
+    if new_embeddings is not None:
+        dim = int(new_embeddings.shape[1])
+    elif cached_vectors:
+        dim = int(next(iter(cached_vectors.values())).shape[0])
+    else:
+        raise RuntimeError("Không có embedding cache và cũng không có item cần encode.")
+
+    embeddings = np.zeros((len(places), dim), dtype=np.float32)
+    for i, vec in cached_vectors.items():
+        embeddings[i] = vec
+    if new_embeddings is not None:
+        for j, i in enumerate(missing_idx):
+            embeddings[i] = new_embeddings[j]
 
     city_arr = places["city_name"].values
-    all_ids = places["id"].values
     print(f"[train] Pre-compute CB lookup (top-{TOP_K_CB}, cùng city)...")
     # Gom index theo city một lần để không quét toàn bộ mỗi item
     city_indices: dict[str, np.ndarray] = {}
@@ -120,10 +191,13 @@ def train_content_based(places: pd.DataFrame) -> np.ndarray:
         if (i + 1) % 5000 == 0 or i + 1 == len(all_ids):
             print(f"[train]   [{i + 1}/{len(all_ids)}] elapsed={time.time() - t0:.1f}s")
 
-    np.save(OUTPUT_ARTIFACT_DIR / "content_embeddings_foody_rich.npy", embeddings)
-    with open(OUTPUT_ARTIFACT_DIR / "cb_lookup_foody_rich.pkl", "wb") as f:
+    np.save(OUTPUT_ARTIFACT_DIR / CB_EMB_FILE, embeddings)
+    pd.DataFrame({"id": all_ids, "content_hash": content_hashes}).to_csv(
+        OUTPUT_ARTIFACT_DIR / CB_EMB_META_FILE, index=False, encoding="utf-8-sig"
+    )
+    with open(OUTPUT_ARTIFACT_DIR / CB_LOOKUP_FILE, "wb") as f:
         pickle.dump(cb_lookup, f)
-    (OUTPUT_ARTIFACT_DIR / "embedding_model_foody_rich.txt").write_text(
+    (OUTPUT_ARTIFACT_DIR / EMB_MODEL_FILE).write_text(
         EMBED_MODEL_NAME, encoding="utf-8"
     )
     print(f"[train] CB lookup: {len(cb_lookup)} items")
