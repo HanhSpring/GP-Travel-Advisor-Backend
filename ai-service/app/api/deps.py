@@ -159,10 +159,41 @@ def _load_collaborative():
         logger.warning("Collaborative Filtering weights not found — skipping")
 
 
+def _sync_session_cf_artifacts_from_r2() -> None:
+    """Download artifacts_session_cf/ từ R2 nếu đã cấu hình — mirror _download_two_tower_weights().
+
+    Trước đây SessionCfReranker là model DUY NHẤT trong 3 hệ (Two-Tower, HybridRecommender của
+    Ngọc, SessionCfReranker) KHÔNG nằm trong luồng tự đồng bộ R2 — _ensure_remote_artifacts()
+    chỉ sync đúng 2 prefix "recommender_artifacts/" và "data/" (dùng cho HybridRecommender), nên
+    dù R2 đã cấu hình, SessionCfReranker vẫn chỉ đọc local. Hàm này vá đúng lỗ hổng đó, dùng lại
+    ensure_r2_prefix() (đã có sẵn trong r2_downloader.py, vốn dùng cho HuggingFace checkpoint) —
+    tải THẲNG vào settings.session_cf_artifact_dir (không qua artifact_cache_dir riêng như
+    HybridRecommender), để load() bên dưới đọc đúng path đã cấu hình, không cần đổi gì thêm."""
+    try:
+        from pathlib import Path
+
+        from app.core.config import settings
+        from app.core.r2_downloader import _r2_configured, ensure_r2_prefix
+
+        if not _r2_configured(settings):
+            logger.info(
+                "R2 chưa cấu hình — SessionCfReranker dùng local path: %s",
+                settings.session_cf_artifact_dir,
+            )
+            return
+
+        ensure_r2_prefix(settings, "artifacts_session_cf", Path(settings.session_cf_artifact_dir))
+        logger.info("✓ Đã đồng bộ artifacts_session_cf/ từ R2")
+    except Exception as e:
+        logger.warning("Không thể đồng bộ artifacts_session_cf từ R2: %s — dùng local nếu có", e)
+
+
 def _load_session_cf_reranker():
     try:
         from app.core.config import settings
         from app.models.session_cf_reranker import SessionCfReranker
+
+        _sync_session_cf_artifacts_from_r2()
 
         try:
             from supabase import create_client

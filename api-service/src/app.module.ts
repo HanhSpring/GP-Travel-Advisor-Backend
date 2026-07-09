@@ -37,6 +37,7 @@ import { AdminItineraryReviewsModule } from './modules/admin/itinerary-reviews/a
 import { AdminDashboardModule } from './modules/admin/dashboard/admin-dashboard.module';
 import { AdminAlgorithmPipelineModule } from './modules/admin/algorithm-pipeline/admin-algorithm-pipeline.module';
 import { AdminAlgorithmSettingsModule } from './modules/admin/algorithm-settings/admin-algorithm-settings.module';
+import { SessionCfTrainingModule } from './modules/admin/session-cf-training/session-cf-training.module';
 
 /*
 Business modules
@@ -96,6 +97,7 @@ import { RecommendationModule } from './modules/recommendation/recommendation.mo
     AdminDashboardModule,
     AdminAlgorithmPipelineModule,
     AdminAlgorithmSettingsModule,
+    SessionCfTrainingModule,
 
     /*
     Business

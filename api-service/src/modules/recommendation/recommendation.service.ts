@@ -378,6 +378,13 @@ export class RecommendationService {
         category: candidate.category,
         cosine_score: candidate.cosine_score,
         predict_ranking: candidate.predict_ranking ?? null,
+        // Field chẩn đoán từ SessionCfReranker — trước đây bị cắt khỏi response khiến không
+        // thể verify/demo cold-start vs loyal-user qua API (chỉ suy đoán được qua chênh lệch
+        // số predict_ranking). Thêm lại để phục vụ demo hội đồng + debug (docs/create-data).
+        is_cold_start: candidate.is_cold_start ?? null,
+        historical_cf_score: candidate.historical_cf_score ?? null,
+        session_score: candidate.session_score ?? null,
+        popularity_score: candidate.popularity_score ?? null,
       })),
     };
   }

@@ -30,6 +30,8 @@ scripts/seed_demo_personas_manifest.json
 
 # Session-Aware CF Reranker trained artifacts (docs/create-data)
 artifacts_session_cf/
+artifacts_session_cf_foody_mixed/
+artifacts_session_cf_warmstart/
 
 # PhoBERT model
 app/models/phobert_timelabel/

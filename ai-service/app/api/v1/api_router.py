@@ -3,6 +3,7 @@ from fastapi import APIRouter
 from app.api.v1.endpoints.itinerary import router as itinerary_router
 from app.api.v1.endpoints.review_pipeline import router as review_pipeline_router
 from app.api.v1.endpoints.retrain import router as retrain_router
+from app.api.v1.endpoints.session_cf_training import router as session_cf_training_router
 
 api_router = APIRouter(prefix="/api/v1")
 
@@ -14,3 +15,6 @@ api_router.include_router(review_pipeline_router)
 
 # Local Admin-triggered recommender retraining (Colab remains independent)
 api_router.include_router(retrain_router)
+
+# Session-Aware CF Reranker training (docs/create-data)
+api_router.include_router(session_cf_training_router)
