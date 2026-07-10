@@ -14,6 +14,7 @@ User thật (tourist_id UUID) được cấp id số ổn định qua `state/tou
 from __future__ import annotations
 
 import json
+import math
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
@@ -34,6 +35,22 @@ from pipeline_config import (
 # Supabase/PostgREST can timeout on large nested travel.places exports. The
 # retrain job runs offline, so prefer smaller pages and a narrow column set.
 PAGE_SIZE = 100
+
+ACTIVITY_WEIGHTS = {
+    "view": 1.0,
+    "click": 2.0,
+    "search": 0.5,
+    "visited": 5.0,
+}
+ACTIVITY_HALF_LIFE_DAYS = {
+    "view": 30.0,
+    "click": 60.0,
+    "search": 30.0,
+    "visited": 365.0,
+    "save": 180.0,
+    "unsave": 180.0,
+}
+ACTIVITY_WINDOW_DAYS = 180
 
 
 def _client(cfg):
@@ -294,6 +311,96 @@ def export_db_reviews(sb) -> tuple[list[tuple[int, str, float]], int, str]:
     return triples, len(rows), max_created
 
 
+def _activity_decay(created_at: str, action_type: str, now: datetime) -> float:
+    """Exponential time decay, robust to Supabase ISO timestamps."""
+    try:
+        created = datetime.fromisoformat(str(created_at).replace("Z", "+00:00"))
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        age_days = max(0.0, (now - created.astimezone(timezone.utc)).total_seconds() / 86400.0)
+    except (TypeError, ValueError):
+        age_days = 0.0
+    half_life = ACTIVITY_HALF_LIFE_DAYS.get(action_type, 30.0)
+    return math.exp(-math.log(2.0) * age_days / half_life)
+
+
+def export_activity_logs(
+    sb, valid_place_ids: set[str]
+) -> tuple[list[tuple[int, str, float]], int, str]:
+    """Aggregate implicit activity into pseudo scores in the rating scale [0.5, 5].
+
+    Save/unsave is treated as a state: only the latest of the two contributes.
+    Other repeated actions use log1p so refresh/spam cannot dominate the matrix.
+    """
+    print("[export] Đang kéo travel.activity_logs từ Supabase...")
+    cutoff = datetime.now(timezone.utc).timestamp() - ACTIVITY_WINDOW_DAYS * 86400
+    cutoff_iso = datetime.fromtimestamp(cutoff, timezone.utc).isoformat()
+    rows = _fetch_all(
+        lambda: sb.schema("travel")
+        .table("activity_logs")
+        .select("tourist_id, place_id, action_type, created_at")
+        .filter("tourist_id", "not.is", "null")
+        .filter("place_id", "not.is", "null")
+        .gte("created_at", cutoff_iso)
+        .order("created_at")
+    )
+
+    mapping = _load_tourist_map()
+    next_id = max(mapping.values()) + 1 if mapping else TOURIST_NUMERIC_ID_BASE
+    now = datetime.now(timezone.utc)
+    grouped: dict[tuple[str, str], dict] = {}
+    max_created = ""
+
+    for row in rows:
+        tid = str(row.get("tourist_id") or "").strip()
+        pid = str(row.get("place_id") or "").strip()
+        action = str(row.get("action_type") or "").strip().lower()
+        created = str(row.get("created_at") or "")
+        if not tid or pid not in valid_place_ids or action not in {
+            *ACTIVITY_WEIGHTS, "save", "unsave"
+        }:
+            continue
+        if tid not in mapping:
+            mapping[tid] = next_id
+            next_id += 1
+        bucket = grouped.setdefault((tid, pid), {"signals": defaultdict(float), "save": None})
+        decay = _activity_decay(created, action, now)
+        if action in ("save", "unsave"):
+            bucket["save"] = (action, decay)
+        else:
+            bucket["signals"][action] += decay
+        max_created = max(max_created, created)
+
+    triples: list[tuple[int, str, float]] = []
+    user_strength: dict[int, float] = defaultdict(float)
+    for (tid, pid), bucket in grouped.items():
+        strength = sum(
+            ACTIVITY_WEIGHTS[action] * math.log1p(decayed_count)
+            for action, decayed_count in bucket["signals"].items()
+        )
+        save_state = bucket["save"]
+        if save_state and save_state[0] == "save":
+            strength += 4.0 * save_state[1]
+        if strength <= 0:
+            continue
+        # Smoothly map implicit strength to the same numeric range as rating SVD.
+        pseudo_rating = 0.5 + 4.5 * (1.0 - math.exp(-strength / 5.0))
+        numeric_id = mapping[tid]
+        triples.append((numeric_id, pid, float(pseudo_rating)))
+        user_strength[numeric_id] += strength
+
+    _save_tourist_map(mapping)
+    pd.DataFrame(
+        {
+            "UserID": list(user_strength.keys()),
+            "strength": list(user_strength.values()),
+            "confidence": [min(1.0, s / 10.0) for s in user_strength.values()],
+        }
+    ).to_csv(OUTPUT_DATA_DIR / "activity_log_user_confidence.csv", index=False, encoding="utf-8-sig")
+    print(f"[export]   {len(rows)} log thô -> {len(triples)} tương tác user-place")
+    return triples, len(rows), max_created
+
+
 def build_rating_matrix(
     triples: list[tuple[int, str, float]], valid_place_ids: set[str]
 ) -> tuple[int, int, int]:
@@ -338,6 +445,38 @@ def build_rating_matrix(
     return len(users), len(items), int(mat.nnz)
 
 
+def build_activity_matrix(
+    triples: list[tuple[int, str, float]], valid_place_ids: set[str]
+) -> tuple[int, int, int]:
+    """Build the second, independent user-place matrix from aggregated logs."""
+    values = {(u, pid): score for u, pid, score in triples if pid in valid_place_ids}
+    if not values:
+        for name in ("activity_log_matrix.npz", "activity_log_users.csv", "activity_log_items.csv"):
+            (OUTPUT_DATA_DIR / name).unlink(missing_ok=True)
+        print("[export] Không có activity log hợp lệ — tiếp tục với rating CF.")
+        return 0, 0, 0
+    users = sorted({u for u, _ in values})
+    items = sorted({pid for _, pid in values})
+    u_idx = {u: i for i, u in enumerate(users)}
+    i_idx = {pid: i for i, pid in enumerate(items)}
+    mat = csr_matrix(
+        (
+            np.asarray(list(values.values()), dtype=np.float32),
+            ([u_idx[u] for u, _ in values], [i_idx[pid] for _, pid in values]),
+        ),
+        shape=(len(users), len(items)),
+    )
+    save_npz(OUTPUT_DATA_DIR / "activity_log_matrix.npz", mat)
+    pd.DataFrame({"UserID": users}).to_csv(
+        OUTPUT_DATA_DIR / "activity_log_users.csv", index=False, encoding="utf-8-sig"
+    )
+    pd.DataFrame({"id": items}).to_csv(
+        OUTPUT_DATA_DIR / "activity_log_items.csv", index=False, encoding="utf-8-sig"
+    )
+    print(f"[export]   → activity_log_matrix.npz: {len(users)} users × {len(items)} items, nnz={mat.nnz}")
+    return len(users), len(items), int(mat.nnz)
+
+
 # ────────────────────────────── Main ──────────────────────────────
 
 def main() -> dict:
@@ -352,6 +491,12 @@ def main() -> dict:
     n_users, n_items, nnz = build_rating_matrix(
         foody + db_triples, set(places["id"].values)
     )
+    log_triples, activity_count, activity_max_created = export_activity_logs(
+        sb, set(places["id"].values)
+    )
+    log_users, log_items, log_nnz = build_activity_matrix(
+        log_triples, set(places["id"].values)
+    )
 
     snapshot = {
         "exported_at": datetime.now(timezone.utc).isoformat(),
@@ -361,6 +506,11 @@ def main() -> dict:
         "matrix_users": n_users,
         "matrix_items": n_items,
         "matrix_nnz": nnz,
+        "activity_logs_count": int(activity_count),
+        "activity_logs_max_created_at": activity_max_created,
+        "activity_matrix_users": log_users,
+        "activity_matrix_items": log_items,
+        "activity_matrix_nnz": log_nnz,
     }
     (OUTPUT_DATA_DIR / "snapshot.json").write_text(
         json.dumps(snapshot, ensure_ascii=False, indent=2), encoding="utf-8"

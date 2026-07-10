@@ -63,6 +63,10 @@ def _copy_outputs_to_input(drive_root: Path) -> None:
         "rating_matrix_foody.npz",
         "rating_matrix_foody_users.csv",
         "rating_matrix_foody_items.csv",
+        "activity_log_matrix.npz",
+        "activity_log_users.csv",
+        "activity_log_items.csv",
+        "activity_log_user_confidence.csv",
         "snapshot.json",
     ):
         p = src / name

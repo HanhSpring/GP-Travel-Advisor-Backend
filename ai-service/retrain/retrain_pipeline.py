@@ -44,6 +44,10 @@ DATA_FILES = [
     "rating_matrix_foody.npz",
     "rating_matrix_foody_users.csv",
     "rating_matrix_foody_items.csv",
+    "activity_log_matrix.npz",
+    "activity_log_users.csv",
+    "activity_log_items.csv",
+    "activity_log_user_confidence.csv",
 ]
 
 
@@ -81,16 +85,30 @@ def fetch_db_counts(cfg) -> dict:
         .limit(1).execute()
     )
     max_created = (latest.data or [{}])[0].get("created_at", "")
+    activities = (
+        sb.schema("travel").table("activity_logs")
+        .select("id", count="exact").limit(1).execute()
+    )
+    latest_activity = (
+        sb.schema("travel").table("activity_logs")
+        .select("created_at").order("created_at", desc=True).limit(1).execute()
+    )
+    max_activity_created = (latest_activity.data or [{}])[0].get("created_at", "")
     return {
         "places_count": places.count or 0,
         "db_reviews_count": reviews.count or 0,
         "db_reviews_max_created_at": max_created or "",
+        "activity_logs_count": activities.count or 0,
+        "activity_logs_max_created_at": max_activity_created or "",
     }
 
 
 def has_changes(current: dict, state: dict) -> bool:
     prev = state.get("db_counts", {})
-    for key in ("places_count", "db_reviews_count", "db_reviews_max_created_at"):
+    for key in (
+        "places_count", "db_reviews_count", "db_reviews_max_created_at",
+        "activity_logs_count", "activity_logs_max_created_at",
+    ):
         if current.get(key) != prev.get(key):
             log(f"Thay đổi ở {key}: {prev.get(key)!r} → {current.get(key)!r}")
             return True
@@ -154,7 +172,7 @@ def quality_gate(cfg, current_manifest: Path | None) -> None:
 
 def _copy_tree_files(src: Path, dst: Path, names: list[str] | None = None) -> None:
     dst.mkdir(parents=True, exist_ok=True)
-    files = [src / n for n in names] if names else sorted(src.iterdir())
+    files = [src / n for n in names if (src / n).exists()] if names else sorted(src.iterdir())
     for f in files:
         if f.is_file():
             shutil.copy2(f, dst / f.name)
@@ -219,7 +237,7 @@ def deploy_r2(cfg) -> None:
         (OUTPUT_DATA_DIR, "data/", DATA_FILES),
     ]
     for src, prefix, names in uploads:
-        files = [src / n for n in names] if names else sorted(src.iterdir())
+        files = [src / n for n in names if (src / n).exists()] if names else sorted(src.iterdir())
         for f in files:
             if not f.is_file():
                 continue

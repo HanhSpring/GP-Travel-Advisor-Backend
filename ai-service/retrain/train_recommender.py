@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import pickle
 import random
 import sys
@@ -339,12 +340,158 @@ def train_cf(places: pd.DataFrame, grid_search: bool, prev_params: dict | None) 
         "best_svd_params": best_params,
         "val_rmse": float(val_rmse),
         "test_rmse": float(test_rmse),
+        # Runtime-only objects used to evaluate rating + log on the exact same split.
+        "_algo": algo,
+        "_val_raw": val_raw,
+        "_test_raw": test_raw,
+        "_user_ids": cf_user_ids,
+        "_item_ids": cf_item_ids,
+    }
+
+
+def train_activity_cf(places: pd.DataFrame, params: dict) -> dict | None:
+    """Train an independent CF model from the implicit activity matrix.
+
+    The exporter has already aggregated, decayed and mapped log strength into
+    [0.5, 5]. Keeping a separate model prevents views/clicks from changing the
+    meaning of explicit ratings.
+    """
+    from surprise import SVD, Dataset, Reader
+
+    required = (
+        "activity_log_matrix.npz", "activity_log_users.csv",
+        "activity_log_items.csv", "activity_log_user_confidence.csv",
+    )
+    output_names = (
+        "log_user_factors.npy", "log_item_factors.npy", "log_user_bias.npy",
+        "log_item_bias.npy", "log_user_ids.csv", "log_item_ids.csv",
+        "log_user_confidence.csv", "log_city_to_item_idx.pkl",
+    )
+    if not all((OUTPUT_DATA_DIR / name).exists() for name in required):
+        for name in output_names:
+            (OUTPUT_ARTIFACT_DIR / name).unlink(missing_ok=True)
+        print("[train] Không có activity matrix -> bỏ qua log CF.")
+        return None
+
+    matrix = load_npz(OUTPUT_DATA_DIR / "activity_log_matrix.npz").astype(np.float32).tocsr()
+    if matrix.nnz == 0:
+        for name in output_names:
+            (OUTPUT_ARTIFACT_DIR / name).unlink(missing_ok=True)
+        print("[train] Activity matrix rỗng -> bỏ qua log CF.")
+        return None
+    users = pd.read_csv(OUTPUT_DATA_DIR / "activity_log_users.csv").iloc[:, 0].astype(int).values
+    items = pd.read_csv(OUTPUT_DATA_DIR / "activity_log_items.csv").iloc[:, 0].astype(str).str.strip().values
+    coo = matrix.tocoo()
+    frame = pd.DataFrame({"u_idx": coo.row, "i_idx": coo.col, "score": coo.data})
+    data = Dataset.load_from_df(frame[["u_idx", "i_idx", "score"]], Reader(rating_scale=(0.5, 5.0)))
+    trainset = data.build_full_trainset()
+    algo = SVD(**params)
+    algo.fit(trainset)
+
+    factors = int(algo.pu.shape[1])
+    P = np.zeros((len(users), factors), dtype=np.float32)
+    Q = np.zeros((len(items), factors), dtype=np.float32)
+    b_u = np.zeros(len(users), dtype=np.float32)
+    b_i = np.zeros(len(items), dtype=np.float32)
+    for raw_u in range(len(users)):
+        try:
+            inner = trainset.to_inner_uid(raw_u)
+            P[raw_u], b_u[raw_u] = algo.pu[inner], algo.bu[inner]
+        except ValueError:
+            pass
+    for raw_i in range(len(items)):
+        try:
+            inner = trainset.to_inner_iid(raw_i)
+            Q[raw_i], b_i[raw_i] = algo.qi[inner], algo.bi[inner]
+        except ValueError:
+            pass
+
+    np.save(OUTPUT_ARTIFACT_DIR / "log_user_factors.npy", P)
+    np.save(OUTPUT_ARTIFACT_DIR / "log_item_factors.npy", Q)
+    np.save(OUTPUT_ARTIFACT_DIR / "log_user_bias.npy", b_u)
+    np.save(OUTPUT_ARTIFACT_DIR / "log_item_bias.npy", b_i)
+    pd.DataFrame({"UserID": users}).to_csv(
+        OUTPUT_ARTIFACT_DIR / "log_user_ids.csv", index=False, encoding="utf-8-sig"
+    )
+    pd.DataFrame({"id": items}).to_csv(
+        OUTPUT_ARTIFACT_DIR / "log_item_ids.csv", index=False, encoding="utf-8-sig"
+    )
+    confidence = pd.read_csv(OUTPUT_DATA_DIR / "activity_log_user_confidence.csv")
+    confidence.to_csv(OUTPUT_ARTIFACT_DIR / "log_user_confidence.csv", index=False, encoding="utf-8-sig")
+
+    res2city = dict(zip(places["id"].astype(str), places["city_name"].astype(str)))
+    city_idx: dict[str, list[int]] = {}
+    for idx, pid in enumerate(items):
+        city = _normalize_city_name(res2city.get(pid, ""))
+        if city:
+            city_idx.setdefault(city, []).append(idx)
+    with open(OUTPUT_ARTIFACT_DIR / "log_city_to_item_idx.pkl", "wb") as f:
+        pickle.dump({k: np.asarray(v, dtype=np.int32) for k, v in city_idx.items()}, f)
+
+    print(f"[train] Log CF: {len(users)} users × {len(items)} items, nnz={matrix.nnz}")
+    return {
+        "global_mean": float(trainset.global_mean),
+        "num_users": int(len(users)),
+        "num_items": int(len(items)),
+        "n_factors": factors,
+        "_algo": algo,
+        "_user_pos": {int(uid): idx for idx, uid in enumerate(users)},
+        "_item_pos": {str(pid): idx for idx, pid in enumerate(items)},
+        "_confidence": {
+            int(row.UserID): max(0.0, min(1.0, float(row.confidence)))
+            for row in confidence.itertuples()
+        },
+    }
+
+
+def evaluate_hybrid_rmse(cf: dict, log_cf: dict | None, max_log_weight: float = 0.35) -> dict:
+    """Evaluate the blend against held-out explicit ratings (never against logs)."""
+    if not log_cf:
+        return {
+            "val_rmse": cf["val_rmse"], "test_rmse": cf["test_rmse"],
+            "val_log_coverage": 0, "test_log_coverage": 0,
+        }
+
+    rating_algo = cf["_algo"]
+    log_algo = log_cf["_algo"]
+    user_ids, item_ids = cf["_user_ids"], cf["_item_ids"]
+    log_users, log_items = log_cf["_user_pos"], log_cf["_item_pos"]
+    confidence = log_cf["_confidence"]
+
+    def score(rows):
+        squared_errors = []
+        covered = 0
+        for raw_u, raw_i, actual, _timestamp in rows:
+            rating_pred = float(rating_algo.predict(raw_u, raw_i).est)
+            numeric_uid = int(user_ids[int(raw_u)])
+            place_id = str(item_ids[int(raw_i)])
+            if numeric_uid in log_users and place_id in log_items:
+                log_pred = float(log_algo.predict(log_users[numeric_uid], log_items[place_id]).est)
+                weight = max_log_weight * confidence.get(numeric_uid, 0.0)
+                prediction = (1.0 - weight) * rating_pred + weight * log_pred
+                covered += 1
+            else:
+                prediction = rating_pred
+            prediction = float(np.clip(prediction, 0.5, 5.0))
+            squared_errors.append((float(actual) - prediction) ** 2)
+        rmse = math.sqrt(float(np.mean(squared_errors))) if squared_errors else float("nan")
+        return rmse, covered
+
+    val_rmse, val_coverage = score(cf["_val_raw"])
+    test_rmse, test_coverage = score(cf["_test_raw"])
+    print(
+        f"[train] Hybrid RMSE (rating + log): val={val_rmse:.4f}, test={test_rmse:.4f}; "
+        f"log coverage={val_coverage}/{len(cf['_val_raw'])}, {test_coverage}/{len(cf['_test_raw'])}"
+    )
+    return {
+        "val_rmse": float(val_rmse), "test_rmse": float(test_rmse),
+        "val_log_coverage": int(val_coverage), "test_log_coverage": int(test_coverage),
     }
 
 
 # ────────────────────────── Manifest (giống cell 10) ──────────────────────────
 
-def write_manifest(cf: dict) -> None:
+def write_manifest(cf: dict, log_cf: dict | None = None, hybrid_metrics: dict | None = None) -> None:
     snapshot = {}
     snap_file = OUTPUT_DATA_DIR / "snapshot.json"
     if snap_file.exists():
@@ -365,6 +512,8 @@ def write_manifest(cf: dict) -> None:
             "distance_decay_km": 5.0,
             "cb_k": 50,
             "cf_k": 50,
+            "rating_cf_weight": 0.65,
+            "log_cf_weight": 0.35,
         },
         "artifacts": {
             "user_factors": "cf_user_factors.npy",
@@ -384,9 +533,34 @@ def write_manifest(cf: dict) -> None:
         },
         # ── Phần thêm bởi retrain pipeline (không ảnh hưởng serving) ──
         "trained_at": datetime.now(timezone.utc).isoformat(),
-        "metrics": {"val_rmse": cf["val_rmse"], "test_rmse": cf["test_rmse"]},
+        "metrics": {
+            "val_rmse": (hybrid_metrics or {}).get("val_rmse", cf["val_rmse"]),
+            "test_rmse": (hybrid_metrics or {}).get("test_rmse", cf["test_rmse"]),
+            "rating_only_val_rmse": cf["val_rmse"],
+            "rating_only_test_rmse": cf["test_rmse"],
+            "hybrid_log_coverage_val": (hybrid_metrics or {}).get("val_log_coverage", 0),
+            "hybrid_log_coverage_test": (hybrid_metrics or {}).get("test_log_coverage", 0),
+        },
         "data_snapshot": snapshot,
     }
+    if log_cf:
+        manifest["log_cf"] = {
+            "global_mean": log_cf["global_mean"],
+            "num_users": log_cf["num_users"],
+            "num_items": log_cf["num_items"],
+            "n_factors": log_cf["n_factors"],
+            "max_weight": 0.35,
+            "artifacts": {
+                "user_factors": "log_user_factors.npy",
+                "item_factors": "log_item_factors.npy",
+                "user_bias": "log_user_bias.npy",
+                "item_bias": "log_item_bias.npy",
+                "user_ids": "log_user_ids.csv",
+                "item_ids": "log_item_ids.csv",
+                "user_confidence": "log_user_confidence.csv",
+                "city_to_item_idx": "log_city_to_item_idx.pkl",
+            },
+        }
     with open(OUTPUT_ARTIFACT_DIR / "serve_manifest.json", "w", encoding="utf-8") as f:
         json.dump(manifest, f, ensure_ascii=False, indent=2)
     print("[train] ✅ serve_manifest.json đã ghi")
@@ -410,7 +584,10 @@ def main(grid_search: bool = False, prev_manifest: Path | None = None) -> dict:
     places = load_places()
     train_content_based(places)
     cf = train_cf(places, grid_search=grid_search, prev_params=prev_params)
-    write_manifest(cf)
+    log_cf = train_activity_cf(places, cf["best_svd_params"])
+    hybrid_metrics = evaluate_hybrid_rmse(cf, log_cf, max_log_weight=0.35)
+    write_manifest(cf, log_cf, hybrid_metrics)
+    cf["log_cf"] = log_cf
     return cf
 
 

@@ -137,3 +137,18 @@ rồi restart service.
   load model). Muốn zero-downtime cần thêm endpoint reload vào ai-service (đụng code).
 - `district_old`, `travel_type` có thể không tồn tại trong `travel.places` (dữ liệu
   crawl cũ) → cột rỗng, embedding vẫn chạy bình thường, chỉ kém giàu ngữ cảnh hơn chút.
+# Activity-log CF (second matrix)
+
+The retrain job keeps explicit ratings and implicit activity in separate matrices.
+`travel.activity_logs` from the latest 180 days is aggregated by `(tourist_id,
+place_id)` with time decay and action weights (`view=1`, `click=2`, `search=0.5`,
+`visited=5`, active `save=4`). The latest `save`/`unsave` event defines save state.
+
+The second matrix produces optional `log_*` artifacts. Serving remains backward
+compatible: rating-only and log-only users use the available model; users present
+in both models use at most 35% log weight, scaled by their activity confidence.
+If log artifacts are absent, behavior is identical to the previous rating-CF build.
+
+RMSE is always evaluated against held-out real ratings. `serve_manifest.json`
+records both `rating_only_test_rmse` and the blended `test_rmse`, plus log coverage
+on the validation/test splits.
