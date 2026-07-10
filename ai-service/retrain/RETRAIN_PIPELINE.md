@@ -106,13 +106,14 @@ description...) nên được gợi ý qua nhánh CB ngay cả khi **chưa có r
 Khi có review, nó vào cả ma trận CF.
 
 **User mới bao giờ được cá nhân hóa?** Review của user thật đã được đưa vào ma trận
-CF (cải thiện item factors/bias cho mọi người). Nhưng **cá nhân hóa CF theo từng
-user thật thì chưa kích hoạt được**: serving nhận `user_id` dạng số, còn NestJS chỉ
-truyền `touristId` khi nó là chuỗi số (`places.service.ts` → `numericUserId`), user
-thật là UUID → luôn `null` → nhánh CF bỏ qua, user vẫn nhận CB + khoảng cách.
-Map `tourist_user_map.csv` đã sẵn sàng; muốn bật nốt chỉ cần sửa nhỏ ở NestJS/API
-(tra UUID → id số trước khi gọi ai-service) — **chưa làm vì yêu cầu không đụng code
-đang chạy**.
+CF (cải thiện item factors/bias cho mọi người). Cá nhân hóa CF theo từng user thật
+**đã kích hoạt**: NestJS truyền thẳng `tourist_id` (UUID của user đăng nhập, mobile
+gửi kèm khi gọi `GET /places/:id`) sang ai-service; route
+`/recommend/places/{id}/recommendations` nhận `user_id` dạng chuỗi và
+`HybridRecommender.resolve_user_id` tra `tourist_user_map.csv` (UUID → id số) để
+chạy nhánh CF. File map được deploy kèm artifact (`deploy_local` + upload R2 prefix
+`recommender_artifacts/`); thiếu map thì user thật chỉ nhận CB + khoảng cách như cũ,
+không lỗi. Lưu ý: user mới chỉ vào map ở lần retrain kế tiếp (sau khi có review).
 
 **Vì sao không grid-search mỗi đêm?** 24 tổ hợp × 3 fold quá nặng để chạy hàng ngày;
 tham số tối ưu ít khi đổi theo ngày. Mặc định dùng lại `best_svd_params` trong

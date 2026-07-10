@@ -33,6 +33,7 @@ from pipeline_config import (
     OUTPUT_ARTIFACT_DIR,
     OUTPUT_DATA_DIR,
     STATE_FILE,
+    TOURIST_MAP_FILE,
     ensure_dirs,
     load_env,
 )
@@ -179,6 +180,9 @@ def backup_current(cfg) -> None:
 def deploy_local(cfg) -> None:
     _copy_tree_files(OUTPUT_ARTIFACT_DIR, Path(cfg["service_artifact_dir"]))
     _copy_tree_files(OUTPUT_DATA_DIR, Path(cfg["service_data_dir"]), DATA_FILES)
+    # Map UUID -> id số đi kèm artifact để serving resolve user thật (nhánh CF)
+    if TOURIST_MAP_FILE.is_file():
+        shutil.copy2(TOURIST_MAP_FILE, Path(cfg["service_artifact_dir"]) / TOURIST_MAP_FILE.name)
     log(
         f"Đã copy artifact mới vào {cfg['service_artifact_dir']} "
         f"và data vào {cfg['service_data_dir']}"
@@ -222,6 +226,13 @@ def deploy_r2(cfg) -> None:
             key = prefix + f.name
             log(f"⬆ Upload r2://{bucket}/{key} ({f.stat().st_size / 1024 / 1024:.1f} MB)")
             client.upload_file(str(f), bucket, key)
+    # Map UUID -> id số: ship kèm artifact để serving resolve user thật (nhánh CF)
+    if TOURIST_MAP_FILE.is_file():
+        key = "recommender_artifacts/" + TOURIST_MAP_FILE.name
+        log(f"⬆ Upload r2://{bucket}/{key}")
+        client.upload_file(str(TOURIST_MAP_FILE), bucket, key)
+    else:
+        log(f"{TOURIST_MAP_FILE.name} chưa có — user thật (UUID) sẽ không có nhánh CF")
     log("Upload R2 hoàn tất")
 
     # Xóa cache local của service: r2_downloader chỉ so SIZE, file .npy cùng

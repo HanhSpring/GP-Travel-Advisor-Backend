@@ -76,7 +76,7 @@ def recommend_cf(user_id: str, top_k: int) -> tuple[list[str], list[float]]:
 
 
 def recommend_for_place(
-    place_id: str, user_id: int | None, k: int | None = None
+    place_id: str, user_id: str | int | None, k: int | None = None
 ) -> list[dict]:
     """Gợi ý "Có thể bạn sẽ thích" cho 1 địa điểm đang xem (Hybrid CB + CF + khoảng cách)."""
     engine = get_model("hybrid_recommender")

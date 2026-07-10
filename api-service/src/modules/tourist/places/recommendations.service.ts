@@ -40,7 +40,7 @@ export class RecommendationsService {
   /** Trả về danh sách place id đã xếp hạng theo model (rỗng nếu AI service không sẵn sàng). */
   async getRecommendedPlaceIds(
     placeId: string,
-    options: { userId?: number | null; k?: number } = {},
+    options: { userId?: string | null; k?: number } = {},
   ): Promise<RecommendationItem[]> {
     const { userId = null, k } = options;
     const url = `${this.baseUrl}/recommend/places/${encodeURIComponent(placeId)}/recommendations`;
@@ -50,7 +50,9 @@ export class RecommendationsService {
         this.http.get<RecommendationsResponse>(url, {
           params: {
             ...(k != null ? { k } : {}),
-            ...(userId != null ? { user_id: userId } : {}),
+            // Tourist UUID (hoặc id số Foody lịch sử) — AI service tự tra
+            // tourist_user_map.csv để về id số của ma trận CF.
+            ...(userId ? { user_id: userId } : {}),
           },
           timeout: this.timeoutMs,
         }),

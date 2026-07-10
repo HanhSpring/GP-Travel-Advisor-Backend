@@ -38,9 +38,14 @@ class HybridRecommender:
     ]
     REQUIRED_DATA = ["Places.csv", "rating_matrix_foody.npz"]
 
+    # Map tourist UUID -> id số (sinh bởi retrain/export_training_data.py).
+    # Optional: thiếu file thì user thật chỉ nhận CB + khoảng cách như trước.
+    TOURIST_MAP_FILE = "tourist_user_map.csv"
+
     def __init__(self, artifact_dir: str, data_dir: str):
         self.artifact_dir = Path(artifact_dir)
         self.data_dir = Path(data_dir)
+        self.tourist_uuid_to_numeric: dict[str, int] = {}
         self.ready = False
 
     # ------------------------------------------------------------------ load
@@ -96,6 +101,8 @@ class HybridRecommender:
 
         self.R_csr = load_npz(data / "rating_matrix_foody.npz").tocsr()  # mask lịch sử
 
+        self.tourist_uuid_to_numeric = self._load_tourist_map()
+
         # Metadata hiển thị + city/coords theo place_id
         places = pd.read_csv(data / "Places.csv", encoding="utf-8-sig", low_memory=False)
         places.columns = [c.strip() for c in places.columns]
@@ -133,6 +140,51 @@ class HybridRecommender:
         )
 
     # --------------------------------------------------------------- helpers
+    def _load_tourist_map(self) -> dict[str, int]:
+        """Đọc tourist_user_map.csv (UUID -> id số) nếu có.
+
+        Ưu tiên bản đi kèm artifact (đồng bộ từ R2), fallback retrain/state/
+        khi chạy local không R2. Thiếu file không phải lỗi — chỉ mất nhánh CF
+        cho user thật.
+        """
+        candidates = [
+            self.artifact_dir / self.TOURIST_MAP_FILE,
+            Path("retrain") / "state" / self.TOURIST_MAP_FILE,
+        ]
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                df = pd.read_csv(path, dtype={"tourist_id": str, "numeric_id": int})
+                mapping = {
+                    str(t).strip().lower(): int(n)
+                    for t, n in zip(df["tourist_id"], df["numeric_id"])
+                }
+                logger.info(
+                    "Tourist map loaded: %d user thật (từ %s)", len(mapping), path
+                )
+                return mapping
+            except Exception as e:
+                logger.warning("Không đọc được tourist map %s: %s", path, e)
+        logger.info(
+            "tourist_user_map.csv không có — user thật (UUID) sẽ không có nhánh CF"
+        )
+        return {}
+
+    def resolve_user_id(self, raw) -> int | None:
+        """Chuyển user_id bất kỳ (id số hoặc tourist UUID) về id số của ma trận CF.
+
+        Trả None nếu không map được — nhánh CF sẽ bị bỏ qua (giữ CB + khoảng cách).
+        """
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        if s.isdigit():
+            return int(s)
+        return self.tourist_uuid_to_numeric.get(s.lower())
+
     def _meta(self, pid: str) -> dict:
         if pid not in self.places.index:
             return {}
@@ -195,6 +247,7 @@ class HybridRecommender:
         if not self.ready:
             raise RuntimeError("Recommender chưa load được artifact")
 
+        user_id = self.resolve_user_id(user_id)
         current_item_id = str(current_item_id)
         city = self.id2city.get(current_item_id, "")
         if not city:
