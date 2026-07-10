@@ -1,7 +1,9 @@
 import {
+  ConflictException,
   Injectable,
   InternalServerErrorException,
   Logger,
+  NotFoundException,
 } from '@nestjs/common';
 import { HttpService } from '@nestjs/axios';
 import { firstValueFrom } from 'rxjs';
@@ -13,12 +15,16 @@ import {
   PipelineRunRequestDto,
   PipelineRunResponseDto,
   ReviewFilterScheduleDto,
+  RecommenderRetrainRunDto,
+  RecommenderRetrainStatusDto,
   ReviewFilterScheduleFrequency,
   UpdateReviewFilterScheduleDto,
 } from './dto/pipeline-run.dto';
 import { AdminAlgorithmSettingsService } from '../algorithm-settings/admin-algorithm-settings.service';
 
 const REVIEW_FILTER_ALGORITHM_NAME = 'review_filter';
+const RECOMMENDER_RETRAIN_ALGORITHM_NAME = 'recommender_retrain';
+const MAX_RETRAIN_RUNS = 50;
 
 type AlgorithmRow = {
   id: string;
@@ -254,6 +260,190 @@ export class AdminAlgorithmPipelineService {
     }
   }
 
+  async startRecommenderRetrain(
+    triggeredBy: string | null,
+    triggerType: 'manual' | 'scheduled',
+  ): Promise<RecommenderRetrainStatusDto> {
+    const algorithm = await this.ensureRecommenderAlgorithm();
+    const { data, error } = await supabase
+      .schema('ai_config')
+      .rpc('create_recommender_training_run', {
+        p_algorithm_id: algorithm.id,
+        p_trigger_type: triggerType,
+        p_triggered_by: triggeredBy,
+        p_max_runs: MAX_RETRAIN_RUNS,
+      });
+
+    if (error) {
+      const detail = error.message || String(error);
+      if (detail.includes('RETRAIN_LIMIT_REACHED')) {
+        throw new ConflictException('Đã đạt giới hạn 50 lần retrain demo');
+      }
+      if (detail.includes('RETRAIN_ALREADY_RUNNING')) {
+        throw new ConflictException('Đang có một retrain job chạy');
+      }
+      throw new InternalServerErrorException(`Không thể tạo retrain job: ${detail}`);
+    }
+
+    const row = (Array.isArray(data) ? data[0] : data) as any;
+    try {
+      await firstValueFrom(
+        this.httpService.post(
+          `${this.aiServiceUrl}/api/v1/retrain/runs`,
+          {
+            run_id: row.id,
+            force: triggerType === 'manual',
+            trigger_type: triggerType,
+          },
+          { timeout: 15_000 },
+        ),
+      );
+      await this.insertRecommenderLog(algorithm.id, 'active', {
+        requestedAction: 'recommender_retrain_started',
+        run_id: row.id,
+        trigger_type: triggerType,
+      });
+    } catch (startError: any) {
+      await supabase
+        .schema('ai_config')
+        .from('training_runs')
+        .update({
+          status: 'failed',
+          completed_at: new Date().toISOString(),
+          error_message:
+            startError?.response?.data?.detail ?? startError?.message ?? 'AI service rejected retrain',
+        })
+        .eq('id', row.id);
+      throw new InternalServerErrorException(
+        'Không thể khởi động retrain trên AI service',
+      );
+    }
+    return this.getRecommenderRetrainStatus();
+  }
+
+  async getRecommenderRetrainStatus(): Promise<RecommenderRetrainStatusDto> {
+    const algorithm = await this.ensureRecommenderAlgorithm();
+    const [{ data: rows, error }, { count, error: countError }] = await Promise.all([
+      supabase
+        .schema('ai_config')
+        .from('training_runs')
+        .select('*')
+        .eq('algorithm_id', algorithm.id)
+        .order('created_at', { ascending: false })
+        .limit(10),
+      supabase
+        .schema('ai_config')
+        .from('training_runs')
+        .select('id', { count: 'exact', head: true })
+        .eq('algorithm_id', algorithm.id),
+    ]);
+    this.throwIfSupabaseError(error || countError, 'Could not load recommender retrain status');
+    const mapped = (rows ?? []).map((row: any) => this.toRetrainRun(row));
+    const usedRuns = count ?? mapped.length;
+    return {
+      currentRun:
+        mapped.find((run) => ['pending', 'running'].includes(run.status)) ?? null,
+      latestRun: mapped[0] ?? null,
+      usedRuns,
+      maxRuns: MAX_RETRAIN_RUNS,
+      remainingRuns: Math.max(0, MAX_RETRAIN_RUNS - usedRuns),
+    };
+  }
+
+  async getRecommenderRetrainRun(id: string): Promise<RecommenderRetrainRunDto> {
+    const algorithm = await this.ensureRecommenderAlgorithm();
+    const { data, error } = await supabase
+      .schema('ai_config')
+      .from('training_runs')
+      .select('*')
+      .eq('id', id)
+      .eq('algorithm_id', algorithm.id)
+      .maybeSingle();
+    this.throwIfSupabaseError(error, 'Could not load recommender retrain run');
+    if (!data) {
+      throw new NotFoundException('Không tìm thấy retrain run');
+    }
+    return this.toRetrainRun(data);
+  }
+
+  async getRecommenderRetrainSchedule(): Promise<ReviewFilterScheduleDto> {
+    const algorithm = await this.ensureRecommenderAlgorithm();
+    return this.buildScheduleResponse(await this.ensureScheduleRow(algorithm.id));
+  }
+
+  async updateRecommenderRetrainSchedule(
+    dto: UpdateReviewFilterScheduleDto,
+  ): Promise<ReviewFilterScheduleDto> {
+    const algorithm = await this.ensureRecommenderAlgorithm();
+    const current = await this.ensureScheduleRow(algorithm.id);
+    const updates: Partial<ScheduleRow> = {};
+    if (typeof dto.autoEnabled === 'boolean') updates.is_enabled = dto.autoEnabled;
+    if (dto.frequency) updates.frequency = dto.frequency;
+    if (dto.runTime !== undefined) updates.run_time = this.normalizeRunTime(dto.runTime);
+    if (dto.runDay !== undefined) updates.run_day = Number(dto.runDay);
+    const frequency = updates.frequency ?? current.frequency;
+    this.validateScheduleDay(frequency, updates.run_day ?? current.run_day ?? 1);
+    if (!Object.keys(updates).length) return this.buildScheduleResponse(current);
+    const { data, error } = await supabase
+      .schema('ai_config')
+      .from('algorithm_schedules')
+      .update({ ...updates, updated_at: new Date().toISOString() })
+      .eq('algorithm_id', algorithm.id)
+      .select('*')
+      .single();
+    this.throwIfSupabaseError(error, 'Could not update recommender retrain schedule');
+    await this.insertScheduleLog(algorithm.id, current, data as ScheduleRow);
+    return this.buildScheduleResponse(data as ScheduleRow);
+  }
+
+  async runRecommenderRetrainIfDue(): Promise<void> {
+    const algorithm = await this.ensureRecommenderAlgorithm();
+    const schedule = this.buildScheduleResponse(await this.ensureScheduleRow(algorithm.id));
+    if (!schedule.autoEnabled) return;
+    const due = this.getDueScheduleTime(schedule);
+    if (!due) return;
+    try {
+      await this.startRecommenderRetrain(null, 'scheduled');
+    } catch (error: any) {
+      if (!(error instanceof ConflictException)) throw error;
+      this.logger.warn(`Scheduled recommender retrain skipped: ${error.message}`);
+    } finally {
+      await this.markScheduleLastRunForAlgorithm(algorithm.id, due.getTime());
+    }
+  }
+
+  private toRetrainRun(row: any): RecommenderRetrainRunDto {
+    return {
+      id: row.id,
+      status: row.status,
+      triggerType: row.trigger_type,
+      triggeredBy: row.triggered_by ?? null,
+      startedAt: this.normalizeUtcTimestamp(row.started_at) || null,
+      completedAt: this.normalizeUtcTimestamp(row.completed_at) || null,
+      durationSeconds: row.duration_seconds ?? null,
+      errorMessage: row.error_message ?? null,
+      metrics: row.metrics ?? null,
+      createdAt: this.normalizeUtcTimestamp(row.created_at),
+    };
+  }
+
+  private async insertRecommenderLog(
+    algorithmId: string,
+    status: 'active' | 'failed',
+    details: Record<string, any>,
+  ): Promise<void> {
+    const { error } = await supabase
+      .schema('ai_config')
+      .from('algorithm_logs')
+      .insert({
+        algorithm_id: algorithmId,
+        status,
+        action: 'updated',
+        details: JSON.stringify(details),
+      });
+    if (error) this.logger.warn(`Could not insert recommender log: ${error.message}`);
+  }
+
   private async insertPipelineLog(
     status: 'active' | 'failed',
     result: PipelineRunResponseDto | null,
@@ -348,6 +538,29 @@ export class AdminAlgorithmPipelineService {
       return retry as AlgorithmRow;
     }
 
+    return inserted as AlgorithmRow;
+  }
+
+  private async ensureRecommenderAlgorithm(): Promise<AlgorithmRow> {
+    const { data, error } = await supabase
+      .schema('ai_config')
+      .from('algorithms')
+      .select('id,name')
+      .eq('name', RECOMMENDER_RETRAIN_ALGORITHM_NAME)
+      .maybeSingle();
+    if (error) throw error;
+    if (data) return data as AlgorithmRow;
+    const { data: inserted, error: insertError } = await supabase
+      .schema('ai_config')
+      .from('algorithms')
+      .insert({
+        name: RECOMMENDER_RETRAIN_ALGORITHM_NAME,
+        description: 'Rating + activity-log recommender retraining pipeline',
+        is_active: true,
+      })
+      .select('id,name')
+      .single();
+    if (insertError || !inserted) throw insertError;
     return inserted as AlgorithmRow;
   }
 
@@ -459,6 +672,21 @@ export class AdminAlgorithmPipelineService {
       })
       .eq('algorithm_id', algorithm.id);
 
+    this.throwIfSupabaseError(error, 'Could not update schedule last_run_at');
+  }
+
+  private async markScheduleLastRunForAlgorithm(
+    algorithmId: string,
+    epochMs: number,
+  ): Promise<void> {
+    const { error } = await supabase
+      .schema('ai_config')
+      .from('algorithm_schedules')
+      .update({
+        last_run_at: new Date(epochMs).toISOString(),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('algorithm_id', algorithmId);
     this.throwIfSupabaseError(error, 'Could not update schedule last_run_at');
   }
 

@@ -44,6 +44,7 @@ DEFAULT_SVD_PARAMS = {"n_factors": 32, "n_epochs": 20, "lr_all": 0.005, "reg_all
 CB_EMB_FILE = "content_embeddings_foody_rich.npy"
 CB_EMB_META_FILE = "content_embedding_meta_foody_rich.csv"
 CB_LOOKUP_FILE = "cb_lookup_foody_rich.pkl"
+CB_LOOKUP_SIGNATURE_FILE = "cb_lookup_signature.txt"
 EMB_MODEL_FILE = "embedding_model_foody_rich.txt"
 
 
@@ -172,36 +173,61 @@ def train_content_based(places: pd.DataFrame) -> np.ndarray:
             embeddings[i] = new_embeddings[j]
 
     city_arr = places["city_name"].values
-    print(f"[train] Pre-compute CB lookup (top-{TOP_K_CB}, cùng city)...")
+    signature_payload = "\n".join(
+        f"{pid}|{city}|{content_hash}"
+        for pid, city, content_hash in zip(all_ids, city_arr, content_hashes)
+    ) + f"\nmodel={EMBED_MODEL_NAME}|top_k={TOP_K_CB}"
+    lookup_signature = hashlib.sha256(signature_payload.encode("utf-8")).hexdigest()
+    signature_path = OUTPUT_ARTIFACT_DIR / CB_LOOKUP_SIGNATURE_FILE
+    lookup_path = OUTPUT_ARTIFACT_DIR / CB_LOOKUP_FILE
+    can_reuse_lookup = (
+        lookup_path.exists()
+        and signature_path.exists()
+        and signature_path.read_text(encoding="utf-8").strip() == lookup_signature
+    )
+
+    cb_lookup: dict[str, list[str]] | None = None
+    if can_reuse_lookup:
+        print(f"[train] CB lookup cache hit: {len(all_ids)} items -> bỏ qua pre-compute.")
+    else:
+        print(f"[train] Pre-compute CB lookup (top-{TOP_K_CB}, cùng city)...")
     # Gom index theo city một lần để không quét toàn bộ mỗi item
     city_indices: dict[str, np.ndarray] = {}
     for city in pd.unique(city_arr):
         city_indices[city] = np.where(city_arr == city)[0]
     fallback_all = np.arange(len(places))
 
-    cb_lookup: dict[str, list[str]] = {}
-    t0 = time.time()
-    for i, rid in enumerate(all_ids):
-        cand_idx = city_indices.get(city_arr[i], fallback_all)
-        if city_arr[i] == "":
-            cand_idx = fallback_all
-        sim = embeddings[i] @ embeddings[cand_idx].T
-        order = np.argsort(-sim)
-        cand_ids = all_ids[cand_idx][order]
-        cb_lookup[str(rid)] = cand_ids[cand_ids != rid][:TOP_K_CB].tolist()
-        if (i + 1) % 5000 == 0 or i + 1 == len(all_ids):
-            print(f"[train]   [{i + 1}/{len(all_ids)}] elapsed={time.time() - t0:.1f}s")
+    if not can_reuse_lookup:
+        cb_lookup = {}
+        t0 = time.time()
+        for i, rid in enumerate(all_ids):
+            cand_idx = city_indices.get(city_arr[i], fallback_all)
+            if city_arr[i] == "":
+                cand_idx = fallback_all
+            sim = embeddings[i] @ embeddings[cand_idx].T
+            take = min(TOP_K_CB + 1, len(cand_idx))
+            if take >= len(cand_idx):
+                top_local = np.argsort(-sim)
+            else:
+                top_local = np.argpartition(-sim, take - 1)[:take]
+                top_local = top_local[np.argsort(-sim[top_local])]
+            cand_ids = all_ids[cand_idx[top_local]]
+            cb_lookup[str(rid)] = cand_ids[cand_ids != rid][:TOP_K_CB].tolist()
+            if (i + 1) % 5000 == 0 or i + 1 == len(all_ids):
+                print(f"[train]   [{i + 1}/{len(all_ids)}] elapsed={time.time() - t0:.1f}s")
 
     np.save(OUTPUT_ARTIFACT_DIR / CB_EMB_FILE, embeddings)
     pd.DataFrame({"id": all_ids, "content_hash": content_hashes}).to_csv(
         OUTPUT_ARTIFACT_DIR / CB_EMB_META_FILE, index=False, encoding="utf-8-sig"
     )
-    with open(OUTPUT_ARTIFACT_DIR / CB_LOOKUP_FILE, "wb") as f:
-        pickle.dump(cb_lookup, f)
+    if cb_lookup is not None:
+        with open(lookup_path, "wb") as f:
+            pickle.dump(cb_lookup, f)
+        signature_path.write_text(lookup_signature, encoding="utf-8")
     (OUTPUT_ARTIFACT_DIR / EMB_MODEL_FILE).write_text(
         EMBED_MODEL_NAME, encoding="utf-8"
     )
-    print(f"[train] CB lookup: {len(cb_lookup)} items")
+    print(f"[train] CB lookup: {len(all_ids)} items")
     return embeddings
 
 

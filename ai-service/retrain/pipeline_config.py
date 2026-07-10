@@ -57,6 +57,16 @@ def load_env() -> dict:
         "r2_access_key_id": os.environ.get("R2_ACCESS_KEY_ID", ""),
         "r2_secret_access_key": os.environ.get("R2_SECRET_ACCESS_KEY", ""),
         "r2_bucket_name": os.environ.get("R2_BUCKET_NAME", "ai-artifacts"),
+        "r2_base_training_prefix": os.environ.get(
+            "R2_BASE_TRAINING_PREFIX", "base_training_data"
+        ).strip("/"),
+        "base_rating_source": os.environ.get(
+            "RETRAIN_BASE_RATING_SOURCE", "auto"
+        ).strip().lower(),
+        "base_rating_cache_dir": os.environ.get(
+            "RETRAIN_BASE_RATING_CACHE_DIR",
+            str(RETRAIN_DIR / "cache" / "base_training_data"),
+        ),
         # Cache local mà ai-service dùng khi R2 bật (settings.artifact_cache_dir)
         "artifact_cache_dir": os.environ.get("ARTIFACT_CACHE_DIR", "/tmp/ai_cache"),
         # Đường dẫn local mà ai-service fallback khi R2 tắt

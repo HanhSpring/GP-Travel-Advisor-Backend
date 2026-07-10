@@ -1,4 +1,4 @@
-import { Body, Controller, Get, Patch, Post, Query } from '@nestjs/common';
+import { Body, Controller, Get, Param, Patch, Post, Query, Request, UseGuards } from '@nestjs/common';
 import { ApiOperation, ApiTags } from '@nestjs/swagger';
 import { AdminAlgorithmPipelineService } from './admin-algorithm-pipeline.service';
 import {
@@ -6,9 +6,15 @@ import {
   PipelineRunRequestDto,
   UpdateReviewFilterScheduleDto,
 } from './dto/pipeline-run.dto';
+import { JwtAuthGuard } from '../../auth/jwt-auth.guard';
+import { RolesGuard } from '../../../common/guards/roles.guard';
+import { Roles } from '../../../common/decorators/roles.decorator';
+import { Role } from '../../../common/enum/role.enum';
 
 @ApiTags('Admin - Algorithm Pipeline')
 @Controller('admin/algorithm-pipeline')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(Role.ADMIN)
 export class AdminAlgorithmPipelineController {
   constructor(private readonly service: AdminAlgorithmPipelineService) {}
 
@@ -60,5 +66,33 @@ export class AdminAlgorithmPipelineController {
   })
   async updateReviewFilterSchedule(@Body() dto: UpdateReviewFilterScheduleDto) {
     return this.service.updateReviewFilterSchedule(dto);
+  }
+
+  @Post('recommender-retrain/run')
+  @ApiOperation({ summary: 'Tạo local recommender retrain job bất đồng bộ' })
+  async runRecommenderRetrain(@Request() req: any) {
+    return this.service.startRecommenderRetrain(req.user?.userId ?? null, 'manual');
+  }
+
+  @Get('recommender-retrain/status')
+  @ApiOperation({ summary: 'Trạng thái và quota retrain recommender' })
+  async getRecommenderRetrainStatus() {
+    return this.service.getRecommenderRetrainStatus();
+  }
+
+  @Get('recommender-retrain/runs/:id')
+  @ApiOperation({ summary: 'Chi tiết một retrain run' })
+  async getRecommenderRetrainRun(@Param('id') id: string) {
+    return this.service.getRecommenderRetrainRun(id);
+  }
+
+  @Get('recommender-retrain/schedule')
+  async getRecommenderRetrainSchedule() {
+    return this.service.getRecommenderRetrainSchedule();
+  }
+
+  @Patch('recommender-retrain/schedule')
+  async updateRecommenderRetrainSchedule(@Body() dto: UpdateReviewFilterScheduleDto) {
+    return this.service.updateRecommenderRetrainSchedule(dto);
   }
 }

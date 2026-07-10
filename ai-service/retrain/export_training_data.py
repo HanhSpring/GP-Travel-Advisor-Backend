@@ -485,7 +485,11 @@ def main() -> dict:
     sb = _client(cfg)
 
     places = export_places(sb)
-    base_matrix = _load_base_rating_matrix(Path(cfg["base_rating_matrix_dir"]))
+    from r2_base_matrix import resolve_base_matrix_dir
+
+    base_dir = resolve_base_matrix_dir(cfg)
+    print(f"[export] Base rating matrix source: {base_dir}")
+    base_matrix = _load_base_rating_matrix(base_dir)
     foody = base_matrix or _load_foody_jsonl(Path(cfg["foody_ratings_jsonl"]))
     db_triples, db_review_count, max_created = export_db_reviews(sb)
     n_users, n_items, nnz = build_rating_matrix(

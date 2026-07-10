@@ -20,6 +20,7 @@ export class ReviewFilterScheduleCron {
     this.isRunning = true;
     try {
       await this.pipelineService.runReviewFilterIfDue();
+      await this.pipelineService.runRecommenderRetrainIfDue();
     } catch (error: any) {
       this.logger.error(
         `Review filter schedule check failed: ${error?.message ?? error}`,

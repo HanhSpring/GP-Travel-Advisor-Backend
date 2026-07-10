@@ -51,6 +51,27 @@ def _load_hybrid_recommender():
         logger.warning(f"Hybrid Recommender load failed: {e}")
 
 
+def reload_hybrid_recommender() -> bool:
+    """Load a fresh engine and atomically swap it in after successful retraining."""
+    try:
+        _ensure_remote_artifacts()
+        from app.core.config import settings
+        from app.models.hybrid_recommender import HybridRecommender
+
+        artifact_dir = _models.get("_artifact_dir", settings.reco_artifact_dir)
+        data_dir = _models.get("_data_dir", settings.reco_data_dir)
+        fresh = HybridRecommender(artifact_dir, data_dir)
+        if not fresh.load():
+            logger.error("Hot reload rejected: new recommender artifact is incomplete")
+            return False
+        _models["hybrid_recommender"] = fresh
+        logger.info("✅ Hybrid Recommender hot-reloaded")
+        return True
+    except Exception as exc:
+        logger.exception("Hybrid Recommender hot reload failed: %s", exc)
+        return False
+
+
 def _load_bge_m3():
     try:
         from sentence_transformers import SentenceTransformer
