@@ -49,6 +49,7 @@ describe('ItineraryController — nối TwoTowerConfigService vào retrieval th�
   let recommendationService: {
     retrieveCandidates: jest.Mock;
     planItinerary: jest.Mock;
+    detectRegions: jest.Mock;
   };
   let twoTowerConfig: { getConfig: jest.Mock };
   let itineraryService: { createGeneratedItinerary: jest.Mock };
@@ -65,6 +66,11 @@ describe('ItineraryController — nối TwoTowerConfigService vào retrieval th�
       planItinerary: jest
         .fn()
         .mockResolvedValue({ days: [], hotel_id: 'hotel-1' }),
+      detectRegions: jest.fn().mockResolvedValue({
+        regions: [],
+        estimated_total_days: 0,
+        num_days: 3,
+      }),
     };
     twoTowerConfig = {
       getConfig: jest.fn().mockResolvedValue(adminEditedConfig),
@@ -97,12 +103,30 @@ describe('ItineraryController — nối TwoTowerConfigService vào retrieval th�
     );
   });
 
-  it('POST /itinerary/plan đọc config từ TwoTowerConfigService và truyền xuống planItinerary', async () => {
-    await controller.plan(dto, undefined);
+  it('POST /itinerary/plan không có regionAllocations → luôn trả về REGION_ALLOCATION_REQUIRED, không gọi planItinerary', async () => {
+    await expect(controller.plan(dto, undefined)).rejects.toMatchObject({
+      response: expect.objectContaining({ code: 'REGION_ALLOCATION_REQUIRED' }),
+    });
+
+    expect(recommendationService.detectRegions).toHaveBeenCalledWith(
+      dto,
+      expect.any(Number),
+      adminEditedConfig,
+    );
+    expect(recommendationService.planItinerary).not.toHaveBeenCalled();
+  });
+
+  it('POST /itinerary/plan có regionAllocations → đọc config từ TwoTowerConfigService và truyền xuống planItinerary', async () => {
+    const dtoWithAllocations = {
+      ...dto,
+      regionAllocations: [{ placeIds: ['place-1'], days: 3 }],
+    } as unknown as CreateItineraryDto;
+
+    await controller.plan(dtoWithAllocations, undefined);
 
     expect(twoTowerConfig.getConfig).toHaveBeenCalledTimes(1);
     expect(recommendationService.planItinerary).toHaveBeenCalledWith(
-      dto,
+      dtoWithAllocations,
       expect.any(Number),
       'scheduler_v2',
       adminEditedConfig,
