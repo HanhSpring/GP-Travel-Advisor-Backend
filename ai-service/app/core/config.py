@@ -74,6 +74,13 @@ class Settings(BaseSettings):
     # Goong Maps API (empty = Haversine fallback)
     goong_api_key: str = ""
 
+    # Modal.com (docs/trigger/06-modal-primary-plan.md) — trigger job GPU train Two-Tower thật.
+    # modal_trigger_training_url = URL cua Modal Web Endpoint "trigger_training" (in ra sau khi
+    # `modal deploy modal_training/modal_app.py`). modal_trigger_secret PHAI khop
+    # MODAL_TRIGGER_SECRET dat trong Modal Secret "training-callback-secret".
+    modal_trigger_training_url: str = ""
+    modal_trigger_secret: str = ""
+
     # Debug-only: dump a Leaflet HTML map per geo-clustering pipeline stage
     # (HDBSCAN raw clusters -> noise/region merge -> K-Means day-split ->
     # weekday matching) into api-service's shared debug-log folder. Off by
