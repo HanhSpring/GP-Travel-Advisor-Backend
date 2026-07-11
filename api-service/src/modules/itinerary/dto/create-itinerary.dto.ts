@@ -1,4 +1,5 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
+import { Type } from 'class-transformer';
 import {
   IsNotEmpty,
   IsEnum,
@@ -11,7 +12,23 @@ import {
   IsNumber,
   IsArray,
   MaxLength,
+  IsBoolean,
+  ValidateNested,
 } from 'class-validator';
+
+// Kết quả wizard phân bổ vùng (region-allocation) — mỗi vùng người dùng
+// xác nhận kèm số ngày họ chọn dành cho vùng đó.
+export class RegionAllocationDto {
+  @ApiProperty({ example: ['place-uuid-1', 'place-uuid-2'] })
+  @IsArray()
+  @IsString({ each: true })
+  placeIds!: string[];
+
+  @ApiProperty({ example: 2, description: 'Số ngày người dùng chọn cho vùng này' })
+  @IsInt()
+  @Min(0)
+  days!: number;
+}
 
 // Định nghĩa các hằng số lựa chọn
 export enum TripType {
@@ -175,6 +192,34 @@ export class CreateItineraryDto {
   @IsNumber({}, { message: 'Ngân sách phải là một số' })
   @Min(0, { message: 'Ngân sách không hợp lệ' })
   budget!: number;
+
+  // 1b. XÁC NHẬN TIẾP TỤC DÙ VƯỢT NGÂN SÁCH ĐỀ XUẤT
+  // Gửi lại true sau khi client đã hiển thị cảnh báo BUDGET_CONFIRMATION_REQUIRED
+  // và người dùng chọn "Tiếp tục với ngân sách hiện tại" thay vì tăng ngân sách.
+  @ApiPropertyOptional({
+    example: false,
+    description:
+      'Xác nhận tiếp tục dù lịch trình vượt ngân sách đề xuất (sau khi đã nhận cảnh báo BUDGET_CONFIRMATION_REQUIRED)',
+  })
+  @IsOptional()
+  @IsBoolean({ message: 'proceedWithOverBudget phải là true/false' })
+  proceedWithOverBudget?: boolean;
+
+  // 1c. KẾT QUẢ WIZARD PHÂN BỔ VÙNG (REGION_ALLOCATION_REQUIRED)
+  // Gửi lại sau khi client đã hiển thị màn hình phân bổ vùng và người dùng
+  // đã chốt số ngày cho từng vùng qua stepper. Vùng có days=0 (hoặc không
+  // có trong mảng này) sẽ bị loại khỏi lịch trình. Không có trường này ở
+  // lần gọi đầu tiên — backend sẽ luôn trả về REGION_ALLOCATION_REQUIRED.
+  @ApiPropertyOptional({
+    type: [RegionAllocationDto],
+    description:
+      'Số ngày người dùng chọn cho từng vùng địa lý đã phát hiện (sau khi nhận REGION_ALLOCATION_REQUIRED)',
+  })
+  @IsOptional()
+  @IsArray()
+  @ValidateNested({ each: true })
+  @Type(() => RegionAllocationDto)
+  regionAllocations?: RegionAllocationDto[];
 
   // 2. SỞ THÍCH ẨM THỰC (Cố định)
   @ApiProperty({

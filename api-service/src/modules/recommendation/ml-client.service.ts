@@ -81,6 +81,30 @@ export interface ItineraryPlanPayload {
   mutation_rate?: number;
   seed?: number;
   planner_engine?: 'scheduler_v2' | 'ga_v1';
+  region_day_allocations?: Array<{ place_ids: string[]; days: number }>;
+}
+
+export interface RegionDetectionPayload {
+  places: ItineraryPlanPayload['places'];
+  num_days: number;
+  daily_start_time: string;
+  daily_end_time: string;
+}
+
+export interface RegionDetectionResult {
+  regions: Array<{
+    region_name: string;
+    place_ids: string[];
+    place_names: string[];
+    max_days: number;
+    total_visit_minutes: number;
+    travel_minutes_from_central: number;
+    is_remote: boolean;
+    suggested_days: number;
+  }>;
+  estimated_total_days: number;
+  num_days: number;
+  shortfall_days: number;
 }
 
 @Injectable()
@@ -162,6 +186,29 @@ export class MlClientService {
     } catch (error) {
       const msg = error?.response?.data?.detail ?? error?.message ?? 'unknown';
       this.logger.error(`planItinerary failed: ${msg}`);
+      throw new Error(`AI Service is unavailable: ${msg}`);
+    }
+  }
+
+  /** Region-allocation wizard, step 1: cheap macro-cluster detection — no
+   * hotel selection, no travel matrix, no CP-SAT solving on the ai-service side. */
+  async detectRegions(
+    payload: RegionDetectionPayload,
+  ): Promise<RegionDetectionResult> {
+    const url = `${this.aiServiceUrl}/itinerary/detect-regions`;
+    try {
+      const response: { data: RegionDetectionResult } = await firstValueFrom(
+        this.http.post<RegionDetectionResult>(url, payload, {
+          timeout: 30_000,
+          maxBodyLength: Infinity,
+          maxContentLength: Infinity,
+          headers: { Connection: 'close' },
+        }),
+      );
+      return response.data;
+    } catch (error) {
+      const msg = error?.response?.data?.detail ?? error?.message ?? 'unknown';
+      this.logger.error(`detectRegions failed: ${msg}`);
       throw new Error(`AI Service is unavailable: ${msg}`);
     }
   }

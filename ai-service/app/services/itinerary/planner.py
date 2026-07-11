@@ -144,19 +144,33 @@ TRAVEL_TIME_WEIGHT = 0.1
 WAIT_TIME_WEIGHT = 0.8
 BUDGET_OVERAGE_UNIT_VND = 1_000
 BUDGET_PENALTY_WEIGHT = 15.0
-# Budget estimate only. This is not an official ride-hailing fare formula.
-# bike is closer to fuel/operating cost; car is a conservative service-car estimate.
+# Real self-drive fuel cost per km for ONE vehicle (see trip_cost_config_service.py
+# for the shared source of truth / seeded defaults — these module-level dicts
+# are overwritten in place by sync_transport_cost_into_planner() at startup).
 TRANSPORT_COST_PER_KM = {
-    "bike": 3_000,
-    "car": 15_000,
+    "bike": 450,
+    "car": 520,
     "taxi": 18_000,
     "truck": 20_000,
 }
 TRANSPORT_COST_DEFAULT = 10_000
+# Seats per vehicle, used to compute how many vehicles the group actually
+# needs (ceil(headcount / capacity)) — fuel cost is per VEHICLE, not per
+# person, so a family of 5 on motorbikes needs 3 bikes' worth of fuel, not 1.
+VEHICLE_CAPACITY = {
+    "bike": 2,
+    "car": 4,
+}
 POI_TARGET_MIN_PER_DAY = 4
 POI_TARGET_MAX_PER_DAY = 10
 POI_TARGET_TIME_SLICE_MINUTES = 90
-CHILD_COST_FACTOR = 0.5
+# Child pricing discount actually affecting money lives in api-service
+# (recommendation.service.ts / trip-cost-config.service.ts), applied before
+# place/hotel prices ever reach this planner. There used to be a
+# CHILD_COST_FACTOR constant here feeding into adult_equivalent, but
+# adult_equivalent is never read by any cost function (_poi_cost/_poi_utility)
+# -- it was dead code, removed to avoid implying this scheduler discounts
+# children internally.
 ROOM_CAPACITY = 2
 FALLBACK_HOTEL_COST_PER_NIGHT = 400_000
 DEFAULT_TRAVEL_BUFFER_PERCENT = 0.20
@@ -575,6 +589,21 @@ def get_time_for_day_json(open_hour: str, day_idx: int) -> Optional[Tuple[int, i
         return None
 
 
+def is_day_explicitly_closed(open_hour: str, day_idx: int) -> bool:
+    """True if the JSON explicitly lists an empty slot array for day_idx —
+    i.e. the place is closed that day — as opposed to the key being absent
+    entirely (no data recorded, which should fall back to "hours unknown"
+    instead of "closed")."""
+    if not open_hour:
+        return False
+    try:
+        data = json.loads(open_hour)
+    except (TypeError, json.JSONDecodeError):
+        return False
+    key = _DAY_JSON_KEYS[day_idx]
+    return key in data and data[key] == []
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Haversine travel time (fallback khi không dùng Goong API)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -789,7 +818,7 @@ def build_travel_matrix(
     times: Dict[Tuple[str, str], int] = {}
     sources: Dict[Tuple[str, str], str] = {}
     reliability: Dict[Tuple[str, str], List[dict]] = {}
-    cache = _load_travel_cache(cache_path)
+    cache = {}
     ids = list(coords.keys())
     try:
         database_cache = _load_distance_matrix_db(ids, vehicle)
@@ -869,7 +898,6 @@ def build_travel_matrix(
                     "  [WARNING] distance_matrix upsert failed: "
                     f"{_safe_console_text(exc)}"
                 )
-            _save_travel_cache(cache_path, cache)
         except Exception as e:
             print(f"  [WARNING] Goong API failed: {_safe_console_text(e)}")
             print("  Falling back to Haversine for uncached pairs.")
@@ -919,7 +947,7 @@ def refresh_travel_matrix_for_day_pools(
             raise RuntimeError("GOONG_API_KEY is required when require_goong=True.")
         return 0
 
-    cache = _load_travel_cache(cache_path)
+    cache = {}
     try:
         database_cache = _load_distance_matrix_db(list(coords.keys()), vehicle)
         for pair, entry in database_cache.items():
@@ -1030,8 +1058,6 @@ def refresh_travel_matrix_for_day_pools(
                 f"{_safe_console_text(exc)}"
             )
 
-    if refreshed_pairs:
-        _save_travel_cache(cache_path, cache)
 
     if require_goong:
         required_non_goong = 0
@@ -1075,7 +1101,6 @@ def fetch_places_from_db(
         client.schema("travel")
         .table("places")
         .select("id, name, longitude, latitude, open_hour_compressed, source, type_id, visit_duration")
-        .not_.is_("open_hour_compressed", "null")
         .not_.is_("longitude", "null")
         .not_.is_("latitude", "null")
         .eq("is_active", True)
@@ -1128,7 +1153,6 @@ def fetch_places_from_supabase_rest(
     url = supabase_url.rstrip("/") + "/rest/v1/places"
     params = {
         "select": "id,name,longitude,latitude,open_hour_compressed,source,type_id,visit_duration",
-        "open_hour_compressed": "not.is.null",
         "longitude": "not.is.null",
         "latitude": "not.is.null",
         "is_active": "eq.true",
@@ -1268,15 +1292,24 @@ def row_to_place(row: dict, day_idx: int) -> Optional["Place"]:
     except (TypeError, ValueError):
         return None
 
-    time_window = get_time_for_day_json(row.get("open_hour") or "", day_idx)
+    raw_open_hour = row.get("open_hour") or ""
+    time_window = get_time_for_day_json(raw_open_hour, day_idx)
     compressed = row.get("open_hour_compressed") or ""
     if time_window is None:
         time_window = get_time_for_day_json(compressed, day_idx)
-    if time_window is None:
+    # An explicit `[]` for this weekday means "closed this day", not "no
+    # data" — must not fall through to the CSV-format fallback or the
+    # open-all-day default, otherwise a place with real per-weekday hours
+    # (e.g. closed Mondays) gets scheduled as if it were open all day.
+    explicitly_closed = time_window is None and (
+        is_day_explicitly_closed(raw_open_hour, day_idx)
+        or is_day_explicitly_closed(compressed, day_idx)
+    )
+    if time_window is None and not explicitly_closed:
         time_window = get_time_for_day(compressed, day_idx)
-    unknown_hours = time_window is None
+    unknown_hours = time_window is None and not explicitly_closed
     if time_window is None:
-        open_min, close_min = 0, 1440
+        open_min, close_min = (0, 0) if explicitly_closed else (0, 1440)
     else:
         open_min, close_min = time_window
 
@@ -1441,12 +1474,19 @@ class Place:
         time_window = get_time_for_day_json(self.open_hour, day_idx)
         if time_window is None:
             time_window = get_time_for_day_json(self.open_hour_compressed, day_idx)
-        if time_window is None:
+        # See row_to_place: an explicit `[]` for this weekday means closed
+        # that day, distinct from "no data" — must not fall back to the CSV
+        # parser or the open-all-day default in that case.
+        explicitly_closed = time_window is None and (
+            is_day_explicitly_closed(self.open_hour, day_idx)
+            or is_day_explicitly_closed(self.open_hour_compressed, day_idx)
+        )
+        if time_window is None and not explicitly_closed:
             time_window = get_time_for_day(self.open_hour_compressed, day_idx)
-            
+
         if time_window is None:
-            open_min, close_min = 0, 1440
-            unknown = True
+            open_min, close_min = (0, 0) if explicitly_closed else (0, 1440)
+            unknown = not explicitly_closed
         else:
             open_min, close_min = time_window
             unknown = False
@@ -1661,15 +1701,22 @@ class DayResult:
     @property
     def visited_pois(self) -> List[POI]:
         """POIs actually visited today, in visit order."""
-        if self.ga_result.visited_poi_indices:
-            return [self.pois[i] for i in self.ga_result.visited_poi_indices]
+        # Prefer the schedule's own ids: visited_poi_indices are relative to
+        # whatever (possibly pre-pruned) pois list the solver actually ran on,
+        # which is not always self.pois -- see scheduler_v2's PRE-PRUNING.
+        # Falling back to indices only when the schedule is unexpectedly empty
+        # avoids silently mis-attributing a visit to the wrong POI.
         scheduled_ids = [
             entry.location_id
             for entry in self.ga_result.schedule
             if not entry.is_return_to_hotel
         ]
-        by_id = {poi.id: poi for poi in self.pois}
-        return [by_id[place_id] for place_id in scheduled_ids if place_id in by_id]
+        if scheduled_ids:
+            by_id = {poi.id: poi for poi in self.pois}
+            return [by_id[place_id] for place_id in scheduled_ids if place_id in by_id]
+        if self.ga_result.visited_poi_indices:
+            return [self.pois[i] for i in self.ga_result.visited_poi_indices]
+        return []
 
 
 @dataclass
@@ -1746,10 +1793,20 @@ class TSP_TW_GA:
         self.day_budget = max(0.0, float(day_budget or 0))
         self.adult_equivalent = max(0.0, float(adult_equivalent or 0))
         self.travel_vehicle = travel_vehicle if travel_vehicle in TRANSPORT_COST_PER_KM else "car"
-        self.cost_per_km = TRANSPORT_COST_PER_KM.get(
+        base_cost_per_km = TRANSPORT_COST_PER_KM.get(
             self.travel_vehicle,
             TRANSPORT_COST_DEFAULT,
         )
+        # Fuel cost is per vehicle, not per person: a group needs
+        # ceil(headcount / seats_per_vehicle) vehicles, each burning fuel over
+        # the same distance, so total cost scales by vehicle count.
+        capacity = VEHICLE_CAPACITY.get(self.travel_vehicle)
+        vehicles = (
+            max(1, math.ceil(max(1.0, self.adult_equivalent) / capacity))
+            if capacity
+            else 1
+        )
+        self.cost_per_km = base_cost_per_km * vehicles
         self.n = len(pois)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
@@ -2309,7 +2366,7 @@ class MultiDayTripPlanner:
         self.adult_count = max(1, int(adult_count or 1))
         self.child_count = max(0, int(child_count or 0))
         self.full_people = self.adult_count + self.child_count
-        self.adult_equivalent = self.adult_count + self.child_count * CHILD_COST_FACTOR
+        self.adult_equivalent = self.full_people
         self.trip_budget_total = max(0.0, float(trip_budget_total or 0))
         self.trip_budget = self.trip_budget_total * 0.9
         if selected_hotel_id is not None:

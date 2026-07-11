@@ -4,6 +4,8 @@ import math
 from dataclasses import dataclass, field
 from typing import Any
 
+from app.services.itinerary import utils
+
 
 MIN_POOL_PER_DAY = 4
 MAX_LOAD_RATIO = 1.0
@@ -12,6 +14,14 @@ POI_TARGET_TIME_SLICE_MINUTES = 90
 POI_TARGET_MAX_PER_DAY = 10
 MEAL_DURATION_MINUTES = 75
 MAX_RESTAURANT_OPTIONS_PER_DAY = 2
+# Cafes are injected via their own greedy nearest-cluster pass (separate from
+# restaurants, separate from attraction K-Means) — cap at 2/day (bumped from 1)
+# so a dense cafe cluster near a day's centroid can't stack many cafe stops
+# onto the same day (e.g. "6 cups of milk tea in one day"), while still giving
+# the CP-SAT solver a spare candidate so a cafe doesn't vanish entirely once
+# scheduling gets tight (cafes are still soft-prioritized, not enforced like
+# the lunch/dinner restaurant slot — see scheduler_v2.py's cafe utility weight).
+MAX_CAFE_OPTIONS_PER_DAY = 2
 REBALANCE_MAX_ITERATIONS = 48
 BACKUP_NONMEAL_PER_DAY = 2
 CANDIDATE_POOL_LOAD_RATIO = 1.25
@@ -65,6 +75,10 @@ class AssignmentConfig:
         return max(1, min(MAX_RESTAURANT_OPTIONS_PER_DAY, self.meal_slots_per_day))
 
     @property
+    def cafe_option_limit(self) -> int:
+        return MAX_CAFE_OPTIONS_PER_DAY
+
+    @property
     def primary_daily_effective(self) -> int:
         reserve = MEAL_DURATION_MINUTES + (30 if self.meal_slots_per_day > 1 else 0)
         return max(120, self.daily_effective - reserve)
@@ -75,6 +89,7 @@ class AssignmentResult:
     day_pools: list[dict[str, list[Any]]]
     day_loads: list[int]
     warnings: list[str] = field(default_factory=list)
+    dropped_points: list[Any] = field(default_factory=list)
 
 
 class ConstrainedKMeansAssignment:
@@ -504,15 +519,8 @@ class ConstrainedKMeansAssignment:
                 for place in candidates
                 if assignments.get(str(place.id)) == cluster_index
             ]
-            if not members:
-                result.append(previous[cluster_index])
-                continue
-            result.append(
-                (
-                    sum(float(place.latitude) for place in members) / len(members),
-                    sum(float(place.longitude) for place in members) / len(members),
-                )
-            )
+            centroid = utils.compute_centroid(members)
+            result.append(centroid if centroid is not None else previous[cluster_index])
         return result
 
     @staticmethod
@@ -675,25 +683,15 @@ class ConstrainedKMeansAssignment:
         day_pools: list[dict[str, list[Any]]],
     ) -> None:
         for pool in day_pools:
-            members = pool.get("attractions", [])
-            if not members:
-                continue
-            pool["day_cluster_center"] = (
-                sum(float(place.latitude) for place in members) / len(members),
-                sum(float(place.longitude) for place in members) / len(members),
-            )
+            centroid = utils.compute_centroid(pool.get("attractions", []))
+            if centroid is not None:
+                pool["day_cluster_center"] = centroid
 
     def _pool_center(self, pool: dict[str, list[Any]]) -> tuple[float, float] | None:
-        members = pool.get("attractions", [])
-        if members:
-            return (
-                sum(float(place.latitude) for place in members) / len(members),
-                sum(float(place.longitude) for place in members) / len(members),
-            )
-        center = pool.get("day_cluster_center")
-        if center is not None:
-            return center
-        return None
+        centroid = utils.compute_centroid(pool.get("attractions", []))
+        if centroid is not None:
+            return centroid
+        return pool.get("day_cluster_center")
 
     def _day_fit_cost(self, place: Any, pool: dict[str, list[Any]]) -> tuple[float, int]:
         center = self._pool_center(pool)
@@ -802,17 +800,7 @@ class ConstrainedKMeansAssignment:
         lat2: float,
         lng2: float,
     ) -> float:
-        radius_km = 6371.0
-        lat1_rad, lat2_rad = math.radians(lat1), math.radians(lat2)
-        delta_lat = math.radians(lat2 - lat1)
-        delta_lng = math.radians(lng2 - lng1)
-        value = (
-            math.sin(delta_lat / 2) ** 2
-            + math.cos(lat1_rad)
-            * math.cos(lat2_rad)
-            * math.sin(delta_lng / 2) ** 2
-        )
-        return 2 * radius_km * math.atan2(math.sqrt(value), math.sqrt(1 - value))
+        return utils.haversine_km_coords(lat1, lng1, lat2, lng2)
 
 
 class AssignmentModule:

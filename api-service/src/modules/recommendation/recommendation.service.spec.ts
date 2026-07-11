@@ -6,7 +6,6 @@ import {
   DEFAULT_TWO_TOWER_RUNTIME_CONFIG,
   TwoTowerRuntimeConfig,
 } from './two-tower-config.types';
-
 jest.mock('../../config/supabase', () => ({
   supabase: {
     schema: jest.fn(),
