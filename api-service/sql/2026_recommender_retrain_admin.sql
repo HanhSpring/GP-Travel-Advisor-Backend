@@ -16,7 +16,7 @@ create or replace function ai_config.create_recommender_training_run(
   p_algorithm_id uuid,
   p_trigger_type text,
   p_triggered_by uuid,
-  p_max_runs integer default 50
+  p_max_runs integer default 0
 )
 returns ai_config.training_runs
 language plpgsql
@@ -24,20 +24,14 @@ security definer
 set search_path = ai_config, public
 as $$
 declare
-  v_count integer;
   v_active integer;
   v_run ai_config.training_runs;
 begin
   -- Serializes quota/concurrency checks even when two Admin requests arrive together.
   perform pg_advisory_xact_lock(hashtext('recommender_retrain:' || p_algorithm_id::text));
 
-  select count(*) into v_count
-  from ai_config.training_runs
-  where algorithm_id = p_algorithm_id;
-
-  if v_count >= p_max_runs then
-    raise exception 'RETRAIN_LIMIT_REACHED';
-  end if;
+  -- p_max_runs is retained only for backward-compatible RPC signature.
+  -- Retrain count is unlimited; concurrency is still restricted to one active run.
 
   select count(*) into v_active
   from ai_config.training_runs

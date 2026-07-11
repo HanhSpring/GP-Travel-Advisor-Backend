@@ -24,7 +24,6 @@ import { AdminAlgorithmSettingsService } from '../algorithm-settings/admin-algor
 
 const REVIEW_FILTER_ALGORITHM_NAME = 'review_filter';
 const RECOMMENDER_RETRAIN_ALGORITHM_NAME = 'recommender_retrain';
-const MAX_RETRAIN_RUNS = 50;
 
 type AlgorithmRow = {
   id: string;
@@ -271,14 +270,12 @@ export class AdminAlgorithmPipelineService {
         p_algorithm_id: algorithm.id,
         p_trigger_type: triggerType,
         p_triggered_by: triggeredBy,
-        p_max_runs: MAX_RETRAIN_RUNS,
+        // Tham số được giữ để tương thích signature RPC cũ nhưng DB không còn áp quota.
+        p_max_runs: 0,
       });
 
     if (error) {
       const detail = error.message || String(error);
-      if (detail.includes('RETRAIN_LIMIT_REACHED')) {
-        throw new ConflictException('Đã đạt giới hạn 50 lần retrain demo');
-      }
       if (detail.includes('RETRAIN_ALREADY_RUNNING')) {
         throw new ConflictException('Đang có một retrain job chạy');
       }
@@ -323,30 +320,19 @@ export class AdminAlgorithmPipelineService {
 
   async getRecommenderRetrainStatus(): Promise<RecommenderRetrainStatusDto> {
     const algorithm = await this.ensureRecommenderAlgorithm();
-    const [{ data: rows, error }, { count, error: countError }] = await Promise.all([
-      supabase
-        .schema('ai_config')
-        .from('training_runs')
-        .select('*')
-        .eq('algorithm_id', algorithm.id)
-        .order('created_at', { ascending: false })
-        .limit(10),
-      supabase
-        .schema('ai_config')
-        .from('training_runs')
-        .select('id', { count: 'exact', head: true })
-        .eq('algorithm_id', algorithm.id),
-    ]);
-    this.throwIfSupabaseError(error || countError, 'Could not load recommender retrain status');
+    const { data: rows, error } = await supabase
+      .schema('ai_config')
+      .from('training_runs')
+      .select('*')
+      .eq('algorithm_id', algorithm.id)
+      .order('created_at', { ascending: false })
+      .limit(10);
+    this.throwIfSupabaseError(error, 'Could not load recommender retrain status');
     const mapped = (rows ?? []).map((row: any) => this.toRetrainRun(row));
-    const usedRuns = count ?? mapped.length;
     return {
       currentRun:
         mapped.find((run) => ['pending', 'running'].includes(run.status)) ?? null,
       latestRun: mapped[0] ?? null,
-      usedRuns,
-      maxRuns: MAX_RETRAIN_RUNS,
-      remainingRuns: Math.max(0, MAX_RETRAIN_RUNS - usedRuns),
     };
   }
 

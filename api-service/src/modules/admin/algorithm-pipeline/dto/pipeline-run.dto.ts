@@ -169,7 +169,4 @@ export interface RecommenderRetrainRunDto {
 export interface RecommenderRetrainStatusDto {
   currentRun: RecommenderRetrainRunDto | null;
   latestRun: RecommenderRetrainRunDto | null;
-  usedRuns: number;
-  maxRuns: number;
-  remainingRuns: number;
 }

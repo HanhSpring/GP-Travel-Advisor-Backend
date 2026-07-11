@@ -21,6 +21,7 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import pickle
 import random
 import sys
@@ -47,6 +48,12 @@ CB_LOOKUP_FILE = "cb_lookup_foody_rich.pkl"
 CB_LOOKUP_SIGNATURE_FILE = "cb_lookup_signature.txt"
 EMB_MODEL_FILE = "embedding_model_foody_rich.txt"
 
+# Retraining uses SentenceTransformer through PyTorch only. Some local environments
+# also contain Keras 3; allowing transformers to auto-detect TensorFlow then raises
+# an unnecessary tf-keras compatibility error before SentenceTransformer can load.
+os.environ.setdefault("USE_TF", "0")
+os.environ.setdefault("TRANSFORMERS_NO_TF", "1")
+
 
 def _normalize_city_name(value) -> str:
     if pd.isna(value):
@@ -58,6 +65,25 @@ def _col_or_blank(df: pd.DataFrame, name: str) -> pd.Series:
     if name in df.columns:
         return df[name]
     return pd.Series([""] * len(df), index=df.index)
+
+
+def validate_training_dependencies() -> None:
+    """Fail before expensive embedding work when a train-only package is missing."""
+    missing: list[str] = []
+    try:
+        import sentence_transformers  # noqa: F401
+    except ImportError:
+        missing.append("sentence-transformers")
+    try:
+        import surprise  # noqa: F401
+    except ImportError:
+        missing.append("scikit-surprise")
+    if missing:
+        packages = " ".join(missing)
+        raise SystemExit(
+            "[train] Thiếu dependency: " + ", ".join(missing) + ". "
+            f"Chạy: python -m pip install {packages}"
+        )
 
 
 # ────────────────────────── Load places (giống cell 5) ──────────────────────────
@@ -594,6 +620,7 @@ def write_manifest(cf: dict, log_cf: dict | None = None, hybrid_metrics: dict | 
 
 def main(grid_search: bool = False, prev_manifest: Path | None = None) -> dict:
     ensure_dirs()
+    validate_training_dependencies()
     for f in ("Places.csv", "rating_matrix_foody.npz",
               "rating_matrix_foody_users.csv", "rating_matrix_foody_items.csv"):
         if not (OUTPUT_DATA_DIR / f).exists():

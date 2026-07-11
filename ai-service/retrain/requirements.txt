@@ -9,5 +9,7 @@ scipy
 supabase
 boto3
 sentence-transformers
+# Embedding training is PyTorch-only; train_recommender.py disables Transformers TF
+# auto-detection so Keras 3 does not require the separate, heavy tf-keras package.
 # Funk-SVD (thư viện Surprise) — chỉ pipeline train cần, service serve KHÔNG cần
 scikit-surprise

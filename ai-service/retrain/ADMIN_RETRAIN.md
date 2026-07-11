@@ -54,7 +54,7 @@ the cache. The existing Colab retrain wrapper remains unchanged.
 - Scheduled runs use change detection and can finish without retraining when no
   places, reviews or activity logs changed.
 - Only one pending/running job is allowed per recommender algorithm.
-- At most 50 jobs can be created for the demo.
+- The number of historical jobs is unlimited; only one pending/running job is allowed.
 - `training_runs` stores progress/results; `model_versions` stores promoted
   artifact metrics; `algorithm_logs` stores audit messages.
 - The UI polls every three seconds and reports rating-only/hybrid RMSE after a
