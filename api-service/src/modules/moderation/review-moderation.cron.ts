@@ -101,7 +101,7 @@ export class ReviewModerationCronService {
       let violationReason = '';
       if (finalStatus === 'violation') {
         if (result.textViolations.length > 0) {
-          violationReason = `Nội dung văn bản: ${result.textViolations.join(', ')}`;
+          violationReason = translateCategories(result.textViolations).join(', ');
         } else {
           violationReason = `Hình ảnh/Video vi phạm tiêu chuẩn cộng đồng`;
         }
@@ -132,7 +132,7 @@ export class ReviewModerationCronService {
         let notifContent = `Đánh giá của bạn vi phạm tiêu chuẩn cộng đồng`;
         let metadata: Record<string, unknown> | undefined;
 
-        if (violationReason.includes('Nội dung văn bản')) {
+        if (result.textViolations.length > 0) {
           notifContent = `Đánh giá của bạn vi phạm tiêu chuẩn cộng đồng: "${content}"`;
         } else {
           notifContent = `Hình ảnh/Video trong đánh giá của bạn vi phạm tiêu chuẩn cộng đồng`;
