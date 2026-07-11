@@ -440,8 +440,9 @@ export class PlacesService {
   }
 
   async getPlaceDetail(placeId: string, touristId?: string) {
-    const numericUserId =
-      touristId && /^\d+$/.test(touristId) ? Number(touristId) : null;
+    // Truyền thẳng tourist UUID của user đăng nhập — AI service tự tra
+    // tourist_user_map.csv (UUID -> id số) để kích hoạt nhánh CF cá nhân hóa.
+    const recommendUserId = touristId?.trim() || null;
 
     // ── Group 1: fire all independent queries in parallel ────────────────────
     const [placeResult, recommended, isFavorite] = await Promise.all([
@@ -456,7 +457,7 @@ export class PlacesService {
         .eq('is_active', true)
         .maybeSingle<PlaceRow>(),
       this.recommendations.getRecommendedPlaceIds(placeId, {
-        userId: numericUserId,
+        userId: recommendUserId,
       }),
       touristId
         ? this.checkFavorite(touristId, placeId)

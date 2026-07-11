@@ -38,9 +38,20 @@ class HybridRecommender:
     ]
     REQUIRED_DATA = ["Places.csv", "rating_matrix_foody.npz"]
 
+    # Map tourist UUID -> id số (sinh bởi retrain/export_training_data.py).
+    # Optional: thiếu file thì user thật chỉ nhận CB + khoảng cách như trước.
+    TOURIST_MAP_FILE = "tourist_user_map.csv"
+    LOG_ARTIFACTS = [
+        "log_user_factors.npy", "log_item_factors.npy", "log_user_bias.npy",
+        "log_item_bias.npy", "log_user_ids.csv", "log_item_ids.csv",
+        "log_user_confidence.csv", "log_city_to_item_idx.pkl",
+    ]
+
     def __init__(self, artifact_dir: str, data_dir: str):
         self.artifact_dir = Path(artifact_dir)
         self.data_dir = Path(data_dir)
+        self.tourist_uuid_to_numeric: dict[str, int] = {}
+        self.log_ready = False
         self.ready = False
 
     # ------------------------------------------------------------------ load
@@ -80,6 +91,7 @@ class HybridRecommender:
         self.decay_km = float(defaults.get("distance_decay_km", 5.0))
         self.cb_k = int(defaults.get("cb_k", 50))
         self.cf_k = int(defaults.get("cf_k", 50))
+        self.max_log_cf_weight = float(defaults.get("log_cf_weight", 0.35))
 
         cf_user_ids = pd.read_csv(art / "cf_user_ids.csv").iloc[:, 0].astype(int).values
         cf_item_ids = (
@@ -95,6 +107,33 @@ class HybridRecommender:
             self.cb_lookup = pickle.load(f)  # id -> [id, ...]
 
         self.R_csr = load_npz(data / "rating_matrix_foody.npz").tocsr()  # mask lịch sử
+
+        # Optional for backward compatibility: an old artifact remains rating-only.
+        if all((art / name).exists() for name in self.LOG_ARTIFACTS):
+            self.log_P = np.load(art / "log_user_factors.npy").astype(np.float32)
+            self.log_Q = np.load(art / "log_item_factors.npy").astype(np.float32)
+            self.log_b_u = np.load(art / "log_user_bias.npy").astype(np.float32)
+            self.log_b_i = np.load(art / "log_item_bias.npy").astype(np.float32)
+            self.log_global_mean = float(man.get("log_cf", {}).get("global_mean", 2.75))
+            log_users = pd.read_csv(art / "log_user_ids.csv").iloc[:, 0].astype(int).values
+            self.log_user_id_to_idx = {int(u): i for i, u in enumerate(log_users)}
+            self.log_item_ids = pd.read_csv(art / "log_item_ids.csv").iloc[:, 0].astype(str).str.strip().values
+            self.log_item_id_to_idx = {pid: i for i, pid in enumerate(self.log_item_ids)}
+            with open(art / "log_city_to_item_idx.pkl", "rb") as f:
+                self.log_city_to_item_idx = pickle.load(f)
+            confidence = pd.read_csv(art / "log_user_confidence.csv")
+            self.log_user_confidence = {
+                int(row.UserID): max(0.0, min(1.0, float(row.confidence)))
+                for row in confidence.itertuples()
+            }
+            log_matrix = data / "activity_log_matrix.npz"
+            self.log_R_csr = load_npz(log_matrix).tocsr() if log_matrix.exists() else None
+            self.log_ready = True
+            logger.info("Log CF loaded: %d users, %d items", len(log_users), len(self.log_item_ids))
+        else:
+            logger.info("Log CF artifact chưa đủ — dùng rating CF như trước")
+
+        self.tourist_uuid_to_numeric = self._load_tourist_map()
 
         # Metadata hiển thị + city/coords theo place_id
         places = pd.read_csv(data / "Places.csv", encoding="utf-8-sig", low_memory=False)
@@ -133,6 +172,51 @@ class HybridRecommender:
         )
 
     # --------------------------------------------------------------- helpers
+    def _load_tourist_map(self) -> dict[str, int]:
+        """Đọc tourist_user_map.csv (UUID -> id số) nếu có.
+
+        Ưu tiên bản đi kèm artifact (đồng bộ từ R2), fallback retrain/state/
+        khi chạy local không R2. Thiếu file không phải lỗi — chỉ mất nhánh CF
+        cho user thật.
+        """
+        candidates = [
+            self.artifact_dir / self.TOURIST_MAP_FILE,
+            Path("retrain") / "state" / self.TOURIST_MAP_FILE,
+        ]
+        for path in candidates:
+            if not path.exists():
+                continue
+            try:
+                df = pd.read_csv(path, dtype={"tourist_id": str, "numeric_id": int})
+                mapping = {
+                    str(t).strip().lower(): int(n)
+                    for t, n in zip(df["tourist_id"], df["numeric_id"])
+                }
+                logger.info(
+                    "Tourist map loaded: %d user thật (từ %s)", len(mapping), path
+                )
+                return mapping
+            except Exception as e:
+                logger.warning("Không đọc được tourist map %s: %s", path, e)
+        logger.info(
+            "tourist_user_map.csv không có — user thật (UUID) sẽ không có nhánh CF"
+        )
+        return {}
+
+    def resolve_user_id(self, raw) -> int | None:
+        """Chuyển user_id bất kỳ (id số hoặc tourist UUID) về id số của ma trận CF.
+
+        Trả None nếu không map được — nhánh CF sẽ bị bỏ qua (giữ CB + khoảng cách).
+        """
+        if raw is None:
+            return None
+        s = str(raw).strip()
+        if not s:
+            return None
+        if s.isdigit():
+            return int(s)
+        return self.tourist_uuid_to_numeric.get(s.lower())
+
     def _meta(self, pid: str) -> dict:
         if pid not in self.places.index:
             return {}
@@ -185,6 +269,52 @@ class HybridRecommender:
         order = part[np.argsort(-scores[part])]
         return [self.cf_item_ids[items[i]] for i in order]
 
+    def _log_cf_topk_in_city(self, user_id, city, k):
+        if not self.log_ready or user_id is None:
+            return []
+        u = self.log_user_id_to_idx.get(int(user_id))
+        items = self.log_city_to_item_idx.get(city)
+        if u is None or items is None or len(items) == 0:
+            return []
+        scores = (
+            self.log_global_mean + self.log_b_u[u] + self.log_b_i[items]
+            + self.log_Q[items] @ self.log_P[u]
+        )
+        if self.log_R_csr is not None and u < self.log_R_csr.shape[0]:
+            start, end = self.log_R_csr.indptr[u], self.log_R_csr.indptr[u + 1]
+            history = set(self.log_R_csr.indices[start:end].tolist())
+            if history:
+                scores = np.where(np.array([it not in history for it in items]), scores, -np.inf)
+        valid = np.isfinite(scores)
+        if not valid.any():
+            return []
+        take = min(k, int(valid.sum()))
+        part = np.argpartition(-scores, take - 1)[:take]
+        order = part[np.argsort(-scores[part])]
+        return [self.log_item_ids[items[i]] for i in order]
+
+    def _combined_cf_topk_in_city(self, user_id, city, k):
+        """Blend normalized rank scores; missing sources are automatically ignored."""
+        rating = self._cf_topk_in_city(user_id, city, self.cf_k)
+        log_cf = self._log_cf_topk_in_city(user_id, city, self.cf_k)
+        if not rating:
+            return log_cf[:k]
+        if not log_cf:
+            return rating[:k]
+
+        log_weight = self.max_log_cf_weight * self.log_user_confidence.get(int(user_id), 0.0)
+        rating_weight = 1.0 - log_weight
+        rating_rank = {pid: idx for idx, pid in enumerate(rating, 1)}
+        log_rank = {pid: idx for idx, pid in enumerate(log_cf, 1)}
+        candidates = list(dict.fromkeys(rating + log_cf))
+        scored = []
+        for pid in candidates:
+            rs = self._rank_score(rating_rank[pid], len(rating)) if pid in rating_rank else 0.0
+            ls = self._rank_score(log_rank[pid], len(log_cf)) if pid in log_rank else 0.0
+            scored.append((pid, rating_weight * rs + log_weight * ls))
+        scored.sort(key=lambda pair: pair[1], reverse=True)
+        return [pid for pid, _ in scored[:k]]
+
     def _cb_topk(self, current_item_id, k):
         return [
             x for x in self.cb_lookup.get(str(current_item_id), []) if x != str(current_item_id)
@@ -195,13 +325,17 @@ class HybridRecommender:
         if not self.ready:
             raise RuntimeError("Recommender chưa load được artifact")
 
+        user_id = self.resolve_user_id(user_id)
         current_item_id = str(current_item_id)
         city = self.id2city.get(current_item_id, "")
         if not city:
             return []
 
         cb = self._cb_topk(current_item_id, self.cb_k)
-        cf = [x for x in self._cf_topk_in_city(user_id, city, self.cf_k) if x != current_item_id]
+        cf = [
+            x for x in self._combined_cf_topk_in_city(user_id, city, self.cf_k)
+            if x != current_item_id
+        ]
         cb_set, cf_set = set(cb), set(cf)
         union = list(dict.fromkeys(cb + cf))
         if not union:
