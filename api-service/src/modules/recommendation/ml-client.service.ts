@@ -100,9 +100,11 @@ export interface RegionDetectionResult {
     total_visit_minutes: number;
     travel_minutes_from_central: number;
     is_remote: boolean;
+    suggested_days: number;
   }>;
   estimated_total_days: number;
   num_days: number;
+  shortfall_days: number;
 }
 
 @Injectable()

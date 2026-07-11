@@ -9,6 +9,7 @@ from app.services.itinerary.assignment import (
     AssignmentConfig,
     AssignmentResult,
     ConstrainedKMeansAssignment,
+    MAX_CAFE_OPTIONS_PER_DAY,
 )
 from app.services.itinerary.clustering_debug_viz import ClusteringDebugRecorder
 from app.services.itinerary.geo_clustering import GeoClusteringAssignment
@@ -34,6 +35,41 @@ except ImportError:  # pragma: no cover
     _sklearn_available = False
 
 
+# ── 0. CONSTRAINT CLASSIFICATION ─────────────────────────────────────────
+# Every constraint in this solver is either:
+#
+#   HARD  — encoded as `model.Add(...)` with no OnlyEnforceIf escape hatch,
+#           so the solver returns INFEASIBLE rather than a solution that
+#           violates it. Reserved for physical/logical impossibilities —
+#           a route cannot visit the same node twice, a place cannot be
+#           entered before it opens, a day cannot contain 3 lunches:
+#             - model.AddCircuit(arcs)                    — route topology
+#             - start_var[j] >= open_time / depart[j] <= close_time
+#             - restaurants <= 2/day, cafes <= 1/day       (meal-slot caps)
+#             - MEAL_MIN_GAP_MINUTES between two meals     (ordering/spacing)
+#             - target_min <= selected_total <= target_max (POI-count band)
+#
+#   SOFT  — a weighted term in _add_objective's Minimize(...) expression
+#           (Section 2 below). Used for anything that's a *preference*, not
+#           an impossibility: travel time, wait time, best-time-window fit,
+#           lunch timing, skipped-POI count, and — as of this pass — budget.
+#
+# Budget is deliberately SOFT, not hard: an earlier version capped
+# activity+transport cost per day with a hard model.Add(...). That looked
+# rigorous, but daily_budget_soft is only a rolling remainder of the whole
+# trip's budget (run() subtracts each day's actual cost from what's left),
+# so a hard per-day cap could force a degraded/greedy day even when a
+# modest overage would still leave the *overall trip* within budget (slack
+# borrowed from days that underspend) — and the moment the hard cap made a
+# day infeasible, _solve_day_with_fallback fell through to
+# _greedy_fallback, which enforces budget only loosely anyway. A "hard"
+# constraint bypassed by a fallback isn't hard in any formal sense — the
+# same failure mode as the old hard "must have lunch" constraint fixed
+# earlier (see LUNCH_HARD_WINDOW below). The real, unconditional
+# hard guarantee lives one layer up: validator.py's budget_exceeded check
+# compares hotel_total_cost + sum(day costs) against the user's whole-trip
+# budget and is a genuine HARD_VIOLATIONS entry — untouched by this file.
+
 # ── 1. MEAL & PHYSIOLOGICAL CONSTRAINTS ──────────────────────────────────
 # Cutoff time: If the itinerary starts after 13:30, the solver skips the 
 # lunch requirement to avoid forcing a meal when the user might have eaten.
@@ -48,10 +84,14 @@ DINNER_END = 19 * 60 + 30
 MEAL_MIN_GAP_MINUTES = 210
 
 # ── 2. SOFT PENALTIES (OBJECTIVE FUNCTION WEIGHTS) ───────────────────────
-# Soft penalty per minute if a lunch restaurant is scheduled outside the 
-# optimal lunch window. Replaces the rigid hard constraints to prevent 
-# "Infeasible" errors when the timeline is tight.
-LUNCH_LATE_PENALTY_PER_MIN = 4
+# Hard bound on when a restaurant may serve as lunch. There is no soft drift
+# beyond this window — a restaurant that can't fit inside it is simply left
+# unselected for that day (SKIPPED_POI_PENALTY already makes skipping cheaper
+# than forcing an ill-fitting slot). This replaced an earlier soft per-minute
+# penalty (LUNCH_LATE_PENALTY_PER_MIN) that was too weak: the solver could
+# still push "lunch" as late as 18:00 (effectively dinner) rather than drop
+# it, since the accumulated penalty was cheaper than the alternative.
+LUNCH_HARD_WINDOW = (10 * 60 + 30, 14 * 60)  # 10:30-14:00
 
 # Constraints to prevent entertainment/nightlife from being scheduled in the morning.
 ENTERTAINMENT_EARLIEST_START = 13 * 60
@@ -60,9 +100,15 @@ LATE_ENTERTAINMENT_EARLIEST_START = 18 * 60
 # Penalty applied per minute if an entertainment POI is scheduled earlier than allowed.
 ENTERTAINMENT_EARLY_PENALTY_PER_MIN = 4
 
-# General penalty for any idle/waiting time between POIs (e.g., arriving 
+# General penalty for any idle/waiting time between POIs (e.g., arriving
 # before opening time). Forces the solver to prefer active continuous routes.
-IDLE_TIME_PENALTY_PER_MIN = 6
+# Empirically tuned via scripts/sensitivity_analysis_weights.py (full-trip
+# sweep across 5 real destinations, see scripts/sensitivity_results_trip.csv):
+# total visited/idle-time improve monotonically from 3->9 with zero budget
+# cost, plateau at 9->12 (no further gain), and only start costing real
+# budget overage past 12 (18+) for negligible extra benefit — 9 is the
+# empirical elbow point.
+IDLE_TIME_PENALTY_PER_MIN = 9
 
 # Penalty for idle time specifically at the beginning of the day.
 HEAD_IDLE_TIME_PENALTY_PER_MIN = 4
@@ -95,6 +141,43 @@ BEST_TIME_LARGE_DEVIATION_PENALTY_PER_MIN = 4
 
 # Allowable buffer (30 mins) before the penalty starts counting.
 BEST_TIME_GRACE_MINUTES = 30
+
+# ── 4. SPENDING-TIER / PRICE-FIT (BUDGET-AWARE POI SCORING) ──────────────
+# Classifies the user's average daily budget into low/medium/high so POI
+# selection favors places matching their spending capacity. Thresholds are
+# an approximate per-trip -> per-day conversion from real domestic-tourism
+# spending data (no dedicated per-day dataset exists, so this is a documented
+# judgment call, not an exact statistic):
+#  - GSO (Tong cuc Thong ke) 2019: avg domestic overnight trip spend
+#    5.563 trieu VND over an avg 3.62-day trip -> ~1.537 trieu VND/day.
+#  - 2024-2025 Booking/Coc Coc consumer surveys: "typical" domestic trip
+#    spend is 2-4 trieu VND/trip; higher-spending 25-34 age group is
+#    5+ trieu VND/trip (~70% of that bracket).
+# 500k/day roughly brackets the low end of the "typical" trip spend;
+# 1.2M/day roughly brackets the higher-spending traveler segment.
+USER_BUDGET_TIER_MEDIUM_VND_PER_DAY = 500_000
+USER_BUDGET_TIER_HIGH_VND_PER_DAY = 1_200_000
+
+# POI-level cost tier (single-item price, e.g. one ticket/one meal). Unlike
+# the user tier above, there is no specific research backing these two
+# thresholds — they remain an uncited, hand-picked bucketing of "cheap
+# vs. mid-range vs. premium single POI cost" and should be treated as a
+# product judgment call, not an empirically-grounded figure.
+POI_PRICE_TIER_MEDIUM_VND = 100_000
+POI_PRICE_TIER_PREMIUM_VND = 500_000
+
+# price_fit_bonus is symmetric by "tier distance" (how many tiers apart the
+# user's spending tier and the POI's price tier are), replacing an earlier
+# ad-hoc matrix that penalized the same 2-tier mismatch inconsistently
+# (-500 for low+premium vs. only -50 for high+cheap) and left some 1-tier
+# mismatches (e.g. medium+cheap, medium+premium) with no penalty at all.
+PRICE_FIT_MATCH_BONUS = 50
+PRICE_FIT_ADJACENT_MISMATCH_PENALTY = 50
+PRICE_FIT_FAR_MISMATCH_PENALTY = 150
+
+# Maps a tier name to an ordinal position so "distance" can be computed
+# between the user's spending tier and a POI's price tier.
+_SPENDING_TIER_INDEX = {"low": 0, "medium": 1, "high": 2, "cheap": 0, "premium": 2}
 
 
 def preferred_time_window(
@@ -600,7 +683,7 @@ class SchedulerV2Planner:
         else:
             enforce_lunch_base = True
 
-        lunch_win = (planner.LUNCH_START, planner.LUNCH_END)
+        lunch_win = LUNCH_HARD_WINDOW
         day_start = (
             self.config.check_in_time
             if is_day_1 and self.config.check_in_time is not None
@@ -619,7 +702,6 @@ class SchedulerV2Planner:
             result = self._solve_day_core(
                 day_number, pois, is_day_1,
                 enforce_lunch=enforce_lunch_base, lunch_window=lunch_win,
-                budget_tolerance_ratio=0.00,
                 target_min=target_min,
             )
             if result is not None:
@@ -638,7 +720,6 @@ class SchedulerV2Planner:
         is_day_1: bool,
         enforce_lunch: bool,
         lunch_window: Optional[Tuple[int, int]],
-        budget_tolerance_ratio: float = 0.10,
         target_min: Optional[int] = None,
     ) -> Optional[planner.GAResult]:
         """
@@ -672,11 +753,11 @@ class SchedulerV2Planner:
         if is_day_1:
             return self._build_day1_model(
                 pois, helper, day_start, enforce_lunch, lunch_window,
-                budget_tolerance_ratio, target_min
+                target_min
             )
         return self._build_circuit_model(
             day_number, pois, helper, day_start, enforce_lunch, lunch_window,
-            budget_tolerance_ratio, target_min
+            target_min
         )
 
     # ────────────────────────────────────────────────────────────────────
@@ -690,7 +771,6 @@ class SchedulerV2Planner:
         day_start: int,
         enforce_lunch: bool,
         lunch_window: Optional[Tuple[int, int]],
-        budget_tolerance_ratio: float,
         target_min: Optional[int],
     ) -> Optional[planner.GAResult]:
         """
@@ -852,7 +932,7 @@ class SchedulerV2Planner:
             i for i in range(1, n + 1) if pois[i - 1].place_type == "cafe"
         ]
         if cafe_nodes:
-            model.Add(sum(selected[i] for i in cafe_nodes) <= 1)
+            model.Add(sum(selected[i] for i in cafe_nodes) <= MAX_CAFE_OPTIONS_PER_DAY)
 
         # ── Max/Min POIs ──
         dynamic_target_min, target_max = self._calculate_target_bounds(
@@ -869,7 +949,7 @@ class SchedulerV2Planner:
         # ── Objective ──
         self._add_objective(
             model, n, pois, selected, start_var, wait,
-            arc_vars, travel_minutes, travel_distance, helper, budget_tolerance_ratio,
+            arc_vars, travel_minutes, travel_distance, helper,
             return_time=return_time,
             day_start=day_start,
             lunch_window=lunch_window,
@@ -934,7 +1014,6 @@ class SchedulerV2Planner:
         day_start: int,
         enforce_lunch: bool,
         lunch_window: Optional[Tuple[int, int]],
-        budget_tolerance_ratio: float,
         target_min: Optional[int],
     ) -> Optional[planner.GAResult]:
         """
@@ -1057,7 +1136,7 @@ class SchedulerV2Planner:
             i for i in range(1, n + 1) if pois[i - 1].place_type == "cafe"
         ]
         if cafe_nodes:
-            model.Add(sum(selected[i] for i in cafe_nodes) <= 1)
+            model.Add(sum(selected[i] for i in cafe_nodes) <= MAX_CAFE_OPTIONS_PER_DAY)
 
         # ── Max/Min POIs ──
         dynamic_target_min, target_max = self._calculate_target_bounds(
@@ -1074,7 +1153,7 @@ class SchedulerV2Planner:
         # ── Objective ──
         self._add_objective(
             model, n, pois, selected, start_var, wait,
-            arc_vars, travel_minutes, travel_distance, helper, budget_tolerance_ratio,
+            arc_vars, travel_minutes, travel_distance, helper,
             return_time=return_time,
             day_start=day_start,
             lunch_window=lunch_window,
@@ -1141,7 +1220,6 @@ class SchedulerV2Planner:
         travel_minutes: dict,
         travel_distance: dict,
         helper,
-        budget_tolerance_ratio: float,
         return_time,
         day_start: int = None,
         lunch_window: Optional[Tuple[int, int]] = None,
@@ -1156,32 +1234,29 @@ class SchedulerV2Planner:
         skipped_terms = []
         activity_cost_terms = []
         best_time_penalty_terms = []
-        lunch_penalty_terms = []
 
         daily_budget_target = self.trip_budget / max(1, self.num_days)
         user_tier = "low"
-        if daily_budget_target >= 1200000:
+        if daily_budget_target >= USER_BUDGET_TIER_HIGH_VND_PER_DAY:
             user_tier = "high"
-        elif daily_budget_target >= 500000:
+        elif daily_budget_target >= USER_BUDGET_TIER_MEDIUM_VND_PER_DAY:
             user_tier = "medium"
 
         for i, poi in enumerate(pois, start=1):
             poi_cost = helper._poi_cost(poi)
             poi_price_tier = "cheap"
-            if poi_cost >= 500000:
+            if poi_cost >= POI_PRICE_TIER_PREMIUM_VND:
                 poi_price_tier = "premium"
-            elif poi_cost >= 100000:
+            elif poi_cost >= POI_PRICE_TIER_MEDIUM_VND:
                 poi_price_tier = "medium"
 
-            price_fit_bonus = 0
-            if user_tier == "low":
-                if poi_price_tier == "cheap": price_fit_bonus = 50
-                elif poi_price_tier == "premium": price_fit_bonus = -500
-            elif user_tier == "medium":
-                if poi_price_tier == "medium": price_fit_bonus = 50
-            elif user_tier == "high":
-                if poi_price_tier == "premium": price_fit_bonus = 100
-                elif poi_price_tier == "cheap": price_fit_bonus = -50
+            tier_distance = abs(_SPENDING_TIER_INDEX[user_tier] - _SPENDING_TIER_INDEX[poi_price_tier])
+            if tier_distance == 0:
+                price_fit_bonus = PRICE_FIT_MATCH_BONUS
+            elif tier_distance == 1:
+                price_fit_bonus = -PRICE_FIT_ADJACENT_MISMATCH_PENALTY
+            else:
+                price_fit_bonus = -PRICE_FIT_FAR_MISMATCH_PENALTY
 
             two_tower_score = helper._poi_utility(poi) / planner.UTILITY_SCALE
             premium_low_score_penalty = 0
@@ -1189,11 +1264,14 @@ class SchedulerV2Planner:
                 premium_low_score_penalty = 250
 
             cost_penalty = int(poi_cost // 10000)
-            # Food utility is scaled down: restaurants 300x, cafes 150x (vs attractions 1000x)
+            # Food utility is scaled down: restaurants 300x, cafes 220x (vs attractions 1000x).
+            # Cafes were bumped up from 150x — at 150x they were losing out to attractions
+            # too often once the schedule got tight, making cafes effectively optional even
+            # though we still don't hard-enforce them like the lunch/dinner restaurant slot.
             if poi.place_type == "restaurant":
                 poi_reward = int(round(two_tower_score * 300))
             elif poi.place_type == "cafe":
-                poi_reward = int(round(two_tower_score * 150))
+                poi_reward = int(round(two_tower_score * 220))
             else:
                 poi_reward = int(round(two_tower_score * 1000))
             stay_penalty = int(poi.visit_duration)
@@ -1249,28 +1327,21 @@ class SchedulerV2Planner:
                 early_minutes * ENTERTAINMENT_EARLY_PENALTY_PER_MIN
             )
 
-        # Soft lunch timing: on-time = no penalty, late/early relative to the
-        # lunch window = penalty proportional to the deviation. Replaces the
-        # old hard "must pick >=1 lunch" constraint — a restaurant that would
-        # be genuinely disruptive to include (long detour, forces dropping
-        # attractions) can now just be skipped instead, since the existing
-        # generic SKIPPED_POI_PENALTY already makes skipping cheaper than
-        # sacrificing attraction utility to force it in.
+        # Hard lunch window: a restaurant capable of serving lunch (hours
+        # overlap the window at all) may ONLY be scheduled inside
+        # LUNCH_HARD_WINDOW if selected — no soft drift beyond it. A
+        # restaurant that can't fit is simply left unselected for that day
+        # (still a genuinely optional stop — enforce_lunch/lunch_window being
+        # None entirely skips this, and skipping is never infeasible thanks
+        # to the existing SKIPPED_POI_PENALTY-based soft treatment).
         if enforce_lunch and lunch_window:
             for i, poi in enumerate(pois, start=1):
                 if poi.place_type != "restaurant":
                     continue
                 if not (poi.open_time <= lunch_window[1] and poi.close_time >= lunch_window[0]):
                     continue
-                lunch_late = model.NewIntVar(0, 24 * 60, f"lunch_late_{i}")
-                lunch_early = model.NewIntVar(0, 24 * 60, f"lunch_early_{i}")
-                model.Add(lunch_late >= start_var[i] - lunch_window[1]).OnlyEnforceIf(selected[i])
-                model.Add(lunch_early >= lunch_window[0] - start_var[i]).OnlyEnforceIf(selected[i])
-                model.Add(lunch_late == 0).OnlyEnforceIf(selected[i].Not())
-                model.Add(lunch_early == 0).OnlyEnforceIf(selected[i].Not())
-                lunch_penalty_terms.append(
-                    (lunch_late + lunch_early) * LUNCH_LATE_PENALTY_PER_MIN
-                )
+                model.Add(start_var[i] >= lunch_window[0]).OnlyEnforceIf(selected[i])
+                model.Add(start_var[i] <= lunch_window[1]).OnlyEnforceIf(selected[i])
 
         for (i, j), var in arc_vars.items():
             tm = travel_minutes.get((i, j), 0)
@@ -1301,17 +1372,27 @@ class SchedulerV2Planner:
             for (i, j), var in arc_vars.items()
         )
 
-        if self.trip_budget_total > 0:
-            max_allowed_cost_k = int(daily_budget_k * (1 + budget_tolerance_ratio))
-            model.Add(activity_cost_k + transport_cost_k <= max_allowed_cost_k)
-
+        # Soft, not hard: a day-level cap here would force greedy_fallback
+        # (weaker budget discipline, no route optimality) whenever a single
+        # day's tight budget+time combination is infeasible — even though
+        # daily_budget_soft is only a rolling remainder of the whole trip's
+        # budget, so a modest overage on one day can still leave the overall
+        # trip within budget (slack borrowed from days that underspend).
+        # The real hard guarantee is validator.py's trip-level
+        # budget_exceeded check against the user's total budget; this term
+        # just steers the solver away from overspending when it can.
         budget_k_overage = model.NewIntVar(0, 2_000_000, "budget_k_overage")
         if self.trip_budget_total > 0:
             model.Add(budget_k_overage >= activity_cost_k + transport_cost_k - daily_budget_k)
         else:
             model.Add(budget_k_overage == 0)
 
-        budget_penalty = budget_k_overage * 2
+        # Same weight used for the reported GAResult.budget_penalty
+        # (_build_result_from_route/_greedy_fallback) — one documented
+        # constant instead of two silently-different multipliers. CP-SAT
+        # linear expressions need an integer coefficient; the constant is
+        # already a whole number (15.0), so this cast loses nothing.
+        budget_penalty = budget_k_overage * int(planner.BUDGET_PENALTY_WEIGHT)
 
         # ── Day-density penalty ──
         # target: one POI per 150 min of available time
@@ -1418,7 +1499,6 @@ class SchedulerV2Planner:
             + sum(wait_terms)
             + sum(entertainment_penalty_terms)
             + sum(best_time_penalty_terms)
-            + sum(lunch_penalty_terms)
             + budget_penalty
             + sum(skipped_terms)
             - sum(utility_terms)
@@ -1941,567 +2021,6 @@ class SchedulerV2Planner:
             region_day_allocations=self.region_day_allocations,
         )
 
-    def _preallocate_days_sweep_legacy(self) -> AssignmentResult:
-        """
-        Sweep Allocation: angle-based sequential day assignment with capacity
-        and distance guardrails. Replaces K-Means.
-
-        Flow:
-          1. Deduplicate candidates
-          2. Separate: primary attractions | cafes | restaurants
-          3. Sweep-assign primary attractions into days (remote POIs get own day)
-          4. Balance uneven pools
-          5. Compute cluster centroids
-          6. Inject cafes near each day cluster (cap 1/day)
-          7. Assign restaurants from global pool (proximity-gated)
-          8. Trim + snapshot counts
-        """
-        candidates = self._deduplicate_candidates(self.attractions + self.restaurants)
-
-        if not candidates or self.num_days <= 0:
-            return AssignmentResult(
-                day_pools=[{"attractions": [], "restaurants": []} for _ in range(self.num_days)],
-                day_loads=[0] * self.num_days,
-            )
-
-        # Very few candidates → round-robin fallback
-        primary_only = [p for p in candidates if p.place_type in {"attraction", "entertainment"}]
-        if len(primary_only) < self.num_days:
-            return self._round_robin_assign(candidates)
-
-        cafes = [p for p in candidates if p.place_type == "cafe"]
-        restaurants = [p for p in candidates if p.place_type == "restaurant"]
-
-        # Sweep-assign primary attractions
-        day_pools = self._sweep_allocate_days(primary_only)
-
-        # Balance uneven days after sweep
-        self._balance_day_pools(day_pools)
-
-        # Centroids from pure attractions only
-        self._compute_cluster_centroids(day_pools)
-
-        # Inject cafes near each day's cluster (1 per day)
-        self._inject_cafes_to_days(cafes, day_pools)
-
-        # Snapshot base counts (before restaurant injection)
-        for pool in day_pools:
-            pool["base_candidate_count"] = len(pool["attractions"]) + len(pool["restaurants"])
-            pool["base_restaurant_count"] = len(pool["restaurants"])
-
-        # Assign restaurants from global pool
-        self._assign_restaurants_to_days(restaurants, day_pools)
-
-        # Record injected restaurant count
-        for pool in day_pools:
-            pool["injected_restaurant_count"] = max(
-                0, len(pool["restaurants"]) - pool["base_restaurant_count"]
-            )
-
-        self._trim_day_pools(day_pools)
-
-        for pool in day_pools:
-            pool["final_candidate_count"] = len(pool["attractions"]) + len(pool["restaurants"])
-
-        day_loads = [self._day_load(pool) for pool in day_pools]
-        return AssignmentResult(
-            day_pools=day_pools,
-            day_loads=day_loads,
-            warnings=[f"sweep_v1 primary={len(primary_only)} cafes={len(cafes)} restaurants={len(restaurants)}"],
-        )
-
-    def _round_robin_assign(self, candidates: list) -> AssignmentResult:
-        """Fallback: distribute candidates evenly when too few for sweep."""
-        day_pools: list[dict] = [
-            {
-                "attractions": [], "restaurants": [],
-                "allocation_method": "round_robin",
-                "is_remote_day": False,
-            }
-            for _ in range(self.num_days)
-        ]
-        for idx, place in enumerate(candidates):
-            day_idx = idx % self.num_days
-            if place.place_type == "restaurant":
-                day_pools[day_idx]["restaurants"].append(place)
-            else:
-                day_pools[day_idx]["attractions"].append(place)
-
-        self._compute_cluster_centroids(day_pools)
-
-        cafes_global = [p for p in candidates if p.place_type == "cafe"]
-        rest_global = [p for p in candidates if p.place_type == "restaurant"]
-        self._inject_cafes_to_days(cafes_global, day_pools)
-        self._assign_restaurants_to_days(rest_global, day_pools)
-
-        for pool in day_pools:
-            pool.setdefault("base_candidate_count", len(pool["attractions"]) + len(pool["restaurants"]))
-            pool.setdefault("base_restaurant_count", len(pool["restaurants"]))
-            pool.setdefault("injected_restaurant_count", 0)
-            pool.setdefault("final_candidate_count", len(pool["attractions"]) + len(pool["restaurants"]))
-            pool.setdefault("cafe_filtered_count", 0)
-
-        day_loads = [self._day_load(pool) for pool in day_pools]
-        return AssignmentResult(
-            day_pools=day_pools, day_loads=day_loads, warnings=["round_robin_fallback"],
-        )
-
-    def _deduplicate_candidates(self, places: list) -> list:
-        """
-        Remove near-duplicate POIs before allocation.
-        Keep the better-ranked one (lower candidate_rank = better).
-
-        Rules (any → duplicate):
-          - Same place_type + distance < 200 m
-          - Same category group + distance < 500 m + token-overlap >= 40 %
-        """
-        if len(places) <= 1:
-            return list(places)
-
-        import re as _re
-
-        def _tokens(name: str) -> set:
-            s = name.lower()
-            s = _re.sub(r'[^\w\s]', ' ', s)
-            stop = {'và', 'của', 'ở', 'tại', 'the', 'a', 'an', 'in', '-', ''}
-            return set(s.split()) - stop
-
-        def _cat(place_type: str) -> str:
-            if place_type in {"restaurant", "cafe"}:
-                return place_type
-            return "poi"
-
-        # Sort best-ranked first so we keep the better option
-        sorted_places = sorted(places, key=lambda p: p.candidate_rank)
-        kept: list = []
-
-        for place in sorted_places:
-            p_tokens = _tokens(place.name)
-            p_cat = _cat(place.place_type)
-            is_dup = False
-
-            for existing in kept:
-                dist = self._haversine_km(
-                    place.latitude, place.longitude,
-                    existing.latitude, existing.longitude,
-                )
-                # Same type, very close → obvious duplicate
-                if place.place_type == existing.place_type and dist < 0.2:
-                    is_dup = True
-                    break
-                # Same category group, somewhat close, and name overlaps
-                if _cat(existing.place_type) == p_cat and dist < 0.5:
-                    e_tokens = _tokens(existing.name)
-                    union = p_tokens | e_tokens
-                    if union:
-                        jaccard = len(p_tokens & e_tokens) / len(union)
-                        if jaccard >= 0.4:
-                            is_dup = True
-                            break
-
-            if not is_dup:
-                kept.append(place)
-
-        return kept
-
-    def _sweep_allocate_days(self, primary: list) -> list[dict]:
-        """
-        Assign primary attractions to days via angular sweep with capacity
-        and distance guardrails.
-
-        Remote POIs (distance >= 30 km OR one-way travel >= 60 min) are
-        assigned to dedicated day slots and not mixed with city-centre POIs.
-
-        Returns day_pools with only attractions (no cafes, no restaurants yet).
-        """
-        anchor_lat = self.hotel_place.latitude
-        anchor_lng = self.hotel_place.longitude
-        avail_min = max(60, self.day_end_time - self.day_start_time)
-        max_used = int(avail_min * 0.90)
-        target_used = int(avail_min * 0.70)
-
-        # Classify
-        remote: list[tuple] = []   # (place, dist_km)
-        normal: list[tuple] = []   # (place, angle_rad, dist_km)
-
-        for p in primary:
-            dist_km = self._haversine_km(p.latitude, p.longitude, anchor_lat, anchor_lng)
-            one_way_min = self._haversine_minutes(p.latitude, p.longitude, anchor_lat, anchor_lng)
-            if dist_km >= 30.0 or one_way_min >= 60:
-                remote.append((p, dist_km))
-            else:
-                angle = math.atan2(p.latitude - anchor_lat, p.longitude - anchor_lng)
-                normal.append((p, angle, dist_km))
-
-        # Farthest-first for remote; angular order for normal
-        remote.sort(key=lambda x: -x[1])
-        normal.sort(key=lambda x: x[1])
-
-        # Initialise day pools
-        day_pools: list[dict] = [
-            {
-                "attractions": [], "restaurants": [],
-                "_used_min": 0, "_est_dist_km": 0.0,
-                "is_remote_day": False, "remote_anchor_name": None,
-                "allocation_method": "sweep",
-            }
-            for _ in range(self.num_days)
-        ]
-
-        # Phase 1: reserve dedicated slots for remote POIs
-        remote_day_set: set[int] = set()
-
-        for r_poi, r_dist in remote:
-            one_way_min = self._haversine_minutes(
-                r_poi.latitude, r_poi.longitude, anchor_lat, anchor_lng
-            )
-            est_day_min = one_way_min * 2 + getattr(r_poi, "visit_duration", 120)
-            stay_min = getattr(r_poi, "visit_duration", 120)
-
-            best_day: Optional[int] = None
-
-            # 1st: an existing remote day whose anchor is within 8 km and has capacity
-            for di in list(remote_day_set):
-                if not day_pools[di]["attractions"]:
-                    continue
-                anchor_poi = day_pools[di]["attractions"][0]
-                if (self._haversine_km(
-                    r_poi.latitude, r_poi.longitude,
-                    anchor_poi.latitude, anchor_poi.longitude,
-                ) <= 8.0 and day_pools[di]["_used_min"] + stay_min + 30 <= max_used):
-                    best_day = di
-                    break
-
-            # 2nd: first empty non-remote day
-            if best_day is None:
-                for di in range(self.num_days):
-                    if di not in remote_day_set and not day_pools[di]["attractions"]:
-                        best_day = di
-                        break
-
-            # 3rd: any non-remote day with enough capacity
-            if best_day is None:
-                for di in range(self.num_days):
-                    if di not in remote_day_set and day_pools[di]["_used_min"] + est_day_min <= max_used:
-                        best_day = di
-                        break
-
-            # Last resort: least-loaded day
-            if best_day is None:
-                best_day = min(range(self.num_days), key=lambda di: day_pools[di]["_used_min"])
-
-            pool = day_pools[best_day]
-            pool["attractions"].append(r_poi)
-            pool["_used_min"] += est_day_min
-            pool["_est_dist_km"] += r_dist * 2
-            pool["is_remote_day"] = True
-            if pool["remote_anchor_name"] is None:
-                pool["remote_anchor_name"] = r_poi.name
-            remote_day_set.add(best_day)
-
-        # Phase 2: sweep normal POIs into non-remote days
-        normal_days = [di for di in range(self.num_days) if di not in remote_day_set]
-        if not normal_days:
-            normal_days = list(range(self.num_days))
-
-        day_cursor = 0
-
-        for poi, angle, poi_dist in normal:
-            assigned = False
-
-            for attempt in range(len(normal_days)):
-                di = normal_days[(day_cursor + attempt) % len(normal_days)]
-                pool = day_pools[di]
-
-                if pool["attractions"]:
-                    prev = pool["attractions"][-1]
-                    travel_min = self._haversine_minutes(
-                        prev.latitude, prev.longitude, poi.latitude, poi.longitude
-                    )
-                    seg_dist = self._haversine_km(
-                        prev.latitude, prev.longitude, poi.latitude, poi.longitude
-                    )
-                else:
-                    travel_min = self._haversine_minutes(
-                        anchor_lat, anchor_lng, poi.latitude, poi.longitude
-                    )
-                    seg_dist = poi_dist
-
-                incremental = travel_min + getattr(poi, "visit_duration", 90)
-                new_used = pool["_used_min"] + incremental
-                new_dist = pool["_est_dist_km"] + seg_dist
-
-                if new_used <= max_used and new_dist <= 80.0:
-                    pool["attractions"].append(poi)
-                    pool["_used_min"] = new_used
-                    pool["_est_dist_km"] = new_dist
-                    assigned = True
-                    if pool["_used_min"] >= target_used:
-                        day_cursor = (day_cursor + 1) % len(normal_days)
-                    break
-
-            if not assigned:
-                # Force-assign to least-loaded normal day (distance limit relaxed)
-                best = min(normal_days, key=lambda di: day_pools[di]["_used_min"])
-                day_pools[best]["attractions"].append(poi)
-                day_pools[best]["_used_min"] += (
-                    self._haversine_minutes(anchor_lat, anchor_lng, poi.latitude, poi.longitude)
-                    + getattr(poi, "visit_duration", 90)
-                )
-
-        # Promote tracking state to diagnostics, clean up temp keys
-        for pool in day_pools:
-            pool["day_used_minutes"] = pool.pop("_used_min", 0)
-            pool["day_estimated_distance"] = round(pool.pop("_est_dist_km", 0.0), 2)
-
-        return day_pools
-
-    def _inject_cafes_to_days(self, cafes: list, day_pools: list) -> None:
-        """
-        Inject at most 1 cafe per day from the global cafe list.
-        Only cafes within 2 km of a day's pure attraction are eligible.
-        Records cafe_filtered_count = total_cafes - total_injected.
-        """
-        available = sorted(cafes, key=lambda p: p.candidate_rank)
-        assigned_ids: set[str] = set()
-        total_injected = 0
-
-        for pool in day_pools:
-            pure_attractions = [p for p in pool["attractions"] if p.place_type == "attraction"]
-            if not pure_attractions:
-                continue
-
-            best_cafe = None
-            best_dist = float("inf")
-
-            for c in available:
-                if c.id in assigned_ids:
-                    continue
-                min_dist = min(
-                    self._haversine_km(c.latitude, c.longitude, a.latitude, a.longitude)
-                    for a in pure_attractions
-                )
-                if min_dist <= 2.0 and min_dist < best_dist:
-                    best_dist = min_dist
-                    best_cafe = c
-
-            if best_cafe is not None:
-                pool["attractions"].append(best_cafe)
-                assigned_ids.add(best_cafe.id)
-                total_injected += 1
-
-        # Store how many cafes weren't injected (useful for diagnostics)
-        remainder = len(cafes) - total_injected
-        for pool in day_pools:
-            pool.setdefault("cafe_filtered_count", remainder)
-
-    def _assign_restaurants_to_days(self, restaurants: list, day_pools: list) -> None:
-        """
-        Assign restaurants from the global pool to day pools using proximity gates.
-
-        Pass 1: give each day exactly 1 qualifying restaurant (centroid ≤3 km OR
-                nearest attraction ≤2.5 km).
-        Pass 2: top up days that still have 0 restaurants with best-available fallback.
-        Pass 3: allow a 2nd restaurant per day if unassigned restaurants remain.
-
-        Restaurants are not shared between days.
-        """
-        available = sorted(restaurants, key=lambda r: r.candidate_rank)
-        assigned_ids: set[str] = set()
-
-        def _best_dist(r, pool: dict) -> float:
-            pure = [p for p in pool["attractions"] if p.place_type == "attraction"]
-            centroid = pool.get("day_cluster_center")
-            if pure:
-                return min(
-                    self._haversine_km(r.latitude, r.longitude, a.latitude, a.longitude)
-                    for a in pure
-                )
-            if centroid:
-                return self._haversine_km(r.latitude, r.longitude, centroid[0], centroid[1])
-            return self._haversine_km(
-                r.latitude, r.longitude,
-                self.hotel_place.latitude, self.hotel_place.longitude,
-            )
-
-        def _qualifies(r, pool: dict) -> bool:
-            centroid = pool.get("day_cluster_center")
-            pure = [p for p in pool["attractions"] if p.place_type == "attraction"]
-            if centroid and self._haversine_km(r.latitude, r.longitude, centroid[0], centroid[1]) <= 3.0:
-                return True
-            if pure and min(
-                self._haversine_km(r.latitude, r.longitude, a.latitude, a.longitude)
-                for a in pure
-            ) <= 2.5:
-                return True
-            return False
-
-        # Pass 1: one qualifying restaurant per day
-        for pool in day_pools:
-            best_r = None
-            best_d = float("inf")
-            for r in available:
-                if r.id in assigned_ids or not _qualifies(r, pool):
-                    continue
-                d = _best_dist(r, pool)
-                if d < best_d:
-                    best_d = d
-                    best_r = r
-            if best_r:
-                pool["restaurants"].append(best_r)
-                assigned_ids.add(best_r.id)
-                pool["injected_reason"] = "near_cluster"
-
-        # Pass 2: fallback for days still missing a restaurant
-        for pool in day_pools:
-            if pool["restaurants"]:
-                continue
-            best_r = None
-            best_d = float("inf")
-            for r in available:
-                if r.id in assigned_ids:
-                    continue
-                d = _best_dist(r, pool)
-                if d < best_d:
-                    best_d = d
-                    best_r = r
-            if best_r:
-                pool["restaurants"].append(best_r)
-                assigned_ids.add(best_r.id)
-                pool["injected_reason"] = "best_available"
-
-        # Pass 3: 2nd restaurant per day if budget allows
-        for pool in day_pools:
-            if len(pool["restaurants"]) >= 2:
-                continue
-            best_r = None
-            best_d = float("inf")
-            for r in available:
-                if r.id in assigned_ids or not _qualifies(r, pool):
-                    continue
-                d = _best_dist(r, pool)
-                if d < best_d:
-                    best_d = d
-                    best_r = r
-            if best_r:
-                pool["restaurants"].append(best_r)
-                assigned_ids.add(best_r.id)
-
-    def _compute_cluster_centroids(self, day_pools: list) -> None:
-        """Compute attraction-only centroid per day and store as day_cluster_center."""
-        for pool in day_pools:
-            pure_attractions = [
-                p for p in pool["attractions"] if p.place_type == "attraction"
-            ]
-            pool["day_cluster_center"] = self._centroid(pure_attractions)
-
-    def _balance_day_pools(self, day_pools: list) -> None:
-        """
-        Cân bằng kích thước cluster sau K-Means.
-
-        K-Means thuần không đảm bảo số lượng POI bằng nhau giữa các ngày.
-        Khi địa điểm tập trung một vùng (VD: trung tâm TP), một cluster có thể
-        nhận 50+ POI còn các cluster khác chỉ có 2-3.
-
-        Thuật toán:
-          1. Tính target = total // num_days, threshold = max(3, target // 2)
-          2. Lặp: tìm ngày quá tải (over) và ngày thiếu (under)
-          3. Dừng khi max_size - min_size <= threshold
-          4. Mỗi bước: chuyển attraction gần centroid của ngày under nhất từ ngày over sang
-             (chỉ chuyển restaurant nếu ngày over có > 1 restaurant)
-        """
-        total = sum(
-            len(pool["attractions"]) + len(pool["restaurants"])
-            for pool in day_pools
-        )
-        if total == 0 or self.num_days <= 1:
-            return
-
-        target = max(1, total // self.num_days)
-        # Dừng khi độ lệch max-min không vượt quá ngưỡng này
-        stop_threshold = max(3, target // 2)
-
-        for _ in range(total * 2):
-            day_sizes = [
-                len(pool["attractions"]) + len(pool["restaurants"])
-                for pool in day_pools
-            ]
-            over_idx = max(range(self.num_days), key=lambda i: day_sizes[i])
-            under_idx = min(range(self.num_days), key=lambda i: day_sizes[i])
-
-            if day_sizes[over_idx] - day_sizes[under_idx] <= stop_threshold:
-                break
-
-            # Centroid của ngày thiếu (fallback về hotel nếu chưa có POI nào)
-            under_places = (
-                day_pools[under_idx]["attractions"]
-                + day_pools[under_idx]["restaurants"]
-            )
-            if under_places:
-                c_lat = sum(p.latitude for p in under_places) / len(under_places)
-                c_lng = sum(p.longitude for p in under_places) / len(under_places)
-            else:
-                c_lat = self.hotel_place.latitude
-                c_lng = self.hotel_place.longitude
-
-            # Tìm POI gần centroid nhất từ ngày quá tải để chuyển sang
-            over_pool = day_pools[over_idx]
-            best_place = None
-            best_dist = float("inf")
-
-            for p in over_pool["attractions"]:
-                d = self._haversine_minutes(p.latitude, p.longitude, c_lat, c_lng)
-                if d < best_dist:
-                    best_dist = d
-                    best_place = (p, "attractions")
-
-            # Chỉ di chuyển restaurant nếu ngày quá tải có > 1 restaurant
-            if best_place is None:
-                for p in over_pool["restaurants"]:
-                    if len(over_pool["restaurants"]) > 1:
-                        d = self._haversine_minutes(
-                            p.latitude, p.longitude, c_lat, c_lng
-                        )
-                        if d < best_dist:
-                            best_dist = d
-                            best_place = (p, "restaurants")
-
-            if best_place is None:
-                break
-
-            place, pool_key = best_place
-            day_pools[over_idx][pool_key].remove(place)
-            day_pools[under_idx][pool_key].append(place)
-
-    def _trim_day_pools(self, day_pools: list) -> None:
-        """
-        Giới hạn số candidates mỗi ngày để CP-SAT không bị timeout.
-
-        Sau K-Means + balance, mỗi ngày có thể có 16+ candidates.
-        Với n=16 nodes, circuit model tạo ra ~n² arc vars → LP relaxation nặng
-        → solver hết 8s mà chưa tìm được FEASIBLE → fall back sang greedy.
-
-        Giải pháp: giữ tối đa MAX_POOL_PER_DAY candidates/ngày.
-        Ưu tiên giữ: tối đa 3 restaurants (bắt buộc cho lunch) + top attractions theo candidate_rank.
-        """
-        max_pool = max(self.target_pois_per_day + 8, 20)
-        for pool in day_pools:
-            if len(pool["restaurants"]) > 2:
-                pool["restaurants"] = sorted(
-                    pool["restaurants"], key=lambda p: p.candidate_rank
-                )[:2]
-                
-            total = len(pool["attractions"]) + len(pool["restaurants"])
-            if total <= max_pool:
-                continue
-            
-            n_keep_attractions = max(0, max_pool - len(pool["restaurants"]))
-            if n_keep_attractions < len(pool["attractions"]):
-                # Sắp xếp theo candidate_rank (thấp = tốt hơn) và giữ top-K
-                pool["attractions"] = sorted(
-                    pool["attractions"], key=lambda p: p.candidate_rank
-                )[:n_keep_attractions]
-
     # ────────────────────────────────────────────────────────────────────
     # HELPERS
     # ────────────────────────────────────────────────────────────────────
@@ -2510,50 +2029,6 @@ class SchedulerV2Planner:
     def _round_travel_minutes(minutes: int | float) -> int:
         value = max(0, int(math.ceil(float(minutes))))
         return int(math.ceil(value / 5.0) * 5) if value > 0 else 0
-
-    @staticmethod
-    def _haversine_km(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
-        """Great-circle distance in km."""
-        R = 6371.0
-        rlat1, rlng1 = math.radians(lat1), math.radians(lng1)
-        rlat2, rlng2 = math.radians(lat2), math.radians(lng2)
-        dlat = rlat2 - rlat1
-        dlng = rlng2 - rlng1
-        a = (
-            math.sin(dlat / 2) ** 2
-            + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlng / 2) ** 2
-        )
-        return 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-
-    @staticmethod
-    def _haversine_minutes(
-        lat1: float,
-        lng1: float,
-        lat2: float,
-        lng2: float,
-        speed_kmh: float = 30,
-    ) -> int:
-        """Haversine distance → phút di chuyển, +5 phút overhead."""
-        R = 6371
-        rlat1, rlng1 = math.radians(lat1), math.radians(lng1)
-        rlat2, rlng2 = math.radians(lat2), math.radians(lng2)
-        dlat = rlat2 - rlat1
-        dlng = rlng2 - rlng1
-        a = (
-            math.sin(dlat / 2) ** 2
-            + math.cos(rlat1) * math.cos(rlat2) * math.sin(dlng / 2) ** 2
-        )
-        km = 2 * R * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-        return int(km / speed_kmh * 60) + 5
-
-    @staticmethod
-    def _centroid(places: list) -> Optional[Tuple[float, float]]:
-        """Geographic centroid of a non-empty list of places."""
-        if not places:
-            return None
-        lat = sum(p.latitude for p in places) / len(places)
-        lng = sum(p.longitude for p in places) / len(places)
-        return (lat, lng)
 
     def _target_pois_per_day(self) -> int:
         available_minutes = max(0, self.day_end_time - self.day_start_time)

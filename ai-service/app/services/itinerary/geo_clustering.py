@@ -13,6 +13,7 @@ from app.services.itinerary.assignment import (
     MEAL_DURATION_MINUTES,
 )
 from app.services.itinerary.clustering_debug_viz import ClusteringDebugRecorder
+from app.services.itinerary import utils
 
 
 class GeoClusteringAssignment:
@@ -76,7 +77,7 @@ class GeoClusteringAssignment:
                 if not points:
                     continue
                 allocated_ids.update(str(p.id) for p in points)
-                subs = self._sweep_split(points, days) if days > 1 else [points]
+                subs = self._constrained_kmeans_split(points, days) if days > 1 else [points]
                 for sub in subs:
                     forced_day_pools.append({
                         "attractions": sorted(sub, key=self._rank_key),
@@ -140,8 +141,14 @@ class GeoClusteringAssignment:
         debug = ClusteringDebugRecorder(f"detect-regions-{num_days}days")
 
         all_places = self._deduplicate(places)
+        # Same place-type set as assign()'s K-Means day-split input (line ~50
+        # below) — cafes are excluded there too (see comment on `assign`), so
+        # excluding them here too keeps a region's reported size consistent
+        # with how many points K-Means will actually split into days later.
+        # Using a wider set here (e.g. including cafe) previously made the
+        # wizard's region sizes disagree with the real day-split counts.
         primary = [
-            p for p in all_places if p.place_type in {"attraction", "cafe", "entertainment"}
+            p for p in all_places if p.place_type in {"attraction", "entertainment"}
         ]
         if not primary:
             return {"regions": [], "estimated_total_days": 0, "num_days": num_days}
@@ -226,9 +233,9 @@ class GeoClusteringAssignment:
                         virtual_hotel, centroid
                     )
                 regions.append({
-                    "region_name": "Vùng Trung Tâm" if idx == 0 else f"Vùng {idx + 1}",
+                    "region_name": self._region_display_name(idx, points, centroid),
                     "place_ids": [str(p.id) for p in points],
-                    "place_names": [getattr(p, "name", "") for p in points],
+                    "place_names": sorted(getattr(p, "name", "") for p in points),
                     "max_days": max_days,
                     "total_visit_minutes": total_visit_minutes,
                     "travel_minutes_from_central": travel_minutes_from_central,
@@ -237,17 +244,70 @@ class GeoClusteringAssignment:
         finally:
             self.config.hotel = previous_hotel
 
+        # Suggested day allocation so the wizard can present a ready-to-submit
+        # default instead of an empty form: the central region (regions[0],
+        # already ordered densest-first) always gets first pick up to its own
+        # max_days, then any still-unallocated days are borrowed from the
+        # remaining regions in order of travel distance from the center
+        # (nearest first) — not density order — since "borrow from the next
+        # region" should mean geographically closest, not merely 2nd-largest.
+        for region in regions:
+            region["suggested_days"] = 0
+        if regions:
+            remaining = num_days
+            regions[0]["suggested_days"] = min(regions[0]["max_days"], remaining)
+            remaining -= regions[0]["suggested_days"]
+            if remaining > 0 and len(regions) > 1:
+                nearest_first = sorted(
+                    range(1, len(regions)),
+                    key=lambda i: regions[i]["travel_minutes_from_central"],
+                )
+                for i in nearest_first:
+                    if remaining <= 0:
+                        break
+                    give = min(regions[i]["max_days"], remaining)
+                    regions[i]["suggested_days"] = give
+                    remaining -= give
+
         debug.record(
             "4. Vùng cuối cùng (region_name)",
             {r["region_name"]: clusters[label] for label, r in zip(ordered_labels, regions)},
         )
         debug.save()
 
+        total_suggested_days = sum(r["suggested_days"] for r in regions)
         return {
             "regions": regions,
             "estimated_total_days": sum(r["max_days"] for r in regions),
             "num_days": num_days,
+            # > 0 when even every detected region combined can't fill the
+            # trip's day count — lets the wizard show ONE consolidated
+            # "not enough places" notice instead of a hard failure later.
+            "shortfall_days": max(0, num_days - total_suggested_days),
         }
+
+    _REGION_NAME_ADMIN_KEYWORDS = (
+        "Phường ", "Xã ", "Thị trấn ", "Quận ", "Huyện ", "Thị xã ", "Thành phố ",
+    )
+
+    def _region_display_name(self, idx: int, points: List[Any], centroid: Optional[Tuple[float, float]]) -> str:
+        """Real, human-meaningful region name derived from the address of the
+        POI nearest the region's centroid (no external geocoding call — just
+        parses the ward/district segment out of the address already stored on
+        the place, e.g. "..., Phường Vĩnh Ninh, Thành phố Huế" -> "Phường Vĩnh
+        Ninh"). Falls back to the old generic "Vùng N" label when the nearest
+        POI has no usable address segment, so this never breaks the wizard.
+        """
+        fallback = f"Vùng {idx + 1}"
+        if not points or not centroid:
+            return fallback
+        anchor = type("_C", (), {"latitude": centroid[0], "longitude": centroid[1]})()
+        nearest = min(points, key=lambda p: self._haversine_km(anchor, p))
+        address = getattr(nearest, "address", None) or ""
+        for segment in (s.strip() for s in address.split(",")):
+            if any(segment.startswith(kw) for kw in self._REGION_NAME_ADMIN_KEYWORDS):
+                return segment
+        return fallback
 
     def _empty_result(self) -> AssignmentResult:
         pools = [
@@ -322,15 +382,7 @@ class GeoClusteringAssignment:
         return max(5, int(km / 30.0 * 60.0))
 
     def _haversine_km(self, p1: Any, p2: Any) -> float:
-        try:
-            lat1, lon1 = math.radians(float(p1.latitude)), math.radians(float(p1.longitude))
-            lat2, lon2 = math.radians(float(p2.latitude)), math.radians(float(p2.longitude))
-            dlat = lat2 - lat1
-            dlon = lon2 - lon1
-            a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
-            return 6371 * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
-        except (ValueError, TypeError, AttributeError):
-            return 0.0
+        return utils.haversine_km_places(p1, p2)
 
     def _dbscan_cluster(self, primary: List[Any]) -> Tuple[Dict[int, List[Any]], List[Any]]:
         if len(primary) <= 3:
@@ -415,7 +467,7 @@ class GeoClusteringAssignment:
                 continue
 
             if n_sub > 1:
-                subs = self._sweep_split(points, n_sub)
+                subs = self._constrained_kmeans_split(points, n_sub)
             else:
                 subs = [points]
 
@@ -430,13 +482,7 @@ class GeoClusteringAssignment:
         return day_pools, remaining_days, deferred_far
 
     def _pool_center(self, pool: dict) -> Optional[Tuple[float, float]]:
-        attractions = pool.get("attractions", [])
-        if not attractions:
-            return None
-        return (
-            sum(float(p.latitude) for p in attractions) / len(attractions),
-            sum(float(p.longitude) for p in attractions) / len(attractions),
-        )
+        return utils.compute_centroid(pool.get("attractions", []))
 
     def _travel_to_centroid_from_place(self, place: Any, centroid: Tuple[float, float]) -> int:
         class Dummy:
@@ -452,7 +498,7 @@ class GeoClusteringAssignment:
                 self.longitude = lon
         return self._haversine_minutes(Dummy(*c1), Dummy(*c2))
 
-    def _sweep_split(self, points: List[Any], n_sub: int) -> List[List[Any]]:
+    def _constrained_kmeans_split(self, points: List[Any], n_sub: int) -> List[List[Any]]:
         """Split `points` into `n_sub` geographically-compact, size-balanced
         groups.
 
@@ -611,7 +657,7 @@ class GeoClusteringAssignment:
             if len(pool["attractions"]) < 2:
                 day_pools.append({"attractions": [], "restaurants": [], "cafes": []})
                 continue
-            subs = self._sweep_split(pool["attractions"], 2)
+            subs = self._constrained_kmeans_split(pool["attractions"], 2)
             day_pools[largest_idx] = {
                 "attractions": sorted(subs[0], key=self._rank_key),
                 "restaurants": [],

@@ -1,12 +1,13 @@
 import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsArray,
+  IsEnum,
   IsNotEmpty,
   IsNumber,
   IsOptional,
   IsString,
-  Min,
 } from 'class-validator';
+import { CostType } from './cost-type.enum';
 
 export class CreateIncurredCostDto {
   @ApiProperty({
@@ -17,6 +18,16 @@ export class CreateIncurredCostDto {
   @IsNotEmpty()
   userId: string;
 
+  @ApiPropertyOptional({
+    description:
+      'Loại chi phí: "Điều chỉnh giá" (chỉ chủ lịch trình, bắt buộc kèm placeId, amount là chênh lệch có thể âm), "Nước uống", "Quà tặng", "Mua sắm", "Phí gửi xe", "Khác" (mặc định).',
+    enum: CostType,
+    example: CostType.PHI_GUI_XE,
+  })
+  @IsOptional()
+  @IsEnum(CostType)
+  type?: CostType;
+
   @ApiProperty({
     description: 'Nội dung/ghi chú khoản chi phát sinh',
     example: 'Gửi xe máy ở bãi gần biển',
@@ -26,11 +37,11 @@ export class CreateIncurredCostDto {
   note: string;
 
   @ApiProperty({
-    description: 'Số tiền phát sinh thêm (VND)',
+    description:
+      'Số tiền (VND), tối thiểu 1.000đ (trị tuyệt đối), server sẽ làm tròn đến đơn vị nghìn. Với type="Điều chỉnh giá" đây là CHÊNH LỆCH so với giá ước tính của hệ thống, có thể âm. Với các type khác phải > 0.',
     example: 20000,
   })
   @IsNumber()
-  @Min(0.01, { message: 'Số tiền phải lớn hơn 0' })
   amount: number;
 
   @ApiPropertyOptional({

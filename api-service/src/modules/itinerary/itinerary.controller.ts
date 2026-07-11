@@ -204,11 +204,13 @@ export class ItineraryController {
           'Hệ thống đã nhận diện được các vùng địa lý trong lịch trình của bạn.',
         numDays: detection.num_days,
         estimatedTotalDays: detection.estimated_total_days,
+        shortfallDays: detection.shortfall_days,
         regions: detection.regions.map((region) => ({
           regionName: region.region_name,
           placeIds: region.place_ids,
           placeNames: region.place_names,
           maxDays: region.max_days,
+          suggestedDays: region.suggested_days,
           totalVisitMinutes: region.total_visit_minutes,
           travelMinutesFromCentral: region.travel_minutes_from_central,
           isRemote: region.is_remote,
@@ -240,16 +242,19 @@ export class ItineraryController {
           unconstrainedPlan?.validation_is_feasible !== false &&
           !body.proceedWithOverBudget
         ) {
+          const adultCount = Number(body.adultCount ?? 0);
+          const childCount = Number(body.childCount ?? 0);
           const calculatedCost = this.service.calculatePlanEstimatedCost(
             unconstrainedPlan as any,
+            adultCount,
+            childCount,
           );
           const recommendedBudget = this.service.calculateRecommendedBudget(
             unconstrainedPlan as any,
+            adultCount,
+            childCount,
           );
-          const participantCount = Math.max(
-            1,
-            Number(body.adultCount ?? 0) + Number(body.childCount ?? 0),
-          );
+          const participantCount = Math.max(1, adultCount + childCount);
           throw new UnprocessableEntityException({
             code: 'BUDGET_CONFIRMATION_REQUIRED',
             message:
@@ -259,7 +264,6 @@ export class ItineraryController {
             reserveRate: 0.1,
             recommendedBudget,
             participantCount,
-            costScope: 'TOTAL_GROUP',
           });
         }
         // Either the unconstrained plan is feasible and the user already

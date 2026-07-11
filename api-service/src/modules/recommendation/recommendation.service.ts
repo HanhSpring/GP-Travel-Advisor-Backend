@@ -39,7 +39,6 @@ import {
   TwoTowerRuntimeConfig,
 } from './two-tower-config.types';
 import { PlannerEngine } from '../../config/planner-engine';
-import { TripCostConfigService } from './trip-cost-config.service';
 interface HotelSelection {
   hotelId: string;
   hotelTotalCost: number;
@@ -84,7 +83,6 @@ export class RecommendationService {
   constructor(
     private readonly mlClient: MlClientService,
     @Inject(CACHE_MANAGER) private readonly cache: Cache,
-    private readonly tripCostConfig: TripCostConfigService,
   ) {}
 
   /**
@@ -458,14 +456,8 @@ export class RecommendationService {
     config: TwoTowerRuntimeConfig = DEFAULT_TWO_TOWER_RUNTIME_CONFIG,
   ): Promise<RegionDetectionResult> {
     const numDays = this.calcNumDays(dto.startDate, dto.endDate);
-    const tripCostConfig = await this.tripCostConfig.getConfig();
     const retrieval = await this.retrieveCandidates(dto, topK, config);
-    const details = await this.fetchPlannerPlaceDetails(
-      retrieval.candidates,
-      dto.adultCount,
-      dto.childCount ?? 0,
-      tripCostConfig.childPriceRatio,
-    );
+    const details = await this.fetchPlannerPlaceDetails(retrieval.candidates);
     if (!details.length) {
       throw new NotFoundException(
         'No place details found for itinerary planning',
@@ -498,30 +490,29 @@ export class RecommendationService {
       dto.dailyStartTime,
       dto.dailyEndTime,
     );
-    const tripCostConfig = await this.tripCostConfig.getConfig();
     const retrievalStartedAt = Date.now();
     const retrieval = await this.retrieveCandidates(dto, topK, config);
     const retrievalMs = Date.now() - retrievalStartedAt;
     const plannerCandidates = retrieval.candidates;
     const detailsStartedAt = Date.now();
-    let details = await this.fetchPlannerPlaceDetails(
-      plannerCandidates,
-      dto.adultCount,
-      dto.childCount ?? 0,
-      tripCostConfig.childPriceRatio,
-    );
+    let details = await this.fetchPlannerPlaceDetails(plannerCandidates);
     if (dto.regionAllocations?.length) {
       // User has confirmed the region-allocation wizard (see
-      // REGION_ALLOCATION_REQUIRED) — drop attraction/cafe/entertainment
-      // candidates from regions the user assigned 0 days to. Hotels and
-      // restaurants are never part of the region wizard, so leave them
-      // untouched here.
+      // REGION_ALLOCATION_REQUIRED) — drop attraction/entertainment
+      // candidates from regions the user assigned 0 days to. Hotels,
+      // restaurants, AND cafes are never part of the region wizard (ai-service's
+      // detect_regions()/assign() only cluster attraction/entertainment places —
+      // see geo_clustering.py), so leave them untouched here. Cafes used to be
+      // listed as region-scoped too, which silently filtered out every cafe
+      // candidate (their id could never be in keptPlaceIds since no region's
+      // place_ids ever contains a cafe) — that starved every itinerary of cafes
+      // once the region wizard became mandatory.
       const keptPlaceIds = new Set(
         dto.regionAllocations
           .filter((allocation) => allocation.days > 0)
           .flatMap((allocation) => allocation.placeIds),
       );
-      const regionScopedTypes = new Set(['attraction', 'cafe', 'entertainment']);
+      const regionScopedTypes = new Set(['attraction', 'entertainment']);
       details = details.filter(
         (place) =>
           !regionScopedTypes.has(place.place_type ?? '') ||
@@ -576,7 +567,6 @@ export class RecommendationService {
       dto.childCount ?? 0,
       Math.max(1, numDays - 1),
       Number(dto.budget ?? 0),
-      tripCostConfig.childPriceRatio,
       dto.regionAllocations ?? [],
     );
     const selectedHotel = details.find(
@@ -656,7 +646,6 @@ export class RecommendationService {
         retrieval,
         details,
         plan: enrichedPlan,
-        childPriceRatio: tripCostConfig.childPriceRatio,
         candidateBuilder: {
           availableMinutes: plannerTargets.availableMinutes,
           dailyQuota: plannerTargets.dailyQuota,
@@ -771,9 +760,6 @@ export class RecommendationService {
 
   private async fetchPlannerPlaceDetails(
     candidates: CandidatePlaceDto[],
-    adultCount: number,
-    childCount: number,
-    childPriceRatio: number,
   ): Promise<ItineraryPlanPayload['places']> {
     const candidateById = new Map(
       candidates.map((candidate, index) => [
@@ -782,9 +768,6 @@ export class RecommendationService {
       ]),
     );
     const ids = candidates.map((candidate) => candidate.place_id);
-    const payingPeople =
-      Math.max(0, Number(adultCount) || 0) +
-      Math.max(0, Number(childCount) || 0) * childPriceRatio;
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
@@ -826,10 +809,7 @@ export class RecommendationService {
           rawPrice != null && Number.isFinite(rawPrice) && rawPrice > 0
             ? Math.round(rawPrice)
             : 0;
-        const estimatedCost =
-          placeType === 'hotel'
-            ? normalizedPrice
-            : Math.round(normalizedPrice * payingPeople);
+        const estimatedCost = normalizedPrice;
         const rawBestTime = String(row.best_time ?? '')
           .trim()
           .toUpperCase();
@@ -870,9 +850,7 @@ export class RecommendationService {
           price_min: rawPrice != null && rawPrice > 0 ? normalizedPrice : null,
           price_max: rawPrice != null && rawPrice > 0 ? normalizedPrice : null,
           price_basis:
-            placeType === 'hotel'
-              ? 'per_person_per_night'
-              : 'group_total',
+            placeType === 'hotel' ? 'per_person_per_night' : 'per_person',
           price_inferred:
             typeof row.price_inferred === 'boolean' ? row.price_inferred : null,
           best_time: bestTime,
@@ -892,21 +870,14 @@ export class RecommendationService {
     childCount: number,
     nights: number,
     tripBudgetTotal: number,
-    childPriceRatio: number,
     regionAllocations: RegionAllocationDto[] = [],
   ): HotelSelection {
     const hotels = places.filter((place) => place.place_type === 'hotel');
     const safeAdults = Math.max(0, Math.trunc(adultCount));
     const safeChildren = Math.max(0, Math.trunc(childCount));
-    // fullPeople is the real, unweighted guest count (for display/logging).
-    // payingGuests is the child-discount-weighted headcount used for money —
-    // it must stay fractional (e.g. 2 adults + 1 child * 0.7 = 2.7) since
-    // truncating it before multiplying silently drops part of the real cost.
+    // fullPeople is the real guest headcount, kept for display/logging only —
+    // hotel cost below is per-adult, never multiplied by headcount.
     const fullPeople = Math.max(1, safeAdults + safeChildren);
-    const payingGuests = Math.max(
-      0.01,
-      safeAdults + safeChildren * childPriceRatio,
-    );
     const stayNights = Math.max(1, Math.trunc(nights));
 
     // (a) Geographic centrality: minimize average distance to the POIs in
@@ -961,9 +932,7 @@ export class RecommendationService {
         Math.round(Number(hotel.estimated_cost ?? 0)),
       );
       if (pricePerPersonPerNight <= 0) continue;
-      const groupNightlyCost = Math.round(
-        pricePerPersonPerNight * payingGuests,
-      );
+      const groupNightlyCost = pricePerPersonPerNight;
       const hotelTotalCost = groupNightlyCost * stayNights;
 
       // (b) Budget safety: room price must not exceed 40% of the total trip
@@ -1240,12 +1209,10 @@ export class RecommendationService {
     days: any[],
     details: ItineraryPlanPayload['places'],
     hotelId: string | null | undefined,
-    childPriceRatio: number,
   ): Record<string, any> {
     const adults = Number(dto.adultCount ?? 0);
     const children = Number(dto.childCount ?? 0);
     const fullPeople = adults + children;
-    const payingGuests = adults + children * childPriceRatio;
     const nights = Math.max(1, numDays - 1);
     const scheduleEntries = days.flatMap((day: any) =>
       Array.isArray(day.schedule) ? day.schedule : [],
@@ -1276,9 +1243,7 @@ export class RecommendationService {
       0,
       Math.round(Number(hotelDetail?.estimated_cost ?? 0)),
     );
-    const hotel = Math.round(
-      hotelPerPersonPerNight * Math.max(0.01, payingGuests) * nights,
-    );
+    const hotel = Math.round(hotelPerPersonPerNight * nights);
     if (hotelDetail?.estimated_cost == null) {
       confidence.missing += 1;
     } else if (hotelDetail.price_inferred === false) {
@@ -1296,7 +1261,7 @@ export class RecommendationService {
     const totalBudget = Number(dto.budget ?? 0);
     return {
       mode: 'database_place_price',
-      note: 'All places.price values are per person. Hotel price is per person per night and is multiplied by full_people and nights.',
+      note: 'All places.price values are per adult. Hotel price is per adult per night; nothing here is multiplied by headcount.',
       assumptionsVnd: {},
       confidence,
       travelers: { adults, children, fullPeople },
@@ -1322,7 +1287,6 @@ export class RecommendationService {
     retrieval: TwoTowerRetrievalResponseDto;
     details: ItineraryPlanPayload['places'];
     plan: unknown;
-    childPriceRatio: number;
     candidateBuilder?: {
       availableMinutes: number;
       dailyQuota: Record<string, number>;
@@ -1438,7 +1402,6 @@ export class RecommendationService {
         days,
         args.details,
         plan.hotel_id ?? null,
-        args.childPriceRatio,
       ),
       days: days.map((day: any) => ({
         day: day.day,
