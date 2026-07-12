@@ -23,6 +23,9 @@ export class ReviewItemDto {
   status: string;
 
   @ApiProperty({ required: false, nullable: true })
+  time_label?: string | null;
+
+  @ApiProperty({ required: false, nullable: true })
   time_ago?: string | null;
 }
 
