@@ -48,8 +48,20 @@ class SessionCfReranker:
         # ảnh hưởng 10% trên tổng — quá nhẹ để tạo hiệu ứng "đẩy địa điểm phổ biến lên
         # cho user mới" đúng như yêu cầu ban đầu.
         self.weight_popularity_cold_start = 0.35
+        # Trọng số cho Ngọc item-prior khi cold-start thật — CHỈ có tác dụng nếu
+        # load_ngoc_item_prior() đã load thành công (xem rerank()); nếu chưa load,
+        # nhánh is_fully_cold tự động rơi về công thức 2 thành phần cũ (graceful degrade),
+        # giá trị mặc định ở đây không ảnh hưởng gì trong trường hợp đó.
+        self.weight_ngoc_prior_cold_start = 0.20
         self.session_window_minutes = 90
         self.top_n_rerank = 30
+
+        # Item-level prior từ model Ngọc (HybridRecommender) — load tùy chọn qua
+        # load_ngoc_item_prior(). Khi có, dùng làm fallback cho _historical_cf_score
+        # khi user_idx is None (cold-start hoàn toàn): score = normalize(μ_Ngọc + b_i_Ngọc)
+        # phản ánh "địa điểm này được 73k user Foody đánh giá cao hay thấp", tốt hơn zero.
+        self._ngoc_item_b: dict[str, float] | None = None   # place_id -> b_i
+        self._ngoc_global_mean: float | None = None
 
     def missing_files(self) -> list[str]:
         return [f for f in self.REQUIRED_ARTIFACTS if not (self.artifact_dir / f).exists()]
@@ -88,6 +100,42 @@ class SessionCfReranker:
         )
         return True
 
+    def load_ngoc_item_prior(self, ngoc_artifact_dir: str) -> bool:
+        """Load item-level CF prior từ HybridRecommender của Ngọc (tùy chọn).
+
+        Khi được load, _historical_cf_score sẽ dùng μ_Ngọc + b_i_Ngọc thay vì 0 cho
+        user cold-start (user_idx is None) — tận dụng tín hiệu explicit rating từ
+        73k user Foody mà không cần map user_id giữa hai hệ thống.
+
+        Chỉ cần b_i/global_mean phía item — KHÔNG đọc Q/P/b_u/user_ids của Ngọc (Q
+        không cần cho prior này; user Foody int ID không map được sang Supabase UUID).
+        """
+        ngoc_dir = Path(ngoc_artifact_dir)
+        required = ["serve_manifest.json", "cf_item_bias.npy", "cf_item_ids.csv"]
+        missing = [f for f in required if not (ngoc_dir / f).exists()]
+        if missing:
+            logger.warning("load_ngoc_item_prior: thiếu file %s — bỏ qua.", missing)
+            return False
+        try:
+            manifest = json.loads((ngoc_dir / "serve_manifest.json").read_text())
+            ngoc_b_i = np.load(ngoc_dir / "cf_item_bias.npy").astype(np.float32)
+            item_ids = (
+                pd.read_csv(ngoc_dir / "cf_item_ids.csv").iloc[:, 0]
+                .astype(str).str.strip().tolist()
+            )
+            self._ngoc_item_b = {pid: float(ngoc_b_i[i]) for i, pid in enumerate(item_ids)}
+            self._ngoc_global_mean = float(manifest["global_mean"])
+            logger.info(
+                "✅ Ngọc item prior loaded: %d items, global_mean=%.3f",
+                len(self._ngoc_item_b), self._ngoc_global_mean,
+            )
+            return True
+        except Exception as exc:
+            logger.warning("load_ngoc_item_prior thất bại: %s — dùng zero fallback.", exc)
+            self._ngoc_item_b = None
+            self._ngoc_global_mean = None
+            return False
+
     # --------------------------------------------------- runtime tuning (đúng khuôn Ngọc)
     def set_weights(self, **kwargs) -> None:
         """Cập nhật trọng số lúc runtime — gọi từ ai_config_service khi khởi động
@@ -96,6 +144,7 @@ class SessionCfReranker:
         for key in [
             "weight_two_tower", "weight_historical_cf",
             "weight_session", "weight_popularity", "weight_popularity_cold_start",
+            "weight_ngoc_prior_cold_start",
         ]:
             if key in kwargs and kwargs[key] is not None:
                 setattr(self, key, max(0.0, min(1.0, float(kwargs[key]))))
@@ -110,14 +159,30 @@ class SessionCfReranker:
         )
 
     # ------------------------------------------------------------------ historical CF
-    def _historical_cf_score(self, user_idx: int | None, item_indices: np.ndarray) -> np.ndarray:
+    #
+    # Thang điểm rating của model Ngọc là 0.5–5.0 (KHÔNG phải 1.0–5.0) — xem báo cáo
+    # TTDATN mục 3.1.4.3 "Bước 3: Giới hạn dự đoán... 0.5 ≤ r̂ᵤᵢ ≤ 5.0". Model persona
+    # (self.global_mean/self.b_u/self.b_i/self.P/self.Q, train qua rating_for_svd =
+    # 1 + 4*combined_score ở train_session_cf.py) vẫn đúng thang 1.0–5.0 như cũ — 2
+    # hằng số normalize khác nhau bên dưới là CỐ Ý, vì đến từ 2 model khác nhau.
+    def _historical_cf_score(
+        self, user_idx: int | None, item_indices: np.ndarray,
+        place_ids: list[str] | None = None,
+    ) -> np.ndarray:
         if user_idx is None:
-            return np.zeros(len(item_indices), dtype=np.float32)   # graceful degrade — đúng kiểu Ngọc
+            if self._ngoc_item_b is not None and place_ids is not None:
+                mu = self._ngoc_global_mean
+                b_i_ngoc = np.array(
+                    [self._ngoc_item_b.get(pid, 0.0) for pid in place_ids], dtype=np.float32
+                )
+                raw = mu + b_i_ngoc
+                return np.clip((raw - 0.5) / 4.5, 0.0, 1.0)   # thang gốc 0.5-5.0 của Ngọc
+            return np.zeros(len(item_indices), dtype=np.float32)   # chưa load prior -> graceful degrade
         raw = (
             self.global_mean + self.b_u[user_idx] + self.b_i[item_indices]
             + self.Q[item_indices] @ self.P[user_idx]
         )
-        # normalize về [0,1] trong phạm vi rating 1-5 (Surprise scale)
+        # normalize về [0,1] trong phạm vi rating 1-5 (Surprise scale, model persona)
         return np.clip((raw - 1.0) / 4.0, 0.0, 1.0)
 
     # --------------------------------------------------------------------- LIVE session
@@ -239,7 +304,18 @@ class SessionCfReranker:
         historical_scores = np.zeros(len(candidates), dtype=np.float32)
         if valid_mask.any():
             historical_scores[valid_mask] = self._historical_cf_score(
-                user_idx, item_indices[valid_mask]
+                user_idx, item_indices[valid_mask],
+                place_ids=[pid for pid, v in zip(place_ids, valid_mask) if v] if user_idx is None else None,
+            )
+        if user_idx is None and self._ngoc_item_b is not None and (~valid_mask).any():
+            # Item KHÔNG có trong vocab CF persona (~vài trăm item) — đây là ĐA SỐ
+            # candidate thực tế, vì catalog Ngọc phủ ~29,844 item. Trước đây các item
+            # này bị bỏ mặc ở 0 (bug: nhánh Ngọc-prior chỉ chạy khi valid_mask rỗng
+            # HOÀN TOÀN, tức chỉ đúng cho trường hợp hiếm gặp) — sửa bằng cách luôn áp
+            # Ngọc-prior cho đúng phần bù ~valid_mask khi user cold-start.
+            historical_scores[~valid_mask] = self._historical_cf_score(
+                None, item_indices[~valid_mask],
+                place_ids=[pid for pid, v in zip(place_ids, valid_mask) if not v],
             )
 
         # Session factor: 1 vector đại diện "ý định ngay lúc này", dot product với
@@ -279,7 +355,16 @@ class SessionCfReranker:
 
             if is_fully_cold:
                 w_pop = self.weight_popularity_cold_start
-                final = (1.0 - w_pop) * tt_norm[i] + w_pop * pop_score
+                if self._ngoc_item_b is not None:
+                    # historical_scores[i] ở đây là Ngọc item-prior (xem
+                    # _historical_cf_score) — TRƯỚC ĐÂY bị bỏ hoàn toàn ở nhánh
+                    # is_fully_cold dù đã tính, khiến việc load prior vô nghĩa cho
+                    # đúng nhóm user nó nhắm tới. Giờ đưa vào công thức 3 thành phần.
+                    w_ngoc = self.weight_ngoc_prior_cold_start
+                    w_tt = max(0.0, 1.0 - w_pop - w_ngoc)
+                    final = w_tt * tt_norm[i] + w_pop * pop_score + w_ngoc * historical_scores[i]
+                else:
+                    final = (1.0 - w_pop) * tt_norm[i] + w_pop * pop_score
             else:
                 final = (
                     self.weight_two_tower * tt_norm[i]

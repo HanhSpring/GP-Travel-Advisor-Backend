@@ -233,7 +233,8 @@ export class ItineraryService {
       .select(
         'id, description, destination, start_date, end_date, status, tracking_active, estimated_cost',
       )
-      .in('id', sharedIds);
+      .in('id', sharedIds)
+      .eq('is_deleted', false);
 
     if (query) {
       itineraryQuery = itineraryQuery.ilike('description', `%${query}%`);
@@ -674,20 +675,23 @@ export class ItineraryService {
     return true;
   }
 
+  /**
+   * Xóa lịch trình: 'pending' (chưa từng bắt đầu) → xóa cứng; các status còn lại
+   * (đã từng bắt đầu: ongoing/completed/uncompleted) → chỉ ẩn (soft-delete) để giữ
+   * lịch sử tracking/review. Logic hard/soft nằm trong RPC travel.delete_itinerary
+   * để đọc status + ghi trong cùng 1 transaction (tránh race condition, 1 round-trip).
+   */
   async deleteItinerary(id: string) {
     const { data, error } = await supabase
       .schema('travel')
-      .from('itineraries')
-      .delete()
-      .eq('id', id)
-      .select('id')
-      .maybeSingle();
+      .rpc('delete_itinerary', { p_id: id });
+
     if (error) {
       throw new InternalServerErrorException(
         'Lỗi khi xóa lịch trình: ' + error.message,
       );
     }
-    if (!data) {
+    if (!(data as any)?.found) {
       throw new NotFoundException(`Itinerary not found: ${id}`);
     }
     return true;
@@ -2564,6 +2568,7 @@ export class ItineraryService {
       .from('itineraries')
       .select('*')
       .eq('id', id)
+      .eq('is_deleted', false)
       .maybeSingle();
 
     if (itinError) {

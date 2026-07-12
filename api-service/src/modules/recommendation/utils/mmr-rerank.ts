@@ -55,6 +55,12 @@ export const INTENT_QUOTA: Record<string, Record<string, number>> = {
   },
 };
 
+// "Khám phá tổng hợp" nghĩa là user KHÔNG chọn loại hình cụ thể — không phải
+// một travel_type thật trong DB, nên không được dùng để lọc attraction theo
+// p_travel_type (places chỉ được gắn các nhãn cụ thể như "Văn hóa & Di sản",
+// "Tham quan & Khám phá"...). Lọc theo đúng chuỗi này sẽ bóp hẹp pool sai mục đích.
+const GENERAL_INTENT = 'Khám phá tổng hợp';
+
 const DEFAULT_QUOTA = {
   attraction: 4,
   restaurant: 2,
@@ -370,6 +376,7 @@ export function getStratifiedFetchPlan(
     if (
       slot === 'attraction' &&
       knownIntents.length === 1 &&
+      knownIntents[0] !== GENERAL_INTENT &&
       tuning.enableAttractionTravelTypeFilter !== false
     ) {
       const primarySlot = TRAVEL_TYPE_SLOT[knownIntents[0]];
