@@ -148,7 +148,7 @@ export class AuthService {
       password: password,
     };
 
-    console.log('Xác thực với credentials:', credentials);
+    console.log('User đăng nhập:', credentials.email);
 
     // 4. Gửi lên Supabase
     const { data, error } =
