@@ -86,11 +86,18 @@ type ScheduleRow = {
 export class AlgorithmTrainingService {
   private readonly logger = new Logger(AlgorithmTrainingService.name);
   private readonly aiServiceUrl: string;
+  // So ngay toi thieu giua 2 lan auto-train (GPU that tien) cho CUNG 1 thuat toan, doc lap voi
+  // tan suat lich admin chon -- chan truong hop admin chon lich "hang ngay" nhung data thay doi
+  // lien tuc thi van khong dot GPU moi ngay. Chinh qua env AUTO_TRAIN_COOLDOWN_DAYS neu can.
+  private readonly autoTrainCooldownMs: number;
 
   constructor(private readonly httpService: HttpService) {
     this.aiServiceUrl = (process.env.AI_SERVICE_URL || 'http://127.0.0.1:8000')
       .trim()
       .replace('://localhost:', '://127.0.0.1:');
+    const cooldownDays = Number(process.env.AUTO_TRAIN_COOLDOWN_DAYS);
+    this.autoTrainCooldownMs =
+      (Number.isFinite(cooldownDays) && cooldownDays > 0 ? cooldownDays : 3) * 24 * 60 * 60 * 1000;
   }
 
   // ------------------------------------------------------------------ helpers
@@ -690,7 +697,10 @@ export class AlgorithmTrainingService {
   }
 
   // ------------------------------------------------------------------ schedule
-  // (chi tu dong hoa buoc "Chuan bi du lieu", KHONG bao gio tu goi train -- nguyen tac README muc 4)
+  // Tu dong hoa ca 2 buoc khi den lich: "Chuan bi du lieu" (luon chay) roi "Train" (chi chay khi
+  // thuc su co du lieu moi VA da qua cooldown toi thieu ke tu lan train gan nhat -- xem
+  // runAutoTrainingIfDue()). Muc tieu la khong buoc admin phai ngoi cho ~30 phut/lan de bam tay,
+  // nhung van gioi han so lan dot GPU khong can thiet.
 
   async getSchedule(algorithmSlug: string): Promise<AlgorithmTrainingScheduleDto> {
     const algorithm = await this.getAlgorithm(algorithmSlug);
@@ -726,8 +736,29 @@ export class AlgorithmTrainingService {
     return this.buildScheduleResponse(data as ScheduleRow);
   }
 
-  /** Goi moi phut boi AlgorithmTrainingScheduleCron -- CHI goi prepare-dataset neu den gio. */
-  async runPrepareDatasetIfDue(): Promise<void> {
+  /** Ban "training" hoan tat gan nhat cua 1 thuat toan, hoac null neu chua tung train lan nao --
+   * dung de tinh cooldown truoc khi auto-train lai. */
+  private async getLastCompletedTrainingAt(algorithmId: string): Promise<Date | null> {
+    const { data, error } = await supabase
+      .schema('ai_config')
+      .from('training_runs')
+      .select('completed_at')
+      .eq('algorithm_id', algorithmId)
+      .eq('run_type', 'training')
+      .eq('status', 'completed')
+      .order('completed_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+    this.throwIfSupabaseError(error, 'Could not load last completed training run');
+    const row = data as { completed_at: string | null } | null;
+    return row?.completed_at ? new Date(row.completed_at) : null;
+  }
+
+  /** Goi moi phut boi AlgorithmTrainingScheduleCron. Khi den lich: luon prepare-dataset; chi goi
+   * tiep run-full-training (GPU that tien) neu (a) dataset khong bi skip (co du lieu moi that su)
+   * VA (b) da qua autoTrainCooldownMs ke tu lan train hoan tat gan nhat VA (c) khong co run nao
+   * dang chay (unique index tren training_runs tu chan, chi can catch ConflictException). */
+  async runAutoTrainingIfDue(): Promise<void> {
     for (const slug of Object.keys(ALGORITHM_NAME_MAP)) {
       const schedule = await this.getSchedule(slug);
       if (!schedule.autoEnabled) continue;
@@ -735,11 +766,31 @@ export class AlgorithmTrainingService {
       const due = this.getDueScheduleTime(schedule);
       if (!due) continue;
 
-      this.logger.log(`Algorithm training (prepare-dataset) auto schedule due for '${slug}' at ${due.toISOString()}`);
+      this.logger.log(`Algorithm training auto schedule due for '${slug}' at ${due.toISOString()}`);
       try {
-        await this.prepareDataset(slug);
+        const dataset = await this.prepareDataset(slug);
+        if (dataset.skipped) {
+          this.logger.log(`Auto-train skipped for '${slug}' -- ${dataset.skipReason ?? 'no new data'}`);
+        } else {
+          const algorithm = await this.getAlgorithm(slug);
+          const lastTrainedAt = await this.getLastCompletedTrainingAt(algorithm.id);
+          const cooledDown =
+            !lastTrainedAt || Date.now() - lastTrainedAt.getTime() >= this.autoTrainCooldownMs;
+          if (!cooledDown) {
+            this.logger.log(
+              `Auto-train skipped for '${slug}' -- still within cooldown (last trained ${lastTrainedAt?.toISOString()}).`,
+            );
+          } else {
+            await this.runFullTraining(slug, { trainingDatasetId: dataset.trainingDatasetId });
+            this.logger.log(`Auto-train job submitted for '${slug}' (dataset=${dataset.trainingDatasetId}).`);
+          }
+        }
       } catch (error: any) {
-        this.logger.error(`Auto prepare-dataset failed for '${slug}': ${error?.message ?? error}`);
+        if (error instanceof ConflictException) {
+          this.logger.log(`Auto-train skipped for '${slug}' -- another run already in progress.`);
+        } else {
+          this.logger.error(`Auto training failed for '${slug}': ${error?.message ?? error}`);
+        }
       } finally {
         await this.markScheduleLastRun(slug, due.getTime());
       }

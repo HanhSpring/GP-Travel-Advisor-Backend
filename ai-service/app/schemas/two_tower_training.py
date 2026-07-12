@@ -35,6 +35,7 @@ class TrainRequest(BaseModel):
 class TrainResponse(BaseModel):
     status: str
     modal_call_id: Optional[str] = None
+    kaggle_kernel_ref: Optional[str] = None
 
 
 class ReloadRequest(BaseModel):

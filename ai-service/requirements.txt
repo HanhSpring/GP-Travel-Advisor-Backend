@@ -41,3 +41,6 @@ boto3==1.34.131
 ortools==9.8.3296
 protobuf>=4.25.0,<5
 geopy>=2.4.0
+
+# Kaggle Notebooks — GPU training trigger (docs/trigger/09-migrate-modal-to-kaggle.md)
+kaggle==1.7.4.5

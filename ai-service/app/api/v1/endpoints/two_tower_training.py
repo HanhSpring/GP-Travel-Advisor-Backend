@@ -83,18 +83,50 @@ async def prepare_dataset(request: PrepareDatasetRequest) -> PrepareDatasetRespo
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
 
+def _run_kaggle_trigger_sync(request: TrainRequest) -> dict:
+    from app.core.kaggle_trigger import push_training_kernel
+
+    return push_training_kernel(
+        run_id=request.run_id,
+        dataset_r2_prefix=request.dataset_r2_prefix,
+        warm_start_weights_r2_key=request.warm_start_weights_r2_key,
+        warm_start_vocab_r2_key=request.warm_start_vocab_r2_key,
+        include_yelp=request.include_yelp,
+        is_demo_mode=request.is_demo_mode,
+    )
+
+
 @router.post(
     "/train",
     response_model=TrainResponse,
-    summary="Spawn job GPU train Two-Tower thật trên Modal (Phase 2 — docs/trigger/06-modal-primary-plan.md)",
+    summary="Spawn job GPU train Two-Tower that (Modal hoac Kaggle, xem TRAINING_BACKEND)",
 )
 async def train(request: TrainRequest) -> TrainResponse:
-    """Proxy MONG toi Modal Web Endpoint (trigger_training trong modal_app.py) -- KHONG dung
-    run_in_executor vi ban than lenh goi Modal chi mat vai tram ms (Modal tu spawn job GPU o phia
-    ho), khac voi prepare-dataset/reload (can chay dong bo pandas/TensorFlow nang trong thread
-    executor). Modal se tu goi lai webhook training-callback (NestJS) khi train xong."""
+    """Backend GPU train duoc chon qua settings.training_backend ("modal" | "kaggle") --
+    docs/trigger/09-migrate-modal-to-kaggle.md. Ca 2 nhanh deu tu goi lai webhook
+    training-callback (NestJS) khi train xong, khong can NestJS biet dang chay o dau."""
     from app.core.config import settings
 
+    if settings.training_backend == "kaggle":
+        if not settings.kaggle_username or not settings.kaggle_key:
+            raise HTTPException(
+                status_code=500,
+                detail="Chua cau hinh KAGGLE_USERNAME/KAGGLE_KEY (.env) — "
+                       "xem docs/trigger/09-migrate-modal-to-kaggle.md muc 3.",
+            )
+        try:
+            # Khac Modal (chi goi HTTP, vai tram ms): goi Kaggle CLI (subprocess, co ghi file +
+            # upload) cham hon dang ke (vai giay toi vai chuc giay) -- can run_in_executor, giong
+            # pattern prepare_dataset()/reload trong cung file, khong dung nhanh "khong executor"
+            # cua Modal ben duoi.
+            loop = asyncio.get_event_loop()
+            result = await loop.run_in_executor(None, _run_kaggle_trigger_sync, request)
+            return TrainResponse(**result)
+        except Exception as exc:
+            logger.error(f"[endpoint] Two-Tower train (Kaggle trigger) failed: {exc}", exc_info=True)
+            raise HTTPException(status_code=502, detail=str(exc)) from exc
+
+    # nhanh Modal cu -- giu nguyen khong doi (xem muc 11, rollback)
     if not settings.modal_trigger_training_url or not settings.modal_trigger_secret:
         raise HTTPException(
             status_code=500,

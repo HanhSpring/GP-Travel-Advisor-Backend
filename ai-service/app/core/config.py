@@ -81,6 +81,17 @@ class Settings(BaseSettings):
     modal_trigger_training_url: str = ""
     modal_trigger_secret: str = ""
 
+    # Kaggle Notebooks (docs/trigger/09-migrate-modal-to-kaggle.md) -- phuong an du phong khong
+    # can the thanh toan, thay the tam thoi cho Modal. training_backend chon nhanh nao dang dung o
+    # two_tower_training.py::train() -- doi ve "modal" bat ky luc nao (xem muc 11, rollback) ma
+    # khong can sua code. kaggle_username/kaggle_key: dung "Legacy API Key" (khong phai token don
+    # KAGGLE_API_TOKEN moi cua Kaggle -- CLI kaggle chua ho tro loai token do, xem muc 3 cua doc).
+    kaggle_username: str = ""
+    kaggle_key: str = ""
+    kaggle_kernel_slug: str = "gp-travel-two-tower-training"
+    kaggle_dataset_slug: str = "gp-travel-two-tower-training-src"
+    training_backend: str = "modal"   # "modal" | "kaggle"
+
     # Debug-only: dump a Leaflet HTML map per geo-clustering pipeline stage
     # (HDBSCAN raw clusters -> noise/region merge -> K-Means day-split ->
     # weekday matching) into api-service's shared debug-log folder. Off by
