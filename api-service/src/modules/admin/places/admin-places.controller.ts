@@ -8,15 +8,29 @@ import {
   Patch,
   Post,
   Query,
+  UseGuards,
 } from '@nestjs/common';
-import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
+import {
+  ApiBearerAuth,
+  ApiOperation,
+  ApiQuery,
+  ApiResponse,
+  ApiTags,
+} from '@nestjs/swagger';
 import { AdminPlacesService } from './admin-places.service';
 import { AdminPlaceListDto } from './dto/admin-place-list.dto';
 import { AdminPlaceDetailDto } from './dto/admin-place-detail.dto';
 import { AdminPlaceRejectRequestDto } from './dto/admin-place-approval.dto';
+import { Roles } from '../../../common/decorators/roles.decorator';
+import { Role } from '../../../common/enum/role.enum';
+import { RolesGuard } from '../../../common/guards/roles.guard';
+import { JwtAuthGuard } from '../../auth/jwt-auth.guard';
 
 @ApiTags('Admin - Places Management')
+@ApiBearerAuth('access-token')
 @Controller('admin/places')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(Role.ADMIN)
 export class AdminPlacesController {
   constructor(private readonly service: AdminPlacesService) {}
 

@@ -81,6 +81,9 @@ export class AdminPlacesService {
   private readonly metadataCacheTtlMs = Number(
     process.env.ADMIN_PLACES_METADATA_CACHE_TTL_MS ?? '300000',
   );
+  private readonly statsQueryTimeoutMs = Number(
+    process.env.ADMIN_PLACES_STATS_QUERY_TIMEOUT_MS ?? '4500',
+  );
 
   private readonly categoryTypeIdsCache = new Map<
     string,
@@ -271,7 +274,7 @@ export class AdminPlacesService {
   }
 
   private onlyVisiblePlaces<T>(query: T): T {
-    return (query as any).or('is_deleted.is.null,is_deleted.eq.false') as T;
+    return (query as any).eq('is_deleted', false) as T;
   }
 
   private normalizeFoodImageUrls(imageUrl?: string) {
@@ -557,10 +560,26 @@ export class AdminPlacesService {
   async getPlaceStats() {
     const { start, end } = this.getCurrentMonthRange();
 
+    const withStatsFallback = async (
+      promise: Promise<number>,
+      fallback = 0,
+    ): Promise<number> => {
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<number>((resolve) =>
+            setTimeout(resolve, this.statsQueryTimeoutMs, fallback),
+          ),
+        ]);
+      } catch {
+        return fallback;
+      }
+    };
+
     const [totalLocations, pendingApproval, newThisMonth] = await Promise.all([
-      this.countPlaces('all'),
-      this.countPlaces('pending'),
-      this.countPlaces('all', start, end),
+      withStatsFallback(this.countPlaces('all')),
+      withStatsFallback(this.countPlaces('pending')),
+      withStatsFallback(this.countPlaces('all', start, end)),
     ]);
 
     return {
@@ -847,7 +866,6 @@ export class AdminPlacesService {
       .from('places')
       .select(
         'id, image_url, name, address, is_approved, vendor_id, type_id, registered_date',
-        { count: 'estimated' },
       );
 
     query = this.onlyVisiblePlaces(query);
@@ -895,6 +913,11 @@ export class AdminPlacesService {
       }
     }
 
+    const totalPromise =
+      !normalizedSearch && !categoryName && !vendorId
+        ? this.countPlaces(status)
+        : Promise.resolve<number | null>(null);
+
     query = query
       .order('registered_date', {
         ascending: false,
@@ -902,7 +925,7 @@ export class AdminPlacesService {
       })
       .order('id', { ascending: false });
 
-    const { data, error, count } = await query.range(
+    const { data, error } = await query.range(
       offset,
       offset + safeLimit - 1,
     );
@@ -966,7 +989,10 @@ export class AdminPlacesService {
       };
     });
 
-    const total = count ?? 0;
+    const countedTotal = await totalPromise;
+    const total =
+      countedTotal ??
+      offset + places.length + (places.length === safeLimit ? safeLimit : 0);
 
     return {
       data: places,
@@ -987,7 +1013,7 @@ export class AdminPlacesService {
         'id, image_url, name, description, address, email, phone, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, estimated_preparation_time, types(id, name, categories(id, name))',
       )
       .eq('id', id)
-      .or('is_deleted.is.null,is_deleted.eq.false')
+      .eq('is_deleted', false)
       .maybeSingle<PlaceDetailRow>();
 
     if (placeError || !place) {
@@ -1009,7 +1035,7 @@ export class AdminPlacesService {
             .from('places')
             .select('id', { count: 'estimated', head: true })
             .eq('vendor_id', place.vendor_id)
-            .or('is_deleted.is.null,is_deleted.eq.false')
+            .eq('is_deleted', false)
         : Promise.resolve({ count: 0, error: null }),
     ]);
 
@@ -1123,7 +1149,7 @@ export class AdminPlacesService {
         updated_at: new Date().toISOString(),
       })
       .eq('id', id)
-      .or('is_deleted.is.null,is_deleted.eq.false')
+      .eq('is_deleted', false)
       .select('id, latitude, longitude')
       .maybeSingle<{ id: string; latitude: number; longitude: number }>();
 
@@ -1151,7 +1177,7 @@ export class AdminPlacesService {
       .from('places')
       .update({ is_deleted: true, is_active: false, updated_at: new Date().toISOString() })
       .eq('id', id)
-      .or('is_deleted.is.null,is_deleted.eq.false')
+      .eq('is_deleted', false)
       .select('id')
       .maybeSingle<{ id: string }>();
 
