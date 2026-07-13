@@ -1,0 +1,36 @@
+=== BEST_TIME_BASE_PENALTY_PER_MIN ===
+Cần Thơ | KHONG DOI
+Huế | avg_idle_time_per_day_min: 405->414.4
+Khánh Hòa | KHONG DOI
+Kiên Giang | KHONG DOI
+Lâm Đồng | KHONG DOI
+=== BEST_TIME_LARGE_DEVIATION_PENALTY_PER_MIN ===
+Cần Thơ | KHONG DOI
+Huế | avg_idle_time_per_day_min: 405->414.4
+Khánh Hòa | KHONG DOI
+Kiên Giang | KHONG DOI
+Lâm Đồng | KHONG DOI
+=== BUDGET_PENALTY_WEIGHT ===
+Cần Thơ | KHONG DOI
+Huế | avg_idle_time_per_day_min: 405->414.4
+Khánh Hòa | KHONG DOI
+Kiên Giang | KHONG DOI
+Lâm Đồng | KHONG DOI
+=== ENTERTAINMENT_EARLY_PENALTY_PER_MIN ===
+Cần Thơ | KHONG DOI
+Huế | avg_idle_time_per_day_min: 405->414.4
+Khánh Hòa | KHONG DOI
+Kiên Giang | KHONG DOI
+Lâm Đồng | KHONG DOI
+=== SKIPPED_POI_PENALTY ===
+Cần Thơ | KHONG DOI
+Huế | avg_idle_time_per_day_min: 405->414.4
+Khánh Hòa | KHONG DOI
+Kiên Giang | KHONG DOI
+Lâm Đồng | KHONG DOI
+=== TAIL_IDLE_EXCESS_PENALTY_PER_MIN ===
+Cần Thơ | KHONG DOI
+Huế | avg_idle_time_per_day_min: 405->414.4
+Khánh Hòa | KHONG DOI
+Kiên Giang | KHONG DOI
+Lâm Đồng | KHONG DOI

@@ -1,0 +1,5 @@
+Cần Thơ | KHONG DOI
+Huế | total_visited: 51->50; total_skipped: 28->23; avg_idle_time_per_day_min: 391.9->405
+Khánh Hòa | KHONG DOI
+Kiên Giang | total_visited: 52->49; total_skipped: 13->10; avg_idle_time_per_day_min: 440.6->455.6
+Lâm Đồng | total_visited: 46->49; total_skipped: 16->14; total_budget_overage: 319560->539560; no_lunch_days: 4->3; avg_idle_time_per_day_min: 322.5->301.9
