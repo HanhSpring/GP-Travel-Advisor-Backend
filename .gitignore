@@ -219,3 +219,8 @@ ai-service/recommender_artifacts/*.npy
 
 # Firebase service account
 api-service/firebase-service-account.json
+
+# Experimental debug logs and parse tool
+experimental_logs/
+api-service/output.md
+ai-service/*.txt

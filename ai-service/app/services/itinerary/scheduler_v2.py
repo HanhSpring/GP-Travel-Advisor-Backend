@@ -45,14 +45,23 @@ except ImportError:  # pragma: no cover
 #           entered before it opens, a day cannot contain 3 lunches:
 #             - model.AddCircuit(arcs)                    — route topology
 #             - start_var[j] >= open_time / depart[j] <= close_time
-#             - restaurants <= 2/day, cafes <= 1/day       (meal-slot caps)
+#             - start_var[j] == arrival[j]                 — no implicit
+#               waiting for a selected POI (arrive exactly when the visit
+#               starts; timeline stays continuous by construction, not by a
+#               penalty — there used to be a `wait` slack variable + a soft
+#               `wait * 30` objective term here, but the hard `== arrival`
+#               constraint already forces wait to 0 whenever selected, and a
+#               free/unconstrained wait for *unselected* POIs is driven to 0
+#               by the minimization anyway — so the soft term could never be
+#               nonzero in any optimal solution. Removed as dead code.)
+#             - restaurants <= 2/day, cafes <= 2/day       (meal-slot caps)
 #             - MEAL_MIN_GAP_MINUTES between two meals     (ordering/spacing)
 #             - target_min <= selected_total <= target_max (POI-count band)
 #
 #   SOFT  — a weighted term in _add_objective's Minimize(...) expression
 #           (Section 2 below). Used for anything that's a *preference*, not
-#           an impossibility: travel time, wait time, best-time-window fit,
-#           lunch timing, skipped-POI count, and — as of this pass — budget.
+#           an impossibility: travel time, best-time-window fit, lunch
+#           timing, skipped-POI count, and — as of this pass — budget.
 #
 # Budget is deliberately SOFT, not hard: an earlier version capped
 # activity+transport cost per day with a hard model.Add(...). That looked
@@ -93,25 +102,33 @@ MEAL_MIN_GAP_MINUTES = 210
 # it, since the accumulated penalty was cheaper than the alternative.
 LUNCH_HARD_WINDOW = (10 * 60 + 30, 14 * 60)  # 10:30-14:00
 
-# Constraints to prevent entertainment/nightlife from being scheduled in the morning.
-ENTERTAINMENT_EARLIEST_START = 13 * 60
-LATE_ENTERTAINMENT_EARLIEST_START = 18 * 60
+# Positive nudge (added straight into effective_reward, not a standalone
+# penalty) for a restaurant candidate whose hours genuinely overlap
+# LUNCH_HARD_WINDOW. The hard lunch window itself only constrains a selected
+# restaurant's start time — it does nothing to make selecting one attractive
+# in the first place, so a lunch stop competed on equal footing against
+# every other POI despite also carrying its own travel_terms cost (the
+# detour to reach it).
+#
+# Calibrated directly against travel_terms' own weight (2 pts/min, see
+# below) rather than picked freestanding: LUNCH_BONUS = 60 min * 2 pts/min
+# = 120. A restaurant reachable within a normal ~60-minute travel budget
+# comes out net-positive (bonus outweighs the travel_terms cost of
+# reaching it) and tends to get kept; one that requires materially more
+# detour than that stays net-negative and still loses out to a better use
+# of that time — "keep lunch unless it costs over ~1 hour of extra travel",
+# using the same points-based tradeoff the rest of the objective runs on,
+# not a hard distance cutoff.
+LUNCH_BONUS = 120
 
-# Penalty applied per minute if an entertainment POI is scheduled earlier than allowed.
-ENTERTAINMENT_EARLY_PENALTY_PER_MIN = 4
-
-# General penalty for any idle/waiting time between POIs (e.g., arriving
-# before opening time). Forces the solver to prefer active continuous routes.
-# Empirically tuned via scripts/sensitivity_analysis_weights.py (full-trip
-# sweep across 5 real destinations, see scripts/sensitivity_results_trip.csv):
-# total visited/idle-time improve monotonically from 3->9 with zero budget
-# cost, plateau at 9->12 (no further gain), and only start costing real
-# budget overage past 12 (18+) for negligible extra benefit — 9 is the
-# empirical elbow point.
-IDLE_TIME_PENALTY_PER_MIN = 9
-
-# Penalty for idle time specifically at the beginning of the day.
+# Penalty for idle time specifically at the beginning of the day, beyond a
+# grace period (HEAD_IDLE_GRACE_MINUTES) — mirrors TAIL_IDLE_GRACE_MINUTES on
+# the other end of the day. A short delay before the first stop is normal
+# schedule slack (e.g. deferring to a POI's best-time window); only a
+# genuinely late first stop (start well past the earliest physically
+# possible time) is worth discouraging.
 HEAD_IDLE_TIME_PENALTY_PER_MIN = 4
+HEAD_IDLE_GRACE_MINUTES = 150
 
 # Heavy penalty for dropping/skipping a valid POI from the itinerary.
 # Ensures the solver maximizes the number of visited places (Prize-Collecting OP).
@@ -142,42 +159,25 @@ BEST_TIME_LARGE_DEVIATION_PENALTY_PER_MIN = 4
 # Allowable buffer (30 mins) before the penalty starts counting.
 BEST_TIME_GRACE_MINUTES = 30
 
-# ── 4. SPENDING-TIER / PRICE-FIT (BUDGET-AWARE POI SCORING) ──────────────
-# Classifies the user's average daily budget into low/medium/high so POI
-# selection favors places matching their spending capacity. Thresholds are
-# an approximate per-trip -> per-day conversion from real domestic-tourism
-# spending data (no dedicated per-day dataset exists, so this is a documented
-# judgment call, not an exact statistic):
-#  - GSO (Tong cuc Thong ke) 2019: avg domestic overnight trip spend
-#    5.563 trieu VND over an avg 3.62-day trip -> ~1.537 trieu VND/day.
-#  - 2024-2025 Booking/Coc Coc consumer surveys: "typical" domestic trip
-#    spend is 2-4 trieu VND/trip; higher-spending 25-34 age group is
-#    5+ trieu VND/trip (~70% of that bracket).
-# 500k/day roughly brackets the low end of the "typical" trip spend;
-# 1.2M/day roughly brackets the higher-spending traveler segment.
-USER_BUDGET_TIER_MEDIUM_VND_PER_DAY = 500_000
-USER_BUDGET_TIER_HIGH_VND_PER_DAY = 1_200_000
-
-# POI-level cost tier (single-item price, e.g. one ticket/one meal). Unlike
-# the user tier above, there is no specific research backing these two
-# thresholds — they remain an uncited, hand-picked bucketing of "cheap
-# vs. mid-range vs. premium single POI cost" and should be treated as a
-# product judgment call, not an empirically-grounded figure.
-POI_PRICE_TIER_MEDIUM_VND = 100_000
-POI_PRICE_TIER_PREMIUM_VND = 500_000
-
-# price_fit_bonus is symmetric by "tier distance" (how many tiers apart the
-# user's spending tier and the POI's price tier are), replacing an earlier
-# ad-hoc matrix that penalized the same 2-tier mismatch inconsistently
-# (-500 for low+premium vs. only -50 for high+cheap) and left some 1-tier
-# mismatches (e.g. medium+cheap, medium+premium) with no penalty at all.
-PRICE_FIT_MATCH_BONUS = 50
-PRICE_FIT_ADJACENT_MISMATCH_PENALTY = 50
-PRICE_FIT_FAR_MISMATCH_PENALTY = 150
-
-# Maps a tier name to an ordinal position so "distance" can be computed
-# between the user's spending tier and a POI's price tier.
-_SPENDING_TIER_INDEX = {"low": 0, "medium": 1, "high": 2, "cheap": 0, "premium": 2}
+# ── 4. SPENDING-TIER / PRICE-FIT — REMOVED 2026-07-12 ────────────────────
+# This section used to classify the user's average daily budget into
+# low/medium/high and reward/penalize each POI by how well its own price
+# tier "matched" that classification (up to -150 for a 2-tier mismatch).
+# Removed because the mechanism judged POI price against a generic tier
+# derived from the user's budget, instead of against real spend — creating
+# a perverse effect where a "high tier" (big-budget) traveler got penalized
+# for choosing an affordable local eatery, and a "low tier" traveler got
+# penalized for an affordable-but-technically-"premium"-priced pick, even
+# though both choices were genuinely fine relative to the user's actual
+# entered budget. Real affordability is already tracked precisely by
+# budget_penalty below (whole-trip rolling remainder, effectively enforcing
+# ~90% of the entered budget via self.trip_budget = trip_budget_total * 0.9)
+# — that mechanism doesn't need a coarse tier proxy, and a big-budget
+# traveler is already free to pick pricier POIs simply because
+# budget_penalty rarely fires for them, without needing an extra bonus for
+# doing so. Hotel selection (a separate, budget-aware step upstream in
+# recommendation.service.ts, before this solver ever runs) is where
+# spending-level personalization for accommodation already happens.
 
 
 def preferred_time_window(
@@ -367,32 +367,6 @@ class SchedulerV2Planner:
         # ── Cluster ──
         self.assignment_result = self._preallocate_days()
 
-    def _is_late_entertainment(self, poi: planner.POI) -> bool:
-        text = planner.normalize_text(f"{poi.name} {poi.place_type}")
-        return any(
-            keyword in text
-            for keyword in (
-                "karaoke",
-                "bar",
-                "pub",
-                "club",
-                "cinema",
-                "rap phim",
-                "billiard",
-                "bida",
-                "game",
-                "escape",
-                "bowling",
-            )
-        )
-
-    def _entertainment_earliest_start(self, poi: planner.POI) -> int:
-        if poi.place_type != "entertainment":
-            return 0
-        if self._is_late_entertainment(poi):
-            return LATE_ENTERTAINMENT_EARLIEST_START
-        return ENTERTAINMENT_EARLIEST_START
-
     def _apply_restaurant_constraints(
         self,
         model: cp_model.CpModel,
@@ -400,18 +374,27 @@ class SchedulerV2Planner:
         selected: dict,
         start_var: dict,
         scope_tag: str,
-    ) -> None:
+    ) -> dict:
+        """Returns {node: dinner_flag} for every restaurant node capable of
+        serving dinner — the caller (_add_objective) needs this to exempt a
+        dinner-flagged assignment from the lunch hard window (see the
+        dinner_flag_by_node parameter there); a restaurant open long enough
+        to cover both meals must not be hard-locked into the lunch window
+        the moment it's selected at all, or it could never be used for
+        dinner without an unsatisfiable start_var >= DINNER_START AND
+        start_var <= LUNCH_HARD_WINDOW[1] conflict."""
         restaurant_nodes = [
             idx + 1
             for idx, poi in enumerate(pois)
             if poi.place_type == "restaurant"
         ]
         if not restaurant_nodes:
-            return
+            return {}
 
         model.Add(sum(selected[i] for i in restaurant_nodes) <= 2)
 
         dinner_flags = []
+        dinner_flag_by_node: dict = {}
         for node in restaurant_nodes:
             poi = pois[node - 1]
             if poi.open_time <= DINNER_END and poi.close_time >= DINNER_START:
@@ -420,6 +403,7 @@ class SchedulerV2Planner:
                 model.Add(start_var[node] <= DINNER_END).OnlyEnforceIf(dinner_flag)
                 model.AddImplication(dinner_flag, selected[node])
                 dinner_flags.append(dinner_flag)
+                dinner_flag_by_node[node] = dinner_flag
 
         if len(restaurant_nodes) >= 2:
             second_meal = model.NewBoolVar(f"{scope_tag}_second_meal")
@@ -456,6 +440,8 @@ class SchedulerV2Planner:
                     model.Add(
                         start_var[left] >= start_var[right] + MEAL_MIN_GAP_MINUTES
                     ).OnlyEnforceIf([pair_selected, left_before_right.Not()])
+
+        return dinner_flag_by_node
 
     # ────────────────────────────────────────────────────────────────────
     # PUBLIC: run
@@ -848,10 +834,6 @@ class SchedulerV2Planner:
             i: model.NewIntVar(0, 24 * 60, f"depart_{i}")
             for i in range(1, n + 1)
         }
-        wait = {
-            i: model.NewIntVar(0, 24 * 60, f"wait_{i}")
-            for i in range(1, n + 1)
-        }
         return_time = model.NewIntVar(0, 24 * 60, "return_time")
 
         # ── Travel times ──
@@ -882,16 +864,11 @@ class SchedulerV2Planner:
         # ── Time constraints ──
         for j in range(1, n + 1):
             poi = pois[j - 1]
-            model.Add(
-                start_var[j] >= arrival[j]
-            ).OnlyEnforceIf(selected[j])
-            model.Add(
-                wait[j] == start_var[j] - arrival[j]
-            ).OnlyEnforceIf(selected[j])
-
             # Keep the timeline continuous. A selected POI must be reachable
             # exactly when its visit starts; no implicit waiting is inserted.
-            model.Add(wait[j] == 0).OnlyEnforceIf(selected[j])
+            model.Add(
+                start_var[j] == arrival[j]
+            ).OnlyEnforceIf(selected[j])
             model.Add(
                 depart[j] == start_var[j] + max(0, int(poi.visit_duration))
             ).OnlyEnforceIf(selected[j])
@@ -921,7 +898,7 @@ class SchedulerV2Planner:
         model.Add(return_time <= self.day_end_time)
 
         # ── Restaurant constraint ──
-        self._apply_restaurant_constraints(
+        dinner_flag_by_node = self._apply_restaurant_constraints(
             model,
             pois,
             selected,
@@ -948,12 +925,13 @@ class SchedulerV2Planner:
 
         # ── Objective ──
         self._add_objective(
-            model, n, pois, selected, start_var, wait,
+            model, n, pois, selected, start_var,
             arc_vars, travel_minutes, travel_distance, helper,
             return_time=return_time,
             day_start=day_start,
             lunch_window=lunch_window,
             enforce_lunch=enforce_lunch,
+            dinner_flag_by_node=dinner_flag_by_node,
         )
 
         # ── Solve ──
@@ -979,7 +957,10 @@ class SchedulerV2Planner:
             has_restaurant = True
             if enforce_lunch and lunch_window:
                 started = solver.Value(start_var[nd])
-                if started < lunch_window[0] or started > lunch_window[1]:
+                is_dinner_time = DINNER_START <= started <= DINNER_END
+                if not is_dinner_time and (
+                    started < lunch_window[0] or started > lunch_window[1]
+                ):
                     lunch_late = True
         reason = (
             "cpsat_optimal" if status == cp_model.OPTIMAL else "cpsat_feasible"
@@ -1063,10 +1044,6 @@ class SchedulerV2Planner:
             i: model.NewIntVar(0, 24 * 60, f"depart_{i}")
             for i in range(1, n + 1)
         }
-        wait = {
-            i: model.NewIntVar(0, 24 * 60, f"wait_{i}")
-            for i in range(1, n + 1)
-        }
         return_time = model.NewIntVar(0, 24 * 60, "return_time")
 
         # ── Travel times ──
@@ -1086,16 +1063,11 @@ class SchedulerV2Planner:
         # ── Time constraints ──
         for j in range(1, n + 1):
             poi = pois[j - 1]
-            model.Add(
-                start_var[j] >= arrival[j]
-            ).OnlyEnforceIf(selected[j])
-            model.Add(
-                wait[j] == start_var[j] - arrival[j]
-            ).OnlyEnforceIf(selected[j])
-
             # Keep the timeline continuous. Opening and meal windows must be
             # satisfied through route selection/order rather than waiting.
-            model.Add(wait[j] == 0).OnlyEnforceIf(selected[j])
+            model.Add(
+                start_var[j] == arrival[j]
+            ).OnlyEnforceIf(selected[j])
             model.Add(
                 depart[j] == start_var[j] + max(0, int(poi.visit_duration))
             ).OnlyEnforceIf(selected[j])
@@ -1125,7 +1097,7 @@ class SchedulerV2Planner:
         model.Add(return_time <= self.day_end_time)
 
         # ── Restaurant constraint ──
-        self._apply_restaurant_constraints(
+        dinner_flag_by_node = self._apply_restaurant_constraints(
             model,
             pois,
             selected,
@@ -1152,12 +1124,13 @@ class SchedulerV2Planner:
 
         # ── Objective ──
         self._add_objective(
-            model, n, pois, selected, start_var, wait,
+            model, n, pois, selected, start_var,
             arc_vars, travel_minutes, travel_distance, helper,
             return_time=return_time,
             day_start=day_start,
             lunch_window=lunch_window,
             enforce_lunch=enforce_lunch,
+            dinner_flag_by_node=dinner_flag_by_node,
         )
 
         # ── Solve ──
@@ -1181,7 +1154,10 @@ class SchedulerV2Planner:
             has_restaurant = True
             if enforce_lunch and lunch_window:
                 started = solver.Value(start_var[nd])
-                if started < lunch_window[0] or started > lunch_window[1]:
+                is_dinner_time = DINNER_START <= started <= DINNER_END
+                if not is_dinner_time and (
+                    started < lunch_window[0] or started > lunch_window[1]
+                ):
                     lunch_late = True
         reason = (
             "cpsat_optimal" if status == cp_model.OPTIMAL else "cpsat_feasible"
@@ -1215,7 +1191,6 @@ class SchedulerV2Planner:
         pois: List[planner.POI],
         selected: dict,
         start_var: dict,
-        wait: dict,
         arc_vars: dict,
         travel_minutes: dict,
         travel_distance: dict,
@@ -1224,62 +1199,52 @@ class SchedulerV2Planner:
         day_start: int = None,
         lunch_window: Optional[Tuple[int, int]] = None,
         enforce_lunch: bool = False,
+        dinner_flag_by_node: Optional[dict] = None,
     ) -> None:
         effective_day_start = day_start if day_start is not None else self.day_start_time
-        available_minutes = max(1, self.day_end_time - effective_day_start)
 
         utility_terms = []
         travel_terms = []
-        wait_terms = []
         skipped_terms = []
         activity_cost_terms = []
         best_time_penalty_terms = []
 
-        daily_budget_target = self.trip_budget / max(1, self.num_days)
-        user_tier = "low"
-        if daily_budget_target >= USER_BUDGET_TIER_HIGH_VND_PER_DAY:
-            user_tier = "high"
-        elif daily_budget_target >= USER_BUDGET_TIER_MEDIUM_VND_PER_DAY:
-            user_tier = "medium"
-
         for i, poi in enumerate(pois, start=1):
             poi_cost = helper._poi_cost(poi)
-            poi_price_tier = "cheap"
-            if poi_cost >= POI_PRICE_TIER_PREMIUM_VND:
-                poi_price_tier = "premium"
-            elif poi_cost >= POI_PRICE_TIER_MEDIUM_VND:
-                poi_price_tier = "medium"
-
-            tier_distance = abs(_SPENDING_TIER_INDEX[user_tier] - _SPENDING_TIER_INDEX[poi_price_tier])
-            if tier_distance == 0:
-                price_fit_bonus = PRICE_FIT_MATCH_BONUS
-            elif tier_distance == 1:
-                price_fit_bonus = -PRICE_FIT_ADJACENT_MISMATCH_PENALTY
-            else:
-                price_fit_bonus = -PRICE_FIT_FAR_MISMATCH_PENALTY
-
             two_tower_score = helper._poi_utility(poi) / planner.UTILITY_SCALE
-            premium_low_score_penalty = 0
-            if user_tier == "high" and poi_price_tier == "premium" and two_tower_score < 0.65:
-                premium_low_score_penalty = 250
 
-            cost_penalty = int(poi_cost // 10000)
-            # Food utility is scaled down: restaurants 300x, cafes 220x (vs attractions 1000x).
-            # Cafes were bumped up from 150x — at 150x they were losing out to attractions
-            # too often once the schedule got tight, making cafes effectively optional even
-            # though we still don't hard-enforce them like the lunch/dinner restaurant slot.
-            if poi.place_type == "restaurant":
-                poi_reward = int(round(two_tower_score * 300))
-            elif poi.place_type == "cafe":
-                poi_reward = int(round(two_tower_score * 220))
-            else:
-                poi_reward = int(round(two_tower_score * 1000))
+            # Same "unlimited budget" exemption used elsewhere in this file
+            # (e.g. budget_k_overage below) — this is a budget-agnostic
+            # "costlier POI = slightly lower reward" nudge, but "unlimited"
+            # means cost shouldn't factor into the choice at all.
+            cost_penalty = int(poi_cost // 10000) if self.trip_budget_total > 0 else 0
+            # One uniform utility scale for every place type. A per-type
+            # discount for restaurant/cafe used to exist here (300x/220x vs
+            # 1000x for attractions) to bias trimming toward keeping
+            # attractions over food — but restaurant/cafe candidates are
+            # already greedily pre-filtered by distance to at most
+            # restaurant_option_limit/cafe_option_limit per day BEFORE this
+            # solver ever runs (see geo_clustering.py's _inject_restaurants/
+            # _inject_cafes), so there's rarely more than 1-2 food candidates
+            # to rank against each other in the first place — the per-type
+            # discount's only real effect was cross-type trimming, which
+            # needed 3 separate hand-tuned numbers to reason about. Within-
+            # type ranking is unaffected by removing it: two_tower_score
+            # already differs per POI regardless of the multiplier applied.
+            poi_reward = int(round(two_tower_score * 1000))
             stay_penalty = int(poi.visit_duration)
-            effective_reward = poi_reward + price_fit_bonus - premium_low_score_penalty - cost_penalty - stay_penalty
+            lunch_bonus = 0
+            if (
+                enforce_lunch
+                and lunch_window
+                and poi.place_type == "restaurant"
+                and poi.open_time <= lunch_window[1]
+                and poi.close_time >= lunch_window[0]
+            ):
+                lunch_bonus = LUNCH_BONUS
+            effective_reward = poi_reward - cost_penalty - stay_penalty + lunch_bonus
 
             utility_terms.append(effective_reward * selected[i])
-            wait_terms.append(wait[i] * 30)
-            # Reduced skipped weight (80) to match winner scoring and let density penalty steer count
             skipped_terms.append(SKIPPED_POI_PENALTY * selected[i].Not())
             activity_cost_terms.append(int(round(poi_cost)) * selected[i])
 
@@ -1313,19 +1278,18 @@ class SchedulerV2Planner:
                     * BEST_TIME_LARGE_DEVIATION_PENALTY_PER_MIN
                 )
 
-        entertainment_penalty_terms = []
-        for i, poi in enumerate(pois, start=1):
-            earliest = self._entertainment_earliest_start(poi)
-            if earliest <= 0:
-                continue
-            early_minutes = model.NewIntVar(
-                0, 24 * 60, f"entertainment_early_minutes_{i}"
-            )
-            model.Add(early_minutes >= earliest - start_var[i])
-            model.Add(early_minutes >= 0)
-            entertainment_penalty_terms.append(
-                early_minutes * ENTERTAINMENT_EARLY_PENALTY_PER_MIN
-            )
+        # HISTORY: a keyword-matched "late-night entertainment" penalty
+        # (karaoke/bar/pub/club/cinema/billiards/game/escape/bowling)
+        # pushing those POIs no earlier than 13:00 (or 18:00 for the late-
+        # night subset) used to run here, as a fallback for entertainment-
+        # type POIs missing a proper best_time tag (best_time_penalty_terms
+        # only fires when a tag exists). Removed 2026-07-12: those specific
+        # late-night venue types have been dropped from the entertainment
+        # category at the data-curation layer — what remains under
+        # "entertainment" (theme parks etc.) is normal daytime-appropriate
+        # content needing no morning restriction. If late-night venue types
+        # are reintroduced later, re-add a best_time-tag-based safeguard
+        # rather than reviving this keyword-matching mechanism.
 
         # Hard lunch window: a restaurant capable of serving lunch (hours
         # overlap the window at all) may ONLY be scheduled inside
@@ -1334,14 +1298,39 @@ class SchedulerV2Planner:
         # (still a genuinely optional stop — enforce_lunch/lunch_window being
         # None entirely skips this, and skipping is never infeasible thanks
         # to the existing SKIPPED_POI_PENALTY-based soft treatment).
+        #
+        # BUGFIX 2026-07-12: this used to apply unconditionally whenever
+        # selected[i], with no exception for a restaurant also being used as
+        # dinner. A restaurant open long enough to overlap BOTH the lunch
+        # window and DINNER_START/DINNER_END (i.e. open most of the day) got
+        # hard-locked into the lunch window the moment it was selected at
+        # all — so _apply_restaurant_constraints's dinner_flag (which forces
+        # start_var >= DINNER_START, itself >= 18:00 > lunch_window[1]=14:00)
+        # could never be true for that node without an immediate
+        # start_var>=18:00 AND start_var<=14:00 contradiction, making that
+        # assignment INFEASIBLE. In practice this meant an all-day restaurant
+        # could only ever be scheduled as lunch, never dinner — only a
+        # restaurant whose hours don't overlap lunch at all (a dinner-only
+        # place) was assignable as dinner. Now exempted: when a dinner_flag
+        # exists for this node, the lunch window only applies if that flag
+        # is false (i.e. this particular assignment isn't the dinner slot).
         if enforce_lunch and lunch_window:
             for i, poi in enumerate(pois, start=1):
                 if poi.place_type != "restaurant":
                     continue
                 if not (poi.open_time <= lunch_window[1] and poi.close_time >= lunch_window[0]):
                     continue
-                model.Add(start_var[i] >= lunch_window[0]).OnlyEnforceIf(selected[i])
-                model.Add(start_var[i] <= lunch_window[1]).OnlyEnforceIf(selected[i])
+                dinner_flag = (dinner_flag_by_node or {}).get(i)
+                if dinner_flag is not None:
+                    model.Add(start_var[i] >= lunch_window[0]).OnlyEnforceIf(
+                        [selected[i], dinner_flag.Not()]
+                    )
+                    model.Add(start_var[i] <= lunch_window[1]).OnlyEnforceIf(
+                        [selected[i], dinner_flag.Not()]
+                    )
+                else:
+                    model.Add(start_var[i] >= lunch_window[0]).OnlyEnforceIf(selected[i])
+                    model.Add(start_var[i] <= lunch_window[1]).OnlyEnforceIf(selected[i])
 
         for (i, j), var in arc_vars.items():
             tm = travel_minutes.get((i, j), 0)
@@ -1394,55 +1383,42 @@ class SchedulerV2Planner:
         # already a whole number (15.0), so this cast loses nothing.
         budget_penalty = budget_k_overage * int(planner.BUDGET_PENALTY_WEIGHT)
 
-        # ── Day-density penalty ──
-        # target: one POI per 150 min of available time
-        target_poi_count = max(1, round(available_minutes / 150))
+        # ── Day-density penalty — REMOVED 2026-07-12 ──
+        # HISTORY: this section originally carried THREE overlapping soft
+        # mechanisms answering "is today's POI count reasonable?", later
+        # consolidated down to just density_penalty_term (target =
+        # available_minutes/150 per POI, penalty = |selected - target| * 200
+        # either direction). Removed entirely in this pass: target_min/
+        # target_max (the HARD band from _calculate_target_bounds) turned out
+        # to reuse the exact same 150-min-per-POI slice as target_by_time (one
+        # of target_min's three inputs) — not a separate, spatially-derived
+        # bound from geo_clustering.py as it looked at a glance, just the same
+        # time-based heuristic duplicated in both a hard and a soft form.
+        # Worse than merely redundant: density_penalty_term's soft target sat
+        # near target_min (the low end of the hard band), actively pulling
+        # selected_total back down against skipped_terms/utility_terms, which
+        # pull toward target_max — two soft mechanisms fighting each other
+        # inside the same already-hard-bounded range. selected_total is now
+        # left free within [target_min, target_max] for utility_terms/
+        # skipped_terms to decide alone. Re-verified via
+        # scripts/sensitivity_analysis_weights.py (day + trip mode) after
+        # removal — see scripts/sensitivity_results_trip.csv for the
+        # before/after comparison this change should be checked against.
 
-        selected_total = model.NewIntVar(0, n, "selected_total")
-        model.Add(selected_total == sum(selected.values()))
-
-        density_diff = model.NewIntVar(0, n, "density_diff")
-        model.AddAbsEquality(density_diff, selected_total - target_poi_count)
-        density_penalty_term = density_diff * 200
-
-        # Dense-day penalty: avg_minutes_per_poi < 90 ⟺ selected > available // 90
-        dense_threshold = max(1, available_minutes // 90)
-        is_too_dense = model.NewBoolVar("is_too_dense")
-        model.Add(selected_total > dense_threshold).OnlyEnforceIf(is_too_dense)
-        model.Add(selected_total <= dense_threshold).OnlyEnforceIf(is_too_dense.Not())
-        dense_penalty_term = is_too_dense * 500
-
-        # Sparse-day penalty: selected_count <= 2 on a full-length day
-        sparse_penalty_term: object = 0
-        if available_minutes >= 720:
-            is_too_sparse = model.NewBoolVar("is_too_sparse")
-            model.Add(selected_total <= 2).OnlyEnforceIf(is_too_sparse)
-            model.Add(selected_total > 2).OnlyEnforceIf(is_too_sparse.Not())
-            sparse_penalty_term = is_too_sparse * 600
-
-        # ── Distance penalty (in 0.1-km integer units) ──
-        arc_dist_10 = {
-            (i, j): int(round(travel_distance.get((i, j), 0.0) * 10))
-            for (i, j) in arc_vars
-        }
-        dist_total_10 = model.NewIntVar(0, 20000, "dist_total_10")
-        model.Add(
-            dist_total_10 == sum(arc_dist_10[(i, j)] * arc_vars[(i, j)] for (i, j) in arc_vars)
-        )
-
-        # >60 km: +20/km over = +2 per 0.1-km unit over 600
-        dist_over_600 = model.NewIntVar(0, 20000, "dist_over_600")
-        model.Add(dist_over_600 >= dist_total_10 - 600)
-        # >80 km: additional +50/km = +5 per unit over 800
-        dist_over_800 = model.NewIntVar(0, 20000, "dist_over_800")
-        model.Add(dist_over_800 >= dist_total_10 - 800)
-        # >100 km: +2000 flat
-        is_extreme_dist = model.NewBoolVar("is_extreme_dist")
-        model.Add(dist_total_10 > 1000).OnlyEnforceIf(is_extreme_dist)
-        model.Add(dist_total_10 <= 1000).OnlyEnforceIf(is_extreme_dist.Not())
-
-        distance_penalty_term = dist_over_600 * 2 + dist_over_800 * 5 + is_extreme_dist * 2000
-
+        # HISTORY: a separate "distance penalty" (0.1-km units, thresholds at
+        # 60/80/100km) used to live here, on top of travel_terms (linear,
+        # always-on, per minute) and travel_penalty_term below (tiered, per
+        # total minutes). Distance and travel time correlate but aren't
+        # identical (traffic, road grade) — in principle a separate lever —
+        # but in practice all three pulled the same direction ("discourage a
+        # far-flung day"), just measured two different ways (km vs minutes),
+        # making the trio hard to reason about together and none of them
+        # covered by the sensitivity study (all magic numbers inline here,
+        # not named module constants). Minutes already capture what actually
+        # matters to the traveler (time stuck traveling); a separate km-based
+        # penalty added no distinguishable signal budget_penalty's own
+        # per-km transport cost doesn't already price in. Removed 2026-07-12.
+        #
         # ── Travel-time penalty ──
         raw_travel_terms = [
             travel_minutes.get((i, j), 0) * var
@@ -1466,9 +1442,18 @@ class SchedulerV2Planner:
             + is_extreme_travel * 2000
         )
 
+        # HISTORY: an always-on linear penalty (idle_tail * 9, no grace
+        # period) used to run alongside the grace-then-penalty term below —
+        # taxing even a few idle minutes at the end of the day on top of the
+        # steeper penalty for genuinely wasted time past a 2-hour grace.
+        # Consolidated into just the grace-then-penalty form: a short idle
+        # tail (<=TAIL_IDLE_GRACE_MINUTES) is normal schedule slack, not
+        # something to penalize from minute one. Removed 2026-07-12 — see
+        # ai-service/tests/test_scheduler_v2_density_fallback.py and
+        # scripts/sensitivity_analysis_weights.py for the matching cleanup
+        # of the now-unused IDLE_TIME_PENALTY_PER_MIN constant/sweep entry.
         idle_tail = model.NewIntVar(0, 24 * 60, "idle_tail")
         model.Add(idle_tail == self.day_end_time - return_time)
-        idle_penalty_term = idle_tail * IDLE_TIME_PENALTY_PER_MIN
         idle_tail_excess = model.NewIntVar(0, 24 * 60, "idle_tail_excess")
         model.Add(
             idle_tail_excess >= idle_tail - TAIL_IDLE_GRACE_MINUTES
@@ -1477,9 +1462,13 @@ class SchedulerV2Planner:
             idle_tail_excess * TAIL_IDLE_EXCESS_PENALTY_PER_MIN
         )
 
-        # Penalize an unnecessarily late first stop. Previously only the idle
-        # tail was penalized, so a route could start at lunch and still finish
-        # late enough to look attractive to the objective.
+        # Penalize an unnecessarily late first stop, beyond a grace period.
+        # Previously only the idle tail was penalized, so a route could
+        # start at lunch and still finish late enough to look attractive to
+        # the objective. A small amount of head idle is normal schedule
+        # slack (e.g. deferring to a POI's best-time window), so — mirroring
+        # TAIL_IDLE_GRACE_MINUTES on the other end of the day — only the
+        # portion past HEAD_IDLE_GRACE_MINUTES is penalized.
         head_idle_terms = []
         for (i, j), arc in arc_vars.items():
             if i not in (0, -1) or not (1 <= j <= n):
@@ -1492,22 +1481,20 @@ class SchedulerV2Planner:
                 - travel_minutes.get((i, j), 0)
             ).OnlyEnforceIf(arc)
             model.Add(head_idle == 0).OnlyEnforceIf(arc.Not())
-            head_idle_terms.append(head_idle * HEAD_IDLE_TIME_PENALTY_PER_MIN)
+            head_idle_excess = model.NewIntVar(0, 24 * 60, f"head_idle_excess_{j}")
+            model.Add(
+                head_idle_excess >= head_idle - HEAD_IDLE_GRACE_MINUTES
+            ).OnlyEnforceIf(arc)
+            model.Add(head_idle_excess == 0).OnlyEnforceIf(arc.Not())
+            head_idle_terms.append(head_idle_excess * HEAD_IDLE_TIME_PENALTY_PER_MIN)
 
         model.Minimize(
             sum(travel_terms)
-            + sum(wait_terms)
-            + sum(entertainment_penalty_terms)
             + sum(best_time_penalty_terms)
             + budget_penalty
             + sum(skipped_terms)
             - sum(utility_terms)
-            + density_penalty_term
-            + dense_penalty_term
-            + sparse_penalty_term
-            + distance_penalty_term
             + travel_penalty_term
-            + idle_penalty_term
             + idle_excess_penalty_term
             + sum(head_idle_terms)
         )

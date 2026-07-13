@@ -218,16 +218,28 @@ def _persist_selected_route_matrix(
     result: planner.MultiDayResult,
     vehicle: str,
 ) -> None:
-    """Persist the exact rounded legs used by the winning schedule.
+    """Persist the exact rounded legs used by the winning schedule, Goong-
+    sourced legs only.
 
     This keeps itinerary timestamps, subsequent solver runs, and API/UI
     reconstruction on the same travel-time and distance values without adding
     travel snapshot columns to itinerary_details.
+
+    BUGFIX 2026-07-12: this used to persist every winning leg regardless of
+    entry.travel_source, including Haversine-estimated ones. distance_matrix
+    has no source column — _load_distance_matrix_db() unconditionally labels
+    every row it reads back "goong_db" — so a Haversine estimate written here
+    got silently relabeled as real Goong data on the next read, contaminating
+    the cache and compounding with every subsequent request that reused it.
+    Only genuinely Goong-sourced legs (planner.GOONG_TRAVEL_SOURCES) may be
+    upserted now.
     """
     travel_minutes: dict[tuple[str, str], int] = {}
     travel_distances: dict[tuple[str, str], float] = {}
     for day in result.days:
         for entry in day.ga_result.schedule:
+            if getattr(entry, "travel_source", "") not in planner.GOONG_TRAVEL_SOURCES:
+                continue
             from_id = str(getattr(entry, "travel_from_id", "") or "")
             destination_id = str(getattr(entry, "location_id", "") or "")
             distance_km = max(
