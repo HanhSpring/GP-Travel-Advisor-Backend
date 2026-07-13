@@ -204,7 +204,8 @@ test_mermaid.png
 secrets/
 
 # Database dumps
-*.sql
+
+!api-service/sql/2026_recommender_retrain_admin.sql
 !api-service/supabase/
 !api-service/supabase/migrations/
 !api-service/supabase/migrations/*.sql

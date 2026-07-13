@@ -1,0 +1,15 @@
+# Phụ thuộc RIÊNG cho retrain pipeline — cài vào venv của ai-service hoặc venv riêng:
+#   pip install -r retrain/requirements.txt
+#
+# numpy/pandas/scipy/supabase/boto3/sentence-transformers thường đã có sẵn
+# trong venv của ai-service (requirements.txt chính) — pip sẽ tự bỏ qua nếu đủ.
+numpy
+pandas
+scipy
+supabase
+boto3
+sentence-transformers
+# Embedding training is PyTorch-only; train_recommender.py disables Transformers TF
+# auto-detection so Keras 3 does not require the separate, heavy tf-keras package.
+# Funk-SVD (thư viện Surprise) — chỉ pipeline train cần, service serve KHÔNG cần
+scikit-surprise

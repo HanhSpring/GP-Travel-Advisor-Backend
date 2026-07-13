@@ -722,8 +722,46 @@ export class SearchService {
   private readonly placesSelect =
     'id, name, average_rating, review_count, image_url, city_id, open_time, close_time, open_hour_compressed, price, types(id, category_id, categories(id, name))';
 
+  // RPC search_places_full chưa tồn tại trên DB (chưa chạy migration) → chỉ log 1 lần.
+  private searchRpcUnavailable = false;
+
+  /**
+   * Đường nhanh: RPC travel.search_places_full (sql/2026_search_results_optimization.sql)
+   * — dùng GIN trigram index trên immutable_unaccent(name) nên vừa nhanh vừa khớp
+   * không dấu ("da nang" ra "Đà Nẵng"), lại join sẵn city + category.
+   * Trả null khi RPC chưa có trên DB để caller fallback về PostgREST ilike.
+   */
+  private async queryPlacesViaRpc(
+    q: string,
+    maxRows: number,
+  ): Promise<any[] | null> {
+    if (this.searchRpcUnavailable) return null;
+    const { data, error } = (await supabase
+      .schema('travel')
+      .rpc('search_places_full', { p_query: q, p_limit: maxRows })) as {
+      data: any[] | null;
+      error: { message: string } | null;
+    };
+    if (error) {
+      if (!this.searchRpcUnavailable) {
+        this.searchRpcUnavailable = true;
+        console.error(
+          'search_places_full RPC không khả dụng, fallback ilike (chạy sql/2026_search_results_optimization.sql để tăng tốc):',
+          error.message,
+        );
+      }
+      return null;
+    }
+    // Đưa row phẳng của RPC về shape mà mapPlaceItem/classifyPlaceType hiểu.
+    return (data ?? []).map((r: any) => ({
+      ...r,
+      types: { categories: [{ name: r.category_name ?? '' }] },
+    }));
+  }
+
   // Infix search — requires GIN trigram index for speed on large tables.
-  private async queryPlaces(q: string, maxRows = 2000): Promise<any[]> {
+  // Trả null khi lỗi (khác [] = không có kết quả) để caller quyết định fallback.
+  private async queryPlaces(q: string, maxRows = 2000): Promise<any[] | null> {
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
@@ -735,7 +773,7 @@ export class SearchService {
       .order('review_count', { ascending: false })
       .limit(maxRows);
     if (error) console.error('queryPlaces (infix) error:', error.message);
-    return error ? [] : (data ?? []);
+    return error ? null : (data ?? []);
   }
 
   // Prefix-only fallback — works with a standard B-tree index.
@@ -772,6 +810,61 @@ export class SearchService {
     return map;
   }
 
+  // Cache kết quả đã phân loại theo query — /search/all rồi /search/results
+  // (đổi tab, phân trang) dùng chung 1 lần fetch thay vì quét DB lại mỗi request.
+  private static readonly SEARCH_CACHE_TTL_MS = 60_000;
+  private static readonly SEARCH_CACHE_MAX = 100;
+  private readonly classifiedCache = new Map<
+    string,
+    { at: number; items: Record<string, unknown>[] }
+  >();
+
+  /**
+   * Fetch + phân loại + sort weighted rank cho 1 query, có cache TTL.
+   * Thứ tự ưu tiên nguồn dữ liệu:
+   *   1) RPC search_places_full (trigram index, join sẵn city/category)
+   *   2) PostgREST ilike infix (cách cũ)
+   *   3) PostgREST ilike prefix — CHỈ khi infix lỗi (prefix ⊆ infix nên
+   *      infix trả 0 kết quả thì prefix chắc chắn cũng 0, khỏi quét thêm lần nữa)
+   */
+  private async getClassifiedPlaces(
+    q: string,
+  ): Promise<Record<string, unknown>[]> {
+    const key = q.toLowerCase();
+    const hit = this.classifiedCache.get(key);
+    if (hit && Date.now() - hit.at < SearchService.SEARCH_CACHE_TTL_MS) {
+      return hit.items;
+    }
+
+    let raw = await this.queryPlacesViaRpc(q, 2000);
+    let cityMap: Map<string, string>;
+    if (raw !== null) {
+      // RPC đã join sẵn tên thành phố — khỏi query bảng cities.
+      cityMap = new Map(
+        raw
+          .filter((r) => r.city_id)
+          .map((r) => [String(r.city_id), String(r.city_name ?? '')]),
+      );
+    } else {
+      raw = await this.queryPlaces(q, 2000);
+      if (raw === null) raw = await this.queryPlacesPrefix(q, 500);
+      cityMap = await this.buildCityMap(raw);
+    }
+
+    // Sort mặc định: rating cao + nhiều review lên đầu (weighted rank).
+    // Sort 1 lần trước khi tách loại — filter giữ nguyên thứ tự đã xếp.
+    const items = this.sortByRank(
+      raw.map((p) => this.mapPlaceItem(p, cityMap)),
+    );
+
+    this.classifiedCache.set(key, { at: Date.now(), items });
+    if (this.classifiedCache.size > SearchService.SEARCH_CACHE_MAX) {
+      const oldest = this.classifiedCache.keys().next().value;
+      if (oldest !== undefined) this.classifiedCache.delete(oldest);
+    }
+    return items;
+  }
+
   async searchAll(query: string) {
     const q = (query ?? '').trim();
     if (!q)
@@ -781,17 +874,10 @@ export class SearchService {
         restaurants: { data: [], total: 0 },
         hotels: { data: [], total: 0 },
       };
-    let [itinResult, rawPlaces] = await Promise.all([
+    const [itinResult, classified] = await Promise.all([
       this.queryItineraries(q, 1, 50),
-      this.queryPlaces(q, 2000),
+      this.getClassifiedPlaces(q),
     ]);
-    if (!rawPlaces.length) rawPlaces = await this.queryPlacesPrefix(q, 500);
-    const cityMap = await this.buildCityMap(rawPlaces);
-    // Sort mặc định: rating cao + nhiều review lên đầu (weighted rank).
-    // Sort 1 lần trước khi tách loại — filter giữ nguyên thứ tự đã xếp.
-    const classified = this.sortByRank(
-      rawPlaces.map((p) => this.mapPlaceItem(p, cityMap)),
-    );
     const activities = classified.filter((p) => p['placeType'] === 'activity');
     const restaurants = classified.filter(
       (p) => p['placeType'] === 'restaurant',
@@ -811,13 +897,13 @@ export class SearchService {
     const safeLimit = Math.max(1, limit);
     if (type === 'itinerary')
       return this.queryItineraries(q, safePage, safeLimit);
-    let raw = await this.queryPlaces(q, 2000);
-    if (!raw.length) raw = await this.queryPlacesPrefix(q, 500);
-    const cityMap = await this.buildCityMap(raw);
+    // q rỗng trước đây thành ilike '%%' → tải 2000 dòng kèm joins (~2s/request).
+    // Màn kết quả tìm kiếm luôn có từ khóa nên trả rỗng như searchAll.
+    if (!q) return { data: [], total: 0, page: safePage, pages: 0 };
     // Sort weighted rank TRƯỚC khi phân trang để thứ tự trang ổn định.
-    const filtered = this.sortByRank(
-      raw.map((p) => this.mapPlaceItem(p, cityMap)),
-    ).filter((p) => p['placeType'] === type);
+    const filtered = (await this.getClassifiedPlaces(q)).filter(
+      (p) => p['placeType'] === type,
+    );
     const total = filtered.length;
     const offset = (safePage - 1) * safeLimit;
     return {

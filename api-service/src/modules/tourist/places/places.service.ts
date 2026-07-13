@@ -89,6 +89,7 @@ interface ReviewContentRow {
   review_id: string;
   content: string | null;
   expiration_date: string | null;
+  time_label: string | null;
 }
 
 interface FoodItemRow {
@@ -117,6 +118,7 @@ interface ReviewPageResult {
     created_at: string;
     provider: string | null;
     status: string;
+    time_label: string | null;
     time_ago: string;
   }>;
   breakdown: Record<number, number>;
@@ -338,7 +340,7 @@ export class PlacesService {
         ? supabase
             .schema('review_ai')
             .from('review_contents')
-            .select('review_id, content, expiration_date')
+            .select('review_id, content, expiration_date, time_label')
             .in('review_id', reviewIds)
         : Promise.resolve({ data: this.emptyContents, error: null }),
     ]);
@@ -399,6 +401,7 @@ export class PlacesService {
         created_at: review.created_at,
         provider: review.provider,
         status: review.status,
+        time_label: content?.time_label ?? null,
         time_ago: this.formatReviewAge(review.created_at),
       };
     });
@@ -440,8 +443,9 @@ export class PlacesService {
   }
 
   async getPlaceDetail(placeId: string, touristId?: string) {
-    const numericUserId =
-      touristId && /^\d+$/.test(touristId) ? Number(touristId) : null;
+    // Truyền thẳng tourist UUID của user đăng nhập — AI service tự tra
+    // tourist_user_map.csv (UUID -> id số) để kích hoạt nhánh CF cá nhân hóa.
+    const recommendUserId = touristId?.trim() || null;
 
     // ── Group 1: fire all independent queries in parallel ────────────────────
     const [placeResult, recommended, isFavorite] = await Promise.all([
@@ -456,7 +460,7 @@ export class PlacesService {
         .eq('is_active', true)
         .maybeSingle<PlaceRow>(),
       this.recommendations.getRecommendedPlaceIds(placeId, {
-        userId: numericUserId,
+        userId: recommendUserId,
       }),
       touristId
         ? this.checkFavorite(touristId, placeId)

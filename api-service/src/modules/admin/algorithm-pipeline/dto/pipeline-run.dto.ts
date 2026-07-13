@@ -152,3 +152,21 @@ export class UpdateReviewFilterScheduleDto {
   @Max(31)
   runDay?: number;
 }
+
+export interface RecommenderRetrainRunDto {
+  id: string;
+  status: string;
+  triggerType: string;
+  triggeredBy: string | null;
+  startedAt: string | null;
+  completedAt: string | null;
+  durationSeconds: number | null;
+  errorMessage: string | null;
+  metrics: Record<string, any> | null;
+  createdAt: string;
+}
+
+export interface RecommenderRetrainStatusDto {
+  currentRun: RecommenderRetrainRunDto | null;
+  latestRun: RecommenderRetrainRunDto | null;
+}

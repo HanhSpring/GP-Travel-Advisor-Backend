@@ -47,7 +47,10 @@ def get_recommendations(req: RecommendRequest):
 )
 def place_recommendations(
     place_id: str,
-    user_id: int | None = Query(default=None, description="UserID (số nguyên); bỏ trống nếu khách chưa đăng nhập"),
+    user_id: str | None = Query(
+        default=None,
+        description="Tourist UUID hoặc id số (Foody lịch sử); bỏ trống nếu khách chưa đăng nhập",
+    ),
     k: int | None = Query(default=None, ge=1, le=50),
 ):
     try:
