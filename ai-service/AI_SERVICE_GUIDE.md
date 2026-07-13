@@ -384,6 +384,17 @@ cp .env.example .env
 uvicorn app.main:app --reload --port 8000
 ```
 
+Với pipeline ML nặng như Lọc đánh giá, không nên dùng `--reload`: tiến trình theo dõi file có thể restart worker giữa lúc model đang được khởi tạo và làm mất model cache.
+Chạy service bằng lệnh sau: uvicorn app.main:app --host 127.0.0.1 --port 8000
+
+
+### Quản lý bộ nhớ model nặng
+
+- Two-Tower, Hybrid Recommender, Session-CF và itinerary vẫn được khởi tạo như trước; review-filter không thay đổi model hoặc kết quả của chúng.
+- BGE-M3 chỉ phục vụ `/embedding`, không được dùng bởi luồng Two-Tower `/recommend/encode-query` hay itinerary hiện tại.
+- BGE-M3 và bộ transformer review-filter được điều phối theo workload để không cùng chiếm RAM. Các request liên tiếp cùng loại vẫn dùng cache; khi đổi loại, cache model nặng của loại trước được giải phóng.
+- Đặt `PRELOAD_BGE_M3=true` trên máy đủ RAM nếu cần giảm cold-start cho request `/embedding` đầu tiên. Môi trường RAM hạn chế nên giữ `false`.
+
 Truy cập Swagger UI tại: `http://localhost:8000/docs`
 
 ---
@@ -399,6 +410,7 @@ Tạo file `.env` từ `.env.example`:
 | `MODEL_WEIGHTS_DIR` | `weights` | Thư mục chứa weights |
 | `API_SERVICE_URL` | `http://localhost:3000` | URL của NestJS backend |
 | `HF_HOME` | `.cache/huggingface` | Cache Hugging Face models |
+| `PRELOAD_BGE_M3` | `false` | `false`: lazy-load BGE-M3 khi gọi `/embedding`, giảm RAM cho review-filter; `true`: preload để giảm độ trễ embedding đầu tiên, chỉ dùng khi máy đủ RAM. |
 | `TWO_TOWER_VOCAB_PATH` | `weights/vocab.pkl` | Đường dẫn vocab Two-Tower |
 | `TWO_TOWER_WEIGHTS_PATH` | `weights/best_model.weights.h5` | Đường dẫn weights Two-Tower |
 | `TF_ENABLE_ONEDNN_OPTS` | `0` | Tắt TensorFlow oneDNN (tránh warning) |

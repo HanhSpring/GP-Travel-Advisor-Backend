@@ -26,6 +26,8 @@ async def lifespan(app: FastAPI):
         
     logger.info("✅ AI Service ready")
     yield
+    from app.api.v1.endpoints.review_pipeline import discard_pipeline_executor
+    discard_pipeline_executor()
     logger.info("🛑 AI Service shutting down")
 
 

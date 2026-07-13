@@ -11,8 +11,12 @@ class PipelineRunRequest(BaseModel):
     classifier_confidence_threshold: float = Field(0.55, description="Nguong tin cay PhoBERT")
     classifier_ambiguity_margin: float = Field(0.10, description="Bien do phan biet nhan PhoBERT")
     conflict_score_threshold: float = Field(0.65, description="Nguong xac nhan xung dot")
-    candidate_mode: str = Field("all", description="'all' | 'topk'")
-    top_k: int = Field(5, description="So candidate toi da khi candidate_mode='topk'")
+    max_candidates_per_review: Optional[int] = Field(
+        None,
+        ge=0,
+        le=1000,
+        description="So review dai han toi da so sanh voi moi review ngan han; 0 hoac None la khong gioi han",
+    )
     promotion_mode: str = Field("representative", description="'representative' | 'all'")
     ttl_hours_by_topic: Optional[Dict[str, int]] = None
     lookback_multiplier_by_topic: Optional[Dict[str, int]] = None

@@ -35,6 +35,7 @@ class Settings(BaseSettings):
     api_service_url: str = "http://localhost:3000"
     hf_home: str = ".cache/huggingface"
     hf_token: Optional[str] = None
+    preload_bge_m3: bool = False
 
     # Supabase (service_role bypasses RLS)
     supabase_url: str = ""
@@ -47,7 +48,7 @@ class Settings(BaseSettings):
     # PhoBERT path (optional)
     phobert_time_model_path: Optional[str] = None
     phobert_time_model_r2_prefix: Optional[str] = None
-    phobert_time_model_cache_dir: str = "/tmp/ai_cache/phobert_timelabel/checkpoint-264"
+    phobert_time_model_cache_dir: str = "/tmp/ai_cache/phobert_timelabel/checkpoint-476"
 
     # Recommender local paths
     reco_artifact_dir: str = "recommender_artifacts"

@@ -1,7 +1,9 @@
 from app.core.logger import get_logger
+from threading import Lock
 
 logger = get_logger(__name__)
 _models: dict = {}
+_model_load_lock = Lock()
 
 
 def load_all_models():
@@ -9,7 +11,14 @@ def load_all_models():
     # Download artifact từ Cloudflare R2 nếu chưa có local.
     _ensure_remote_artifacts()
 
-    _load_bge_m3()
+    # BGE-M3 is large and unrelated to review filtering. On memory-constrained
+    # hosts it is loaded lazily by get_model(); deployments that prioritize the
+    # /embedding cold-start latency can explicitly preload it.
+    from app.core.config import settings
+    if settings.preload_bge_m3:
+        _load_bge_m3()
+    else:
+        logger.info("BGE-M3 preload disabled; it will be loaded on first /embedding request")
     _load_two_tower()
     _load_content_based()
     _load_collaborative()
@@ -200,4 +209,28 @@ def _load_review_classifier():
 
 
 def get_model(name: str):
+    if name == "bge_m3" and name not in _models:
+        with _model_load_lock:
+            if name not in _models:
+                logger.info("Lazy-loading BGE-M3 for the first embedding request")
+                _load_bge_m3()
     return _models.get(name)
+
+
+def unload_model(name: str) -> bool:
+    """Drop a cached model and return whether an instance was released."""
+    model = _models.pop(name, None)
+    if model is None:
+        return False
+
+    del model
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    logger.info("Unloaded model: %s", name)
+    return True
