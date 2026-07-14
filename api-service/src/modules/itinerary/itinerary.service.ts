@@ -306,7 +306,7 @@ export class ItineraryService {
     const { data, error } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('itinerary_id, places(image_url)')
+      .select('id, itinerary_id, detail_type, places(image_url)')
       .in('itinerary_id', itineraryIds);
 
     if (error) {
@@ -314,10 +314,20 @@ export class ItineraryService {
       return stats;
     }
 
+    // Dòng khách sạn không phải "địa điểm tham quan" — loại khỏi
+    // totalLocations VÀ visitedLocations, khớp với cách các màn khác đếm
+    // địa điểm (bỏ qua khách sạn, xem DayCostCalculator.visitActivities()).
+    const hotelDetailIds = new Set(
+      (data ?? [])
+        .filter((row: any) => row.detail_type === 'HOTEL')
+        .map((row: any) => row.id),
+    );
+
     for (const row of data ?? []) {
       const itineraryId = (row as any).itinerary_id;
       const current = stats.get(itineraryId);
       if (!current) continue;
+      if ((row as any).detail_type === 'HOTEL') continue;
       current.totalLocations += 1;
       const place = Array.isArray((row as any).places)
         ? (row as any).places[0]
@@ -352,8 +362,10 @@ export class ItineraryService {
     for (const v of visits ?? []) {
       const itineraryId = (v as any).itinerary_id;
       if (!stats.has(itineraryId)) continue;
+      const detailId = (v as any).itinerary_detail_id;
+      if (hotelDetailIds.has(detailId)) continue;
       const set = visitedDetailIds.get(itineraryId) ?? new Set<string>();
-      set.add((v as any).itinerary_detail_id);
+      set.add(detailId);
       visitedDetailIds.set(itineraryId, set);
     }
     for (const [itineraryId, detailIds] of visitedDetailIds) {
@@ -421,12 +433,14 @@ export class ItineraryService {
     const metadataByItinerary = new Map(
       (itineraryRows ?? []).map((row: any) => [row.id, row]),
     );
-    const { childPriceRatio } = await this.tripCostConfig.getConfig();
 
-    return {
-      ...payload,
-      itineraries: itineraries.map((item: any) => {
+    const enriched = await Promise.all(
+      itineraries.map(async (item: any) => {
         const metadata: any = metadataByItinerary.get(item.id);
+        // itineraries.estimated_cost là NGÂN SÁCH người dùng tự nhập (mức có
+        // thể chi trả) — KHÔNG phải chi phí ước tính thật của kế hoạch, dù
+        // tên cột dễ gây nhầm. Giữ lại field này riêng cho UI nào cần hiện
+        // ngân sách, không dùng để suy ra estimatedCostForGroup nữa.
         const estimatedCost = Math.max(
           0,
           Math.round(
@@ -444,11 +458,26 @@ export class ItineraryService {
           ),
         );
         const participantCount = Math.max(1, adultCount + childCount);
-        // Display-only, computed fresh from the per-adult estimatedCost —
-        // never stored, never divided back (see plan §D).
-        const estimatedCostForGroup = Math.round(
-          estimatedCost * adultCount + estimatedCost * childPriceRatio * childCount,
-        );
+
+        // Chi phí hiển thị ở danh sách là TỔNG CẢ CHUYẾN (đã gồm khách sạn +
+        // 10% dự trù) — cùng con số với Sổ chi tiêu (roundedGroupTotal).
+        // Chỉ riêng "số địa điểm" bên cạnh mới không tính khách sạn (khách
+        // sạn không phải "địa điểm tham quan"), 2 con số này khác phạm vi
+        // nhau là có chủ đích, không phải cần khớp nhau.
+        let estimatedCostForGroup = 0;
+        try {
+          const result = await this.computeGroupEstimatedCost(
+            item.id,
+            adultCount,
+            childCount,
+          );
+          estimatedCostForGroup = result.roundedGroupTotal;
+        } catch (err: any) {
+          this.logger.warn(
+            `Cannot compute estimated cost for itinerary ${item.id}: ${err?.message ?? err}`,
+          );
+        }
+
         return {
           ...item,
           estimated_cost: estimatedCost,
@@ -461,6 +490,11 @@ export class ItineraryService {
           participantCount,
         };
       }),
+    );
+
+    return {
+      ...payload,
+      itineraries: enriched,
     };
   }
 
@@ -2871,8 +2905,11 @@ export class ItineraryService {
           open_hour_compressed: place?.open_hour_compressed ?? null,
           latitude: place?.latitude,
           longitude: place?.longitude,
-          rating: place?.average_rating || 4.5,
-          reviewCount: place?.review_count || 100,
+          // FIX: '||' coi 0 là falsy nên địa điểm CHƯA CÓ đánh giá thật (rating
+          // = 0) bị đè thành 4.5/100 giả — dùng '??' để chỉ fallback khi thật
+          // sự null/undefined, giữ nguyên số 0 hợp lệ.
+          rating: place?.average_rating ?? 0,
+          reviewCount: place?.review_count ?? 0,
           status: visitStatusByDetailId.get(act.id) ?? 'chuaDi',
         };
       });
@@ -3026,8 +3063,19 @@ export class ItineraryService {
     const { childPriceRatio } = await this.tripCostConfig.getConfig();
     // Display-only, computed fresh every time from the canonical per-adult
     // total — never stored, never divided back (see plan §D).
+    // FIX: trẻ em phải cộng ĐÚNG 3 thành phần (địa điểm × ratio + khách sạn
+    // × ratio + xăng xe KHÔNG nhân ratio, chia đều theo đầu người thật) —
+    // trước đây nhân cả estimatedTripCost (đã gồm xăng xe) theo ratio, làm
+    // phần xăng xe bị nhân ratio sai, y hệt lỗi đã sửa ở
+    // IncurredCostsService.computeCostBreakdown().
+    const transportPerAdultForChild =
+      Math.round(transportCost / participantCount / 1000) * 1000;
+    const childBaseCost =
+      placeCost * childPriceRatio +
+      hotelCost * childPriceRatio +
+      transportPerAdultForChild;
     const estimatedCostForGroup = Math.round(
-      estimatedTripCost * adultCount + estimatedTripCost * childPriceRatio * childCount,
+      estimatedTripCost * adultCount + childBaseCost * childCount,
     );
 
     return {
@@ -3830,6 +3878,60 @@ export class ItineraryService {
         transportCost,
         participantCount,
       ),
+    };
+  }
+
+  /**
+   * "Chi phí ước tính của tất cả thành viên" — NGUỒN DUY NHẤT dùng bởi cả
+   * danh sách lịch trình (withEstimatedListCosts) và Sổ chi tiêu
+   * (IncurredCostsService.computeCostBreakdown). Trước đây danh sách lịch
+   * trình tự tính riêng bằng itineraries.estimated_cost (thực ra là NGÂN
+   * SÁCH người dùng nhập — "mức có thể chi trả", không phải chi phí ước
+   * tính thật), khiến 2 màn hiện 2 con số khác hẳn nhau cho cùng 1 lịch
+   * trình. Trẻ em: ăn uống/lưu trú nhân childPriceRatio, xăng xe DÙNG CHUNG
+   * 1 mức với người lớn (chia theo đầu người thật, không phải theo giá vé).
+   *
+   * [roundedGroupTotal] là số NÊN HIỂN THỊ ra UI (đã gồm 10% dự trù, làm
+   * tròn từng người đến hàng trăm nghìn rồi mới nhân số người — quy ước
+   * dùng chung toàn hệ thống, xem IncurredCostsService.computeCostBreakdown).
+   * [estimatedCostForGroup] (chưa dự trù) chỉ để tham chiếu/so sánh.
+   */
+  async computeGroupEstimatedCost(
+    itineraryId: string,
+    adultCount: number,
+    childCount: number,
+  ): Promise<{
+    estimatedCostForGroup: number;
+    estimatedCostPerAdult: number;
+    estimatedCostPerChild: number;
+    roundedGroupTotal: number;
+  }> {
+    const { calculatedTripCost, placeCost, hotelCost, transportCost } =
+      await this.calculateTripCostBreakdown(itineraryId);
+    const { childPriceRatio } = await this.tripCostConfig.getConfig();
+
+    const participantCount = Math.max(1, adultCount + childCount);
+    const transportPerAdult =
+      Math.round(transportCost / participantCount / 1000) * 1000;
+    const childBaseCost =
+      placeCost * childPriceRatio + hotelCost * childPriceRatio + transportPerAdult;
+
+    const reserveRate = 0.1;
+    const roundedCostPerAdult =
+      Math.round((calculatedTripCost * (1 + reserveRate)) / 100000) * 100000;
+    const roundedCostPerChild =
+      childCount > 0
+        ? Math.round((childBaseCost * (1 + reserveRate)) / 100000) * 100000
+        : 0;
+
+    return {
+      estimatedCostForGroup: Math.round(
+        calculatedTripCost * adultCount + childBaseCost * childCount,
+      ),
+      estimatedCostPerAdult: Math.round(calculatedTripCost),
+      estimatedCostPerChild: Math.round(childBaseCost),
+      roundedGroupTotal:
+        roundedCostPerAdult * adultCount + roundedCostPerChild * childCount,
     };
   }
 

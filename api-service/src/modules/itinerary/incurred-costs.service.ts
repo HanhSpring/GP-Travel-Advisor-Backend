@@ -590,24 +590,34 @@ export class IncurredCostsService {
    * chuyển "completed" (itinerary-tracking.service.ts hook vào đây).
    */
   /**
-   * Card 2: "chi phí thực tế đã tiêu" — không cộng thẳng toàn bộ
-   * incurred_costs, mà chỉ tính giá hiệu lực (đã gồm price_adjustment) của
-   * những ĐỊA ĐIỂM ĐÃ ĐI, cộng với chi phí phát sinh gắn với 1 địa điểm đã đi
-   * (hoặc không gắn địa điểm nào). Chi phí phát sinh gắn với 1 địa điểm CHƯA
-   * đi thì không tính — validatePlaceId() vốn đã chặn việc tạo mới trường
-   * hợp này, tình huống này chỉ có thể xảy ra nếu status visit bị đổi lại
-   * sau khi đã tạo cost.
+   * Nguồn "chi phí thực tế" DÙNG CHUNG cho Card 2 (spentSoFar) và Card 3 (mỗi
+   * người phải trả) — không cộng thẳng toàn bộ incurred_costs/kế hoạch, mà
+   * chỉ tính giá hiệu lực (đã gồm price_adjustment) của những ĐỊA ĐIỂM ĐÃ ĐI
+   * (khách sạn tính đủ 100% ngay khi dòng khách sạn được đánh dấu đã đi/check-in
+   * — không có giá/đêm riêng trong schema nên không thể chia theo số đêm thực
+   * tế đã qua), cộng với chi phí phát sinh gắn với 1 địa điểm đã đi (hoặc
+   * không gắn địa điểm nào). Chi phí phát sinh gắn với 1 địa điểm CHƯA đi thì
+   * không tính — validatePlaceId() vốn đã chặn việc tạo mới trường hợp này,
+   * tình huống này chỉ có thể xảy ra nếu status visit bị đổi lại sau khi đã
+   * tạo cost.
    */
-  private async computeSpentSoFar(
+  private async computeActualSpending(
     itineraryId: string,
-    adhocCosts: Array<{ amount: number; placeId: string | null }>,
-  ): Promise<number> {
+    adhocCosts: Array<{ amount: number; chargedTo: string[]; placeId: string | null }>,
+  ): Promise<{
+    spentSoFar: number;
+    /** Per-adult, chỉ địa điểm/khách sạn ĐÃ ĐI (không gồm xăng xe — khớp
+     * spentSoFar). Dùng làm gốc chia cho distributeCosts() ở Card 3. */
+    actualBaseCost: number;
+    visitedIncurredCosts: Array<{ amount: number; chargedTo: string[] }>;
+  }> {
     const visitedDetailIds = await this.getVisitedDetailIds(itineraryId);
     const { placeCost, hotelCost } =
       await this.itineraryService.calculateTripCostBreakdown(
         itineraryId,
         visitedDetailIds,
       );
+    const actualBaseCost = placeCost + hotelCost;
 
     const { data: detailRows, error } = await supabase
       .schema('travel')
@@ -625,11 +635,19 @@ export class IncurredCostsService {
         .map((d: any) => d.place_id as string),
     );
 
-    const adhocSpent = adhocCosts
-      .filter((cost) => !cost.placeId || visitedPlaceIds.has(cost.placeId))
-      .reduce((sum, cost) => sum + cost.amount, 0);
+    const visitedIncurredCosts = adhocCosts.filter(
+      (cost) => !cost.placeId || visitedPlaceIds.has(cost.placeId),
+    );
+    const adhocSpent = visitedIncurredCosts.reduce(
+      (sum, cost) => sum + cost.amount,
+      0,
+    );
 
-    return Math.round(placeCost + hotelCost + adhocSpent);
+    return {
+      spentSoFar: Math.round(actualBaseCost + adhocSpent),
+      actualBaseCost,
+      visitedIncurredCosts,
+    };
   }
 
   async computeCostBreakdown(itineraryId: string): Promise<{
@@ -717,50 +735,22 @@ export class IncurredCostsService {
     const { childPriceRatio, transportCostPerKm } =
       await this.tripCostConfig.getConfig();
     const memberIds = profileList.map((p) => p.id);
+
+    // Card 3 "mỗi người phải trả" dùng CHI PHÍ THỰC TẾ (chỉ địa điểm đã đi +
+    // chi phí phát sinh gắn với địa điểm đã đi), KHÔNG dùng chi phí kế hoạch
+    // tĩnh nữa — khớp đúng triết lý của Card 2 (spentSoFar) để 2 con số không
+    // lệch nhau về ý nghĩa.
+    const { spentSoFar, actualBaseCost, visitedIncurredCosts } =
+      await this.computeActualSpending(itineraryId, incurredCosts);
     const { totals, childrenShare, childrenAssignedTo } = distributeCosts(
       memberIds,
       ctx.creatorId,
       ctx.childCount,
       childPriceRatio,
-      calculatedTripCost,
-      incurredCosts,
+      actualBaseCost,
+      visitedIncurredCosts,
     );
 
-    const spentSoFar = await this.computeSpentSoFar(
-      itineraryId,
-      incurredCosts,
-    );
-    // Same "group total" formula used throughout (see
-    // itinerary.service.ts's estimatedCostForGroup) — applied to both the
-    // estimated cost and the user's payable limit. Computed fresh every
-    // time, never stored, never divided back.
-    const estimatedCostForGroup = Math.round(
-      calculatedTripCost * ctx.adultCount +
-        calculatedTripCost * childPriceRatio * ctx.childCount,
-    );
-    const payableLimitForGroup = Math.round(
-      ctx.userBudget * ctx.adultCount +
-        ctx.userBudget * childPriceRatio * ctx.childCount,
-    );
-    // Dự trù 10% và làm tròn hàng trăm nghìn áp dụng cho TỪNG NGƯỜI (không
-    // phải làm tròn tổng nhóm rồi chia ngược) — vì chi phí thực tế sẽ được
-    // chia sẻ riêng cho từng người, không phải một quỹ chung. roundedGroupTotal
-    // chỉ là tổng suy ra từ 2 mức đã làm tròn này, không phải nguồn số liệu gốc.
-    const reserveRate = 0.1;
-    const roundedCostPerAdult =
-      Math.round((calculatedTripCost * (1 + reserveRate)) / 100000) * 100000;
-    const roundedCostPerChild =
-      ctx.childCount > 0
-        ? Math.round(
-            (calculatedTripCost * childPriceRatio * (1 + reserveRate)) /
-              100000,
-          ) * 100000
-        : 0;
-    const roundedGroupTotal =
-      roundedCostPerAdult * ctx.adultCount +
-      roundedCostPerChild * ctx.childCount;
-    const reserveCost = Math.round(estimatedCostForGroup * reserveRate);
-    const contingencyCost = roundedGroupTotal - estimatedCostForGroup;
     // Breakdown cho UI "Quản lý chi phí" xổ ra khi bấm vào dòng người
     // lớn/trẻ em (mục "Địa điểm & ăn uống" / "Lưu trú" / "Xăng xe/tự túc").
     // placeCost/hotelCost đã per-adult sẵn (xem itinerary.service.ts) — trẻ
@@ -770,6 +760,47 @@ export class IncurredCostsService {
     const participantCount = Math.max(1, ctx.adultCount + ctx.childCount);
     const transportPerAdult =
       Math.round(transportCost / participantCount / 1000) * 1000;
+    // FIX: chi phí trẻ em phải cộng ĐÚNG 3 thành phần được hiển thị (địa điểm
+    // × ratio + khách sạn × ratio + xăng xe KHÔNG nhân ratio) — trước đây
+    // dùng calculatedTripCost × ratio, tức là nhân ratio luôn cả phần xăng xe
+    // bên trong calculatedTripCost, trái với transportPerAdult hiển thị (dùng
+    // chung, không nhân ratio). Chênh lệch đó lộ ra thành số "phí dự trù" vô
+    // lý ở dòng trẻ em vì phí dự trù được suy ra bằng phép trừ, hấp thụ luôn
+    // phần sai số này.
+    const childBaseCost =
+      placeCost * childPriceRatio + hotelCost * childPriceRatio + transportPerAdult;
+
+    // Same "group total" formula used throughout (see
+    // itinerary.service.ts's estimatedCostForGroup) — applied to both the
+    // estimated cost and the user's payable limit. Computed fresh every
+    // time, never stored, never divided back.
+    const estimatedCostForGroup = Math.round(
+      calculatedTripCost * ctx.adultCount + childBaseCost * ctx.childCount,
+    );
+    const payableLimitForGroup = Math.round(
+      ctx.userBudget * ctx.adultCount +
+        ctx.userBudget * childPriceRatio * ctx.childCount,
+    );
+    // Dự trù 10% áp dụng cho TỪNG NGƯỜI, làm tròn đến hàng trăm nghìn — quy
+    // ước DÙNG CHUNG cho cả người lớn và trẻ em (không phải làm tròn tổng
+    // nhóm rồi chia ngược): mỗi người làm tròn xong mới nhân số người để ra
+    // roundedGroupTotal, để tổng nhóm luôn khớp bội số 100.000 gọn gàng.
+    const reserveRate = 0.1;
+    const roundedCostPerAdult =
+      Math.round((calculatedTripCost * (1 + reserveRate)) / 100000) * 100000;
+    const roundedCostPerChild =
+      ctx.childCount > 0
+        ? Math.round((childBaseCost * (1 + reserveRate)) / 100000) * 100000
+        : 0;
+    const roundedGroupTotal =
+      roundedCostPerAdult * ctx.adultCount +
+      roundedCostPerChild * ctx.childCount;
+    const contingencyCost = roundedGroupTotal - estimatedCostForGroup;
+    // reserveCost dùng LẠI đúng contingencyCost (thay vì tự tính riêng
+    // estimatedCostForGroup × 10%) — 2 công thức trước đây ra 2 con số "dự
+    // trù" khác nhau ở 2 chỗ hiển thị khác nhau trong app, gây lệch số y hệt
+    // lỗi ở trên.
+    const reserveCost = contingencyCost;
 
     return {
       memberTotals: profileList.map((p) => ({
@@ -787,7 +818,7 @@ export class IncurredCostsService {
       spentSoFar,
       estimatedCostForGroup,
       estimatedCostPerAdult: Math.round(calculatedTripCost),
-      estimatedCostPerChild: Math.round(calculatedTripCost * childPriceRatio),
+      estimatedCostPerChild: Math.round(childBaseCost),
       payableLimitForGroup,
       payableLimitPerAdult: Math.round(ctx.userBudget),
       payableLimitPerChild: Math.round(ctx.userBudget * childPriceRatio),
