@@ -128,7 +128,7 @@ export class DashboardService {
     return next;
   }
 
-  // ─── Active Users Chart ──────────────────────────────────────────────
+  // ─── New Registered Users Chart ─────────────────────────────────────
   async getActiveUsersChart(
     month?: number,
     week?: number,
@@ -177,7 +177,7 @@ export class DashboardService {
 
     const bucketStart = new Date(`${startDate}T00:00:00.000Z`);
     const bucketEnd = new Date(`${endDate}T00:00:00.000Z`);
-    const bucketUserIds = new Map<string, Set<string>>();
+    const bucketCounts = new Map<string, number>();
 
     for (
       let cursor = new Date(bucketStart);
@@ -187,30 +187,29 @@ export class DashboardService {
           ? this.addUtcMonths(cursor, 1)
           : this.addUtcDays(cursor, 1)
     ) {
-      bucketUserIds.set(this.formatDateKey(cursor), new Set<string>());
+      bucketCounts.set(this.formatDateKey(cursor), 0);
     }
 
     const exclusiveEnd = this.addUtcDays(bucketEnd, 1);
 
     const { data, error } = await supabase
-      .schema('travel')
-      .from('activity_logs')
-      .select('tourist_id, created_at')
+      .from('users')
+      .select('id, created_at')
       .gte('created_at', startDate)
       .lt('created_at', this.formatDateKey(exclusiveEnd));
 
     if (error) {
       throw new InternalServerErrorException(
-        `Lỗi khi lấy dữ liệu biểu đồ: ${error.message}`,
+        `Lỗi khi lấy dữ liệu biểu đồ user mới đăng ký: ${error.message}`,
       );
     }
 
     for (const row of (data ?? []) as Array<{
-      tourist_id: string | null;
+      id: string | null;
       created_at: string | null;
     }>) {
-      if (!row.tourist_id || !row.created_at) continue;
-      const createdAt = new Date(`${row.created_at.replace(' ', 'T')}Z`);
+      if (!row.id || !row.created_at) continue;
+      const createdAt = new Date(row.created_at);
       const bucketDate =
         intervalText === '1 month'
           ? new Date(
@@ -223,18 +222,17 @@ export class DashboardService {
                 createdAt.getUTCDate(),
               ),
             );
-      bucketUserIds.get(this.formatDateKey(bucketDate))?.add(row.tourist_id);
+      const bucketKey = this.formatDateKey(bucketDate);
+      bucketCounts.set(bucketKey, (bucketCounts.get(bucketKey) ?? 0) + 1);
     }
 
-    const result = Array.from(bucketUserIds.entries()).map(
-      ([key, userIds]) => ({
-        date: this.formatChartLabel(
-          new Date(`${key}T00:00:00.000Z`),
-          intervalText,
-        ),
-        users: userIds.size,
-      }),
-    );
+    const result = Array.from(bucketCounts.entries()).map(([key, count]) => ({
+      date: this.formatChartLabel(
+        new Date(`${key}T00:00:00.000Z`),
+        intervalText,
+      ),
+      users: count,
+    }));
 
     this.setCachedChart(cacheKey, result);
     return result;
@@ -442,9 +440,10 @@ export class DashboardService {
 
     const now = new Date();
     const startOfMonth = new Date(
-      now.getFullYear(),
-      now.getMonth(),
-      1,
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1),
+    ).toISOString();
+    const startOfNextMonth = new Date(
+      Date.UTC(now.getUTCFullYear(), now.getUTCMonth() + 1, 1),
     ).toISOString();
 
     const [
@@ -460,8 +459,9 @@ export class DashboardService {
       }),
       supabase
         .from('users')
-        .select('id', { count: 'estimated', head: true })
-        .gte('created_at', startOfMonth),
+        .select('id', { count: 'exact', head: true })
+        .gte('created_at', startOfMonth)
+        .lt('created_at', startOfNextMonth),
       supabase
         .schema('review_ai')
         .from('reviews')
