@@ -64,7 +64,6 @@ export class DashboardService {
   } | null = null;
   private readonly STATS_CACHE_TTL_MS = 2 * 60 * 1000;
 
-
   // ─── Cache helpers ───────────────────────────────────────────────────
   private getCachedPlaces(key: string): PopularPlaceStats[] | null {
     const entry = this._placesCache.get(key);
@@ -104,6 +103,29 @@ export class DashboardService {
     this._chartCache.clear();
     this._interactionCache = null;
     this._statsCache = null;
+  }
+
+  private formatDateKey(date: Date): string {
+    return date.toISOString().slice(0, 10);
+  }
+
+  private formatChartLabel(date: Date, intervalText: string): string {
+    const day = String(date.getUTCDate()).padStart(2, '0');
+    const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+    const year = date.getUTCFullYear();
+    return intervalText === '1 month' ? `${month}/${year}` : `${day}/${month}`;
+  }
+
+  private addUtcDays(date: Date, days: number): Date {
+    const next = new Date(date);
+    next.setUTCDate(next.getUTCDate() + days);
+    return next;
+  }
+
+  private addUtcMonths(date: Date, months: number): Date {
+    const next = new Date(date);
+    next.setUTCMonth(next.getUTCMonth() + months);
+    return next;
   }
 
   // ─── Active Users Chart ──────────────────────────────────────────────
@@ -153,14 +175,29 @@ export class DashboardService {
       }
     }
 
-    const { data, error } = (await supabase.rpc('get_active_users_chart', {
-      p_start_date: startDate,
-      p_end_date: endDate,
-      p_interval: intervalText,
-    })) as {
-      data: Array<{ time_label: unknown; users_count: unknown }> | null;
-      error: { message: string } | null;
-    };
+    const bucketStart = new Date(`${startDate}T00:00:00.000Z`);
+    const bucketEnd = new Date(`${endDate}T00:00:00.000Z`);
+    const bucketUserIds = new Map<string, Set<string>>();
+
+    for (
+      let cursor = new Date(bucketStart);
+      cursor <= bucketEnd;
+      cursor =
+        intervalText === '1 month'
+          ? this.addUtcMonths(cursor, 1)
+          : this.addUtcDays(cursor, 1)
+    ) {
+      bucketUserIds.set(this.formatDateKey(cursor), new Set<string>());
+    }
+
+    const exclusiveEnd = this.addUtcDays(bucketEnd, 1);
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('activity_logs')
+      .select('tourist_id, created_at')
+      .gte('created_at', startDate)
+      .lt('created_at', this.formatDateKey(exclusiveEnd));
 
     if (error) {
       throw new InternalServerErrorException(
@@ -168,10 +205,36 @@ export class DashboardService {
       );
     }
 
-    const result = (data ?? []).map((row) => ({
-      date: String(row.time_label),
-      users: Number(row.users_count),
-    }));
+    for (const row of (data ?? []) as Array<{
+      tourist_id: string | null;
+      created_at: string | null;
+    }>) {
+      if (!row.tourist_id || !row.created_at) continue;
+      const createdAt = new Date(`${row.created_at.replace(' ', 'T')}Z`);
+      const bucketDate =
+        intervalText === '1 month'
+          ? new Date(
+              Date.UTC(createdAt.getUTCFullYear(), createdAt.getUTCMonth(), 1),
+            )
+          : new Date(
+              Date.UTC(
+                createdAt.getUTCFullYear(),
+                createdAt.getUTCMonth(),
+                createdAt.getUTCDate(),
+              ),
+            );
+      bucketUserIds.get(this.formatDateKey(bucketDate))?.add(row.tourist_id);
+    }
+
+    const result = Array.from(bucketUserIds.entries()).map(
+      ([key, userIds]) => ({
+        date: this.formatChartLabel(
+          new Date(`${key}T00:00:00.000Z`),
+          intervalText,
+        ),
+        users: userIds.size,
+      }),
+    );
 
     this.setCachedChart(cacheKey, result);
     return result;
@@ -241,6 +304,87 @@ export class DashboardService {
       return this._interactionCache.data;
     }
 
+    const [usersResult, itinerariesResult] = await Promise.all([
+      supabase
+        .from('users')
+        .select('id')
+        .eq('role', 'TOURIST')
+        .eq('is_active', '1'),
+      supabase
+        .schema('travel')
+        .from('itineraries')
+        .select('creator_id, status')
+        .eq('is_deleted', false),
+    ]);
+
+    const queryError = usersResult.error || itinerariesResult.error;
+    if (queryError) {
+      throw new InternalServerErrorException(
+        `Lá»—i khi tÃ­nh toÃ¡n tÆ°Æ¡ng tÃ¡c ngÆ°á»i dÃ¹ng: ${queryError.message}`,
+      );
+    }
+
+    const touristIds = new Set(
+      ((usersResult.data ?? []) as Array<{ id: string | null }>)
+        .map((user) => user.id)
+        .filter((id): id is string => Boolean(id)),
+    );
+    const tripStatsByUser = new Map<
+      string,
+      { totalTrips: number; completedTrips: number }
+    >();
+
+    for (const userId of touristIds) {
+      tripStatsByUser.set(userId, { totalTrips: 0, completedTrips: 0 });
+    }
+
+    for (const itinerary of (itinerariesResult.data ?? []) as Array<{
+      creator_id: string | null;
+      status: string | null;
+    }>) {
+      if (!itinerary.creator_id || !touristIds.has(itinerary.creator_id)) {
+        continue;
+      }
+      const stats = tripStatsByUser.get(itinerary.creator_id) ?? {
+        totalTrips: 0,
+        completedTrips: 0,
+      };
+      stats.totalTrips += 1;
+      if (itinerary.status === 'completed') {
+        stats.completedTrips += 1;
+      }
+      tripStatsByUser.set(itinerary.creator_id, stats);
+    }
+
+    const totalValidUsers = touristIds.size || 1;
+    let noInteractionUsers = 0;
+    let createdTripUsers = 0;
+    let completedTripUsers = 0;
+
+    for (const stats of tripStatsByUser.values()) {
+      if (stats.totalTrips === 0) {
+        noInteractionUsers += 1;
+      } else if (stats.completedTrips > 0) {
+        completedTripUsers += 1;
+      } else {
+        createdTripUsers += 1;
+      }
+    }
+
+    const interactionResult: UserInteractionStats = {
+      noInteraction: Math.round((noInteractionUsers / totalValidUsers) * 100),
+      createdTrip: Math.round((createdTripUsers / totalValidUsers) * 100),
+      completedTrip: Math.round((completedTripUsers / totalValidUsers) * 100),
+    };
+
+    this._interactionCache = {
+      data: interactionResult,
+      expiresAt: Date.now() + this.INTERACTION_CACHE_TTL_MS,
+    };
+
+    return interactionResult;
+    /*
+
     const { data, error } = (await supabase.rpc(
       'get_user_interaction_stats',
     )) as {
@@ -287,6 +431,7 @@ export class DashboardService {
     };
 
     return result;
+    */
   }
 
   // ─── Dashboard Stats (tổng hợp, 1 call thay 4 calls) ────────────────
@@ -295,37 +440,53 @@ export class DashboardService {
       return this._statsCache.data;
     }
 
-    const [rUsers, rReviewTotal, rReviewPending, rReviewViolation] =
-      await Promise.allSettled([
-        supabase.rpc('get_user_statistics'),
-        supabase
-          .schema('review_ai')
-          .from('reviews')
-          .select('id', { count: 'exact', head: true }),
-        supabase
-          .schema('review_ai')
-          .from('reviews')
-          .select('id', { count: 'exact', head: true })
-          .eq('status', 'pending'),
-        supabase
-          .schema('review_ai')
-          .from('reviews')
-          .select('id', { count: 'exact', head: true })
-          .eq('status', 'violation'),
-      ]);
+    const now = new Date();
+    const startOfMonth = new Date(
+      now.getFullYear(),
+      now.getMonth(),
+      1,
+    ).toISOString();
 
-    let totalUsers = 0;
-    let newUsersMonth = 0;
-    if (rUsers.status === 'fulfilled' && !rUsers.value.error) {
-      const d = rUsers.value.data as Array<{
-        total_users: number;
-        new_this_month: number;
-      }> | null;
-      if (d && d.length > 0) {
-        totalUsers = Number(d[0].total_users ?? 0);
-        newUsersMonth = Number(d[0].new_this_month ?? 0);
-      }
-    }
+    const [
+      rUserTotal,
+      rUserNewMonth,
+      rReviewTotal,
+      rReviewPending,
+      rReviewViolation,
+    ] = await Promise.allSettled([
+      supabase.from('users').select('id', {
+        count: 'estimated',
+        head: true,
+      }),
+      supabase
+        .from('users')
+        .select('id', { count: 'estimated', head: true })
+        .gte('created_at', startOfMonth),
+      supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('id', { count: 'estimated', head: true }),
+      supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('id', { count: 'estimated', head: true })
+        .eq('status', 'pending'),
+      supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('id', { count: 'estimated', head: true })
+        .eq('status', 'violation'),
+    ]);
+
+    const totalUsers =
+      rUserTotal.status === 'fulfilled'
+        ? Number(rUserTotal.value.count ?? 0)
+        : 0;
+
+    const newUsersMonth =
+      rUserNewMonth.status === 'fulfilled'
+        ? Number(rUserNewMonth.value.count ?? 0)
+        : 0;
     const totalReviews =
       rReviewTotal.status === 'fulfilled'
         ? Number(rReviewTotal.value.count ?? 0)

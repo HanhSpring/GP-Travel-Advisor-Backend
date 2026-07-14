@@ -1,7 +1,7 @@
 export class GetOrdersDto {
-  placeId: string;
+  placeId?: string;
   status?: string = 'all';
   restaurant?: string = 'all';
-  page?: number = 1;
-  limit?: number = 10;
+  page?: number | string = 1;
+  limit?: number | string = 10;
 }

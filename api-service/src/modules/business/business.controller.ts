@@ -104,8 +104,8 @@ export class BusinessController {
 
   @Get('dashboard')
   @ApiResponse({ type: DashboardDto })
-  getDashboard(@Query() query: VendorDto) {
-    return this.businessService.getDashboard(query.vendorId);
+  getDashboard(@Query() query: VendorDto, @Req() req: any) {
+    return this.businessService.getDashboard(query.vendorId || req.user.userId);
   }
 
   @Post('add-new-place')
@@ -145,7 +145,10 @@ export class BusinessController {
       // 👉 BỔ SUNG CÁC DÒNG DƯỚI ĐÂY ĐỂ TRUYỀN DỮ LIỆU SANG SERVICE
       p_open_time: body.p_open_time || body.openTime,
       p_close_time: body.p_close_time || body.closeTime,
-      p_open_hour_compressed: body.p_open_hour_compressed || body.openHourCompressed || body.open_hour_compressed,
+      p_open_hour_compressed:
+        body.p_open_hour_compressed ||
+        body.openHourCompressed ||
+        body.open_hour_compressed,
       p_description: body.p_description || body.description,
       p_images: this.parseFlexible(body.p_images || body.images),
     };
@@ -192,8 +195,10 @@ export class BusinessController {
 
   @Get('food-performance')
   @ApiOperation({ summary: 'Hiệu suất món ăn theo vendor' })
-  getFoodPerformance(@Query() query: VendorDto) {
-    return this.businessService.getFoodPerformance(query.vendorId);
+  getFoodPerformance(@Query() query: VendorDto, @Req() req: any) {
+    return this.businessService.getFoodPerformance(
+      query.vendorId || req.user.userId,
+    );
   }
 
   @Put('update-order-status')
@@ -204,8 +209,11 @@ export class BusinessController {
 
   @Get('orders/filter')
   @ApiResponse({ type: [OrderItemDto] })
-  getFilteredOrders(@Query() query: GetOrdersDto) {
-    return this.businessService.getFilteredOrders(query);
+  getFilteredOrders(@Query() query: GetOrdersDto, @Req() req: any) {
+    return this.businessService.getFilteredOrdersForVendor(
+      query,
+      req.user.userId,
+    );
   }
 
   // ── Menu item CRUD ──────────────────────────────────────────────────────────
