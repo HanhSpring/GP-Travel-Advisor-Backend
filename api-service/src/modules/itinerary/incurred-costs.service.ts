@@ -651,11 +651,22 @@ export class IncurredCostsService {
     payableLimitForGroup: number;
     payableLimitPerAdult: number;
     payableLimitPerChild: number;
+    // Tổng cả nhóm đã gồm 10% dự trù, làm tròn đến hàng trăm nghìn — dùng để
+    // hiển thị con số "to nhất" và làm ngưỡng so sánh cảnh báo vượt ngân sách
+    // (thay cho việc mỗi màn tự làm tròn/suy dự trù một kiểu khác nhau).
+    reserveCost: number;
+    roundedGroupTotal: number;
+    contingencyCost: number;
+    roundedCostPerAdult: number;
+    roundedCostPerChild: number;
     placeCostPerAdult: number;
     placeCostPerChild: number;
     hotelCostPerAdult: number;
     hotelCostPerChild: number;
     transportPerAdult: number;
+    // Minh bạch cho UI: hiển thị rõ "Địa điểm/Lưu trú trẻ em = người lớn ×
+    // childPriceRatio" thay vì chỉ hiện số trẻ em không rõ căn cứ.
+    childPriceRatio: number;
     // Minh bạch cho UI: mức giá/km hiện đang dùng để tính transportPerAdult,
     // để user hiểu con số đó từ đâu ra thay vì thấy "thấp" mà không rõ căn cứ.
     transportRatePerKm: { motorbike: number; car: number };
@@ -731,6 +742,25 @@ export class IncurredCostsService {
       ctx.userBudget * ctx.adultCount +
         ctx.userBudget * childPriceRatio * ctx.childCount,
     );
+    // Dự trù 10% và làm tròn hàng trăm nghìn áp dụng cho TỪNG NGƯỜI (không
+    // phải làm tròn tổng nhóm rồi chia ngược) — vì chi phí thực tế sẽ được
+    // chia sẻ riêng cho từng người, không phải một quỹ chung. roundedGroupTotal
+    // chỉ là tổng suy ra từ 2 mức đã làm tròn này, không phải nguồn số liệu gốc.
+    const reserveRate = 0.1;
+    const roundedCostPerAdult =
+      Math.round((calculatedTripCost * (1 + reserveRate)) / 100000) * 100000;
+    const roundedCostPerChild =
+      ctx.childCount > 0
+        ? Math.round(
+            (calculatedTripCost * childPriceRatio * (1 + reserveRate)) /
+              100000,
+          ) * 100000
+        : 0;
+    const roundedGroupTotal =
+      roundedCostPerAdult * ctx.adultCount +
+      roundedCostPerChild * ctx.childCount;
+    const reserveCost = Math.round(estimatedCostForGroup * reserveRate);
+    const contingencyCost = roundedGroupTotal - estimatedCostForGroup;
     // Breakdown cho UI "Quản lý chi phí" xổ ra khi bấm vào dòng người
     // lớn/trẻ em (mục "Địa điểm & ăn uống" / "Lưu trú" / "Xăng xe/tự túc").
     // placeCost/hotelCost đã per-adult sẵn (xem itinerary.service.ts) — trẻ
@@ -761,11 +791,17 @@ export class IncurredCostsService {
       payableLimitForGroup,
       payableLimitPerAdult: Math.round(ctx.userBudget),
       payableLimitPerChild: Math.round(ctx.userBudget * childPriceRatio),
+      reserveCost,
+      roundedGroupTotal,
+      contingencyCost,
+      roundedCostPerAdult,
+      roundedCostPerChild,
       placeCostPerAdult: Math.round(placeCost),
       placeCostPerChild: Math.round(placeCost * childPriceRatio),
       hotelCostPerAdult: Math.round(hotelCost),
       hotelCostPerChild: Math.round(hotelCost * childPriceRatio),
       transportPerAdult,
+      childPriceRatio,
       transportRatePerKm: {
         motorbike: transportCostPerKm.motorbike,
         car: transportCostPerKm.car,
