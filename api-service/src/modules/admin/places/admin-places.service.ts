@@ -46,6 +46,7 @@ interface PlaceDetailRow {
   latitude: number | null;
   longitude: number | null;
   is_approved: boolean | null;
+  rejection_reason: string | null;
   vendor_id: string | null;
   registered_date: string | null;
   types: TypeRow | TypeRow[] | null;
@@ -76,10 +77,16 @@ interface ResolvedPlaceType {
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
 type SupabaseCountAlgorithm = 'exact' | 'planned' | 'estimated';
 
+import { CommonNotificationsService } from '../../common/notifications/notifications.service';
+
 @Injectable()
 export class AdminPlacesService {
+  constructor(private readonly notificationsService: CommonNotificationsService) {}
   private readonly metadataCacheTtlMs = Number(
     process.env.ADMIN_PLACES_METADATA_CACHE_TTL_MS ?? '300000',
+  );
+  private readonly statsQueryTimeoutMs = Number(
+    process.env.ADMIN_PLACES_STATS_QUERY_TIMEOUT_MS ?? '4500',
   );
 
   private readonly categoryTypeIdsCache = new Map<
@@ -271,7 +278,7 @@ export class AdminPlacesService {
   }
 
   private onlyVisiblePlaces<T>(query: T): T {
-    return (query as any).or('is_deleted.is.null,is_deleted.eq.false') as T;
+    return (query as any).eq('is_deleted', false) as T;
   }
 
   private normalizeFoodImageUrls(imageUrl?: string) {
@@ -557,10 +564,26 @@ export class AdminPlacesService {
   async getPlaceStats() {
     const { start, end } = this.getCurrentMonthRange();
 
+    const withStatsFallback = async (
+      promise: Promise<number>,
+      fallback = 0,
+    ): Promise<number> => {
+      try {
+        return await Promise.race([
+          promise,
+          new Promise<number>((resolve) =>
+            setTimeout(resolve, this.statsQueryTimeoutMs, fallback),
+          ),
+        ]);
+      } catch {
+        return fallback;
+      }
+    };
+
     const [totalLocations, pendingApproval, newThisMonth] = await Promise.all([
-      this.countPlaces('all'),
-      this.countPlaces('pending'),
-      this.countPlaces('all', start, end),
+      withStatsFallback(this.countPlaces('all')),
+      withStatsFallback(this.countPlaces('pending')),
+      withStatsFallback(this.countPlaces('all', start, end)),
     ]);
 
     return {
@@ -847,7 +870,6 @@ export class AdminPlacesService {
       .from('places')
       .select(
         'id, image_url, name, address, is_approved, vendor_id, type_id, registered_date',
-        { count: 'estimated' },
       );
 
     query = this.onlyVisiblePlaces(query);
@@ -895,6 +917,11 @@ export class AdminPlacesService {
       }
     }
 
+    const totalPromise =
+      !normalizedSearch && !categoryName && !vendorId
+        ? this.countPlaces(status)
+        : Promise.resolve<number | null>(null);
+
     query = query
       .order('registered_date', {
         ascending: false,
@@ -902,7 +929,7 @@ export class AdminPlacesService {
       })
       .order('id', { ascending: false });
 
-    const { data, error, count } = await query.range(
+    const { data, error } = await query.range(
       offset,
       offset + safeLimit - 1,
     );
@@ -966,7 +993,10 @@ export class AdminPlacesService {
       };
     });
 
-    const total = count ?? 0;
+    const countedTotal = await totalPromise;
+    const total =
+      countedTotal ??
+      offset + places.length + (places.length === safeLimit ? safeLimit : 0);
 
     return {
       data: places,
@@ -984,10 +1014,10 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, image_url, name, description, address, email, phone, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, estimated_preparation_time, types(id, name, categories(id, name))',
+        'id, image_url, name, description, address, email, phone, city_id, cities(name), latitude, longitude, is_approved, rejection_reason, vendor_id, registered_date, estimated_preparation_time, types(id, name, categories(id, name))',
       )
       .eq('id', id)
-      .or('is_deleted.is.null,is_deleted.eq.false')
+      .eq('is_deleted', false)
       .maybeSingle<PlaceDetailRow>();
 
     if (placeError || !place) {
@@ -1009,7 +1039,7 @@ export class AdminPlacesService {
             .from('places')
             .select('id', { count: 'estimated', head: true })
             .eq('vendor_id', place.vendor_id)
-            .or('is_deleted.is.null,is_deleted.eq.false')
+            .eq('is_deleted', false)
         : Promise.resolve({ count: 0, error: null }),
     ]);
 
@@ -1037,6 +1067,7 @@ export class AdminPlacesService {
       category,
       registered_date: place.registered_date ?? '',
       status: this.mapStatus(place.is_approved),
+      rejection_reason: place.rejection_reason ?? null,
       contact_phone: place.phone ?? vendor?.phone_number ?? '',
       contact_email: place.email ?? vendor?.email ?? '',
       vendor: vendor
@@ -1077,14 +1108,30 @@ export class AdminPlacesService {
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
-      .update({ is_approved: true, is_active: true, updated_at: new Date().toISOString() })
+      .update({
+        is_approved: true,
+        is_active: true,
+        rejection_reason: null,
+        updated_at: new Date().toISOString(),
+      })
       .eq('id', id)
-      .select('id, name, is_approved')
-      .single<{ id: string; name: string; is_approved: boolean }>();
+      .select('id, name, is_approved, vendor_id')
+      .single<{ id: string; name: string; is_approved: boolean; vendor_id: string | null }>();
 
     if (error || !data) {
       throw new InternalServerErrorException(
         `Failed to approve place: ${error?.message || 'Unknown error'}`,
+      );
+    }
+
+    if (data.vendor_id) {
+      await this.notificationsService.createNotification(
+        [data.vendor_id],
+        'Địa điểm đã được duyệt',
+        `Địa điểm "${data.name}" của bạn đã được quản trị viên phê duyệt.`,
+        'success',
+        'place_approved',
+        { place_id: data.id }
       );
     }
 
@@ -1123,7 +1170,7 @@ export class AdminPlacesService {
         updated_at: new Date().toISOString(),
       })
       .eq('id', id)
-      .or('is_deleted.is.null,is_deleted.eq.false')
+      .eq('is_deleted', false)
       .select('id, latitude, longitude')
       .maybeSingle<{ id: string; latitude: number; longitude: number }>();
 
@@ -1151,7 +1198,7 @@ export class AdminPlacesService {
       .from('places')
       .update({ is_deleted: true, is_active: false, updated_at: new Date().toISOString() })
       .eq('id', id)
-      .or('is_deleted.is.null,is_deleted.eq.false')
+      .eq('is_deleted', false)
       .select('id')
       .maybeSingle<{ id: string }>();
 
@@ -1169,17 +1216,34 @@ export class AdminPlacesService {
   }
 
   async rejectPlace(id: string, note?: string) {
+    const rejectionReason = note?.trim() || null;
+
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
-      .update({ is_approved: false, updated_at: new Date().toISOString() })
+      .update({
+        is_approved: false,
+        rejection_reason: rejectionReason,
+        updated_at: new Date().toISOString(),
+      })
       .eq('id', id)
-      .select('id, name, is_approved')
-      .single<{ id: string; name: string; is_approved: boolean }>();
+      .select('id, name, is_approved, vendor_id')
+      .single<{ id: string; name: string; is_approved: boolean; vendor_id: string | null }>();
 
     if (error || !data) {
       throw new InternalServerErrorException(
         `Failed to reject place: ${error?.message || 'Unknown error'}`,
+      );
+    }
+
+    if (data.vendor_id) {
+      await this.notificationsService.createNotification(
+        [data.vendor_id],
+        'Địa điểm bị từ chối',
+        `Địa điểm "${data.name}" của bạn đã bị từ chối.${rejectionReason ? `\nLý do: ${rejectionReason}` : ''}`,
+        'error',
+        'place_rejected',
+        { place_id: data.id }
       );
     }
 
@@ -1188,8 +1252,7 @@ export class AdminPlacesService {
       name: data.name,
       status: 'rejected',
       message: 'Place rejected successfully',
-      note: note ?? null,
-      note_saved: false,
+      note: rejectionReason,
     };
   }
 }

@@ -14,7 +14,7 @@ import { Type } from 'class-transformer';
 
 export class CreateOrderItemDto {
   @ApiProperty()
-  @IsUUID('4')
+  @IsUUID()
   food_item_id: string;
 
   @ApiProperty({ minimum: 1, maximum: 99 })

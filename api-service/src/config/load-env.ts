@@ -7,7 +7,12 @@ import { resolve } from 'node:path';
 const envPath = resolve(__dirname, '..', '..', '.env');
 const parsed = config({ path: envPath }).parsed ?? {};
 
-for (const key of ['SUPABASE_URL', 'SUPABASE_KEY'] as const) {
+for (const key of [
+  'SUPABASE_URL',
+  'SUPABASE_KEY',
+  'BUSINESS_PLACES_USE_ORDERED_QUERY',
+  'ADMIN_PLACES_STATS_QUERY_TIMEOUT_MS',
+] as const) {
   const value = parsed[key]?.trim();
   if (value) process.env[key] = value;
 }

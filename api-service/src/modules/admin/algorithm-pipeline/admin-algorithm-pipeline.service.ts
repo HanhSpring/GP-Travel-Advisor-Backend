@@ -270,8 +270,9 @@ export class AdminAlgorithmPipelineService {
         p_algorithm_id: algorithm.id,
         p_trigger_type: triggerType,
         p_triggered_by: triggeredBy,
-        // Tham số được giữ để tương thích signature RPC cũ nhưng DB không còn áp quota.
-        p_max_runs: 0,
+        // RPC mới bỏ quota nhưng vẫn giữ tham số để tương thích. Dùng max int thay
+        // vì 0 để cả function DB bản cũ (còn kiểm tra count >= p_max_runs) cũng hoạt động.
+        p_max_runs: 2_147_483_647,
       });
 
     if (error) {

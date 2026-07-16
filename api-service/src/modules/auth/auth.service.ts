@@ -148,8 +148,6 @@ export class AuthService {
       password: password,
     };
 
-    console.log('Xác thực với credentials:', credentials);
-
     // 4. Gửi lên Supabase
     const { data, error } =
       await this.supabase.auth.signInWithPassword(credentials);

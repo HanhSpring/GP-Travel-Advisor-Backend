@@ -964,9 +964,13 @@ def refresh_travel_matrix_for_day_pools(
     for pool in day_pools:
         if goong_unavailable:
             break
+        # BUGFIX 2026-07-12: cafes were missing from this list, so any
+        # cafe leg was structurally never eligible for a live Goong refresh
+        # here — it stayed Haversine forever regardless of API budget.
         places = [
             *(pool.get("attractions") or []),
             *(pool.get("restaurants") or []),
+            *(pool.get("cafes") or []),
         ]
         ids = [hotel_id, *[place.id for place in places if place.id in coords]]
         ids = list(dict.fromkeys(ids))

@@ -53,13 +53,12 @@ const PARAM_CAPACITY_PREFIX = 'vehicle_capacity_';
 
 const DEFAULTS: Record<string, number> = {
   [PARAM_CHILD_PRICE_RATIO]: 0.7,
-  // Giá xăng thực tế trung bình (7/2026): E5 RON92 ~19.730đ/l, xe máy tiêu
-  // hao 2.0-2.5l/100km -> ~395-493đ/km, lấy ~450đ/km. RON95 ~20.410đ/l, ô tô
-  // tiêu hao 7-10l/100km -> ~428-612đ/km, lấy ~520đ/km. Đây là giá cho MỘT
-  // xe — nhân số xe cần dùng ở estimateSelfDriveTransportCost(), không nhân
-  // theo đầu người trực tiếp.
-  transport_cost_per_km_motorbike: 450,
-  transport_cost_per_km_car: 520,
+  // Cập nhật theo yêu cầu chủ dự án (2026-07-14): giá xăng xe/ô tô thực tế
+  // đã tăng so với mức cấu hình cũ (450/520). Đây là giá cho MỘT xe — nhân
+  // số xe cần dùng ở estimateSelfDriveTransportCost(), không nhân theo đầu
+  // người trực tiếp.
+  transport_cost_per_km_motorbike: 600,
+  transport_cost_per_km_car: 1800,
   transport_cost_per_km_taxi: 18000,
   transport_cost_per_km_truck: 20000,
   [PARAM_TRANSPORT_DEFAULT]: 10000,

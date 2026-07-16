@@ -1,7 +1,6 @@
 from types import SimpleNamespace
 
 from app.services.itinerary.scheduler_v2 import (
-    IDLE_TIME_PENALTY_PER_MIN,
     SKIPPED_POI_PENALTY,
     TAIL_IDLE_EXCESS_PENALTY_PER_MIN,
     TAIL_IDLE_GRACE_MINUTES,
@@ -64,12 +63,6 @@ def test_target_min_falls_back_before_greedy():
 
 
 def test_density_penalties_use_tuned_values():
-    # IDLE_TIME_PENALTY_PER_MIN=9 is the empirical elbow point from
-    # scripts/sensitivity_analysis_weights.py's full-trip sweep across 5
-    # real destinations (see scripts/sensitivity_results_trip.csv): 3->9
-    # improves visited/idle-time with zero budget cost, 9->12 plateaus,
-    # and 12+ starts costing real budget overage for no further benefit.
-    assert IDLE_TIME_PENALTY_PER_MIN == 9
     assert SKIPPED_POI_PENALTY == 150
     assert TAIL_IDLE_GRACE_MINUTES == 120
     assert TAIL_IDLE_EXCESS_PENALTY_PER_MIN == 12

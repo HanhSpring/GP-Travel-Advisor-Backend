@@ -3,10 +3,11 @@ import {
   CanActivate,
   ExecutionContext,
   ForbiddenException,
+  InternalServerErrorException,
   UnauthorizedException,
 } from '@nestjs/common';
 import { Reflector } from '@nestjs/core';
-import { createClient } from '@supabase/supabase-js';
+import { supabase } from '../../config/supabase';
 
 @Injectable()
 export class RolesGuard implements CanActivate {
@@ -35,28 +36,29 @@ export class RolesGuard implements CanActivate {
 
     // 3. KẾT NỐI DATABASE ĐỂ KIỂM TRA THỜI GIAN THỰC (Real-time Security Check)
     // Việc này giúp xử lý lỗi thiếu Role ở Token Google và kiểm tra trạng thái Khóa/Xóa
-    const supabaseAdmin = createClient(
-      process.env.SUPABASE_URL as string,
-      process.env.SUPABASE_KEY as string,
-    );
-
-    const { data: dbUser, error } = await supabaseAdmin
+    const { data: dbUser, error } = await supabase
       .from('users')
-      // `users` has no `is_deleted` column. Selecting it makes PostgREST
-      // reject the entire authorization query with error 42703.
       .select('role, is_active')
       .eq('id', user.userId)
       .single();
 
     // 4. KIỂM TRA TÀI KHOẢN CÓ TỒN TẠI HOẶC BỊ XÓA KHÔNG
-    if (error || !dbUser) {
+    if (error) {
+      throw new InternalServerErrorException(
+        `Khong the kiem tra quyen nguoi dung: ${error.message}`,
+      );
+    }
+
+    if (!dbUser) {
       throw new ForbiddenException(
         'Tài khoản không tồn tại hoặc đã bị xóa khỏi hệ thống',
       );
     }
 
     // 5. KIỂM TRA TÀI KHOẢN CÓ ĐANG BỊ KHÓA KHÔNG
-    if (dbUser.is_active === '0') {
+    const isActive =
+      String(dbUser.is_active) === '1' || dbUser.is_active === true;
+    if (!isActive) {
       throw new ForbiddenException(
         'Tài khoản của bạn hiện đang bị khóa. Vui lòng liên hệ Admin.',
       );

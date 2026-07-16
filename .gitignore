@@ -204,7 +204,7 @@ test_mermaid.png
 secrets/
 
 # Database dumps
-*.sql
+
 !api-service/sql/2026_recommender_retrain_admin.sql
 !api-service/supabase/
 !api-service/supabase/migrations/
@@ -219,3 +219,8 @@ ai-service/recommender_artifacts/*.npy
 
 # Firebase service account
 api-service/firebase-service-account.json
+
+# Experimental debug logs and parse tool
+experimental_logs/
+api-service/output.md
+ai-service/*.txt

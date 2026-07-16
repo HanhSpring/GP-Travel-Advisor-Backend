@@ -15,13 +15,10 @@ POI_TARGET_MAX_PER_DAY = 10
 MEAL_DURATION_MINUTES = 75
 MAX_RESTAURANT_OPTIONS_PER_DAY = 2
 # Cafes are injected via their own greedy nearest-cluster pass (separate from
-# restaurants, separate from attraction K-Means) — cap at 2/day (bumped from 1)
-# so a dense cafe cluster near a day's centroid can't stack many cafe stops
-# onto the same day (e.g. "6 cups of milk tea in one day"), while still giving
-# the CP-SAT solver a spare candidate so a cafe doesn't vanish entirely once
-# scheduling gets tight (cafes are still soft-prioritized, not enforced like
-# the lunch/dinner restaurant slot — see scheduler_v2.py's cafe utility weight).
-MAX_CAFE_OPTIONS_PER_DAY = 2
+# restaurants, separate from attraction K-Means) — cap at 1/day so a dense
+# cafe cluster near a day's centroid can't stack multiple cafe stops onto the
+# same day (e.g. "6 cups of milk tea in one day").
+MAX_CAFE_OPTIONS_PER_DAY = 1
 REBALANCE_MAX_ITERATIONS = 48
 BACKUP_NONMEAL_PER_DAY = 2
 CANDIDATE_POOL_LOAD_RATIO = 1.25

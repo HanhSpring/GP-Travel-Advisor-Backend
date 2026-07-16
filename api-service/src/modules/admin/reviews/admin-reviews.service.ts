@@ -665,12 +665,15 @@ export class AdminReviewsService {
     }
 
     try {
+      const updatePayload: Record<string, unknown> = { status };
+      if (status === 'violation' && reason) {
+        updatePayload.violation_reason = reason;
+      }
+
       const { error } = await supabase
         .schema('review_ai')
         .from('reviews')
-        .update({
-          status,
-        })
+        .update(updatePayload)
         .eq('id', reviewId);
 
       if (error) throw error;
@@ -782,6 +785,7 @@ export class AdminReviewsService {
       }
 
       const shouldApprove =
+        (review as ReviewRow).status !== 'violation' &&
         contentRow.expiration_date &&
         new Date(contentRow.expiration_date).getTime() <= Date.now();
 

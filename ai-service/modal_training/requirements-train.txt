@@ -1,0 +1,9 @@
+# Dependencies rieng cho modal_training/ (GPU, khac voi ai-service/requirements.txt la ban
+# tensorflow-cpu inference-only). Modal image (modal_app.py) tu pip_install truc tiep khi build,
+# file nay chi dung khi muon chay/test run_training() cuc bo (khong qua Modal) tren may co GPU.
+tensorflow[and-cuda]==2.16.1
+tensorflow-recommenders
+boto3
+pandas
+numpy
+httpx
