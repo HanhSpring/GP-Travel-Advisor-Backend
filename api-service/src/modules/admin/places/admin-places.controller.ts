@@ -172,7 +172,7 @@ export class AdminPlacesController {
   @ApiOperation({
     summary: 'Reject a place',
     description:
-      'Mark a place as rejected/unapproved. Optional note is returned only, not saved yet.',
+      'Mark a place as rejected/unapproved and persist the optional rejection reason.',
   })
   @ApiResponse({
     status: 200,
