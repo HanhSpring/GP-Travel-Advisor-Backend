@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import argparse
 import os
 import sys
 from pathlib import Path
@@ -52,7 +53,7 @@ SCRIPT_DIR   = Path(__file__).parent.parent   # gốc ai-service/
 UPLOAD_DIRS  = {
     "recommender_artifacts": SCRIPT_DIR / "recommender_artifacts",
     "data": SCRIPT_DIR / "data",
-    "phobert_timelabel/checkpoint-264": SCRIPT_DIR / "app" / "models" / "phobert_timelabel" / "checkpoint-264",
+    "phobert_timelabel/checkpoint-476": SCRIPT_DIR / "app" / "models" / "phobert_timelabel" / "checkpoint-476",
     
     "artifacts_session_cf": SCRIPT_DIR / "artifacts_session_cf",
 }
@@ -61,6 +62,16 @@ UPLOAD_DIRS  = {
 SKIP_NAMES   = {"README.md", "samples_csv"}
 SKIP_SUFFIXES = {".md"}
 # ─────────────────────────────────────────────────────────────────────────────
+
+
+def _parse_args():
+    parser = argparse.ArgumentParser(description="Upload AI-service assets to Cloudflare R2")
+    parser.add_argument(
+        "--only",
+        choices=sorted(UPLOAD_DIRS),
+        help="Only upload one configured R2 prefix (default: upload all prefixes)",
+    )
+    return parser.parse_args()
 
 
 def make_r2_client():
@@ -128,6 +139,8 @@ def upload_prefix(prefix: str, local_dir: Path, client=None) -> dict:
 
 
 def main():
+    args = _parse_args()
+
     if not all([ENDPOINT_URL, ACCESS_KEY, SECRET_KEY]):
         print("❌ Thiếu biến môi trường R2. Xem hướng dẫn đầu file.")
         sys.exit(1)
@@ -139,7 +152,13 @@ def main():
     total_uploaded = 0
     total_skipped  = 0
 
-    for prefix, local_dir in UPLOAD_DIRS.items():
+    upload_dirs = (
+        {args.only: UPLOAD_DIRS[args.only]}
+        if args.only
+        else UPLOAD_DIRS
+    )
+
+    for prefix, local_dir in upload_dirs.items():
         if not local_dir.exists():
             print(f"⚠ Thư mục '{local_dir}' không tồn tại — bỏ qua.")
             continue

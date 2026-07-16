@@ -1,29 +1,17 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
+﻿# -*- coding: utf-8 -*-
+"""Local review filtering pipeline backed by Supabase.
+
+Configuration is loaded from .env. No JSON or CSV output files are created.
 """
-review_filter_local_new.py
-
-Local Supabase runner for the short-term review filtering pipeline.
-Reads pending review contents from review_ai.review_contents joined to review_ai.reviews,
-then writes Algorithm 1 results back to review_ai.review_contents and Algorithm 2
-conflicts to review_ai.review_conflicts.
-
-Configuration is loaded from a .env file. Required:
-    SUPABASE_URL
-    SUPABASE_KEY
-
-Optional:
-    SUPABASE_SCHEMA=review_ai
-    SUPABASE_BATCH_SIZE=500
-    SUPABASE_LIMIT=
-    USE_PRETRAINED_MODEL=true
-    USE_PRETRAINED_CLASSIFIERS=true
-    PHOBERT_TIME_MODEL=
-"""
-
-from __future__ import annotations
 
 import os
+import sys
+sys.setrecursionlimit(5000)
+
+def _from_pretrained_safe(auto_cls, model_name_or_path, **kwargs):
+    """Load a Hugging Face model/tokenizer using the installed local runtime."""
+    return auto_cls.from_pretrained(model_name_or_path, **kwargs)
+
 import json
 import math
 import re
@@ -76,6 +64,24 @@ OBSERVATION_RULES: Dict[str, Any] = {
     "other":      {"window_days": 14,  "threshold": 3, "sim_threshold": 0.65},
 }
 
+# A promoted short-term cluster hides conflicting long-term reviews only when
+# the repeated new evidence is stronger than the minimum promotion condition.
+REPLACEMENT_EXTRA_SUPPORT = 1
+REPLACEMENT_CONFLICT_SCORE_THRESHOLD = 0.75
+REPLACEMENT_SENTIMENT_CONSISTENCY_THRESHOLD = 0.80
+REPLACEMENT_COHESION_MARGIN = 0.03
+
+# Algorithm 2 should not miss obvious same-topic contradictions just because
+# the sentiment model assigns both sides the same coarse polarity.
+ALGORITHM2_MIN_SIMILARITY = 0.50
+ALGORITHM2_STRONG_POLARITY_GAP = 0.45
+ALGORITHM2_STRONG_CONTRADICTION_THRESHOLD = 0.62
+ALGORITHM2_LEXICAL_POLARITY_MIN = 0.25
+ALGORITHM2_ASPECT_CONTRADICTION_MIN_SIMILARITY = 0.35
+ALGORITHM2_ASPECT_CONTRADICTION_THRESHOLD = 0.50
+ALGORITHM2_ASPECT_TOPIC_FOCUS_MIN = 0.25
+ALGORITHM2_ASPECT_POLARITY_GAP_MIN = 0.20
+
 ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC: Dict[str, int] = {
     "traffic": 3,
     "weather": 3,
@@ -90,6 +96,20 @@ ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC: Dict[str, int] = {
     "other": 6,
 }
 
+TOPIC_CONTRAST_PHRASES: Dict[str, Dict[str, List[str]]] = {
+    "service": {
+        "positive": ["phuc vu nhanh", "nhan vien nhanh", "nhanh hon", "kha nhanh", "chu dong", "ho tro", "nhiet tinh", "tu van ro", "hai long", "phuc vu tot", "dich vu tot", "cai thien", "on", "rat tot", "khong phai cho qua lau", "khong phai doi lau"],
+        "negative": ["phuc vu cham", "nhan vien cham", "cham tre", "cho lau", "doi lau", "phai cho", "thieu chu dong", "chua nhiet tinh", "khong nhiet tinh", "ho tro cham", "giai quyet cham", "thai do te", "phuc vu kem", "dich vu kem"],
+    },
+    "cleanliness": {"positive": ["sach se", "sach", "don dep", "gon gang", "ve sinh tot"], "negative": ["ban", "khong sach", "mat ve sinh", "mui hoi", "rac", "am moc"]},
+    "crowd": {"positive": ["vang ve", "it khach", "khong dong", "khong phai doi", "thoai mai"], "negative": ["dong duc", "qua dong", "xep hang", "cho doi", "chen chuc", "qua tai"]},
+    "traffic": {"positive": ["de di", "de tim", "thuan tien", "thong thoang", "bai do xe rong"], "negative": ["ket xe", "tac duong", "kho di", "kho tim", "duong xau", "khong co cho dau"]},
+    "infra": {"positive": ["moi", "hien dai", "tot", "on dinh", "day du", "nang cap xong"], "negative": ["xuong cap", "hong", "dang sua", "dang thi cong", "cu ky", "can nang cap"]},
+    "price": {"positive": ["gia hop ly", "gia re", "dang tien", "xung dang", "khong qua dat"], "negative": ["qua dat", "dat qua", "gia cao", "khong xung dang", "mat tien"]},
+    "food": {"positive": ["ngon", "rat ngon", "vua mieng", "tuoi", "dam da", "thom"], "negative": ["khong ngon", "nhat", "te", "do", "nguoi", "that vong"]},
+    "weather": {"positive": ["troi dep", "mat me", "thoi tiet dep", "de chiu"], "negative": ["mua lon", "nang nong", "ngap", "gio lon", "bao", "oi buc"]},
+}
+
 # Transient topics: a single weak time signal is enough to classify as short-term.
 TRANSIENT_TOPICS = {"traffic", "weather", "crowd"}
 
@@ -102,6 +122,7 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
         "duong vao", "cung duong", "mo duong", "lan duong", "duong nho",
         "di bo", "gui xe", "giu xe", "phi gui xe", "bai giu xe",
         "oto", "xe om", "grab", "taxi", "xe dap",
+        "ket cung", "nhich tung chut", "xe ra vao", "dung giua duong",
     ],
     "weather": [
         "thoi tiet", "troi mua", "mua lon", "nang nong", "bao lon", "gio lon",
@@ -112,6 +133,10 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
         "gio manh", "bao to", "con bao", "troi u am", "troi quang",
         "troi tot", "khi hau", "nhiet do", "do am", "oi buc",
         "mua bat chot", "mua tam ta", "nang gat", "ret", "lanh buot",
+        # NOTE: no-diacritic collisions to avoid here: "mua qua" (mua quà),
+        # "gio qua" (bao giờ quay lại), "dinh mua"/"doi mua" (định/đòi mua).
+        "am u", "troi am u", "xam xit", "mua rao", "mua to",
+        "mua bat ngo", "nang qua", "nang kinh khung", "troi trong",
     ],
     "crowd": [
         "dong duc", "qua dong", "qua tai", "xep hang", "cho doi", "it khach",
@@ -121,6 +146,10 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
         "chen lan", "qua tai", "khong con cho", "ghe trong", "ban trong",
         "gio cao diem", "cuoi tuan dong", "dong nguoi", "vang lanh",
         "doi hang", "doi vo", "cho hang tieng", "chen vao",
+        "dong lam", "rat dong", "cang dong", "dong hon", "nguoi dong",
+        "dong du khach", "dong nghet", "dong kin", "nuom nuop",
+        "hon ca tieng", "gan ca tieng", "cho ca tieng", "doi ca tieng",
+        "nguoi voi nguoi", "dong cuc",
     ],
     "infra": [
         "sua chua", "nang cap", "dong cua", "xuong cap", "cai tao",
@@ -143,6 +172,11 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
         "cho dau xe", "cho do xe", "ham xe",
         "cau thang", "hanh lang", "san nha", "san vuon", "mat san", "mai che",
         "khuon vien", "quy hoach", "trung tam thuong mai",
+        # Generic descriptions of physical buildings/facilities. Aesthetic
+        # judgements such as "kien truc dep" are still handled by atmosphere.
+        "cong trinh", "kien truc", "trung tu", "khang trang", "quy mo",
+        "gian chinh", "chinh dien", "khu trung bay", "nha luu niem",
+        "khu tuong niem", "san rong", "tang tret", "tang ham",
     ],
     "cleanliness": [
         "sach se", "ve sinh", "mat ve sinh", "khong ve sinh", "kem ve sinh",
@@ -165,6 +199,7 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
         "nhan vien thu", "giai quyet", "phan hoi",
         "nhan vien nhiet tinh", "phong cach phuc vu",
         "tiep don", "don tiep", "chao hoi", "huong dan",
+        "huong dan vien", "tour guide", "tai xe",
         "xin loi", "giai thich", "xu ly", "khieu nai",
         "chuyen nghiep", "nhiet tinh", "vui ve", "niem no",
         "hach dich", "kinh dich", "co biec", "kho chiu",
@@ -183,7 +218,7 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
         "bao nhieu tien", "ngan dong", "nghin dong", "trieu dong", "k 1 bat", "k mot bat",
         "gia niem yet", "gia ninh yet", "gia co dinh",
         "tien ve", "tien phong", "tien an", "phi phat sinh",
-        "gia tot", "gia binh dan", "binh dan", "sang chanh",
+        "gia tot", "gia binh dan", "binh dan",
         "dang dong tien", "khong xung dang", "bo tui", "so voi ngay thuong", "muc gia",
         "coupon", "voucher", "ma giam gia", "uu dai",
         "tinh tien", "bill",
@@ -227,7 +262,7 @@ TOPIC_KEYWORDS: Dict[str, List[str]] = {
         "ban dem", "buoi toi", "ban ngay", "hoang hon",
         "romantic", "khong gian thu gian", "yen tinh",
         "phong cach rieng", "tao nha", "mo ao",
-        "on ao", "yen ang", "thoang mat", "am cung",
+        "on ao", "yen ang", "thoang mat", "am cung", "sang chanh",
     ],
     "activity": [
         "khu vui choi", "tro choi", "khu choi", "choi game", "game",
@@ -286,6 +321,8 @@ TOPIC_PROTOTYPES: Dict[str, List[str]] = {
         "giao thong thong thoang di lai de dang",
         "khu vuc hay ket xe gio cao diem",
         "xe may o to di chuyen kho khan duong nho",
+        "xe co dong duc di chuyen mat nhieu thoi gian",
+        "duong dan vao ket xe o to xe may noi duoi",
     ],
     "weather": [
         "troi mua lon duong ngap nuoc kho di lai",
@@ -304,6 +341,8 @@ TOPIC_PROTOTYPES: Dict[str, List[str]] = {
         "dong khach vao dip cuoi tuan le tet",
         "it nguoi thoai mai khong gian rong rai",
         "hang doi dai phai cho ca tieng dong",
+        "khach qua dong phai chen lan va cho doi lau",
+        "khong gian qua tai het cho ngoi va phai xep hang",
     ],
     "infra": [
         "dang sua chua xay dung nen on ao nhieu bui",
@@ -318,6 +357,9 @@ TOPIC_PROTOTYPES: Dict[str, List[str]] = {
         "bai do xe cho dau xe va loi vao khong thuan tien",
         "khuon vien phong oc ban ghe thiet bi can duoc nang cap",
         "trung tam thuong mai toa nha moi xay co quy hoach ro rang",
+        "bai xe nho kho gui xe va khong du cho dau xe",
+        "loi vao cau thang hanh lang bang chi dan khong ro",
+        "wifi may lanh ban ghe am thanh anh sang can nang cap",
     ],
     "cleanliness": [
         "nha ve sinh ban hoi kho chiu mat ve sinh",
@@ -355,6 +397,9 @@ TOPIC_PROTOTYPES: Dict[str, List[str]] = {
         "muc gia cao hon ngay thuong va kha mac vao dip le",
         "mot bat pho gia 40k khong qua dat so voi chat luong",
         "gia ca phu hop voi mat bang chung khong phai la qua dat",
+        "gia ve phi vao cua va hoa don cao hon mong doi",
+        "mua hang khong dang tien vi gia cao ma chat luong binh thuong",
+        "co khuyen mai giam gia nen chi phi kha hop ly",
     ],
     "food": [
         "do an ngon huong vi dac trung dac sac kho quen",
@@ -419,7 +464,8 @@ TOPIC_PROTOTYPES: Dict[str, List[str]] = {
 TOPIC_E5_DESCRIPTIONS: Dict[str, str] = {
     "traffic": (
         "Đánh giá đề cập đến giao thông, tắc đường, kẹt xe, khó di chuyển đến địa điểm, "
-        "bãi đỗ xe, chỗ đậu xe, phương tiện, đường xá xung quanh."
+        "xe cộ đông, giờ cao điểm, phương tiện và tình trạng lưu thông trên đường. "
+        "Nếu chỉ nói về bãi đỗ xe, chỗ đậu xe, biển chỉ dẫn hoặc lối vào vật lý thì thuộc infra."
     ),
     "weather": (
         "Đánh giá đề cập đến điều kiện thời tiết bên ngoài như trời mưa, nắng nóng, "
@@ -601,12 +647,16 @@ POSITIVE_WORDS: List[str] = [
     "rat dep", "dep lam", "ngon lam", "tot lam", "rat hai long",
     "cuon hut", "an tuong manh", "khong the quen", "dang nho",
     "chat luong", "uy tin", "chuyen nghiep", "nhiet tinh", "niem no",
+    "kha on", "phuc vu kha on", "phuc vu nhanh", "chu dong",
+    "ho tro nhiet tinh", "khong phai cho qua lau", "khong phai doi lau",
     "ve sinh", "sach", "nhanh", "hieu qua", "tien loi",
     "phong phu", "da dang", "da chon lua", "nhieu lua chon",
     "gia tri", "xung dang", "xung tam", "tuyet hao",
     "rat thich", "thich lam", "quy lam", "quy",
     "rat dang", "se quay lai", "nhat dinh quay lai", "recommend",
     "goi y", "de xuat", "dang thu", "nen thu", "nen den",
+    "ok", "rat la ok", "rong rai", "thoang mat", "nhon nhip",
+    "mat me", "khong khi trong lanh", "nhieu hoat dong",
 ]
 
 NEGATIVE_WORDS: List[str] = [
@@ -614,7 +664,7 @@ NEGATIVE_WORDS: List[str] = [
     "qua dat", "cho lau", "om ao", "ban", "on ao", "kem chat luong",
     "that bai", "kem", "lua dao", "chan nan", "kho chiu", "bat man",
     "cham tre", "phuc vu kem", "nhan vien thu", "tho lo",
-    "khong sach", "bat tien", "mat vi", "khong ngon", "nhieu loi",
+    "khong sach", "bat tien", "khong ngon", "nhieu loi",
     "hay hong", "qua on", "nguy hiem", "xu ly cham",
     "khong phu hop", "hon don", "lang phi", "cau tha", "vo cam",
     # Expanded
@@ -625,12 +675,122 @@ NEGATIVE_WORDS: List[str] = [
     "khong dang tin", "khong chuyen nghiep", "thieu chuyen mon",
     "hu hong", "xuong cap", "kem chat", "kem luong",
     "phuc vu do", "nhan vien te", "chu quan hu",
+    "phuc vu cham", "thieu chu dong", "chua nhiet tinh", "thieu ho tro",
     "dat ma khong ngon", "dat ma kem", "dat vo ly",
-    "ban biu", "ban thiu", "o ban", "khong ve sinh",
-    "hoi", "con trung", "gian", "ruoi", "mut",
+    # NOTE: "o ban" (ở bẩn) removed — collides with "cô bán / chỗ bán";
+    # "mat vi" (mất vị) removed — collides with "thoáng mát, vị trí".
+    "ban biu", "ban thiu", "khong ve sinh",
+    "mui hoi", "hoi ham", "hoi thoi", "co mui", "mui kho chiu",
+    "con trung", "ruoi",
     "cho lau qua", "cho mai", "doi rat lau",
     "khong nhan", "tu choi", "vo ly", "lo lang",
     "kho chiu qua", "phat buc", "tuc gian", "that kinh",
+    "mat hung", "khong yen", "khong duoc nhu mong doi", "khong nhu mong doi",
+    "xam xit", "gio manh", "gio lon", "lanh buot", "gio tat",
+    "khong thoai mai", "nguoi ngat", "nguoi lanh", "met", "met moi",
+    "qua met", "kha oai", "oai", "am anh", "tut han", "tut tam trang",
+    "ket xe", "dong nghet", "dong qua", "qua dong", "chen chuc",
+    "hit khoi bui", "khoi bui", "coi chung", "khong nen den",
+    "khong nen mua", "khong dang tien", "khong bat mat", "ngan lam",
+    # "gia cao" alone collides with "đánh giá cao" — only qualified forms.
+    "qua ngot", "khong thay re", "mac", "gia mac",
+    "gia qua cao", "gia rat cao", "gia kha cao", "muc gia cao",
+    "cao hon gap doi", "gap doi", "hang gia", "khong that",
+    "coc can", "duoi khach", "lam nhu xin an", "khong muon ban",
+    # Expanded from common review complaint vocabulary
+    "buc minh", "cau gat", "mat cau co", "lo di", "phot lo",
+    "kinh tom", "dang so", "ban thiu", "nho nhop", "hoi tanh",
+    "lua dao", "bi lua", "quyt tien", "dan canh", "cheo keo",
+    "chat chem", "cat co", "xot thuong", "cam thu",
+    "bang hoang", "lam xau", "tra hinh",
+]
+
+# Stronger phrase-level sentiment cues. These are intentionally longer than the
+# base lexicon because they should override model optimism in mixed reviews
+# ("view dep nhung gio manh qua...") without making generic words too negative.
+STRONG_NEGATIVE_SENTIMENT_PHRASES: List[str] = [
+    "khong nen den", "khong nen mua", "khong dang tien", "khong xung dang",
+    "khong duoc nhu mong doi", "khong nhu mong doi", "khong thoai mai",
+    "mat hung", "that vong", "te vo cung", "qua te", "rat te",
+    "phuc vu khong vui tinh", "coc can", "duoi khach", "lam nhu xin an",
+    "khong muon ban", "khong ngon", "khong thay re", "hang gia",
+    # "gia cao" alone collides with "đánh giá cao" — qualified forms only.
+    "khong that", "cao hon gap doi", "gia qua cao", "gia rat cao",
+    "gia kha cao", "muc gia cao", "qua dat",
+    "ket xe qua met", "dong nghet", "xe may chen chuc", "o to noi duoi",
+    "hit khoi bui", "gio manh qua", "gio lon qua", "gio tat lien tuc",
+    "lanh buot", "xam xit", "anh sang toi", "len hinh khong dep",
+    "tam trang luc toi noi tut", "tut han luon",
+    "khong quay lai", "khong muon quay lai", "khong hai long",
+    "thieu chuyen nghiep", "thai do te", "nhan vien te",
+    "phuc vu kem", "phuc vu cham", "doi rat lau", "cho rat lau",
+    "do an te", "do an do", "mon an te", "mon an do",
+    "chat luong kem", "khong hop ly", "khong de xuat",
+    "khong tot", "khong dep", "khong vui", "khong thich",
+    # "rat chan"/"chan that" collide with "rất chân thật/chân chất" — dropped.
+    "khong on chut nao", "khong on lam", "qua chan",
+    "do te", "tham hai", "chua hai long",
+    "bat tien", "bat on", "phai doi lau", "phai cho lau",
+    "phai ve som", "khong bang mong doi", "khong nhu ky vong",
+    # Staff-attitude and scam complaints (generalized from labeled data).
+    # NOTE: bare "qua toi" collides with "qua tới" (arrive), and bare
+    # "thuong tam" with "bình thường tầm" — only prefixed forms are safe.
+    "rat toi", "cuc ki toi", "cuc ky toi",
+    "thai do qua toi", "nhan vien qua toi", "phuc vu qua toi",
+    "thai do toi", "thai do kem", "thai do te", "thai do rat chan",
+    "coi thuong khach", "noi nang kho nghe", "kho nghe", "cuc tuc",
+    "mat cau co", "cang ngay cang kem", "khong mot loi xin loi",
+    "kinh tom", "dang so", "ban thiu", "nho nhop", "mat ve sinh",
+    "lua dao", "bi lua", "quyt tien", "dan canh", "tra hinh",
+    "gia cat co", "chat chem", "nhap vien", "ngo doc",
+    "tut het cam xuc", "tut mood", "te hai",
+    "khong bao gio quay lai", "khong co y thuc",
+    # Grief/tragedy vocabulary — memorial-site reviews the annotators mark negative
+    "am anh", "rat thuong tam", "qua thuong tam", "that thuong tam",
+    "xot thuong", "cam thu", "bang hoang",
+    "lam xau", "cau gat",
+    # Trip-ruined phrasing common in traffic/weather complaints
+    "mat vui", "ket cung", "dong khung khiep", "chon chan",
+]
+
+MILD_NEGATIVE_SENTIMENT_PHRASES: List[str] = [
+    "hoi lanh", "hoi met", "kha met", "kha oai", "khong yen",
+    "khong de chiu", "khong on", "kho di", "kho chiu", "doi lau",
+    "mat thoi gian", "mau nguoi", "ngoi chua lau da phai ve",
+    "sai ngay", "cao diem", "mua khong ky", "co vat hay khong",
+    "co vat hay khong lay", "co vat hay khong lay thi van tinh thue",
+    "hoi dat", "hoi mac", "kha dat", "kha mac", "khong re",
+    # "chua duoc" alone collides with "chùa được xây..." — qualified forms only;
+    # same for bare "khong duoc" ("không được nói to" etc. is not sentiment).
+    "khong duoc dep", "khong duoc tot", "khong duoc ngon",
+    "khong duoc sach", "khong duoc nhu", "khong duoc thoai mai",
+    "chua duoc dep", "chua duoc tot", "chua duoc ngon",
+    "chua duoc sach", "chua duoc nhu", "chua duoc ve sinh",
+    "tam thoi", "binh thuong",
+    "khong co gi dac biet", "khong nhu ky vong", "duoc moi cai",
+    "tru diem", "diem tru", "hoi that vong", "khong an tuong",
+    "hoi te", "khong ro", "khong bang", "khong nhu", "qua lau",
+    "lau qua", "phai doi", "phai cho", "khong muon", "khong thich",
+    "khong dep", "khong ngon lam", "khong tot lam", "hoi chan",
+    "kha te", "hoi kem", "khong con dep", "khong bang truoc",
+    "buc minh", "lo di", "khong chu y", "cham chap", "kha chan",
+    "khong con thoai mai", "lon xon", "lam lem", "muon hon du tinh",
+    "tre hon du tinh",
+]
+
+STRONG_POSITIVE_SENTIMENT_PHRASES: List[str] = [
+    "rat la ok", "rat ok", "la ok", "rat tuyet", "rat dep", "rat ngon",
+    "rong rai", "thoang mat", "nhon nhip", "nhieu hoat dong",
+    "khong khi trong lanh", "rat mat", "de chiu",
+    "khong qua dat", "khong qua mac", "gia ca binh thuong",
+]
+
+# Negated/praise phrases that CONTAIN a strong-negative substring. Each
+# occurrence cancels one strong-negative hit: "không quá đắt" contains
+# "qua dat" but is praise; "đánh giá cao" contains "gia cao"-like praise.
+STRONG_NEGATIVE_OVERRIDE_PHRASES: List[str] = [
+    "khong qua dat", "khong qua mac", "khong qua te", "khong thay dat",
+    "khong he dat", "khong bi dat", "danh gia cao",
 ]
 
 # Lighter models chosen for best accuracy-to-size trade-off on Vietnamese text.
@@ -639,10 +799,21 @@ DEFAULT_EMBEDDING_MODEL  = "sentence-transformers/paraphrase-multilingual-MiniLM
 DEFAULT_TOPIC_MODEL      = "intfloat/multilingual-e5-small"
 # lxyuan/distilbert-base-multilingual-cased-sentiments-student: ~260MB (DistilBERT),
 # outputs positive/neutral/negative directly — simpler and lighter than star-rating models.
-DEFAULT_SENTIMENT_MODEL = "lxyuan/distilbert-base-multilingual-cased-sentiments-student"
-# MoritzLaurer/mDeBERTa-v3-base-mnli-xnli: ~550MB, best multilingual NLI balance,
-# handles Vietnamese well for topic and time_label zero-shot classification.
-DEFAULT_ZEROSHOT_MODEL = "MoritzLaurer/mDeBERTa-v3-base-mnli-xnli"
+DEFAULT_SENTIMENT_MODEL = "5CD-AI/Vietnamese-Sentiment-visobert"
+# Zero-shot NLI is disabled by default. The current pipeline uses E5 for topic
+# classification and fine-tuned PhoBERT for time_label classification.
+DEFAULT_ZEROSHOT_MODEL = None
+
+SENTIMENT_TOKENIZER_FALLBACKS_BY_MODEL: Dict[str, List[str]] = {
+    # This fine-tuned model is XLM-R based. In some transformers/tokenizers
+    # combinations, its tokenizer.json raises:
+    #   argument 'vocab': 'dict' object cannot be converted to 'Sequence'
+    # Reusing the canonical XLM-R tokenizer avoids that broken metadata path.
+    "5cd-ai/vietnamese-sentiment-visobert": [
+        "FacebookAI/xlm-roberta-base",
+        "xlm-roberta-base",
+    ],
+}
 
 
 # ---------------------------------------------------------------------------
@@ -667,19 +838,64 @@ def ensure_aware_utc(dt: datetime) -> datetime:
 
 
 def strip_accents(text: str) -> str:
+    text = text.replace("đ", "d").replace("Đ", "D")
     normalized = unicodedata.normalize("NFD", text)
     return "".join(ch for ch in normalized if unicodedata.category(ch) != "Mn")
+
+
+# Common Vietnamese review shorthands. Canonicalising them lets the
+# negation-aware sentiment counter and every keyword matcher treat
+# "k tot", "ko ngon", "nhan dc" the same as their full spellings.
+_SHORTHAND_REPLACEMENTS: List[Tuple[re.Pattern, str]] = [
+    # standalone "k"/"ko" = "khong". Amounts like "30k" are a single token and
+    # unaffected; the lookbehinds also protect the rarer "30 k" spelling.
+    (re.compile(r"(?<!\d)(?<!\d )\bk\b"), "khong"),
+    (re.compile(r"\bko\b"), "khong"),
+    (re.compile(r"\bhok\b"), "khong"),
+    (re.compile(r"\bkhg\b"), "khong"),
+    (re.compile(r"\bdc\b"), "duoc"),
+    (re.compile(r"\bnv\b"), "nhan vien"),
+]
 
 
 def normalize_text(text: str) -> str:
     text = strip_accents(text.lower())
     text = re.sub(r"[^a-z0-9\s]", " ", text)
     text = re.sub(r"\s+", " ", text).strip()
+    for pattern, replacement in _SHORTHAND_REPLACEMENTS:
+        text = pattern.sub(replacement, text)
     return text
 
 
 def simple_tokens(text: str) -> List[str]:
     return [tok for tok in text.split(" ") if tok]
+
+
+def resolve_torch_device(torch_module, preference: str = "cpu"):
+    """Resolve model device.
+
+    Default to CPU because CUDA device-side asserts can poison later model calls.
+    Pass --model-device cuda/auto only when explicitly benchmarking GPU execution.
+    """
+    pref = str(preference or "cpu").strip().lower()
+    if pref in {"cuda", "gpu", "auto"} and torch_module.cuda.is_available():
+        return torch_module.device("cuda")
+    return torch_module.device("cpu")
+
+
+SIMILARITY_STOPWORDS = frozenset({
+    "va", "la", "thi", "co", "cua", "cho", "minh", "toi", "ban", "nay",
+    "mot", "trong", "khi", "voi", "rat", "kha", "da", "duoc", "bi", "o",
+    "vao", "ra", "ve", "nhung", "neu", "cung", "cac", "nhu", "hon", "luc",
+    "vi", "de", "nen", "roi", "van", "qua", "lam", "thay", "nguoi",
+})
+
+
+def content_token_set(text: str) -> set[str]:
+    return {
+        tok for tok in simple_tokens(normalize_text(text))
+        if len(tok) > 1 and tok not in SIMILARITY_STOPWORDS
+    }
 
 
 def count_keyword_hits(text: str, keywords: List[str]) -> int:
@@ -697,8 +913,25 @@ def count_keyword_hits(text: str, keywords: List[str]) -> int:
     return count
 
 
+def count_strong_negative_hits(text: str) -> int:
+    """Strong-negative phrase count with negated-praise compensation.
+
+    "không quá đắt" contains the strong phrase "qua dat" but is praise;
+    subtract one hit per override occurrence so such reviews are not
+    treated as explicit complaints.
+    """
+    hits = count_keyword_hits(text, STRONG_NEGATIVE_SENTIMENT_PHRASES)
+    overrides = count_keyword_hits(text, STRONG_NEGATIVE_OVERRIDE_PHRASES)
+    return max(0, hits - overrides)
+
+
 # Vietnamese negation tokens (normalized/no-diacritic form).
-_VI_NEG_TOKENS = frozenset({"khong", "chang", "chua", "dung", "khoi"})
+# Only unambiguous negators are safe after accent stripping.  ``chùa/chưa``,
+# ``đứng/đừng`` and ``khói/khỏi`` collapse to the same normalized tokens;
+# treating them as generic negators flips ordinary praise in reviews about temples
+# ("chùa được xây..." -> negative).  Qualified ``chua ...`` complaints are
+# already covered by the phrase lexicons below.
+_VI_NEG_TOKENS = frozenset({"khong", "chang"})
 
 def count_sentiment_hits_negation_aware(
     norm_text: str,
@@ -718,6 +951,48 @@ def count_sentiment_hits_negation_aware(
         window = token_list[max(0, tok_idx - 3): tok_idx]
         return any(t in _VI_NEG_TOKENS for t in window)
 
+    def _has_noisy_positive_context(tok_idx: int, kw: str) -> bool:
+        prev_tok = token_list[tok_idx - 1] if tok_idx > 0 else ""
+        next_tok = token_list[tok_idx + 1] if tok_idx + 1 < len(token_list) else ""
+        next_two = " ".join(token_list[tok_idx + 1: tok_idx + 3])
+        if kw == "on" and next_tok == "ao":
+            return True
+        if kw == "kha" and (
+            next_tok in {"cao", "mac", "dat", "met", "oai", "lanh", "te", "chan", "toi", "ban"}
+            or next_two in {"cao hon", "la cao", "la mac"}
+        ):
+            return True
+        if kw == "duoc" and prev_tok in {"khong", "chua", "chang"}:
+            return False
+        return False
+
+    def _has_noisy_negative_context(tok_idx: int, kw: str) -> bool:
+        prev_tok = token_list[tok_idx - 1] if tok_idx > 0 else ""
+        next_tok = token_list[tok_idx + 1] if tok_idx + 1 < len(token_list) else ""
+        if kw == "toi":
+            return not (
+                prev_tok in {"rat", "qua", "te", "that", "sieu"}
+                or next_tok in {"qua", "te"}
+            )
+        if kw == "ban":
+            dirty_context = {"bui", "thiu", "biu", "do", "qua", "lem", "nhem"}
+            return prev_tok not in dirty_context and next_tok not in dirty_context
+        if kw == "mac":
+            return prev_tok not in {"qua", "hoi", "kha", "rat", "gia", "cung", "ban"} and next_tok != "qua"
+        if kw == "chan":
+            # "chân" (foot/genuine): chân thật, chân chất, chân núi, chân gà...
+            return (
+                next_tok in {"that", "thanh", "chat", "tinh", "ga", "nui", "tay", "dung", "ly", "troi"}
+                or prev_tok in {"duoi", "khoi", "ban"}
+            )
+        if kw == "kem":
+            # "kem" (ice cream / kem chống nắng) vs "kém" (poor).
+            return (
+                prev_tok in {"an", "ban", "mua", "thoa", "boi", "cay", "mon", "vi", "ly"}
+                or next_tok in {"chong", "rainbow", "tuoi", "op", "dua", "socola", "vani", "sua", "flan"}
+            )
+        return False
+
     eff_pos = 0
     eff_neg = 0
 
@@ -726,6 +1001,8 @@ def count_sentiment_hits_negation_aware(
         if len(parts) == 1:
             for i, tok in enumerate(token_list):
                 if tok == kw:
+                    if _has_noisy_positive_context(i, kw):
+                        continue
                     if _is_negated(i):
                         eff_neg += 1  # "không ngon" → negative
                     else:
@@ -739,6 +1016,8 @@ def count_sentiment_hits_negation_aware(
         if len(parts) == 1:
             for i, tok in enumerate(token_list):
                 if tok == kw:
+                    if _has_noisy_negative_context(i, kw):
+                        continue
                     if _is_negated(i):
                         eff_pos += 1  # "không tệ" → positive
                     else:
@@ -842,11 +1121,10 @@ class PipelineConfig:
     classifier_confidence_threshold: float
     classifier_ambiguity_margin: float
     topic_other_threshold: float
-    candidate_mode: str
-    top_k: int
     old_lookback_multiplier: int
     promotion_mode: str
     conflict_score_threshold: float = 0.65
+    max_candidates_per_review: Optional[int] = None
     ttl_hours_by_topic: Optional[Dict[str, int]] = None
     observation_rules: Optional[Dict[str, Any]] = None
     lookback_multiplier_by_topic: Optional[Dict[str, int]] = None
@@ -864,9 +1142,10 @@ class PipelineConfig:
 # ---------------------------------------------------------------------------
 
 class EmbeddingProvider:
-    def __init__(self, use_pretrained_model: bool, model_name: str):
+    def __init__(self, use_pretrained_model: bool, model_name: str, model_device: str = "cpu"):
         self.model_active = False
         self.model_error: Optional[str] = None
+        self.model_last_error: Optional[str] = None
         self._model = None
         self._tokenizer = None
         self._torch = None
@@ -877,7 +1156,7 @@ class EmbeddingProvider:
         try:
             import torch
             from transformers import AutoTokenizer, AutoModel
-            _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            _device = resolve_torch_device(torch, model_device)
             self._tokenizer = AutoTokenizer.from_pretrained(model_name)
             self._model = _from_pretrained_safe(AutoModel, model_name)
             self._model.to(_device)
@@ -892,23 +1171,47 @@ class EmbeddingProvider:
         mask = attention_mask.unsqueeze(-1).expand(last_hidden_state.size()).float()
         return (last_hidden_state * mask).sum(1) / mask.sum(1).clamp(min=1e-9)
 
+    def _move_to_cpu(self) -> bool:
+        if self._torch is None or self._model is None:
+            return False
+        if str(getattr(self, "_device", "")) == "cpu":
+            return False
+        try:
+            self._device = self._torch.device("cpu")
+            self._model.to(self._device)
+            return True
+        except Exception as exc:
+            self.model_last_error = str(exc)
+            return False
+
+    def _embed_pretrained(self, normalized_text: str) -> List[float]:
+        inputs = self._tokenizer(
+            [normalized_text],
+            return_tensors="pt",
+            padding=True,
+            truncation=True,
+            max_length=512,
+        )
+        inputs = {k: v.to(self._device) for k, v in inputs.items()}
+        with self._torch.no_grad():
+            outputs = self._model(**inputs)
+        embedding = self._mean_pool(outputs.last_hidden_state, inputs["attention_mask"])
+        embedding = self._torch.nn.functional.normalize(embedding, p=2, dim=1)
+        return [float(v) for v in embedding[0].cpu().tolist()]
+
     def embed(self, normalized_text: str, tokens: List[str]) -> List[float]:
         if self.model_active and self._model is not None and self._tokenizer is not None:
             try:
-                inputs = self._tokenizer(
-                    [normalized_text],
-                    return_tensors="pt",
-                    padding=True,
-                    truncation=True,
-                    max_length=512,
-                )
-                inputs = {k: v.to(self._device) for k, v in inputs.items()}
-                with self._torch.no_grad():
-                    outputs = self._model(**inputs)
-                embedding = self._mean_pool(outputs.last_hidden_state, inputs["attention_mask"])
-                embedding = self._torch.nn.functional.normalize(embedding, p=2, dim=1)
-                return [float(v) for v in embedding[0].cpu().tolist()]
-            except Exception:
+                self.model_last_error = None
+                return self._embed_pretrained(normalized_text)
+            except Exception as exc:
+                self.model_last_error = str(exc)
+                if self._move_to_cpu():
+                    try:
+                        self.model_last_error = None
+                        return self._embed_pretrained(normalized_text)
+                    except Exception as exc2:
+                        self.model_last_error = str(exc2)
                 return hash_embedding(tokens)
         return hash_embedding(tokens)
 
@@ -963,20 +1266,138 @@ class _DirectSentimentClassifier:
     """Wraps AutoModelForSequenceClassification for text-classification without using pipeline()."""
     def __init__(self, model_name: str, device):
         import torch
-        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        from transformers import AutoModelForSequenceClassification
         self._torch = torch
-        self._tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self._tokenizer = self._load_tokenizer(model_name)
         self._model = _from_pretrained_safe(AutoModelForSequenceClassification, model_name)
+        self._sync_tokenizer_and_model_vocab()
         self._model.to(device)
         self._model.eval()
         self._id2label = {int(k): str(v) for k, v in self._model.config.id2label.items()}
         self._device = device
 
+    def _tokenizer_vocab_size(self) -> int:
+        try:
+            return int(len(self._tokenizer))
+        except Exception:
+            return int(getattr(self._tokenizer, "vocab_size", 0) or 0)
+
+    def _model_vocab_size(self) -> int:
+        try:
+            embeddings = self._model.get_input_embeddings()
+            return int(getattr(embeddings, "num_embeddings", 0) or 0)
+        except Exception:
+            return 0
+
+    def _resize_token_embeddings(self, required_size: int) -> None:
+        current_size = self._model_vocab_size()
+        if required_size > current_size:
+            raise ValueError(
+                "Sentiment tokenizer/model vocab mismatch: "
+                f"tokenizer_vocab_size={required_size}, model_vocab_size={current_size}. "
+                "Refusing to resize the pretrained model because it can exhaust memory "
+                "and the tokenizer would not be semantically compatible with the model."
+            )
+
+    def _sync_tokenizer_and_model_vocab(self) -> None:
+        tokenizer_size = self._tokenizer_vocab_size()
+        if tokenizer_size > 0:
+            self._resize_token_embeddings(tokenizer_size)
+
+    def _ensure_input_ids_fit_model(self, inputs: Dict[str, Any]) -> None:
+        if "input_ids" not in inputs:
+            return
+        model_vocab_size = self._model_vocab_size()
+        if model_vocab_size <= 0:
+            return
+        max_token_id = int(inputs["input_ids"].max().item())
+        if max_token_id < model_vocab_size:
+            return
+
+        raise ValueError(
+            "Sentiment tokenizer/model vocab mismatch: "
+            f"max_input_id={max_token_id}, model_vocab_size={model_vocab_size}, "
+            f"tokenizer_vocab_size={self._tokenizer_vocab_size()}."
+        )
+
+    def _move_to_cpu(self) -> bool:
+        if str(getattr(self, "_device", "")) == "cpu":
+            return False
+        try:
+            self._device = self._torch.device("cpu")
+            self._model.to(self._device)
+            return True
+        except Exception:
+            return False
+
+    def _load_tokenizer(self, model_name: str):
+        """Load sentiment tokenizer with fallbacks for ViSoBERT/XLM-R tokenizer metadata."""
+        from transformers import AutoTokenizer, XLMRobertaTokenizer, XLMRobertaTokenizerFast
+
+        model_key = model_name.lower()
+        fallback_sources = SENTIMENT_TOKENIZER_FALLBACKS_BY_MODEL.get(model_key, [])
+        # Always prefer the tokenizer shipped with the fine-tuned model. A
+        # fallback tokenizer is only accepted when its vocabulary is genuinely
+        # compatible; _sync_tokenizer_and_model_vocab enforces that invariant.
+        tokenizer_sources = [model_name, *fallback_sources]
+
+        attempts = [
+            *[
+                (lambda src=src: AutoTokenizer.from_pretrained(
+                    src, use_fast=False, tokenizer_file=None
+                ))
+                for src in tokenizer_sources
+            ],
+            *[
+                (lambda src=src: XLMRobertaTokenizer.from_pretrained(
+                    src, tokenizer_file=None
+                ))
+                for src in tokenizer_sources
+            ],
+            *[
+                (lambda src=src: AutoTokenizer.from_pretrained(src))
+                for src in tokenizer_sources
+            ],
+            *[
+                (lambda src=src: XLMRobertaTokenizerFast.from_pretrained(src))
+                for src in tokenizer_sources
+            ],
+        ]
+
+        last_error = None
+        for load in attempts:
+            try:
+                return load()
+            except Exception as exc:
+                last_error = exc
+
+        try:
+            import sentencepiece  # noqa: F401
+        except ImportError as exc:
+            raise RuntimeError("sentencepiece is required by the configured tokenizer") from exc
+
+        for load in attempts:
+            try:
+                return load()
+            except Exception as exc:
+                last_error = exc
+        raise last_error
+
     def __call__(self, text: str, top_k=None):
-        inputs = self._tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
-        inputs = {k: v.to(self._device) for k, v in inputs.items()}
-        with self._torch.no_grad():
-            logits = self._model(**inputs).logits
+        try:
+            inputs = self._tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            self._ensure_input_ids_fit_model(inputs)
+            inputs = {k: v.to(self._device) for k, v in inputs.items()}
+            with self._torch.no_grad():
+                logits = self._model(**inputs).logits
+        except Exception:
+            if not self._move_to_cpu():
+                raise
+            inputs = self._tokenizer(text, return_tensors="pt", truncation=True, max_length=512)
+            self._ensure_input_ids_fit_model(inputs)
+            inputs = {k: v.to(self._device) for k, v in inputs.items()}
+            with self._torch.no_grad():
+                logits = self._model(**inputs).logits
         probs = self._torch.nn.functional.softmax(logits, dim=-1)[0].cpu().tolist()
         results = [{"label": self._id2label[i], "score": float(p)} for i, p in enumerate(probs)]
         if top_k is not None:
@@ -1019,34 +1440,56 @@ class _DirectZeroShotClassifier:
 class _PhoBERTTimeClassifier:
     """Fine-tuned PhoBERT classifier for time_label (short-term / long-term).
 
-    Loaded from a local model path configured with PHOBERT_TIME_MODEL.
+    Loaded from the local model path configured in .env.
+    When unavailable, the pipeline returns "amb" for time_label.
     """
 
     def __init__(self, model_path: str, device):
-        try:
-            import sentencepiece  # noqa: F401
-        except ImportError as exc:
-            raise RuntimeError(
-                "Install sentencepiece before using PHOBERT_TIME_MODEL: pip install sentencepiece"
-            ) from exc
+        # sentencepiece is required by PhoBERT's BPE tokenizer
+        import sentencepiece  # noqa: F401
 
         import torch
         from transformers import AutoTokenizer, AutoModelForSequenceClassification
         self._torch = torch
 
+        # HuggingFace Trainer không tự lưu tokenizer, nên thư mục fine-tuned
+        # có thể thiếu tokenizer_config.json / vocab.txt / bpe.codes.
+        # Fine-tuning không thay đổi vocabulary → dùng base tokenizer là đúng.
+        self._requested_device = device
+        # Time-label inference is small, and CUDA device-side asserts poison the
+        # whole notebook runtime. Keep this classifier on CPU so tokenizer/model
+        # mismatches surface as readable Python errors instead of CUDA asserts.
+        self._device = torch.device("cpu")
+        self._tokenizer_source = model_path
+
         try:
             self._tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
         except Exception:
+            self._tokenizer_source = "vinai/phobert-base"
             self._tokenizer = AutoTokenizer.from_pretrained("vinai/phobert-base", use_fast=False)
 
         self._model = _from_pretrained_safe(AutoModelForSequenceClassification, model_path)
-        self._model.to(device)
+        self._model.to(self._device)
         self._model.eval()
         self._id2label = {int(k): str(v) for k, v in self._model.config.id2label.items()}
-        self._device = device
+        embeddings = self._model.get_input_embeddings()
+        self._model_vocab_size = int(getattr(embeddings, "num_embeddings", 0) or 0)
+        self._tokenizer_vocab_size = int(getattr(self._tokenizer, "vocab_size", 0) or 0)
 
     def __call__(self, text: str) -> Dict[str, float]:
         inputs = self._tokenizer(text, return_tensors="pt", truncation=True, max_length=256)
+        if self._model_vocab_size and "input_ids" in inputs:
+            max_token_id = int(inputs["input_ids"].max().item())
+            if max_token_id >= self._model_vocab_size:
+                raise ValueError(
+                    "PhoBERT tokenizer/model vocab mismatch: "
+                    f"max_input_id={max_token_id}, "
+                    f"model_vocab_size={self._model_vocab_size}, "
+                    f"tokenizer_source={self._tokenizer_source}, "
+                    f"tokenizer_vocab_size={self._tokenizer_vocab_size}. "
+                    "Save the tokenizer with the fine-tuned checkpoint, or use the "
+                    "same base tokenizer that was used during training."
+                )
         inputs = {k: v.to(self._device) for k, v in inputs.items()}
         with self._torch.no_grad():
             logits = self._model(**inputs).logits
@@ -1063,9 +1506,15 @@ class TopicE5Classifier:
     with full diacritics give good zero-shot accuracy across domains.
     """
 
-    def __init__(self, use_pretrained_classifiers: bool, model_name: str):
+    def __init__(
+        self,
+        use_pretrained_classifiers: bool,
+        model_name: str,
+        model_device: str = "cpu",
+    ):
         self.active = False
         self.error: Optional[str] = None
+        self.last_error: Optional[str] = None
         self._model = None
         self._tokenizer = None
         self._torch = None
@@ -1076,7 +1525,7 @@ class TopicE5Classifier:
         try:
             import torch
             from transformers import AutoTokenizer, AutoModel
-            _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            _device = resolve_torch_device(torch, model_device)
             self._tokenizer = AutoTokenizer.from_pretrained(model_name)
             self._model = _from_pretrained_safe(AutoModel, model_name)
             self._model.to(_device)
@@ -1086,6 +1535,20 @@ class TopicE5Classifier:
             self.active = True
         except Exception as exc:
             self.error = str(exc)
+
+    def _move_to_cpu(self) -> bool:
+        if self._torch is None or self._model is None:
+            return False
+        if str(getattr(self, "_device", "")) == "cpu":
+            return False
+        try:
+            self._device = self._torch.device("cpu")
+            self._model.to(self._device)
+            self._label_embs = None
+            return True
+        except Exception as exc:
+            self.last_error = str(exc)
+            return False
 
     def _encode(self, texts: List[str]) -> "Any":
         inputs = self._tokenizer(
@@ -1115,12 +1578,7 @@ class TopicE5Classifier:
         try:
             import math
             label_embs = self._get_label_embeddings()
-            # "query: " prefix per E5 convention; use raw text WITH diacritics.
-            query_emb = self._encode([f"query: {raw_text}"])[0]
-            raw_scores = {
-                topic: float(self._torch.dot(query_emb, lemb).cpu())
-                for topic, lemb in label_embs.items()
-            }
+            raw_scores = self._score_document(raw_text, label_embs)
             # Temperature-scaled softmax. Lower temperature = more concentrated distribution
             # (winner-take-all). With topic labels plus "other" and E5 cosine similarities
             # clustered in [0.78, 0.92], T=0.07 gives the winner ~30-60% probability,
@@ -1131,8 +1589,72 @@ class TopicE5Classifier:
             exp_scores = {t: math.exp(s / temperature) for t, s in raw_scores.items()}
             total = sum(exp_scores.values()) or 1.0
             return {t: v / total for t, v in exp_scores.items()}
-        except Exception:
+        except Exception as exc:
+            self.last_error = str(exc)
+            if self._move_to_cpu():
+                try:
+                    import math
+                    label_embs = self._get_label_embeddings()
+                    raw_scores = self._score_document(raw_text, label_embs)
+                    temperature = 0.07
+                    exp_scores = {t: math.exp(s / temperature) for t, s in raw_scores.items()}
+                    total = sum(exp_scores.values()) or 1.0
+                    self.last_error = None
+                    return {t: v / total for t, v in exp_scores.items()}
+                except Exception as exc2:
+                    self.last_error = str(exc2)
             return None
+
+    def _score_document(self, raw_text: str, label_embs) -> Dict[str, float]:
+        """Score a review hierarchically instead of truncating it as one document.
+
+        Reviews frequently start with access/location details and discuss the real
+        experience later.  A single 512-token embedding therefore overweights the
+        beginning and can turn an activity/atmosphere review into ``infra``.  We
+        embed coherent chunks, then combine document-level context with the best
+        and average chunk evidence.  This is domain-independent and also preserves
+        short-review behaviour (there is only one chunk in that case).
+        """
+        text = (
+            str(raw_text or "")
+            .replace("\\r\\n", "\n")
+            .replace("\\n", "\n")
+            .strip()
+        )
+        if not text:
+            return {topic: 0.0 for topic in label_embs}
+
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n+", text) if p.strip()]
+        chunks: List[str] = []
+        for paragraph in paragraphs or [text]:
+            sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", paragraph) if s.strip()]
+            current = ""
+            for sentence in sentences or [paragraph]:
+                if current and len(current) + len(sentence) > 700:
+                    chunks.append(current)
+                    current = sentence
+                else:
+                    current = f"{current} {sentence}".strip()
+            if current:
+                chunks.append(current)
+        chunks = chunks[:12] or [text]
+
+        # Keep a full-document vector for global context and chunk vectors for
+        # late/local evidence.  The full text is deliberately capped by tokenizer.
+        queries = [f"query: {text}"] + [f"query: {chunk}" for chunk in chunks]
+        embeddings = self._encode(queries)
+        scores: Dict[str, float] = {}
+        for topic, label_emb in label_embs.items():
+            document_score = float(self._torch.dot(embeddings[0], label_emb).cpu())
+            chunk_scores = [
+                float(self._torch.dot(chunk_emb, label_emb).cpu())
+                for chunk_emb in embeddings[1:]
+            ]
+            best = max(chunk_scores)
+            top = sorted(chunk_scores, reverse=True)[: min(3, len(chunk_scores))]
+            top_mean = sum(top) / len(top)
+            scores[topic] = 0.40 * document_score + 0.35 * top_mean + 0.25 * best
+        return scores
 
 
 class ClassifierProvider:
@@ -1140,14 +1662,14 @@ class ClassifierProvider:
         self,
         use_pretrained_classifiers: bool,
         sentiment_model_name: str,
-        zeroshot_model_name: str,
+        zeroshot_model_name: Optional[str],
         topic_model_name: str,
         confidence_threshold: float,
         ambiguity_margin: float,
         phobert_time_model_path: Optional[str] = None,
+        model_device: str = "cpu",
     ):
         self.confidence_threshold = confidence_threshold
-        self.short_term_confidence_threshold = max(0.75, confidence_threshold)
         self.ambiguity_margin = ambiguity_margin
 
         self.sentiment_pipeline = None
@@ -1158,14 +1680,16 @@ class ClassifierProvider:
         self.zeroshot_active = False
         self.phobert_time_active = False
         self.sentiment_error: Optional[str] = None
+        self.sentiment_last_error: Optional[str] = None
         self.zeroshot_error: Optional[str] = None
         self.phobert_time_error: Optional[str] = None
+        self.phobert_time_last_error: Optional[str] = None
 
         if not use_pretrained_classifiers:
             return
 
         import torch
-        _device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        _device = resolve_torch_device(torch, model_device)
 
         try:
             self.sentiment_pipeline = _DirectSentimentClassifier(sentiment_model_name, _device)
@@ -1173,14 +1697,19 @@ class ClassifierProvider:
         except Exception as exc:
             self.sentiment_error = str(exc)
 
-        try:
-            self.zeroshot_pipeline = _DirectZeroShotClassifier(zeroshot_model_name, _device)
-            self.zeroshot_active = True
-        except Exception as exc:
-            self.zeroshot_error = str(exc)
+        if zeroshot_model_name:
+            try:
+                self.zeroshot_pipeline = _DirectZeroShotClassifier(zeroshot_model_name, _device)
+                self.zeroshot_active = True
+            except Exception as exc:
+                self.zeroshot_error = str(exc)
 
-        # E5 topic classifier loads independently — a failure doesn't block sentiment/NLI.
-        self.topic_classifier = TopicE5Classifier(use_pretrained_classifiers, topic_model_name)
+        # E5 topic classifier loads independently — a failure doesn't block sentiment.
+        self.topic_classifier = TopicE5Classifier(
+            use_pretrained_classifiers,
+            topic_model_name,
+            model_device=model_device,
+        )
 
         # Fine-tuned PhoBERT for time_label — optional, loaded only when path is given.
         if phobert_time_model_path:
@@ -1195,6 +1724,7 @@ class ClassifierProvider:
         if not self.sentiment_active or self.sentiment_pipeline is None:
             return None
         try:
+            self.sentiment_last_error = None
             raw = self.sentiment_pipeline(text, top_k=None)
             rows = raw[0] if (isinstance(raw, list) and raw and isinstance(raw[0], list)) else (raw if isinstance(raw, list) else [raw])
 
@@ -1203,10 +1733,24 @@ class ClassifierProvider:
                 for item in rows
             }
 
-            # Direct pos/neu/neg output (e.g. lxyuan/distilbert-base-multilingual-cased-sentiments-student).
-            pos = label_to_score.get("positive", 0.0)
-            neu = label_to_score.get("neutral", 0.0)
-            neg = label_to_score.get("negative", 0.0)
+            # Direct pos/neu/neg output. Supports labels used by ViSoBERT
+            # (Negative/Positive/Neutral), PhoBERT sentiment (NEG/POS/NEU),
+            # and fallback LABEL_0/1/2 configs where 0=negative, 1=positive, 2=neutral.
+            pos = (
+                label_to_score.get("positive", 0.0)
+                + label_to_score.get("pos", 0.0)
+                + label_to_score.get("label_1", 0.0)
+            )
+            neu = (
+                label_to_score.get("neutral", 0.0)
+                + label_to_score.get("neu", 0.0)
+                + label_to_score.get("label_2", 0.0)
+            )
+            neg = (
+                label_to_score.get("negative", 0.0)
+                + label_to_score.get("neg", 0.0)
+                + label_to_score.get("label_0", 0.0)
+            )
             total = pos + neu + neg
             if total > 0:
                 return {"positive": pos / total, "neutral": neu / total, "negative": neg / total}
@@ -1223,7 +1767,8 @@ class ClassifierProvider:
             neutral = star_scores[3] / total
             positive = (star_scores[4] + star_scores[5]) / total
             return {"positive": positive, "neutral": neutral, "negative": negative}
-        except Exception:
+        except Exception as exc:
+            self.sentiment_last_error = str(exc)
             return None
 
     def predict_topic(self, text: str) -> Optional[Dict[str, float]]:
@@ -1257,33 +1802,48 @@ class ClassifierProvider:
         except Exception:
             return None
 
-    def predict_time_label(self, text: str) -> Optional[Tuple[str, Optional[Dict[str, str]]]]:
-        """Returns (time_label, error_info) or None if PhoBERT is unavailable.
+    def _canonical_time_label(self, label: str) -> Optional[str]:
+        norm = normalize_text(str(label).replace("_", " ").replace("-", " "))
+        if norm in {"short term", "shortterm", "ngan han", "temporary"}:
+            return "short-term"
+        if norm in {"long term", "longterm", "dai han", "stable"}:
+            return "long-term"
+        return None
 
-        Chỉ sử dụng PhoBERT fine-tuned. Trả về None khi model chưa được tải,
-        lúc đó pipeline sẽ gán "amb".
-        """
+    def predict_time_label(self, text: str) -> Optional[Tuple[str, Optional[Dict[str, str]]]]:
+        """Returns (time_label, error_info), or None only when PhoBERT is not loaded."""
         if not self.phobert_time_active or self.phobert_time_classifier is None:
             return None
         try:
+            self.phobert_time_last_error = None
             scores = self.phobert_time_classifier(text)
             sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
             top_label, top_score = sorted_items[0]
             second_score = sorted_items[1][1] if len(sorted_items) > 1 else 0.0
             margin = top_score - second_score
+            canonical_label = self._canonical_time_label(top_label)
 
-            required_confidence = (
-                self.short_term_confidence_threshold
-                if top_label == "short-term"
-                else self.confidence_threshold
-            )
+            if canonical_label is None:
+                return (
+                    "amb",
+                    {
+                        "code": "unknown_phobert_label",
+                        "predicted_label": str(top_label),
+                        "score": f"{top_score:.4f}",
+                        "all_scores": json.dumps(scores, ensure_ascii=False),
+                        "message": "PhoBERT đã chạy nhưng nhãn trả về không phải short-term/long-term. Kiểm tra id2label trong config của checkpoint.",
+                    },
+                )
+
+            required_confidence = self.confidence_threshold
 
             if top_score < required_confidence:
                 return (
                     "amb",
                     {
                         "code": "weak_temporal_signal_phobert",
-                        "predicted_label": top_label,
+                        "predicted_label": canonical_label,
+                        "raw_label": str(top_label),
                         "score": f"{top_score:.4f}",
                         "required_confidence": f"{required_confidence:.4f}",
                         "message": f"PhoBERT không đủ tự tin (score={top_score:.2f}) để phân loại ngắn hạn hay dài hạn.",
@@ -1294,12 +1854,25 @@ class ClassifierProvider:
                     "amb",
                     {
                         "code": "conflicting_time_anchor_phobert",
+                        "predicted_label": canonical_label,
+                        "raw_label": str(top_label),
+                        "score": f"{top_score:.4f}",
+                        "second_score": f"{second_score:.4f}",
+                        "required_margin": f"{self.ambiguity_margin:.4f}",
                         "message": f"PhoBERT không phân biệt rõ (margin={margin:.2f}) ngắn hạn hay dài hạn.",
                     },
                 )
-            return top_label, None
-        except Exception:
-            return None
+            return canonical_label, None
+        except Exception as exc:
+            self.phobert_time_last_error = str(exc)
+            return (
+                "amb",
+                {
+                    "code": "phobert_inference_error",
+                    "message": "PhoBERT đã load nhưng lỗi khi chạy inference time_label.",
+                    "detail": str(exc),
+                },
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1307,18 +1880,24 @@ class ClassifierProvider:
 # ---------------------------------------------------------------------------
 
 class ReviewFilteringPipeline:
-    def __init__(self, config: PipelineConfig, supabase_client: Optional[Any] = None):
+    def __init__(
+        self,
+        config: PipelineConfig,
+        supabase_client: Optional[Any] = None,
+        embedding_provider: Optional[EmbeddingProvider] = None,
+        classifier_provider: Optional[ClassifierProvider] = None,
+    ):
         self.config = config
         self.supabase = supabase_client
         if self.supabase is None and config.supabase_url and config.supabase_key:
             if create_client is None:
                 raise ImportError("supabase-py not installed. Run: pip install supabase")
             self.supabase = create_client(config.supabase_url, config.supabase_key)
-        self.embedding_provider = EmbeddingProvider(
+        self.embedding_provider = embedding_provider or EmbeddingProvider(
             use_pretrained_model=config.use_pretrained_model,
             model_name=config.embedding_model_name,
         )
-        self.classifier_provider = ClassifierProvider(
+        self.classifier_provider = classifier_provider or ClassifierProvider(
             use_pretrained_classifiers=config.use_pretrained_classifiers,
             sentiment_model_name=config.sentiment_model_name,
             zeroshot_model_name=config.zeroshot_model_name,
@@ -1327,6 +1906,12 @@ class ReviewFilteringPipeline:
             ambiguity_margin=config.classifier_ambiguity_margin,
             phobert_time_model_path=config.phobert_time_model_path,
         )
+        # These two settings can change in the database without invalidating
+        # the cached model weights.
+        self.classifier_provider.confidence_threshold = config.classifier_confidence_threshold
+        self.classifier_provider.ambiguity_margin = config.classifier_ambiguity_margin
+        self.algorithm3_historical_updates: List[Dict[str, Any]] = []
+        self.algorithm3_result: Dict[str, Any] = {}
 
     def _table(self, name: str):
         if self.supabase is None:
@@ -1344,6 +1929,10 @@ class ReviewFilteringPipeline:
         contents = self.algorithm_1_classify_reviews(reviews)
         conflicts, algorithm2_meta = self.algorithm_2_detect_conflicts(contents)
         time_result = self.algorithm_small_time_management(contents, conflicts, algorithm2_meta)
+        # Keep the detailed Algorithm 3 decisions available to the service
+        # layer. The public run response only contains aggregate counters, but
+        # persistence needs the exact expired, hidden and promoted content IDs.
+        self.algorithm3_result = time_result
 
         if owns_io:
             self._upsert_review_contents(contents)
@@ -1387,8 +1976,6 @@ class ReviewFilteringPipeline:
                     "fallback_reason": self.classifier_provider.phobert_time_error,
                 },
             },
-            "algorithm2_candidate_mode": self.config.candidate_mode,
-            "algorithm2_top_k": self.config.top_k,
             "algorithm2_input_summary": algorithm2_meta,
             "algorithm3_promotion_mode": self.config.promotion_mode,
         }
@@ -1411,6 +1998,51 @@ class ReviewFilteringPipeline:
     def _lookback_multiplier_for_topic(self, topic: str) -> int:
         values = self.config.lookback_multiplier_by_topic or ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC
         return int(values.get(topic, self.config.old_lookback_multiplier))
+
+    def _max_observation_window_days(self) -> int:
+        rules = self.config.observation_rules or OBSERVATION_RULES
+        return max(1, max(int(rule.get("window_days", 1)) for rule in rules.values()))
+
+    def _load_recent_short_terms_for_algorithm3(self) -> List[Dict[str, Any]]:
+        """Load DB history already bounded by Algorithm 3's largest window."""
+        if self.supabase is None:
+            return []
+
+        lower_bound = self.config.now - timedelta(
+            days=self._max_observation_window_days()
+        )
+        rows: List[Dict[str, Any]] = []
+        offset = 0
+        batch_size = max(1, int(self.config.supabase_batch_size))
+
+        while True:
+            response = (
+                self._table("review_contents")
+                .select(
+                    "id,content,processing_status,time_label,expiration_date,main_topic,"
+                    "topic_scores,sentiment_scores,embedding,error_info,has_conflict,"
+                    "is_temporary,reviews!inner(id,place_id,created_at,rating)"
+                )
+                .eq("time_label", "short-term")
+                .gte("reviews.created_at", to_iso(lower_bound))
+                .range(offset, offset + batch_size - 1)
+                .execute()
+            )
+            payload = response.data or []
+            if not payload:
+                break
+            for row in payload:
+                if not row.get("embedding"):
+                    continue
+                review_row = row.get("reviews") or {}
+                if isinstance(review_row, list):
+                    review_row = review_row[0] if review_row else {}
+                rows.append(self._map_db_content_row(row, review_row))
+            if len(payload) < batch_size:
+                break
+            offset += batch_size
+
+        return rows
 
     def _read_input_reviews(self) -> List[Dict[str, Any]]:
         rows: List[Dict[str, Any]] = []
@@ -1618,12 +2250,10 @@ class ReviewFilteringPipeline:
                 sentiment_scores = self._build_topic_sentiment_scores(raw_text, base_sentiment, topic_scores)
                 expiration_dt = self._assign_ttl(time_label, topic, review_created_at)
 
-                content_db_id = review.get("content_db_id")
-                place_id = review.get("place_id") or review.get("business_id") or "supabase"
+                place_id = review.get("place_id") or review.get("business_id")
 
                 outputs.append({
-                    "id": str(content_db_id or uuid.uuid4()),
-                    "content_db_id": content_db_id,
+                    "id": str(review["content_db_id"]),
                     "review_id": review.get("review_id"),
                     "place_id": place_id,
                     "user_id": review.get("user_id"),
@@ -1644,12 +2274,10 @@ class ReviewFilteringPipeline:
                 })
             except Exception as exc:
                 review_created_at = self._resolve_review_created_at(review, idx)
-                content_db_id = review.get("content_db_id")
                 outputs.append({
-                    "id": str(content_db_id or uuid.uuid4()),
-                    "content_db_id": content_db_id,
+                    "id": str(review["content_db_id"]),
                     "review_id": review.get("review_id"),
-                    "place_id": review.get("place_id") or review.get("business_id") or "supabase",
+                    "place_id": review.get("place_id") or review.get("business_id"),
                     "user_id": review.get("user_id"),
                     "content": str(review.get("content", review.get("text_vi", ""))),
                     "stars": review.get("stars"),
@@ -1676,6 +2304,7 @@ class ReviewFilteringPipeline:
         scores: Dict[str, float],
         keyword_raw: Dict[str, float],
         norm_text: str = "",
+        title_norm: str = "",
     ) -> Dict[str, float]:
         """Use strong lexical evidence to break close E5/prototype topic ties.
 
@@ -1693,29 +2322,142 @@ class ReviewFilteringPipeline:
         atmosphere = ev("atmosphere")
         food = ev("food")
         service = ev("service")
+        price = ev("price")
         infra = ev("infra")
         crowd = ev("crowd")
+        traffic = ev("traffic")
+        weather = ev("weather")
+        cleanliness = ev("cleanliness")
+        traffic_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "ket xe", "tac duong", "un tac", "giao thong", "tac nghen",
+                "xe may chen", "o to noi duoi", "oto noi duoi", "coi xe",
+                "duong dong", "dong xe", "xe co dong", "gio cao diem",
+            )
+        )
+        heavy_traffic_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "ket xe", "tac duong", "un tac", "giao thong", "tac nghen",
+                "dong nghet", "xe may chen chuc", "o to noi duoi",
+                "oto noi duoi", "dung cho den do", "hit khoi bui",
+            )
+        )
+        parking_infra_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "bai do xe", "bai xe", "cho dau xe", "cho do xe",
+                "gui xe", "giu xe", "phi gui xe", "bai giu xe",
+                "khong co cho dau xe", "kho tim bai xe", "ham gui xe",
+            )
+        )
+        weather_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "thoi tiet", "troi mua", "mua lon", "mua phun", "mua bat chot",
+                "troi nang", "nang nong", "nang gat", "nang gay", "troi lanh",
+                "lanh gia", "se lanh", "gio lon", "gio manh", "bao", "ngap nuoc",
+                "troi dep", "troi xau", "troi u am", "oi buc", "mat me",
+                "am u", "xam xit", "mua rao", "mua to", "mua bat ngo",
+                "nang qua", "nang kinh khung",
+            )
+        )
+        heavy_weather_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "troi mua", "mua lon", "mua bat chot", "nang nong",
+                "nang gat", "lanh gia", "gio lon", "gio manh", "bao",
+                "ngap nuoc", "troi xau", "troi u am", "xam xit",
+                "mua rao", "mua phun", "mua trai mua", "mua do xuong",
+                "am u", "mua to", "mua bat ngo",
+                "nang qua", "nang kinh khung",
+            )
+        )
+        title_weather_pattern = any(
+            phrase in title_norm
+            for phrase in (
+                "troi mua", "mua lon", "mua rao", "mua trai mua",
+                "gio lon", "gio manh", "nang nong", "troi u am",
+                "thoi tiet xau", "ngap nuoc",
+                "am u", "nang qua", "nang kinh khung", "mua cai la",
+                "dinh mua trai mua", "mua bat chot", "mua bat ngo",
+            )
+        )
+        dominant_weather_pattern = heavy_weather_pattern and (
+            title_weather_pattern or weather >= 2.00
+        )
+        cleanliness_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "sach se", "ve sinh", "nha ve sinh", "toilet", "wc", "phong tam",
+                "mui hoi", "hoi ham", "hoi thoi", "rac", "bui bam", "am moc",
+                "ban ghe ban", "san ban", "chen dia ban", "ly ban", "con trung",
+                "ruoi", "muoi", "kien", "gian",
+            )
+        )
+        strong_cleanliness_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "nha ve sinh ban", "toilet ban", "wc ban", "mui hoi",
+                "hoi ham", "hoi thoi", "rac thai", "rac day", "am moc",
+                "khong ve sinh", "kem ve sinh", "con trung", "ruoi",
+            )
+        )
         price_false_positive = any(
             phrase in norm_text
             for phrase in (
                 "danh gia cao", "duoc danh gia cao", "review cao",
             )
         )
-        price_amount_pattern = bool(
-            re.search(r"\b\d+\s*(k|ngan|nghin|trieu|vnd)\b", norm_text)
-            or re.search(r"\b\d{2,3}\s?000\b", norm_text)
-        )
+        price_amount_count = len(
+            re.findall(r"\b\d+\s*(?:k|ngan|nghin|trieu|vnd)\b", norm_text)
+        ) + len(re.findall(r"\b\d{2,3}\s?000\b", norm_text))
+        price_amount_pattern = price_amount_count > 0
         standalone_price_word = (
             bool(re.search(r"\bgia\b", norm_text))
             and not any(
                 phrase in norm_text
-                for phrase in ("danh gia", "duoc danh gia", "review gia", "gia dinh", "gia vi")
+                for phrase in (
+                    "danh gia", "duoc danh gia", "review gia", "gia dinh", "gia vi",
+                    "nguoi gia", "cu gia", "khi gia", "gia yeu", "gia tre", "gia ca roi",
+                )
             )
+        )
+        # Free-entry mentions ("vào cửa miễn phí", "không thu phí") are usually an
+        # incidental perk inside a venue/infra description, not the review focus.
+        free_entry_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "mien phi", "khong ton phi", "khong tinh phi", "khong mat phi",
+                "khong thu phi", "khong co thu phi", "khong ton tien ve",
+            )
+        )
+        # Judgmental price language — the reviewer is evaluating cost, not just
+        # listing amounts as visit information.
+        price_eval_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "qua dat", "dat qua", "gia cao", "gia qua cao", "gia hoi cao",
+                "muc gia cao", "kha mac", "hoi mac", "qua mac", "gia mac",
+                "cung mac", "khong re", "khong thay re", "gia re", "re hon",
+                "re lam", "binh dan", "gia hop ly", "gia tot", "gia phai chang",
+                "phai chang", "dang dong tien", "khong dang tien",
+                "khong xung dang", "tra gia", "gia thach",
+                # NOTE: "mat tien" (mất tiền) is intentionally absent — it also
+                # matches "mặt tiền" (facade); "hoa don" also matches "hoá đồng".
+                "kha thach", "cat co", "chat chem", "ton tien",
+                "uu dai", "khuyen mai", "giam gia",
+                "so voi ngay thuong", "xuat hoa don", "tinh hoa don", "bill",
+            )
+        ) or (
+            bool(re.search(r"(?<!khong )(?<!chang )\bmac\b", norm_text))
+            and "mac du" not in norm_text
         )
         explicit_price_pattern = any(
             phrase in norm_text
             for phrase in (
-                "mien phi", "phi vao cua", "gia ve", "gia vao", "gia phong",
+                "phi vao cua", "gia ve", "gia vao", "gia phong",
                 "gia menu", "mat phi", "ton tien", "bao nhieu tien",
                 "muc gia", "gia cao", "gia hoi cao", "gia qua cao",
                 "so voi ngay thuong", "qua dat", "khong qua dat",
@@ -1724,9 +2466,15 @@ class ReviewFilteringPipeline:
                 "hoi mac", "xung dang", "dang dong tien", "phi dich vu",
             )
         ) or standalone_price_word
-        price_pattern = price_amount_pattern or explicit_price_pattern
+        price_pattern = price_amount_pattern or explicit_price_pattern or free_entry_pattern
         if price_false_positive:
             price_pattern = False
+        # Strong price now requires evaluative language or a review that is
+        # essentially a price listing (many amounts). A couple of amounts quoted
+        # as visit information in a venue/tour review is not enough.
+        strong_price_pattern = (
+            price_eval_pattern or price_amount_count >= 4
+        ) and not price_false_positive
         infra_pattern = any(
             phrase in norm_text
             for phrase in (
@@ -1760,6 +2508,32 @@ class ReviewFilteringPipeline:
                 "ham gui xe", "cua hang nho", "quan nho", "quan rong",
             )
         )
+        access_infra_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "duong vao", "duong len", "duong di", "loi vao", "loi di",
+                "cua vao", "cong vao", "kho tim duong", "hoi duong",
+                "bang chi dan", "bien chi dan", "chi dan", "bien bao",
+                "hem nho", "ngo nho", "duong nho", "duong xau", "duong kho",
+                "doc dung", "ghep ghenh", "da tang", "duong tron",
+            )
+        )
+        facility_infra_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "co so vat chat", "trang thiet bi", "thang may", "may lanh",
+                "dieu hoa", "wifi", "internet", "ban ghe", "ghe ngoi",
+                "phong oc", "khuon vien", "toa nha", "san nha", "mai che",
+                "am thanh", "anh sang", "loa", "man hinh", "dien nuoc",
+                "dong cua", "sua chua", "thi cong", "nang cap", "xuong cap",
+            )
+        )
+        clear_infra_pattern = (
+            heavy_infra_pattern
+            or parking_infra_pattern
+            or access_infra_pattern
+            or facility_infra_pattern
+        )
         address_only_infra_pattern = any(
             phrase in norm_text
             for phrase in (
@@ -1775,6 +2549,32 @@ class ReviewFilteringPipeline:
                 "trang tri dep", "noi that dep", "kien truc dep",
                 "lang man", "yen tinh", "am cung", "thoang mat",
                 "goc chup anh", "diem check in", "song nuoc dep",
+            )
+        )
+        # Explicit scenery praise: when this coexists with access-road/parking
+        # mentions, the aesthetic experience is usually the review focus and the
+        # road is just how the reviewer got there.
+        scenic_praise_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "canh dep", "dep tuyet", "tuyet dep", "view dep",
+                "phong canh dep", "khung canh dep", "canh quan dep",
+                "dep me", "dep lam", "view ho", "view song", "view nui",
+                "ho dep", "nui dep", "non nuoc huu tinh",
+            )
+        )
+        clear_crowd_pattern = any(
+            phrase in norm_text
+            for phrase in (
+                "dong duc", "qua dong", "dong nguoi", "dong khach",
+                "nhieu nguoi", "day nguoi", "xep hang", "cho doi",
+                "hang dai", "cho hang tieng", "chen chuc", "chen lan",
+                "qua tai", "kin cho", "het cho", "khong con cho",
+                "gio cao diem", "cuoi tuan dong",
+                "dong lam", "rat dong", "cang dong", "dong hon",
+                "nguoi dong", "dong du khach", "dong nghet", "dong kin",
+                "hon ca tieng", "gan ca tieng", "cho ca tieng",
+                "doi ca tieng", "nguoi voi nguoi", "dong cuc",
             )
         )
         activity_pattern = any(
@@ -1817,16 +2617,19 @@ class ReviewFilteringPipeline:
                 "dau tam", "trai cay", "vuon dau",
             )
         )
-        strong_food_pattern = any(
-            phrase in norm_text
-            for phrase in (
+        strong_food_phrases = [
                 "pho", "pho bo", "bat pho", "com", "bun", "bun ca", "bun rieu",
                 "banh chung", "gio cha", "cha ca", "xoi", "sua chua",
                 "do an", "mon an", "thuc an", "do uong", "nuoc dung",
                 "nuoc leo", "thit", "gan", "quay", "mam", "dac san",
                 "an ngon", "ngon", "mem", "thom", "nhat", "man", "ngot",
-            )
-        )
+        ]
+        # Use token boundaries for short food words.  Raw substring matching made
+        # ``pho`` match ``phong``, and ``gan`` match ``khong gian``/``gan day``,
+        # stealing activity, atmosphere and infrastructure reviews.
+        strong_food_pattern = count_keyword_hits(
+            norm_text, strong_food_phrases
+        ) > 0
         food_delivery_pattern = any(
             phrase in norm_text
             for phrase in (
@@ -1842,6 +2645,7 @@ class ReviewFilteringPipeline:
                 "phuc vu nhanh", "phuc vu cham", "chu quan", "quan chu",
                 "ban hang", "chao moi", "tu van", "goi mon", "len mon",
                 "ra mon", "order", "tiep khach", "xu ly", "khieu nai",
+                "huong dan vien", "tour guide", "tai xe",
             )
         )
         service_complaint_pattern = any(
@@ -1984,36 +2788,319 @@ class ReviewFilteringPipeline:
             adjusted["infra"] = adjusted.get("infra", 0.0) * 0.86
         elif (strong_activity_pattern or entertainment_pattern) and infra <= 1:
             adjusted["infra"] = adjusted.get("infra", 0.0) * 0.82
+        # "Miễn phí"/"không thu phí" with no price judgement or repeated amounts:
+        # the review is about the venue itself, not its cost. Likewise a single
+        # amount quoted inside a strongly activity/infra-focused review is visit
+        # information, not a price evaluation.
+        free_entry_only = (
+            free_entry_pattern
+            and not price_eval_pattern
+            and price_amount_count == 0
+        )
+        incidental_amount_only = (
+            price_amount_count <= 3
+            and not price_eval_pattern
+            and not free_entry_pattern
+            and (
+                (strong_activity_pattern and activity >= 2)
+                or (clear_infra_pattern and infra >= 2)
+            )
+        )
+        if free_entry_only or incidental_amount_only:
+            adjusted["price"] = adjusted.get("price", 0.0) * 0.45
+            if free_entry_only and infra >= 1:
+                adjusted["infra"] = adjusted.get("infra", 0.0) * 1.10
         if ev("price") >= 2:
             if price_false_positive:
                 adjusted["price"] = adjusted.get("price", 0.0) * 0.70
+            elif free_entry_only:
+                pass  # already handled above; do not re-boost via keyword count
             elif heavy_infra_pattern or infra_pattern:
-                adjusted["price"] = adjusted.get("price", 0.0) * (1.05 if explicit_price_pattern else 0.85)
-            elif price_amount_pattern and not explicit_price_pattern and (activity >= 1 or food >= 1 or infra >= 1):
+                adjusted["price"] = adjusted.get("price", 0.0) * (1.18 if strong_price_pattern else 0.85)
+            elif price_amount_pattern and not price_eval_pattern and (activity >= 1 or food >= 1 or infra >= 1):
                 adjusted["price"] = adjusted.get("price", 0.0) * 0.90
-            elif explicit_price_pattern:
-                adjusted["price"] = adjusted.get("price", 0.0) * 1.42
+            elif strong_price_pattern:
+                adjusted["price"] = adjusted.get("price", 0.0) * 1.60
             else:
                 adjusted["price"] = adjusted.get("price", 0.0) * 1.15
-        elif price_pattern:
-            adjusted["price"] = adjusted.get("price", 0.0) * (1.50 if explicit_price_pattern else 1.12)
+        elif price_pattern and not (free_entry_only or incidental_amount_only):
+            adjusted["price"] = adjusted.get("price", 0.0) * (1.55 if strong_price_pattern else 1.12)
             if food <= 1:
                 adjusted["food"] = adjusted.get("food", 0.0) * 0.90
             if activity <= 1:
                 adjusted["activity"] = adjusted.get("activity", 0.0) * 0.92
-        if crowd >= 2:
-            adjusted["crowd"] = adjusted.get("crowd", 0.0) * 1.25
+        if crowd >= 2.20:
+            adjusted["crowd"] = adjusted.get("crowd", 0.0) * (1.85 if clear_crowd_pattern else 1.35)
             if not infra_pattern:
                 adjusted["infra"] = adjusted.get("infra", 0.0) * 0.90
-        elif crowd == 1 and any(
-            phrase in norm_text
-            for phrase in ("dong nguoi", "nhieu nguoi", "xep hang", "cho doi", "chen chuc")
-        ):
-            adjusted["crowd"] = adjusted.get("crowd", 0.0) * 1.18
+            if not strong_activity_pattern:
+                adjusted["activity"] = adjusted.get("activity", 0.0) * 0.72
+            if not atmosphere_pattern:
+                adjusted["atmosphere"] = adjusted.get("atmosphere", 0.0) * 0.82
+        elif 1 <= crowd < 2.20 and clear_crowd_pattern:
+            adjusted["crowd"] = adjusted.get("crowd", 0.0) * 1.35
         if strong_service_pattern and ev("weather") <= 1:
             adjusted["weather"] = adjusted.get("weather", 0.0) * 0.60
         if ev("weather") >= 2:
             adjusted["weather"] = adjusted.get("weather", 0.0) * 1.25
+
+        # Final evidence gates tuned from the manual confusion matrix:
+        # traffic/weather/atmosphere were frequently absorbed by infra/food/price,
+        # while food/infra were over-predicted. These rules only fire when lexical
+        # evidence for the target topic is explicit enough to be a reliable tie-breaker.
+        if heavy_traffic_pattern or (traffic >= 2 and traffic_pattern):
+            adjusted["traffic"] = adjusted.get("traffic", 0.0) * 1.90
+            adjusted["infra"] = adjusted.get("infra", 0.0) * 0.82
+            adjusted["activity"] = adjusted.get("activity", 0.0) * 0.88
+            adjusted["atmosphere"] = adjusted.get("atmosphere", 0.0) * 0.88
+            if not explicit_price_pattern:
+                adjusted["price"] = adjusted.get("price", 0.0) * 0.82
+            if not strong_food_pattern:
+                adjusted["food"] = adjusted.get("food", 0.0) * 0.88
+        elif traffic_pattern and traffic >= 1:
+            adjusted["traffic"] = adjusted.get("traffic", 0.0) * 1.35
+            adjusted["infra"] = adjusted.get("infra", 0.0) * 0.94
+        elif parking_infra_pattern and infra >= 1:
+            adjusted["traffic"] = adjusted.get("traffic", 0.0) * 0.55
+            adjusted["infra"] = adjusted.get("infra", 0.0) * 1.35
+
+        if dominant_weather_pattern or (weather >= 2.00 and weather_pattern and not atmosphere_pattern and not clear_infra_pattern):
+            adjusted["weather"] = adjusted.get("weather", 0.0) * 1.65
+            if not strong_food_pattern:
+                adjusted["food"] = adjusted.get("food", 0.0) * 0.78
+            if not heavy_infra_pattern:
+                adjusted["infra"] = adjusted.get("infra", 0.0) * 0.82
+            if not strong_activity_pattern:
+                adjusted["activity"] = adjusted.get("activity", 0.0) * 0.84
+            if not atmosphere_pattern:
+                adjusted["atmosphere"] = adjusted.get("atmosphere", 0.0) * 0.88
+        elif weather_pattern and weather >= 1 and not atmosphere_pattern and not clear_infra_pattern:
+            adjusted["weather"] = adjusted.get("weather", 0.0) * 1.20
+            if not heavy_infra_pattern:
+                adjusted["infra"] = adjusted.get("infra", 0.0) * 0.94
+            if food <= 1:
+                adjusted["food"] = adjusted.get("food", 0.0) * 0.86
+
+        if (
+            clear_infra_pattern
+            and infra >= 1
+            and not heavy_traffic_pattern
+            and not dominant_weather_pattern
+        ):
+            if scenic_praise_pattern and atmosphere >= 1:
+                # Scenery-focused review that mentions the access road/parking
+                # in passing: keep infra competitive but do not let it swallow
+                # the aesthetic focus of the review.
+                adjusted["infra"] = adjusted.get("infra", 0.0) * 1.20
+                adjusted["atmosphere"] = adjusted.get("atmosphere", 0.0) * 1.25
+            else:
+                adjusted["infra"] = adjusted.get("infra", 0.0) * 1.65
+                if not strong_activity_pattern:
+                    adjusted["activity"] = adjusted.get("activity", 0.0) * 0.78
+                if not atmosphere_pattern:
+                    adjusted["atmosphere"] = adjusted.get("atmosphere", 0.0) * 0.84
+            if not heavy_traffic_pattern:
+                adjusted["traffic"] = adjusted.get("traffic", 0.0) * 0.58
+            if not heavy_weather_pattern:
+                adjusted["weather"] = adjusted.get("weather", 0.0) * 0.62
+
+        if strong_price_pattern and not price_false_positive:
+            adjusted["price"] = adjusted.get("price", 0.0) * 1.35
+            if not strong_activity_pattern:
+                adjusted["activity"] = adjusted.get("activity", 0.0) * 0.78
+            if not clear_infra_pattern:
+                adjusted["infra"] = adjusted.get("infra", 0.0) * 0.88
+            if not strong_food_pattern:
+                adjusted["food"] = adjusted.get("food", 0.0) * 0.88
+            adjusted["weather"] = adjusted.get("weather", 0.0) * 0.70
+
+        if strong_cleanliness_pattern or cleanliness >= 2:
+            adjusted["cleanliness"] = adjusted.get("cleanliness", 0.0) * 1.75
+            adjusted["food"] = adjusted.get("food", 0.0) * 0.62
+            if not clear_infra_pattern:
+                adjusted["infra"] = adjusted.get("infra", 0.0) * 0.70
+            adjusted["price"] = adjusted.get("price", 0.0) * 0.58
+        elif cleanliness_pattern and cleanliness >= 1:
+            adjusted["cleanliness"] = adjusted.get("cleanliness", 0.0) * 1.35
+            if food <= 1:
+                adjusted["food"] = adjusted.get("food", 0.0) * 0.76
+
+        if (
+            atmosphere_pattern
+            and atmosphere >= 1
+            and not heavy_infra_pattern
+            and not dominant_weather_pattern
+        ):
+            adjusted["atmosphere"] = adjusted.get("atmosphere", 0.0) * 1.65
+            adjusted["infra"] = adjusted.get("infra", 0.0) * 0.58
+            if not explicit_price_pattern:
+                adjusted["price"] = adjusted.get("price", 0.0) * 0.62
+            if food <= 2:
+                adjusted["food"] = adjusted.get("food", 0.0) * 0.70
+            if not strong_activity_pattern:
+                adjusted["activity"] = adjusted.get("activity", 0.0) * 0.78
+
+        if (
+            (strong_activity_pattern or entertainment_pattern)
+            and activity >= 1
+            and not clear_crowd_pattern
+            and not heavy_traffic_pattern
+            and not dominant_weather_pattern
+        ):
+            adjusted["activity"] = adjusted.get("activity", 0.0) * 1.45
+            if not strong_service_pattern:
+                adjusted["service"] = adjusted.get("service", 0.0) * 0.74
+            if not heavy_infra_pattern:
+                adjusted["infra"] = adjusted.get("infra", 0.0) * 0.72
+            if food <= 2 and not market_food_pattern:
+                adjusted["food"] = adjusted.get("food", 0.0) * 0.72
+
+        if not price_pattern:
+            adjusted["price"] = adjusted.get("price", 0.0) * 0.52
+        elif price_pattern and not explicit_price_pattern and max(activity, atmosphere, infra, food) >= 2:
+            adjusted["price"] = adjusted.get("price", 0.0) * 0.82
+
+        if strong_food_pattern and food >= 1:
+            if (weather_pattern or traffic_pattern) and food <= 2:
+                adjusted["food"] = adjusted.get("food", 0.0) * 0.62
+            if atmosphere_pattern and atmosphere >= 1 and food <= 2 and not market_food_pattern:
+                adjusted["food"] = adjusted.get("food", 0.0) * 0.70
+
+        # Final dominant-evidence arbitration. These are structural distinctions,
+        # not dataset examples: moving vehicle flow is traffic (not merely a road),
+        # external conditions are weather, and explicit staff/process complaints
+        # are service even when food items are mentioned as order context.
+        if heavy_traffic_pattern:
+            adjusted["traffic"] = adjusted.get("traffic", 0.0) * 1.55
+            adjusted["infra"] = adjusted.get("infra", 0.0) * 0.55
+            adjusted["crowd"] = adjusted.get("crowd", 0.0) * 0.82
+        if dominant_weather_pattern:
+            adjusted["weather"] = adjusted.get("weather", 0.0) * 1.55
+            adjusted["infra"] = adjusted.get("infra", 0.0) * 0.62
+            adjusted["atmosphere"] = adjusted.get("atmosphere", 0.0) * 0.60
+            adjusted["food"] = adjusted.get("food", 0.0) * 0.72
+        if clear_crowd_pattern and crowd >= 2.20 and not heavy_traffic_pattern:
+            adjusted["crowd"] = adjusted.get("crowd", 0.0) * 1.40
+            adjusted["activity"] = adjusted.get("activity", 0.0) * 0.72
+            adjusted["infra"] = adjusted.get("infra", 0.0) * 0.82
+        if strong_service_pattern and service_complaint_pattern:
+            adjusted["service"] = adjusted.get("service", 0.0) * 1.65
+            adjusted["food"] = adjusted.get("food", 0.0) * 0.58
+            adjusted["infra"] = adjusted.get("infra", 0.0) * 0.68
+            adjusted["activity"] = adjusted.get("activity", 0.0) * 0.75
+        if strong_price_pattern and not price_false_positive:
+            adjusted["price"] = adjusted.get("price", 0.0) * 1.25
+            if not strong_food_pattern:
+                adjusted["food"] = adjusted.get("food", 0.0) * 0.82
+
+        # Repeated activity/aesthetic evidence may coexist with one incidental
+        # access, price or crowd sentence. Restore the sustained review focus
+        # only when its lexical coverage is clearly stronger.
+        if (
+            (strong_activity_pattern or entertainment_pattern)
+            and activity >= 2.50
+            and (not clear_crowd_pattern or crowd < 2.20)
+            and not heavy_traffic_pattern
+            and not dominant_weather_pattern
+        ):
+            adjusted["activity"] = adjusted.get("activity", 0.0) * 1.35
+            adjusted["infra"] = adjusted.get("infra", 0.0) * 0.76
+            adjusted["price"] = adjusted.get("price", 0.0) * 0.76
+            adjusted["crowd"] = adjusted.get("crowd", 0.0) * 0.82
+        if (
+            atmosphere_pattern
+            and atmosphere >= 2.50
+            and atmosphere >= infra + 0.40
+            and not dominant_weather_pattern
+            and not strong_activity_pattern
+        ):
+            adjusted["atmosphere"] = adjusted.get("atmosphere", 0.0) * 1.35
+            adjusted["infra"] = adjusted.get("infra", 0.0) * 0.72
+            adjusted["price"] = adjusted.get("price", 0.0) * 0.82
+
+        # Conservative near-tie arbitration.  Broad topic multipliers tend to
+        # improve recall at the cost of the already-strong topics.  At this late
+        # stage, only rescue a weak topic when (1) its lexical evidence is
+        # explicit and repeated, and (2) the semantic/lexical blended score is
+        # already close to the current winner.  This mainly resolves reviews
+        # whose incidental access/facility sentence lets ``infra`` absorb the
+        # sustained activity, scenery or price focus.
+        def _winner() -> Tuple[str, float]:
+            if not adjusted:
+                return "other", 0.0
+            return max(adjusted.items(), key=lambda item: item[1])
+
+        def _rescue_if_close(
+            topic: str,
+            allowed_winners: set[str],
+            min_ratio: float,
+        ) -> bool:
+            winner_topic, winner_score = _winner()
+            candidate_score = float(adjusted.get(topic, 0.0))
+            if winner_topic == topic:
+                return True
+            if winner_topic not in allowed_winners or winner_score <= 0.0:
+                return False
+            if candidate_score < winner_score * min_ratio:
+                return False
+            adjusted[topic] = winner_score * 1.015
+            return True
+
+        # Crowd is a contextual attribute in many activity reviews.  It should
+        # win only when its repeated evidence is at least as focused as the
+        # actions being described; otherwise keep it competitive but remove the
+        # earlier crowd-dominance boost.  The strict evidence gap preserves
+        # genuine crowd reviews and the current 100% crowd recall.
+        winner_topic, _ = _winner()
+        if (
+            winner_topic == "crowd"
+            and (strong_activity_pattern or entertainment_pattern)
+            and activity >= 2.50
+            and activity >= crowd + 0.40
+        ):
+            adjusted["crowd"] = adjusted.get("crowd", 0.0) * 0.78
+
+        activity_focus = (
+            (strong_activity_pattern or entertainment_pattern)
+            and activity >= 2.50
+            and not heavy_traffic_pattern
+            and not dominant_weather_pattern
+            and (not clear_crowd_pattern or activity >= crowd + 0.40)
+        )
+        if activity_focus:
+            _rescue_if_close(
+                "activity",
+                {"infra", "crowd", "service", "food", "atmosphere"},
+                0.82,
+            )
+
+        atmosphere_focus = (
+            (scenic_praise_pattern or atmosphere_pattern)
+            and atmosphere >= 2.50
+            and not dominant_weather_pattern
+            and not strong_activity_pattern
+            and not entertainment_pattern
+        )
+        if atmosphere_focus:
+            _rescue_if_close(
+                "atmosphere",
+                {"infra", "service", "food", "price", "other"},
+                0.84,
+            )
+
+        price_focus = (
+            strong_price_pattern
+            and price >= 1.45
+            and not price_false_positive
+            and not free_entry_only
+            and not incidental_amount_only
+        )
+        if price_focus:
+            _rescue_if_close(
+                "price",
+                {"infra", "activity", "cleanliness", "food", "atmosphere"},
+                0.82,
+            )
 
         return adjusted
 
@@ -2034,10 +3121,32 @@ class ReviewFilteringPipeline:
              reviews that semantically match "other" are not forced into a specific topic.
         """
         # ── 1. Keyword counts ─────────────────────────────────────────────────
-        keyword_raw: Dict[str, float] = {
-            topic: float(count_keyword_hits(norm_text, keywords))
-            for topic, keywords in TOPIC_KEYWORDS.items()
-        }
+        # Use both frequency and distribution. A topic repeated across several
+        # clauses is more likely to be the review's focus than a location/access
+        # detail mentioned once. The first short line is commonly a user-written
+        # title, so explicit evidence there receives a modest, generic boost.
+        # CSV/JSON exports sometimes preserve line breaks as the two literal
+        # characters ``\\n``. Canonicalise both representations before detecting
+        # a title or clause boundary.
+        lexical_doc = str(raw_text or "").replace("\\r\\n", "\n").replace("\\n", "\n")
+        raw_lines = [line.strip() for line in lexical_doc.splitlines() if line.strip()]
+        title_norm = normalize_text(raw_lines[0]) if raw_lines and len(raw_lines[0]) <= 160 else ""
+        lexical_segments = [
+            normalize_text(part)
+            for part in re.split(r"[.!?;\n]+", lexical_doc)
+            if len(normalize_text(part)) >= 4
+        ]
+        keyword_raw: Dict[str, float] = {}
+        for topic, keywords in TOPIC_KEYWORDS.items():
+            base_hits = float(count_keyword_hits(norm_text, keywords))
+            title_hits = float(count_keyword_hits(title_norm, keywords)) if title_norm else 0.0
+            covered_segments = sum(
+                1 for segment in lexical_segments
+                if count_keyword_hits(segment, keywords) > 0
+            )
+            # Coverage is capped so verbose reviews cannot win merely by length.
+            coverage_bonus = 0.45 * min(4, covered_segments)
+            keyword_raw[topic] = base_hits + 1.25 * title_hits + coverage_bonus
         keyword_total = sum(keyword_raw.values())
         keyword_norm = {
             t: (s / keyword_total if keyword_total else 0.0)
@@ -2074,7 +3183,9 @@ class ReviewFilteringPipeline:
                     )
                 source = "e5"
 
-            combined = self._apply_topic_decision_adjustments(combined, keyword_raw, norm_text)
+            combined = self._apply_topic_decision_adjustments(
+                combined, keyword_raw, norm_text, title_norm
+            )
             best_combined = max(combined.values()) if combined else 0.0
 
             # "other" when E5 very strongly predicts it OR no specific topic is confident.
@@ -2093,7 +3204,9 @@ class ReviewFilteringPipeline:
         if keyword_total == 0.0:
             return "other", {**{k: 0.0 for k in TOPIC_KEYWORDS}, "other": 1.0}, "keyword"
         score_payload = {k: v / keyword_total for k, v in keyword_raw.items()}
-        score_payload = self._apply_topic_decision_adjustments(score_payload, keyword_raw, norm_text)
+        score_payload = self._apply_topic_decision_adjustments(
+            score_payload, keyword_raw, norm_text, title_norm
+        )
         adjusted_total = sum(score_payload.values()) or 1.0
         score_payload = {k: v / adjusted_total for k, v in score_payload.items()}
         score_payload["other"] = 0.0
@@ -2179,17 +3292,22 @@ class ReviewFilteringPipeline:
         model_result = self.classifier_provider.predict_time_label(raw_text)
         if model_result is not None:
             return model_result
+        if self.classifier_provider.phobert_time_active:
+            return "amb", {
+                "code": "phobert_inference_unavailable",
+                "message": "PhoBERT đã active nhưng không trả về kết quả inference.",
+                "detail": self.classifier_provider.phobert_time_last_error or "",
+            }
         return "amb", {
             "code": "no_phobert_model",
             "message": "PhoBERT chưa được tải. Đặt --phobert-time-model để phân loại time_label.",
         }
 
-    def _classify_sentiment(self, raw_text: str, norm_text: str, stars) -> Dict[str, float]:
-        """Model first; stars + negation-aware keyword fallback when model unavailable."""
-        model_result = self.classifier_provider.predict_sentiment(raw_text)
-        if model_result is not None:
-            return model_result
-
+    def _rule_based_sentiment(
+        self,
+        norm_text: str,
+        stars,
+    ) -> Tuple[Dict[str, float], float]:
         stars_int = int(stars) if stars is not None else None
         if stars_int is None:
             base_pos, base_neu, base_neg = 0.33, 0.34, 0.33
@@ -2204,23 +3322,219 @@ class ReviewFilteringPipeline:
         eff_pos, eff_neg = count_sentiment_hits_negation_aware(
             norm_text, POSITIVE_WORDS, NEGATIVE_WORDS
         )
+        strong_neg_hits = count_strong_negative_hits(norm_text)
+        mild_neg_hits = count_keyword_hits(norm_text, MILD_NEGATIVE_SENTIMENT_PHRASES)
+        strong_pos_hits = count_keyword_hits(norm_text, STRONG_POSITIVE_SENTIMENT_PHRASES)
+
+        # Titles and explicit recommendation/return intent are high-salience
+        # summaries written by the reviewer. Weight their polarity without using
+        # any venue- or dataset-specific phrase.
+        # normalize_text removes newlines, so recover a likely title from the
+        # first sentence as a conservative fallback (maximum 18 tokens).
+        title_match = re.split(r"[.!?]", norm_text, maxsplit=1)[0].strip()
+        title_norm = title_match if len(title_match.split()) <= 18 else ""
+        if title_norm:
+            title_pos, title_neg = count_sentiment_hits_negation_aware(
+                title_norm, POSITIVE_WORDS, NEGATIVE_WORDS
+            )
+            title_strong_neg = count_strong_negative_hits(title_norm)
+            title_strong_pos = count_keyword_hits(
+                title_norm, STRONG_POSITIVE_SENTIMENT_PHRASES
+            )
+            eff_pos += title_pos + 2 * title_strong_pos
+            eff_neg += title_neg + 2 * title_strong_neg
+
+        # Keep the action close to the negated modal.  The former ``.{0,24}``
+        # pattern misread praise such as "khong nen bo qua ngoi chua ... den"
+        # as "khong nen den" merely because ``den`` appeared later.
+        negative_intent = any(
+            phrase in norm_text
+            for phrase in (
+                "khong nen den", "chang nen den", "khong muon den",
+                "khong nen mua", "chang nen mua", "khong muon mua",
+                "khong nen an", "khong nen uong",
+                "khong muon quay lai", "chang muon quay lai",
+                "khong the quay lai", "khong nen gioi thieu",
+            )
+        )
+        if negative_intent:
+            strong_neg_hits += 1
+
+        # Long complaint phrases should dominate incidental praise in the same review.
+        # Example: "khung cảnh đẹp nhưng trời xám xịt, gió mạnh, lên hình không đẹp".
+        eff_neg += 2 * strong_neg_hits + mild_neg_hits
+        eff_pos += strong_pos_hits
+
+        contrast_negative = bool(
+            re.search(
+                r"\b(nhung|tuy nhien|mac du|song)\b.{0,120}\b("
+                r"te|rat te|qua te|that vong|kho chiu|ket xe|dong nghet|"
+                r"khong ngon|khong tot|khong dep|khong sach|khong dang|"
+                r"khong nen|coc can|duoi khach|mat ve sinh|cho rat lau|doi rat lau"
+                r")\b",
+                norm_text,
+            )
+        )
+        if contrast_negative:
+            eff_neg += 2
+
+        # A few broad positive tokens are useful, but they should not outweigh
+        # concrete price/traffic/weather/service complaints.
+        if strong_neg_hits > 0 and eff_pos > 0:
+            eff_pos = max(0, eff_pos - min(eff_pos, strong_neg_hits))
+        if eff_neg >= 2 and eff_neg >= eff_pos and strong_pos_hits == 0:
+            eff_pos = max(0, eff_pos - 1)
+        complaint_evidence = (
+            strong_neg_hits > 0
+            or contrast_negative
+            or (mild_neg_hits >= 2 and eff_neg >= eff_pos)
+            or (eff_neg >= 3 and eff_neg > eff_pos)
+        )
+        if complaint_evidence and stars_int is not None and stars_int >= 4:
+            # Some public reviews carry high stars but the useful text is a
+            # concrete complaint. Do not let stars dominate those cases.
+            base_pos, base_neu, base_neg = 0.45, 0.20, 0.35
+        no_long_wait_patterns = (
+            "khong phai cho qua lau",
+            "khong phai cho lau",
+            "khong phai doi qua lau",
+            "khong phai doi lau",
+            "khong cho qua lau",
+            "khong doi qua lau",
+        )
+        for phrase in no_long_wait_patterns:
+            if phrase in norm_text:
+                if eff_neg > 0:
+                    eff_neg -= 1
+                eff_pos += 1
+
         keyword_total = eff_pos + eff_neg
 
         if keyword_total > 0:
             kw_ratio = (eff_pos - eff_neg) / keyword_total
             if kw_ratio > 0.3:
-                pos = min(0.90, base_pos + 0.15)
-                neg = max(0.02, base_neg - 0.10)
-            elif kw_ratio < -0.3:
-                pos = max(0.02, base_pos - 0.10)
-                neg = min(0.90, base_neg + 0.15)
+                boost = min(0.35, 0.12 + 0.04 * keyword_total)
+                pos = min(0.92, base_pos + boost)
+                neg = max(0.02, base_neg - boost * 0.75)
+            elif kw_ratio < -0.12:
+                if strong_neg_hits > 0 or contrast_negative:
+                    boost = min(0.68, 0.20 + 0.055 * keyword_total + 0.09 * strong_neg_hits)
+                    pos = max(0.02, base_pos - boost * 1.05)
+                    neg = min(0.96, base_neg + boost * 1.10)
+                else:
+                    boost = min(0.52, 0.15 + 0.05 * keyword_total + 0.035 * mild_neg_hits)
+                    pos = max(0.02, base_pos - boost * 0.85)
+                    neg = min(0.94, base_neg + boost)
             else:
-                pos, neg = base_pos, base_neg
+                if strong_neg_hits > 0 or (mild_neg_hits >= 2 and eff_neg >= eff_pos):
+                    boost = min(0.48, 0.18 + 0.06 * strong_neg_hits + 0.04 * mild_neg_hits)
+                    pos = max(0.04, base_pos - boost * 0.80)
+                    neg = min(0.90, base_neg + boost)
+                else:
+                    pos, neg = base_pos, base_neg
             neu = max(0.02, 1.0 - pos - neg)
             total = pos + neu + neg
-            return {"positive": pos / total, "neutral": neu / total, "negative": neg / total}
+            strength = min(
+                1.0,
+                (keyword_total + strong_neg_hits + 0.5 * mild_neg_hits + int(contrast_negative)) / 5.0,
+            )
+            return (
+                {"positive": pos / total, "neutral": neu / total, "negative": neg / total},
+                strength,
+            )
 
-        return {"positive": base_pos, "neutral": base_neu, "negative": base_neg}
+        return {"positive": base_pos, "neutral": base_neu, "negative": base_neg}, 0.0
+
+    def _blend_sentiment(
+        self,
+        model_result: Optional[Dict[str, float]],
+        rule_result: Dict[str, float],
+        rule_strength: float,
+    ) -> Dict[str, float]:
+        if model_result is None:
+            return rule_result
+
+        model_pol = float(model_result["positive"] - model_result["negative"])
+        rule_pol = float(rule_result["positive"] - rule_result["negative"])
+
+        if rule_strength <= 0.0:
+            return model_result
+
+        if model_pol * rule_pol < 0 and abs(rule_pol) >= 0.30:
+            # The model is currently optimistic on many explicit complaints.
+            # Let strong lexical evidence override it more decisively.
+            # Requires a clearly-polarised rule signal (|pol| >= 0.30): every
+            # verified complaint in the labeled set scores beyond -0.35, while
+            # mixed positive reviews cluster in the weakly-negative band.
+            rule_weight = min(0.90, 0.62 + 0.28 * rule_strength)
+        else:
+            rule_weight = min(0.62, 0.22 + 0.40 * rule_strength)
+        model_weight = 1.0 - rule_weight
+
+        blended = {
+            "positive": model_weight * model_result["positive"] + rule_weight * rule_result["positive"],
+            "neutral": model_weight * model_result["neutral"] + rule_weight * rule_result["neutral"],
+            "negative": model_weight * model_result["negative"] + rule_weight * rule_result["negative"],
+        }
+        if (
+            rule_strength >= 0.45
+            and rule_result.get("negative", 0.0) >= 0.52
+            and blended["positive"] > blended["negative"]
+        ):
+            # Clear complaint evidence is still under-called by the model; nudge
+            # borderline blended cases over the decision boundary.
+            needed = min(blended["positive"] - blended["negative"] + 0.05, blended["positive"] * 0.45)
+            if needed > 0:
+                blended["positive"] -= needed
+                blended["negative"] += needed
+        total = sum(blended.values()) or 1.0
+        return {k: float(v / total) for k, v in blended.items()}
+
+    def _classify_sentiment(self, raw_text: str, norm_text: str, stars) -> Dict[str, float]:
+        """Blend model sentiment with negation-aware lexical evidence."""
+        model_result = self.classifier_provider.predict_sentiment(raw_text)
+        rule_result, rule_strength = self._rule_based_sentiment(norm_text, stars)
+        blended = self._blend_sentiment(model_result, rule_result, rule_strength)
+
+        # Many review sources expose a short user-written title on the first
+        # non-empty line. It is a high-salience summary (e.g. an overall warning)
+        # and should not be drowned out by a long body containing incidental
+        # positive nouns/adjectives. Apply this to any sufficiently explicit
+        # title, independent of topic or venue.
+        sentiment_doc = str(raw_text or "").replace("\\r\\n", "\n").replace("\\n", "\n")
+        lines = [line.strip() for line in sentiment_doc.splitlines() if line.strip()]
+        if len(lines) >= 2 and len(lines[0]) <= 160:
+            title_rule, title_strength = self._rule_based_sentiment(
+                normalize_text(lines[0]), None
+            )
+            title_polarity = title_rule["positive"] - title_rule["negative"]
+            if title_strength >= 0.20 and abs(title_polarity) >= 0.20:
+                title_weight = min(0.45, 0.22 + 0.25 * title_strength)
+                blended = {
+                    label: (1.0 - title_weight) * blended[label]
+                    + title_weight * title_rule[label]
+                    for label in ("positive", "neutral", "negative")
+                }
+                body_norm = normalize_text(" ".join(lines[1:]))
+                body_strong_negative = count_strong_negative_hits(body_norm) > 0
+                if (
+                    title_rule["negative"] >= 0.55
+                    and title_strength >= 0.40
+                    and body_strong_negative
+                    and blended["negative"] <= blended["positive"]
+                ):
+                    # An explicit negative headline is the author's summary, not
+                    # a weak clause. Cross the decision boundary conservatively
+                    # while retaining the original probability information.
+                    transfer = min(
+                        blended["positive"] * 0.45,
+                        (blended["positive"] - blended["negative"] + 0.06) / 2.0,
+                    )
+                    blended["positive"] -= transfer
+                    blended["negative"] += transfer
+                total = sum(blended.values()) or 1.0
+                blended = {label: float(value / total) for label, value in blended.items()}
+        return blended
 
     def _split_sentences(self, raw_text: str) -> List[str]:
         """Split review into clauses on punctuation and Vietnamese contrast conjunctions.
@@ -2265,7 +3579,7 @@ class ReviewFilteringPipeline:
             sent_topic: Dict[str, float] = (
                 (tc.predict(sent) or {}) if (tc and tc.active) else {}
             )
-            sent_sentiment = self.classifier_provider.predict_sentiment(sent) or base_sentiment
+            sent_sentiment = self._classify_sentiment(sent, normalize_text(sent), None)
             sent_data.append((sent_topic, sent_sentiment))
 
         result: Dict[str, Dict[str, float]] = {}
@@ -2285,11 +3599,79 @@ class ReviewFilteringPipeline:
                 }
                 continue
 
-            # Weighted-average sentiment direction across sentences for this topic,
-            # then scaled by overall topic_score so _flatten_sentiment still works correctly.
-            pos = sum(ss["positive"] * st.get(topic, 0.0) for st, ss in sent_data) / total_weight
-            neu = sum(ss["neutral"]  * st.get(topic, 0.0) for st, ss in sent_data) / total_weight
-            neg = sum(ss["negative"] * st.get(topic, 0.0) for st, ss in sent_data) / total_weight
+            # Sentence-level classifiers are useful for mixed-topic reviews, but
+            # short isolated clauses are substantially noisier and often overly
+            # positive. Preserve the title/negation-aware document decision as
+            # the anchor instead of replacing it completely with clause scores.
+            clause_sentiment = {
+                "positive": sum(ss["positive"] * st.get(topic, 0.0) for st, ss in sent_data) / total_weight,
+                "neutral":  sum(ss["neutral"]  * st.get(topic, 0.0) for st, ss in sent_data) / total_weight,
+                "negative": sum(ss["negative"] * st.get(topic, 0.0) for st, ss in sent_data) / total_weight,
+            }
+            ordered_base = sorted(base_sentiment.values(), reverse=True)
+            base_margin = ordered_base[0] - ordered_base[1]
+            canonical_doc = str(raw_text or "").replace("\\n", "\n")
+            doc_lines = [line.strip() for line in canonical_doc.splitlines() if line.strip()]
+            title_text = doc_lines[0] if len(doc_lines) >= 2 and len(doc_lines[0]) <= 160 else ""
+            title_rule, title_strength = self._rule_based_sentiment(
+                normalize_text(title_text), None
+            ) if title_text else (
+                {"positive": 0.33, "neutral": 0.34, "negative": 0.33}, 0.0
+            )
+            reliable_negative_title = (
+                title_strength >= 0.40
+                and title_rule["negative"] >= 0.55
+            )
+            complaint_clauses = [
+                normalize_text(part)
+                for part in re.split(r"[.!?;\n]+", canonical_doc)
+                if normalize_text(part)
+            ]
+            complaint_clause_count = sum(
+                1 for clause in complaint_clauses
+                if count_strong_negative_hits(clause) > 0
+            )
+            body_complaint_count = sum(
+                1 for clause in complaint_clauses[1:]
+                if count_strong_negative_hits(clause) > 0
+            )
+            reliable_document_complaint = (
+                base_sentiment["negative"] >= base_sentiment["positive"]
+                and (
+                    (reliable_negative_title and body_complaint_count >= 1)
+                    or complaint_clause_count >= 2
+                    or (
+                        base_sentiment["negative"] >= 0.55
+                        and complaint_clause_count >= 1
+                    )
+                )
+            )
+            # Preserve clause-level nuance for ordinary/mixed reviews. Only let
+            # the document anchor dominate when negative evidence is explicit;
+            # this asymmetry raises negative recall without sacrificing the very
+            # high positive recall of the sentence model. The document classifier
+            # is title- and negation-aware while isolated short clauses skew
+            # positive, so any negative-leaning document decision gets extra
+            # weight over the clause aggregate.
+            base_negative_leaning = (
+                base_sentiment["negative"] > base_sentiment["positive"]
+            )
+            if reliable_document_complaint:
+                document_weight = 0.80
+            elif base_negative_leaning and complaint_clause_count >= 1:
+                document_weight = 0.62
+            elif base_negative_leaning:
+                # Negative-leaning document without any explicit complaint
+                # clause: often a mixed/positive review the model misreads.
+                document_weight = 0.30
+            elif base_margin >= 0.20:
+                document_weight = 0.24
+            else:
+                document_weight = 0.16
+            clause_weight = 1.0 - document_weight
+            pos = document_weight * base_sentiment["positive"] + clause_weight * clause_sentiment["positive"]
+            neu = document_weight * base_sentiment["neutral"]  + clause_weight * clause_sentiment["neutral"]
+            neg = document_weight * base_sentiment["negative"] + clause_weight * clause_sentiment["negative"]
 
             result[topic] = {
                 "positive": float(pos * topic_score),
@@ -2353,8 +3735,11 @@ class ReviewFilteringPipeline:
             ]
 
             topic = str(content.get("main_topic"))
-            ttl_hours = self._ttl_hours_for_topic(topic, 72)
-            lookback_multiplier = self._lookback_multiplier_for_topic(topic)
+            ttl_hours = TTL_HOURS_BY_TOPIC.get(topic, 72)
+            lookback_multiplier = ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC.get(
+                topic,
+                self.config.old_lookback_multiplier,
+            )
             lookback_hours = ttl_hours * max(1, lookback_multiplier)
             ref_time = parse_iso(content["created_at"])
             if ref_time is not None:
@@ -2368,9 +3753,7 @@ class ReviewFilteringPipeline:
             total_pairs_examined += len(candidates)
 
             for old in candidates:
-                sim = cosine_similarity(content["embedding"], old["embedding"])
-                if sim < 0.5:
-                    continue
+                sim = self._review_similarity(content, old)
 
                 conflict_topic = content["main_topic"]
 
@@ -2385,32 +3768,92 @@ class ReviewFilteringPipeline:
                 adjusted_sim = sim * (0.5 + 0.5 * topic_conf)
 
                 nli_label, p_contra = self._infer_nli(content, old, sim, conflict_topic)
-                sentiment_gap = self._sentiment_distance_for_topic(content, old, conflict_topic)
-                conflict_score = 0.45 * adjusted_sim + 0.25 * sentiment_gap + 0.30 * p_contra
+                polarity_gap = self._polarity_gap_for_conflict(content, old, conflict_topic)
+                sentiment_gap = max(
+                    self._sentiment_distance_for_topic(content, old, conflict_topic),
+                    polarity_gap,
+                )
+                aspect_conflict_score = self._aspect_contradiction_score(
+                    content,
+                    old,
+                    conflict_topic,
+                    sim,
+                    topic_conf,
+                    polarity_gap,
+                )
+                strong_polarity_conflict = (
+                    nli_label == "contradiction"
+                    and sentiment_gap >= ALGORITHM2_STRONG_POLARITY_GAP
+                )
+                aspect_contradiction = (
+                    aspect_conflict_score >= ALGORITHM2_ASPECT_CONTRADICTION_THRESHOLD
+                )
 
-                if sim >= 0.8 or (sim >= 0.5 and nli_label == "contradiction"):
-                    if conflict_score >= self.config.conflict_score_threshold:
-                        conflicts.append({
-                            "id": str(uuid.uuid4()),
-                            "new_content_id": content["id"],
-                            "old_content_id": old["id"],
-                            "conflict_score": float(round(conflict_score, 4)),
-                            "conflict_topic": content["main_topic"],
-                            "created_at": content["created_at"],
-                        })
-                        content["has_conflict"] = True
-                        old["has_conflict"] = True
+                if (
+                    sim < ALGORITHM2_MIN_SIMILARITY
+                    and not strong_polarity_conflict
+                    and not aspect_contradiction
+                ):
+                    continue
+
+                if aspect_contradiction:
+                    conflict_score = max(
+                        aspect_conflict_score,
+                        0.30 * max(0.0, adjusted_sim)
+                        + 0.40 * sentiment_gap
+                        + 0.30 * p_contra,
+                    )
+                    min_conflict_score = ALGORITHM2_ASPECT_CONTRADICTION_THRESHOLD
+                elif strong_polarity_conflict:
+                    conflict_score = (
+                        0.20 * max(0.0, adjusted_sim)
+                        + 0.40 * sentiment_gap
+                        + 0.40 * p_contra
+                    )
+                    min_conflict_score = ALGORITHM2_STRONG_CONTRADICTION_THRESHOLD
+                else:
+                    conflict_score = 0.45 * adjusted_sim + 0.25 * sentiment_gap + 0.30 * p_contra
+                    min_conflict_score = self.config.conflict_score_threshold
+
+                should_record_conflict = (
+                    sim >= 0.8
+                    or (sim >= ALGORITHM2_MIN_SIMILARITY and nli_label == "contradiction")
+                    or strong_polarity_conflict
+                    or aspect_contradiction
+                )
+
+                if should_record_conflict and conflict_score >= min_conflict_score:
+                    conflicts.append({
+                        "id": str(uuid.uuid4()),
+                        "new_content_id": content["id"],
+                        "old_content_id": old["id"],
+                        "conflict_score": float(round(conflict_score, 4)),
+                        "conflict_topic": content["main_topic"],
+                        "conflict_evidence": (
+                            "aspect_sentiment_contradiction"
+                            if aspect_contradiction
+                            else (
+                                "sentiment_contradiction"
+                                if strong_polarity_conflict
+                                else "semantic_contradiction"
+                            )
+                        ),
+                        "created_at": content["created_at"],
+                    })
+                    content["has_conflict"] = True
+                    old["has_conflict"] = True
 
         meta = {
             "review_new_count": len(review_news),
             "review_old_count": len(review_olds),
             "current_review_old_count": len(current_review_olds),
             "historical_review_old_count": len(historical_review_olds),
+            "historical_long_term_source": "review_ai.review_contents",
             "total_pairs_examined": total_pairs_examined,
-            "candidate_mode": self.config.candidate_mode,
-            "top_k": self.config.top_k,
             "lookback_multiplier_default": self.config.old_lookback_multiplier,
             "lookback_multiplier_by_topic": self.config.lookback_multiplier_by_topic or ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC,
+            "max_candidates_per_review": self.config.max_candidates_per_review,
+            "aspect_contradiction_threshold": ALGORITHM2_ASPECT_CONTRADICTION_THRESHOLD,
         }
         return conflicts, meta
 
@@ -2419,21 +3862,134 @@ class ReviewFilteringPipeline:
         review_new: Dict[str, Any],
         raw_candidates: List[Dict[str, Any]],
     ) -> List[Dict[str, Any]]:
-        if self.config.candidate_mode == "all":
+        limit = self.config.max_candidates_per_review
+        if limit is None or limit <= 0 or len(raw_candidates) <= limit:
             return raw_candidates
 
         ref_time = parse_iso(review_new.get("created_at"))
 
-        def candidate_rank(old: Dict[str, Any]) -> Tuple[float, float]:
+        def candidate_rank(old: Dict[str, Any]) -> float:
             old_time = parse_iso(old.get("created_at"))
-            age_hours = 0.0
             if ref_time is not None and old_time is not None:
-                age_hours = max(0.0, (ref_time - old_time).total_seconds() / 3600.0)
-            sim = cosine_similarity(review_new["embedding"], old["embedding"])
-            return (-sim, age_hours)
+                return max(0.0, (ref_time - old_time).total_seconds())
+            return float("inf")
 
         ranked = sorted(raw_candidates, key=candidate_rank)
-        return ranked[: max(1, self.config.top_k)]
+        return ranked[:limit]
+
+    def _model_polarity_for_topic(
+        self, review: Dict[str, Any], topic: Optional[str]
+    ) -> float:
+        if topic:
+            t = review["sentiment_scores"].get(topic, {})
+            tot = (t.get("positive", 0.0) + t.get("neutral", 0.0) + t.get("negative", 0.0))
+            if tot > 0:
+                return (t.get("positive", 0.0) - t.get("negative", 0.0)) / tot
+        flat = self._flatten_sentiment(review["sentiment_scores"])
+        return flat["positive"] - flat["negative"]
+
+    def _lexical_polarity_for_conflict(self, text: str) -> float:
+        norm_text = normalize_text(text)
+        rule_result, rule_strength = self._rule_based_sentiment(norm_text, None)
+        if rule_strength <= 0:
+            return 0.0
+        return float(rule_result["positive"] - rule_result["negative"])
+
+    def _topic_contrast_hits(self, text: str, topic: str) -> Tuple[int, int]:
+        phrase_sets = TOPIC_CONTRAST_PHRASES.get(topic)
+        if not phrase_sets:
+            return 0, 0
+
+        norm_text = normalize_text(text)
+
+        def _count(phrases: List[str]) -> int:
+            hits = 0
+            for phrase in phrases:
+                norm_phrase = normalize_text(phrase)
+                if not norm_phrase:
+                    continue
+                if " " in norm_phrase:
+                    hits += norm_text.count(norm_phrase)
+                elif norm_phrase in norm_text.split():
+                    hits += 1
+            return hits
+
+        return _count(phrase_sets.get("positive", [])), _count(phrase_sets.get("negative", []))
+
+    def _aspect_contradiction_score(
+        self,
+        review_new: Dict[str, Any],
+        review_old: Dict[str, Any],
+        topic: str,
+        similarity: float,
+        topic_confidence: float,
+        polarity_gap: float,
+    ) -> float:
+        """Score same-topic, opposite-aspect contradictions missed by global NLI.
+
+        Full-review embeddings can be high for two service reviews even when the
+        actual aspect is opposite ("phuc vu cham" vs "phuc vu nhanh"). This
+        signal requires explicit topic contrast phrases plus enough polarity gap,
+        so it is narrower than simply lowering Algorithm 2's global threshold.
+        """
+        if similarity < ALGORITHM2_ASPECT_CONTRADICTION_MIN_SIMILARITY:
+            return 0.0
+        if topic_confidence < ALGORITHM2_ASPECT_TOPIC_FOCUS_MIN:
+            return 0.0
+
+        new_pos_hits, new_neg_hits = self._topic_contrast_hits(
+            str(review_new.get("content", "")),
+            topic,
+        )
+        old_pos_hits, old_neg_hits = self._topic_contrast_hits(
+            str(review_old.get("content", "")),
+            topic,
+        )
+
+        opposite_phrases = (
+            (new_pos_hits > 0 and old_neg_hits > 0)
+            or (new_neg_hits > 0 and old_pos_hits > 0)
+        )
+        if not opposite_phrases:
+            return 0.0
+
+        new_pol = self._polarity_for_conflict(review_new, topic)
+        old_pol = self._polarity_for_conflict(review_old, topic)
+        opposite_polarity = new_pol * old_pol < 0
+        if not opposite_polarity and polarity_gap < ALGORITHM2_ASPECT_POLARITY_GAP_MIN:
+            return 0.0
+
+        phrase_strength = min(1.0, (new_pos_hits + new_neg_hits + old_pos_hits + old_neg_hits) / 4.0)
+        polarity_strength = min(1.0, polarity_gap)
+        similarity_strength = max(0.0, min(1.0, similarity))
+        topic_strength = max(0.0, min(1.0, topic_confidence))
+
+        return float(
+            0.30 * similarity_strength
+            + 0.25 * topic_strength
+            + 0.25 * polarity_strength
+            + 0.20 * phrase_strength
+        )
+
+    def _polarity_for_conflict(
+        self, review: Dict[str, Any], topic: Optional[str]
+    ) -> float:
+        model_pol = self._model_polarity_for_topic(review, topic)
+        lexical_pol = self._lexical_polarity_for_conflict(str(review.get("content", "")))
+
+        # Prefer lexical polarity when it is clear enough. This protects Algorithm 2
+        # from sentiment-model mistakes on short aspect-focused Vietnamese reviews.
+        if abs(lexical_pol) >= ALGORITHM2_LEXICAL_POLARITY_MIN:
+            return lexical_pol
+        return model_pol
+
+    def _polarity_gap_for_conflict(
+        self, a: Dict[str, Any], b: Dict[str, Any], topic: Optional[str]
+    ) -> float:
+        return abs(
+            self._polarity_for_conflict(a, topic)
+            - self._polarity_for_conflict(b, topic)
+        )
 
     def _infer_nli(
         self,
@@ -2442,18 +3998,8 @@ class ReviewFilteringPipeline:
         similarity: float,
         conflict_topic: Optional[str] = None,
     ) -> Tuple[str, float]:
-        # Prefer topic-specific sentiment so unrelated content doesn't distort polarity.
-        def _topic_polarity(review: Dict[str, Any]) -> float:
-            if conflict_topic:
-                t = review["sentiment_scores"].get(conflict_topic, {})
-                tot = (t.get("positive", 0.0) + t.get("neutral", 0.0) + t.get("negative", 0.0))
-                if tot > 0:
-                    return (t.get("positive", 0.0) - t.get("negative", 0.0)) / tot
-            flat = self._flatten_sentiment(review["sentiment_scores"])
-            return flat["positive"] - flat["negative"]
-
-        a_pol = _topic_polarity(a)  # range [-1, +1]
-        b_pol = _topic_polarity(b)
+        a_pol = self._polarity_for_conflict(a, conflict_topic)  # range [-1, +1]
+        b_pol = self._polarity_for_conflict(b, conflict_topic)
         pol_product = a_pol * b_pol
         pol_distance = abs(a_pol - b_pol)  # range [0, 2]
 
@@ -2499,6 +4045,27 @@ class ReviewFilteringPipeline:
         if flat["negative"] > flat["positive"]:
             return -1
         return 0
+
+    def _lexical_overlap_similarity(self, a: Dict[str, Any], b: Dict[str, Any]) -> float:
+        left = content_token_set(str(a.get("content", "")))
+        right = content_token_set(str(b.get("content", "")))
+        if not left or not right:
+            return 0.0
+        return float((2.0 * len(left & right)) / (len(left) + len(right)))
+
+    def _review_similarity(self, a: Dict[str, Any], b: Dict[str, Any]) -> float:
+        embedding_sim = cosine_similarity(a.get("embedding", []), b.get("embedding", []))
+        lexical_sim = self._lexical_overlap_similarity(a, b)
+
+        # Hash embeddings are sparse/noisy. Same-topic repeated observations often
+        # share enough domain words to be obvious even when cosine is unreliable.
+        same_sentiment = self._sentiment_label(a.get("sentiment_scores", {})) == self._sentiment_label(
+            b.get("sentiment_scores", {})
+        )
+        lexical_adjusted = lexical_sim
+        if lexical_sim >= 0.30:
+            lexical_adjusted += 0.25 if same_sentiment else 0.15
+        return float(max(embedding_sim, min(1.0, lexical_adjusted)))
 
     def _sentiment_distance(self, a: Dict[str, Any], b: Dict[str, Any]) -> float:
         a_sent = self._flatten_sentiment(a["sentiment_scores"])
@@ -2552,6 +4119,7 @@ class ReviewFilteringPipeline:
         now = self.config.now
         hidden_review_ids: List[str] = []
         notifications: List[Dict[str, Any]] = []
+        self._promotion_diagnostics: List[Dict[str, Any]] = []
 
         for content in contents:
             expiration = parse_iso(content.get("expiration_date"))
@@ -2564,15 +4132,27 @@ class ReviewFilteringPipeline:
                     "notified_at": to_iso(now),
                 })
 
-        conflict_ids = {c["new_content_id"] for c in conflicts} | {c["old_content_id"] for c in conflicts}
-        long_term_summaries, promoted_ids = self._derive_long_term_summaries(contents, conflict_ids)
+        (
+            long_term_summaries,
+            promoted_ids,
+            hidden_long_term_ids,
+            conflict_resolutions,
+        ) = self._derive_long_term_summaries(contents, conflicts)
+
+        for content_id in hidden_long_term_ids:
+            if content_id not in hidden_review_ids:
+                hidden_review_ids.append(content_id)
 
         return {
             "generated_at": to_iso(now),
             "hidden_review_ids": hidden_review_ids,
+            "hidden_long_term_review_ids": hidden_long_term_ids,
             "notifications": notifications,
             "long_term_summaries": long_term_summaries,
             "promoted_review_content_ids": promoted_ids,
+            "conflict_resolutions": conflict_resolutions,
+            "promotion_diagnostics": self._promotion_diagnostics,
+            "algorithm3_input_summary": self._algorithm3_input_summary,
             "algorithm2_input_summary": algorithm2_meta,
             "promotion_mode": self.config.promotion_mode,
         }
@@ -2580,44 +4160,102 @@ class ReviewFilteringPipeline:
     def _derive_long_term_summaries(
         self,
         contents: List[Dict[str, Any]],
-        conflict_ids: set[str],
-    ) -> Tuple[List[Dict[str, Any]], List[str]]:
+        conflicts: List[Dict[str, Any]],
+    ) -> Tuple[List[Dict[str, Any]], List[str], List[str], List[Dict[str, Any]]]:
         by_group: Dict[Tuple[str, str], List[Dict[str, Any]]] = defaultdict(list)
-        for content in contents:
+        current_content_ids = {str(content.get("id")) for content in contents}
+        recent_db_short_terms = self._load_recent_short_terms_for_algorithm3()
+        candidates_by_id: Dict[str, Dict[str, Any]] = {
+            str(content.get("id")): content for content in recent_db_short_terms
+        }
+        # Freshly classified values from this batch override a DB copy.
+        candidates_by_id.update({str(content.get("id")): content for content in contents})
+        max_window_start = self.config.now - timedelta(
+            days=self._max_observation_window_days()
+        )
+        contents_by_id: Dict[str, Dict[str, Any]] = {
+            str(content.get("id")): content for content in contents
+        }
+        conflicts_by_new_id: Dict[str, List[Dict[str, Any]]] = defaultdict(list)
+        for conflict in conflicts:
+            new_content_id = conflict.get("new_content_id")
+            if new_content_id:
+                conflicts_by_new_id[str(new_content_id)].append(conflict)
+
+        # DB applied the largest window. Apply the topic-specific window before
+        # grouping, so expired observations never enter a group or cluster.
+        for content in candidates_by_id.values():
             if content.get("time_label") != "short-term":
                 continue
-            key = (str(content.get("place_id")), str(content.get("main_topic")))
+            created_at = parse_iso(content.get("created_at"))
+            if created_at is None or created_at < max_window_start:
+                continue
+            topic = str(content.get("main_topic") or "other")
+            rule = self._observation_rule_for_topic(topic)
+            topic_window_start = self.config.now - timedelta(
+                days=int(rule["window_days"])
+            )
+            if created_at < topic_window_start:
+                continue
+            key = (str(content.get("place_id")), topic)
             by_group[key].append(content)
+
+        self._algorithm3_input_summary = {
+            "max_observation_window_days": self._max_observation_window_days(),
+            "db_short_term_count_in_max_window": len(recent_db_short_terms),
+            "deduplicated_content_count": len(candidates_by_id),
+            "topic_window_candidate_count": sum(len(items) for items in by_group.values()),
+            "group_count": len(by_group),
+        }
 
         summaries: List[Dict[str, Any]] = []
         promoted_content_ids: List[str] = []
+        hidden_long_term_ids: List[str] = []
+        conflict_resolutions: List[Dict[str, Any]] = []
 
         for (place_id, topic), group_items in by_group.items():
             rule = self._observation_rule_for_topic(topic)
             window_days = int(rule["window_days"])
             threshold = int(rule["threshold"])
             sim_threshold = float(rule["sim_threshold"])
-            window_start = self.config.now - timedelta(days=window_days)
+            candidates = group_items
 
-            candidates = [
-                item for item in group_items
-                if parse_iso(item["created_at"]) and parse_iso(item["created_at"]) >= window_start
-                and item["id"] not in conflict_ids
-            ]
+            group_diag = {
+                "place_id": place_id,
+                "topic": topic,
+                "short_term_count": len(group_items),
+                "candidate_count_in_window": len(candidates),
+                "required_support_count": threshold,
+                "sim_threshold": sim_threshold,
+                "window_days": window_days,
+                "clusters": [],
+                "status": "pending",
+            }
+            self._promotion_diagnostics.append(group_diag)
 
             if len(candidates) < threshold:
+                group_diag["status"] = "not_enough_candidates_in_window"
                 continue
 
             clusters: List[List[Dict[str, Any]]] = []
             for item in sorted(candidates, key=lambda x: x["created_at"]):
                 placed = False
                 for cluster in clusters:
-                    if cosine_similarity(item["embedding"], cluster[0]["embedding"]) >= sim_threshold:
+                    cluster_sim = max(self._review_similarity(item, other) for other in cluster)
+                    if cluster_sim >= sim_threshold:
                         cluster.append(item)
                         placed = True
                         break
                 if not placed:
                     clusters.append([item])
+
+            for cluster in clusters:
+                group_diag["clusters"].append({
+                    "size": len(cluster),
+                    "review_content_ids": [str(item.get("id")) for item in cluster],
+                    "cohesion": float(round(self._cluster_cohesion(cluster), 4)),
+                })
+            group_diag["status"] = "clusters_built"
 
             for cluster in clusters:
                 if len(cluster) < threshold:
@@ -2627,9 +4265,36 @@ class ReviewFilteringPipeline:
                 sentiment_counter = Counter(
                     self._sentiment_label(item["sentiment_scores"]) for item in cluster
                 )
+                sentiment_consistency = self._sentiment_consistency(sentiment_counter, len(cluster))
+                cluster_cohesion = self._cluster_cohesion(cluster)
+                cluster_conflicts = [
+                    conflict
+                    for item in cluster
+                    for conflict in conflicts_by_new_id.get(str(item.get("id")), [])
+                ]
+                conflicting_old_ids = sorted({
+                    str(conflict.get("old_content_id"))
+                    for conflict in cluster_conflicts
+                    if conflict.get("old_content_id")
+                })
+                avg_conflict_score = (
+                    sum(float(conflict.get("conflict_score", 0.0)) for conflict in cluster_conflicts)
+                    / len(cluster_conflicts)
+                    if cluster_conflicts else 0.0
+                )
+                should_hide_old = self._has_strong_replacement_evidence(
+                    support_count=len(cluster),
+                    threshold=threshold,
+                    avg_conflict_score=avg_conflict_score,
+                    sentiment_consistency=sentiment_consistency,
+                    cluster_cohesion=cluster_cohesion,
+                    sim_threshold=sim_threshold,
+                    has_conflicting_old=bool(conflicting_old_ids),
+                )
 
+                summary_id = str(uuid.uuid4())
                 summaries.append({
-                    "id": str(uuid.uuid4()),
+                    "id": summary_id,
                     "place_id": place_id,
                     "topic": topic,
                     "representative_review_id": representative["review_id"],
@@ -2644,6 +4309,15 @@ class ReviewFilteringPipeline:
                         "neutral": int(sentiment_counter.get("neutral", 0)),
                         "negative": int(sentiment_counter.get("negative", 0)),
                     },
+                    "sentiment_consistency": float(round(sentiment_consistency, 4)),
+                    "cluster_cohesion": float(round(cluster_cohesion, 4)),
+                    "conflicting_long_term_content_ids": conflicting_old_ids,
+                    "avg_conflict_score": float(round(avg_conflict_score, 4)),
+                    "replacement_evidence": (
+                        "strong"
+                        if should_hide_old
+                        else ("insufficient" if conflicting_old_ids else "none")
+                    ),
                     "long_term_derived_at": to_iso(self.config.now),
                 })
 
@@ -2653,8 +4327,80 @@ class ReviewFilteringPipeline:
                     target["is_temporary"] = False
                     target["expiration_date"] = None
                     promoted_content_ids.append(target["id"])
+                    if str(target.get("id")) not in current_content_ids:
+                        self.algorithm3_historical_updates.append(target)
 
-        return summaries, promoted_content_ids
+                if conflicting_old_ids:
+                    action = "hide" if should_hide_old else "keep"
+                    reason = (
+                        "strong_repeated_conflicting_short_term_evidence"
+                        if should_hide_old
+                        else "promoted_cluster_not_strong_enough_to_hide_old_long_term"
+                    )
+                    for old_id in conflicting_old_ids:
+                        old_content = contents_by_id.get(old_id)
+                        if should_hide_old:
+                            if old_id not in hidden_long_term_ids:
+                                hidden_long_term_ids.append(old_id)
+                            if old_content is not None:
+                                old_content["is_hidden"] = True
+                                old_content["hidden_reason"] = "superseded_by_promoted_long_term_summary"
+                                old_content["superseded_by_summary_id"] = summary_id
+                        conflict_resolutions.append({
+                            "old_content_id": old_id,
+                            "new_summary_id": summary_id,
+                            "action": action,
+                            "reason": reason,
+                            "support_count": len(cluster),
+                            "required_support_count": threshold + REPLACEMENT_EXTRA_SUPPORT,
+                            "avg_conflict_score": float(round(avg_conflict_score, 4)),
+                            "required_conflict_score": REPLACEMENT_CONFLICT_SCORE_THRESHOLD,
+                            "sentiment_consistency": float(round(sentiment_consistency, 4)),
+                            "required_sentiment_consistency": REPLACEMENT_SENTIMENT_CONSISTENCY_THRESHOLD,
+                            "cluster_cohesion": float(round(cluster_cohesion, 4)),
+                            "required_cluster_cohesion": float(round(
+                                min(1.0, sim_threshold + REPLACEMENT_COHESION_MARGIN), 4
+                            )),
+                        })
+
+                group_diag["status"] = "promoted"
+
+        return summaries, promoted_content_ids, hidden_long_term_ids, conflict_resolutions
+
+    def _sentiment_consistency(self, sentiment_counter: Counter, cluster_size: int) -> float:
+        if cluster_size <= 0 or not sentiment_counter:
+            return 0.0
+        return float(max(sentiment_counter.values()) / cluster_size)
+
+    def _cluster_cohesion(self, cluster: List[Dict[str, Any]]) -> float:
+        if len(cluster) < 2:
+            return 1.0
+        sims: List[float] = []
+        for i, left in enumerate(cluster):
+            for right in cluster[i + 1:]:
+                sims.append(self._review_similarity(left, right))
+        return float(sum(sims) / len(sims)) if sims else 1.0
+
+    def _has_strong_replacement_evidence(
+        self,
+        support_count: int,
+        threshold: int,
+        avg_conflict_score: float,
+        sentiment_consistency: float,
+        cluster_cohesion: float,
+        sim_threshold: float,
+        has_conflicting_old: bool,
+    ) -> bool:
+        if not has_conflicting_old:
+            return False
+        required_support = threshold + REPLACEMENT_EXTRA_SUPPORT
+        required_cohesion = min(1.0, sim_threshold + REPLACEMENT_COHESION_MARGIN)
+        return (
+            support_count >= required_support
+            and avg_conflict_score >= REPLACEMENT_CONFLICT_SCORE_THRESHOLD
+            and sentiment_consistency >= REPLACEMENT_SENTIMENT_CONSISTENCY_THRESHOLD
+            and cluster_cohesion >= required_cohesion
+        )
 
     def _sentiment_label(self, sentiment: Dict[str, Any]) -> str:
         flat = self._flatten_sentiment(sentiment)
@@ -2771,6 +4517,140 @@ def write_contents_to_db(client, contents: List[Dict[str, Any]]) -> None:
             .upsert(chunk, on_conflict="id")
             .execute()
         )
+
+
+def _content_review_ids(client, content_ids: List[str]) -> List[str]:
+    """Resolve review IDs for review_content IDs in bounded REST requests."""
+    unique_content_ids = list(dict.fromkeys(str(value) for value in content_ids if value))
+    review_ids: List[str] = []
+    resolved_content_ids = set()
+    for i in range(0, len(unique_content_ids), _DB_BATCH):
+        chunk = unique_content_ids[i : i + _DB_BATCH]
+        response = (
+            client
+            .schema("review_ai")
+            .from_("review_contents")
+            .select("id,review_id")
+            .in_("id", chunk)
+            .execute()
+        )
+        for row in response.data or []:
+            if row.get("id") and row.get("review_id"):
+                resolved_content_ids.add(str(row["id"]))
+                review_ids.append(str(row["review_id"]))
+
+    unresolved = set(unique_content_ids) - resolved_content_ids
+    if unresolved:
+        raise RuntimeError(
+            "Cannot resolve review_id for review_contents: "
+            + ", ".join(sorted(unresolved))
+        )
+    return list(dict.fromkeys(review_ids))
+
+
+def _expired_short_term_review_ids(client, now_iso: str) -> List[str]:
+    """Load every expired short-term review, including old processed rows."""
+    review_ids: List[str] = []
+    offset = 0
+    while True:
+        response = (
+            client
+            .schema("review_ai")
+            .from_("review_contents")
+            .select("review_id")
+            .eq("time_label", "short-term")
+            .lte("expiration_date", now_iso)
+            .range(offset, offset + _DB_BATCH - 1)
+            .execute()
+        )
+        rows = response.data or []
+        review_ids.extend(
+            str(row["review_id"])
+            for row in rows
+            if row.get("review_id")
+        )
+        if len(rows) < _DB_BATCH:
+            break
+        offset += _DB_BATCH
+    return list(dict.fromkeys(review_ids))
+
+
+def apply_algorithm3_db_updates(
+    client,
+    result: Dict[str, Any],
+    now_iso: str,
+) -> Dict[str, int]:
+    """Persist Algorithm 3 visibility and promotion decisions."""
+    promoted_content_ids = list(
+        dict.fromkeys(
+            str(value)
+            for value in result.get("promoted_review_content_ids", [])
+            if value
+        )
+    )
+    hidden_long_term_content_ids = list(
+        dict.fromkeys(
+            str(value)
+            for value in result.get("hidden_long_term_review_ids", [])
+            if value
+        )
+    )
+
+    # Make promotion persistence explicit. This also covers historical
+    # short-term contents that were not part of the current pending batch.
+    for i in range(0, len(promoted_content_ids), _DB_BATCH):
+        chunk = promoted_content_ids[i : i + _DB_BATCH]
+        (
+            client
+            .schema("review_ai")
+            .from_("review_contents")
+            .update({
+                "time_label": "long-term",
+                "expiration_date": None,
+                "is_temporary": False,
+            })
+            .in_("id", chunk)
+            .execute()
+        )
+
+    expired_review_ids = _expired_short_term_review_ids(client, now_iso)
+    hidden_long_term_review_ids = _content_review_ids(
+        client, hidden_long_term_content_ids
+    )
+    hidden_review_ids = list(
+        dict.fromkeys([*expired_review_ids, *hidden_long_term_review_ids])
+    )
+
+    for i in range(0, len(hidden_review_ids), _DB_BATCH):
+        chunk = hidden_review_ids[i : i + _DB_BATCH]
+        (
+            client
+            .schema("review_ai")
+            .from_("reviews")
+            .update({"status": "hidden"})
+            .in_("id", chunk)
+            .execute()
+        )
+
+    promoted_review_ids = _content_review_ids(client, promoted_content_ids)
+    for i in range(0, len(promoted_review_ids), _DB_BATCH):
+        chunk = promoted_review_ids[i : i + _DB_BATCH]
+        (
+            client
+            .schema("review_ai")
+            .from_("reviews")
+            .update({"status": "approved"})
+            .eq("status", "hidden")
+            .in_("id", chunk)
+            .execute()
+        )
+
+    return {
+        "expired_reviews_hidden": len(expired_review_ids),
+        "long_term_reviews_hidden": len(hidden_long_term_review_ids),
+        "contents_promoted": len(promoted_content_ids),
+        "promoted_reviews_checked": len(promoted_review_ids),
+    }
 
 
 def write_conflicts_to_db(client, conflicts: List[Dict[str, Any]]) -> None:

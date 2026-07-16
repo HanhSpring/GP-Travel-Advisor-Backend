@@ -8,6 +8,7 @@ ghi kết quả về DB và trả về dict summary cho endpoint.
 from __future__ import annotations
 
 from pathlib import Path
+from threading import Lock
 from typing import Any, Dict
 
 from app.core.config import settings
@@ -22,6 +23,7 @@ from app.services.review_filter_pipeline import (
     PipelineConfig,
     ReviewFilteringPipeline,
     _create_supabase_client,
+    apply_algorithm3_db_updates,
     fetch_pending_reviews,
     mark_conflicted_contents,
     utc_now,
@@ -30,6 +32,9 @@ from app.services.review_filter_pipeline import (
 )
 
 logger = get_logger(__name__)
+
+_PIPELINE_RUN_LOCK = Lock()
+_MODEL_PROVIDER_CACHE: Dict[str, tuple[Any, Any]] = {}
 
 _AI_SERVICE_DIR = Path(__file__).resolve().parents[2]
 
@@ -92,6 +97,13 @@ def _resolve_phobert_time_model_path() -> str | None:
 
 
 def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
+    # Transformer initialization and inference are memory intensive. Serialize
+    # runs so a manual trigger and the scheduler cannot load duplicate models.
+    with _PIPELINE_RUN_LOCK:
+        return _run_pipeline(request)
+
+
+def _run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
     """Thực thi pipeline phân loại review. Trả về dict summary."""
 
     now = utc_now()
@@ -121,7 +133,21 @@ def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
     }
 
     if not reviews:
-        logger.info("[pipeline] Không có review pending. Kết thúc.")
+        if not request.dry_run:
+            algorithm3_updates = apply_algorithm3_db_updates(
+                supabase,
+                {},
+                now.isoformat(),
+            )
+            empty_result["hidden_reviews"] = algorithm3_updates[
+                "expired_reviews_hidden"
+            ]
+            logger.info(
+                "[pipeline] Không có review pending; đã cập nhật short-term hết hạn: %s",
+                algorithm3_updates,
+            )
+        else:
+            logger.info("[pipeline] Không có review pending; dry_run bỏ qua ghi DB.")
         return empty_result
 
     phobert_time_model_path = _resolve_phobert_time_model_path()
@@ -139,18 +165,42 @@ def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         classifier_confidence_threshold=request.classifier_confidence_threshold,
         classifier_ambiguity_margin=request.classifier_ambiguity_margin,
         topic_other_threshold=request.topic_other_threshold,
-        candidate_mode=request.candidate_mode,
-        top_k=request.top_k,
         old_lookback_multiplier=6,
         promotion_mode=request.promotion_mode,
         conflict_score_threshold=request.conflict_score_threshold,
+        max_candidates_per_review=request.max_candidates_per_review or None,
         ttl_hours_by_topic=request.ttl_hours_by_topic,
         observation_rules=request.observation_rules,
         lookback_multiplier_by_topic=request.lookback_multiplier_by_topic,
         phobert_time_model_path=phobert_time_model_path,
+        save_json=settings.pipeline_save_json,
     )
 
-    pipeline = ReviewFilteringPipeline(config, supabase_client=supabase)
+    cache_key = "|".join([
+        str(use_pretrained),
+        config.embedding_model_name,
+        config.sentiment_model_name,
+        str(config.zeroshot_model_name),
+        config.topic_model_name,
+        str(config.phobert_time_model_path),
+    ])
+    cached_providers = _MODEL_PROVIDER_CACHE.get(cache_key)
+    logger.info(
+        "[pipeline] Model providers: %s",
+        "reuse cached providers" if cached_providers else "initialize providers",
+    )
+    pipeline = ReviewFilteringPipeline(
+        config,
+        supabase_client=supabase,
+        embedding_provider=cached_providers[0] if cached_providers else None,
+        classifier_provider=cached_providers[1] if cached_providers else None,
+    )
+    if cached_providers is None:
+        _MODEL_PROVIDER_CACHE.clear()
+        _MODEL_PROVIDER_CACHE[cache_key] = (
+            pipeline.embedding_provider,
+            pipeline.classifier_provider,
+        )
     if not pipeline.classifier_provider.phobert_time_active:
         logger.warning(
             "[pipeline] PhoBERT time-label model is not active. path=%s error=%s",
@@ -159,12 +209,30 @@ def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         )
     report, contents, conflicts = pipeline.run(reviews)
 
+    algorithm3_updates = None
     if not request.dry_run:
-        logger.info(f"[pipeline] Ghi {len(contents)} contents về Supabase...")
-        write_contents_to_db(supabase, contents)
+        contents_to_write = [*contents, *pipeline.algorithm3_historical_updates]
+        contents_to_write = list(
+            {str(item["id"]): item for item in contents_to_write}.values()
+        )
+        logger.info(
+            "[pipeline] Ghi %d contents về Supabase (%d cập nhật lịch sử từ Algorithm 3)...",
+            len(contents_to_write),
+            len(pipeline.algorithm3_historical_updates),
+        )
+        write_contents_to_db(supabase, contents_to_write)
         logger.info(f"[pipeline] Ghi {len(conflicts)} conflicts về Supabase...")
         write_conflicts_to_db(supabase, conflicts)
         mark_conflicted_contents(supabase, conflicts)
+        algorithm3_updates = apply_algorithm3_db_updates(
+            supabase,
+            pipeline.algorithm3_result,
+            now.isoformat(),
+        )
+        logger.info(
+            "[pipeline] Da ap dung ket qua Algorithm 3 vao Supabase: %s",
+            algorithm3_updates,
+        )
     else:
         logger.info("[pipeline] dry_run=True — bỏ qua ghi DB.")
 
@@ -174,7 +242,12 @@ def run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         "contents_processed": report["algorithm1_total_contents"],
         "conflicts_detected": report["algorithm2_total_conflicts"],
         "long_term_summaries": report["algorithm3_total_long_term_summaries"],
-        "hidden_reviews": report["algorithm3_total_hidden_reviews"],
+        "hidden_reviews": (
+            algorithm3_updates["expired_reviews_hidden"]
+            + algorithm3_updates["long_term_reviews_hidden"]
+            if algorithm3_updates is not None
+            else report["algorithm3_total_hidden_reviews"]
+        ),
         "output_dir": str(batch_output_dir),
         "embedding_model_active": report["embedding_model"]["active"],
         "sentiment_model_active": report["classifier_models"]["sentiment"]["active"],

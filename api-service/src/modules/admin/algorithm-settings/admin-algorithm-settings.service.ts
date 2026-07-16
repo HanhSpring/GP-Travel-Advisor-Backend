@@ -235,8 +235,7 @@ const REVIEW_FILTER_PARAM_LABELS: Record<string, string> = {
   classifier_confidence_threshold: 'Độ tin cậy tối thiểu của mô hình',
   classifier_ambiguity_margin: 'Biên độ phân biệt nhãn',
   conflict_score_threshold: 'Ngưỡng điểm xung đột',
-  candidate_mode: 'Chế độ lựa chọn đánh giá so sánh',
-  top_k: 'Số đánh giá tối đa để so sánh',
+  max_candidates_per_review: 'Giới hạn đánh giá so sánh',
   promotion_mode: 'Chế độ nâng cấp đánh giá',
 };
 
@@ -269,19 +268,12 @@ const REVIEW_FILTER_DEFAULTS: Record<string, Omit<ParameterMetaDto, 'name'>> = {
     maxValue: 0.9,
     description: REVIEW_FILTER_PARAM_LABELS.conflict_score_threshold,
   },
-  candidate_mode: {
+  max_candidates_per_review: {
     defaultValue: 0,
     currentValue: 0,
     minValue: 0,
-    maxValue: 1,
-    description: REVIEW_FILTER_PARAM_LABELS.candidate_mode,
-  },
-  top_k: {
-    defaultValue: 5,
-    currentValue: 5,
-    minValue: 1,
-    maxValue: 50,
-    description: REVIEW_FILTER_PARAM_LABELS.top_k,
+    maxValue: 1000,
+    description: REVIEW_FILTER_PARAM_LABELS.max_candidates_per_review,
   },
   promotion_mode: {
     defaultValue: 0,
@@ -597,8 +589,10 @@ export class AdminAlgorithmSettingsService {
       ),
       classifier_ambiguity_margin: value('classifier_ambiguity_margin', 0.1),
       conflict_score_threshold: value('conflict_score_threshold', 0.65),
-      candidate_mode: value('candidate_mode', 0) === 1 ? 'topk' : 'all',
-      top_k: Math.round(value('top_k', 5)),
+      max_candidates_per_review: (() => {
+        const configured = Math.round(value('max_candidates_per_review', 0));
+        return configured === 0 ? null : configured;
+      })(),
       promotion_mode:
         value('promotion_mode', 0) === 1 ? 'all' : 'representative',
       ttl_hours_by_topic: byTopic('ttl_hours', {}),
@@ -920,14 +914,20 @@ export class AdminAlgorithmSettingsService {
 
       const minValue = toNumber(row.min_value);
       const maxValue = toNumber(row.max_value);
-      if (change.newValue < minValue || change.newValue > maxValue) {
+      const isUnlimitedCandidateValue =
+        change.parameterName === 'max_candidates_per_review' &&
+        change.newValue === 0;
+      if (
+        !isUnlimitedCandidateValue &&
+        (change.newValue < minValue || change.newValue > maxValue)
+      ) {
         throw new BadRequestException(
           `Tham số ${change.parameterName} phải nằm trong khoảng ${minValue} - ${maxValue}`,
         );
       }
 
       if (
-        ['candidate_mode', 'promotion_mode'].includes(change.parameterName) &&
+        change.parameterName === 'promotion_mode' &&
         ![0, 1].includes(change.newValue)
       ) {
         throw new BadRequestException(
@@ -936,7 +936,7 @@ export class AdminAlgorithmSettingsService {
       }
 
       if (
-        (change.parameterName === 'top_k' ||
+        (change.parameterName === 'max_candidates_per_review' ||
           change.parameterName.startsWith('ttl_hours.') ||
           change.parameterName.startsWith('lookback_multiplier.') ||
           change.parameterName.startsWith('window_days.') ||
@@ -1204,8 +1204,7 @@ export class AdminAlgorithmSettingsService {
     }
     if (
       parameterName === 'conflict_score_threshold' ||
-      parameterName === 'candidate_mode' ||
-      parameterName === 'top_k' ||
+      parameterName === 'max_candidates_per_review' ||
       parameterName.startsWith('lookback_multiplier.')
     ) {
       return 'Phát hiện xung đột';

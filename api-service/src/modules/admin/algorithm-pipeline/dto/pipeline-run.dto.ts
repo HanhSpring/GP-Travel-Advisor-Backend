@@ -34,10 +34,17 @@ export class PipelineRunRequestDto {
   @IsNumber()
   topic_other_threshold?: number;
 
-  @ApiPropertyOptional({ default: 'all', enum: ['all', 'topk'] })
+  @ApiPropertyOptional({
+    nullable: true,
+    minimum: 0,
+    maximum: 1000,
+    description: 'Giới hạn đánh giá dài hạn so sánh cho mỗi đánh giá ngắn hạn',
+  })
   @IsOptional()
-  @IsString()
-  candidate_mode?: string;
+  @IsNumber()
+  @Min(0)
+  @Max(1000)
+  max_candidates_per_review?: number | null;
 
   @ApiPropertyOptional({
     default: 'representative',
