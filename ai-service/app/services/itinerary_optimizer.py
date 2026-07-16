@@ -10,6 +10,7 @@ import logging
 from typing import Optional, Tuple, List
 from ortools.sat.python import cp_model
 from app.schemas.optimize import ActivityInput, OptimizedActivity
+from app.services.itinerary import planner
 
 logger = logging.getLogger(__name__)
 
@@ -133,8 +134,8 @@ def optimize_day_schedule(
             if act.is_locked and act.locked_arrive_time:
                 pass
             else:
-                model.Add(arrival[i] >= 11 * 60 + 30)
-                model.Add(departure[i] <= 13 * 60 + 30)
+                model.Add(arrival[i] >= planner.LUNCH_START)
+                model.Add(departure[i] <= planner.LUNCH_END)
                 
     arrival[START_NODE] = model.NewIntVar(start_min, end_min, 'start')
     departure[START_NODE] = arrival[START_NODE]

@@ -100,7 +100,7 @@ MEAL_MIN_GAP_MINUTES = 210
 # penalty (LUNCH_LATE_PENALTY_PER_MIN) that was too weak: the solver could
 # still push "lunch" as late as 18:00 (effectively dinner) rather than drop
 # it, since the accumulated penalty was cheaper than the alternative.
-LUNCH_HARD_WINDOW = (10 * 60 + 30, 14 * 60)  # 10:30-14:00
+LUNCH_HARD_WINDOW = (planner.LUNCH_START, planner.LUNCH_END)  # nguồn giá trị: planner.py
 
 # Positive nudge (added straight into effective_reward, not a standalone
 # penalty) for a restaurant candidate whose hours genuinely overlap

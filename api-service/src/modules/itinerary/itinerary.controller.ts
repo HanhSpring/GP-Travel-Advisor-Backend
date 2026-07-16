@@ -667,6 +667,25 @@ export class ItineraryController {
     return this.service.getSuggestions(itineraryId, activityId);
   }
 
+  /** See ItineraryService.getAddPlaceSuggestions for the ranking/fallback logic. */
+  @Get(':id/place-suggestions')
+  @HttpCode(HttpStatus.OK)
+  @ApiOperation({
+    summary: 'Lấy gợi ý địa điểm để thêm vào lịch trình',
+    description:
+      'Trả về tối đa `limit` địa điểm từ candidates thừa lúc tạo lịch trình, ' +
+      'sắp xếp theo rating rồi review_count, đã loại các địa điểm có trong lịch trình.',
+  })
+  @ApiParam({ name: 'id', description: 'ID lịch trình' })
+  @ApiQuery({ name: 'limit', required: false, type: Number, example: 10 })
+  async getAddPlaceSuggestions(
+    @Param('id') id: string,
+    @Query('limit') limit?: string,
+  ) {
+    const safeLimit = limit ? Math.min(parseInt(limit, 10) || 10, 30) : 10;
+    return this.service.getAddPlaceSuggestions(id, safeLimit);
+  }
+
   @Patch(':id/activities')
   @ApiOperation({
     summary: 'Cập nhật danh sách hoạt động/thời gian của lịch trình',

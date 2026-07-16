@@ -16,11 +16,13 @@ import { ShareItineraryDto } from './dto/share-itinerary.dto';
 import { RespondItineraryShareDto } from './dto/respond-itinerary-share.dto';
 import { CreateItineraryShareLinkDto } from './dto/create-itinerary-share-link.dto';
 import { RespondItineraryShareLinkDto } from './dto/respond-itinerary-share-link.dto';
+import { LUNCH_START_MIN, LUNCH_END_MIN } from '../../common/constants/lunch-window.constant';
 
 import { CreateItineraryDto, TransportMode } from './dto/create-itinerary.dto';
 import { HotelRoomResponseDto } from './dto/hotel-room-response.dto';
 import { getRoomsByPlaceId } from './room-catalog';
 import { TripCostConfigService } from '../recommendation/trip-cost-config.service';
+import { RecommendationsService } from '../tourist/places/recommendations.service';
 import { CostType } from './dto/cost-type.enum';
 
 // ─── Địa chỉ FastAPI optimizer (đọc từ env hoặc dùng mặc định) ───
@@ -76,7 +78,10 @@ export interface AIPlanResult {
 export class ItineraryService {
   private readonly logger = new Logger(ItineraryService.name);
 
-  constructor(private readonly tripCostConfig: TripCostConfigService) {}
+  constructor(
+    private readonly tripCostConfig: TripCostConfigService,
+    private readonly recommendationsService: RecommendationsService,
+  ) {}
 
   async getHotelRooms(placeId: string): Promise<HotelRoomResponseDto[]> {
     const normalizedPlaceId = placeId?.trim();
@@ -590,6 +595,29 @@ export class ItineraryService {
       throw new InternalServerErrorException(
         'Lỗi khi tạo lịch trình: ' + itineraryError?.message,
       );
+    }
+
+    // Fire-and-forget: this is secondary data for getAddPlaceSuggestions,
+    // must not slow down or fail itinerary creation.
+    const leftoverIds: string[] = (plan as any).leftover_candidate_ids ?? [];
+    if (leftoverIds.length > 0) {
+      supabase
+        .schema('travel')
+        .from('itinerary_candidate_places')
+        .insert(
+          leftoverIds.map((placeId) => ({
+            itinerary_id: (itinerary as any).id,
+            place_id: placeId,
+          })),
+        )
+        .then(({ error }) => {
+          if (error) {
+            console.warn(
+              '[ItineraryService] Không thể lưu candidates thừa:',
+              error.message,
+            );
+          }
+        });
     }
 
     const placeCostById = await this.getPlaceEstimatedCostMap(plan);
@@ -1931,8 +1959,13 @@ export class ItineraryService {
    * @param itineraryId - ID lịch trình
    * @param activityId  - ID hoạt động cần tìm gợi ý thay thế
    */
+  /**
+   * Same ranking source as the "you might like" section on the place detail
+   * page (RecommendationsService.getRecommendedPlaceIds — no category filter,
+   * preserves the AI model's order), minus hotels and places already in this
+   * itinerary. Falls back to same-city places sorted by rating.
+   */
   async getSuggestions(itineraryId: string, activityId: string) {
-    // ─── Bước 1: Lấy thông tin địa điểm hiện tại ─────────────────
     const { data: current, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -1943,7 +1976,6 @@ export class ItineraryService {
         places:place_id (
           id,
           city_id,
-          type_id,
           latitude,
           longitude
         )
@@ -1961,85 +1993,111 @@ export class ItineraryService {
 
     const currentPlace = (current as any).places;
 
-    // ─── Lấy tourist_id từ itinerary ──────────────────────────────────
     const { data: itineraryInfo } = await supabase
       .schema('travel')
       .from('itineraries')
-      .select('tourist_id')
+      .select('creator_id')
       .eq('id', itineraryId)
       .single();
-    
-    const userId = itineraryInfo?.tourist_id;
 
-    // ─── Bước 2: Lấy tất cả place_id đã có trong lịch trình (để loại trừ) ─
+    const userId = itineraryInfo?.creator_id;
+
     const { data: existingDetails } = await supabase
       .schema('travel')
       .from('itinerary_details')
       .select('place_id')
       .eq('itinerary_id', itineraryId);
 
-    const excludedPlaceIds = (existingDetails ?? []).map(
-      (d: any) => d.place_id,
-    ).filter(Boolean);
+    const excludedPlaceIds = (existingDetails ?? [])
+      .map((d: any) => d.place_id)
+      .filter(Boolean);
 
-    // ─── Bước 3: Gọi AI Service lấy danh sách gợi ý ────────────────────────────
-    let aiPlaceIds: string[] = [];
-    try {
-      const AI_SERVICE_URL = process.env.AI_SERVICE_URL || 'http://127.0.0.1:8000';
-      const url = userId 
-        ? `${AI_SERVICE_URL}/recommend/places/${currentPlace.id}/recommendations?user_id=${userId}&k=20`
-        : `${AI_SERVICE_URL}/recommend/places/${currentPlace.id}/recommendations?k=20`;
-        
-      const response = await axios.get(url, { timeout: 8000 });
-      const items = response.data?.items || [];
-      aiPlaceIds = items.map((item: any) => item.id);
-    } catch (err: any) {
-      console.warn(`[ItineraryService] Call AI recommend failed, fallback to DB:`, err.message);
-    }
-
-    let suggestions: any[] = [];
     const selectQuery = `
       id,
       name,
       address,
       image_url,
       average_rating,
-      estimated_cost,
+      review_count,
       latitude,
       longitude,
+      open_hour_compressed,
       types (name, categories (id, name))
     `;
 
-    if (aiPlaceIds.length > 0) {
-      const filteredIds = aiPlaceIds.filter(id => !excludedPlaceIds.includes(id));
-      
-      if (filteredIds.length > 0) {
-        const { data: aiPlaces, error: aiErr } = await supabase
-          .schema('travel')
-          .from('places')
-          .select(selectQuery)
-          .in('id', filteredIds);
-          
-        if (!aiErr && aiPlaces) {
-          // Tính toán khoảng cách và sắp xếp
-          suggestions = aiPlaces.map(p => {
-            const dist = (currentPlace.latitude && currentPlace.longitude && p.latitude && p.longitude)
-              ? this._haversineKm(currentPlace.latitude, currentPlace.longitude, p.latitude, p.longitude)
-              : 999999;
-            return { ...p, distanceKm: dist };
-          }).sort((a, b) => a.distanceKm - b.distanceKm).slice(0, 10);
+    const format = (rows: any[]) =>
+      rows.map((p: any) => {
+        const dist =
+          currentPlace.latitude &&
+          currentPlace.longitude &&
+          p.latitude &&
+          p.longitude
+            ? this._haversineKm(
+                currentPlace.latitude,
+                currentPlace.longitude,
+                p.latitude,
+                p.longitude,
+              )
+            : null;
+        let imageUrl =
+          'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80';
+        if (Array.isArray(p.image_url) && p.image_url.length > 0) {
+          imageUrl = p.image_url[0];
+        } else if (
+          typeof p.image_url === 'string' &&
+          p.image_url.trim().length > 0
+        ) {
+          imageUrl = p.image_url;
         }
+        return {
+          id: p.id,
+          name: p.name,
+          address: p.address || '',
+          category: this.extractCategoryName(p) ?? 'Khác',
+          rating: p.average_rating ?? 0,
+          reviewCount: p.review_count ?? 0,
+          imageUrl,
+          distanceKm: dist != null ? Number(dist.toFixed(1)) : null,
+          latitude: p.latitude,
+          longitude: p.longitude,
+          isSameCategory: false,
+          openHourCompressed: p.open_hour_compressed || null,
+        };
+      });
+
+    const recommended = await this.recommendationsService.getRecommendedPlaceIds(
+      currentPlace.id,
+      { userId },
+    );
+    const recommendedIds = recommended
+      .map((item) => item.id)
+      .filter((id) => !excludedPlaceIds.includes(id));
+
+    let suggestions: any[] = [];
+    if (recommendedIds.length > 0) {
+      const { data: aiPlaces, error: aiErr } = await supabase
+        .schema('travel')
+        .from('places')
+        .select(selectQuery)
+        .in('id', recommendedIds)
+        .neq('slot_type', 'accommodation');
+
+      if (!aiErr && aiPlaces) {
+        const byId = new Map(aiPlaces.map((p: any) => [p.id, p]));
+        suggestions = recommendedIds
+          .map((id) => byId.get(id))
+          .filter(Boolean)
+          .slice(0, 10);
       }
     }
 
-    // ─── Fallback: Nếu AI không trả về hoặc lỗi, dùng logic cũ ───────
     if (suggestions.length === 0) {
       let query = supabase
         .schema('travel')
         .from('places')
         .select(selectQuery)
         .eq('city_id', currentPlace.city_id)
-        .eq('type_id', currentPlace.type_id);
+        .neq('slot_type', 'accommodation');
 
       if (excludedPlaceIds.length > 0) {
         query = query.not('id', 'in', `(${excludedPlaceIds.join(',')})`);
@@ -2047,46 +2105,105 @@ export class ItineraryService {
 
       const { data: fallbackData, error: suggestErr } = await query
         .order('average_rating', { ascending: false })
-        .limit(20);
+        .limit(10);
 
       if (suggestErr) {
-        console.error('[ItineraryService] getSuggestions fallback error:', suggestErr);
+        console.error(
+          '[ItineraryService] getSuggestions fallback error:',
+          suggestErr,
+        );
         return { suggestions: [] };
       }
-      
-      if (fallbackData) {
-        suggestions = fallbackData.map(p => {
-          const dist = (currentPlace.latitude && currentPlace.longitude && p.latitude && p.longitude)
-            ? this._haversineKm(currentPlace.latitude, currentPlace.longitude, p.latitude, p.longitude)
-            : 999999;
-          return { ...p, distanceKm: dist };
-        }).sort((a, b) => a.distanceKm - b.distanceKm).slice(0, 10);
-      }
+
+      suggestions = fallbackData ?? [];
     }
 
-    // ─── Bước 4: Format kết quả với ước tính khoảng cách ────────
-    const formatted = (suggestions ?? []).map((p: any) => {
-      const timeDiff = this._estimateTimeDiff(
-        currentPlace.latitude,
-        currentPlace.longitude,
-        p.latitude,
-        p.longitude,
-      );
+    return { suggestions: format(suggestions) };
+  }
 
-      return {
-        id: p.id,
-        name: p.name,
-        category: this.extractCategoryName(p) ?? 'Khác',
-        address: p.address,
-        imageUrl: p.image_url,
-        rating: p.average_rating ?? 0,
-        estimatedCost: p.estimated_cost ?? 0,
-        isFree: (p.estimated_cost ?? 0) === 0,
-        timeDiffLabel: timeDiff,
-      };
-    });
+  /**
+   * "Add place" suggestions: Two-Tower candidates fetched at itinerary
+   * creation but not chosen by the planner, ranked by rating/review_count.
+   * Returns fewer than `limit` (or empty) for itineraries created before this
+   * table existed, or once candidates run out — mobile falls back to
+   * /search/nearby in that case.
+   */
+  async getAddPlaceSuggestions(itineraryId: string, limit = 10) {
+    const { data: usedRows } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select('place_id')
+      .eq('itinerary_id', itineraryId);
+    const usedIds = new Set(
+      (usedRows || []).map((r: any) => r.place_id).filter(Boolean),
+    );
 
-    return { suggestions: formatted };
+    const { data: candidateRows, error } = await supabase
+      .schema('travel')
+      .from('itinerary_candidate_places')
+      .select(
+        `
+        place_id,
+        places:place_id (
+          id, name, address, average_rating, review_count, image_url,
+          latitude, longitude, open_hour_compressed, slot_type,
+          types (id, category_id, categories (id, name))
+        )
+      `,
+      )
+      .eq('itinerary_id', itineraryId);
+
+    if (error || !candidateRows) return [];
+
+    // Filter by slot_type here regardless of what was persisted, to stay
+    // correct even for rows saved before restaurant/cafe were excluded.
+    const allowedSlotTypes = new Set(['attraction', 'entertainment']);
+    return candidateRows
+      .map((row: any) => row.places)
+      .filter(
+        (p: any) =>
+          p && allowedSlotTypes.has(p.slot_type) && !usedIds.has(p.id),
+      )
+      .sort((a: any, b: any) => {
+        const ratingDiff = (b.average_rating ?? 0) - (a.average_rating ?? 0);
+        if (ratingDiff !== 0) return ratingDiff;
+        return (b.review_count ?? 0) - (a.review_count ?? 0);
+      })
+      .slice(0, limit)
+      .map((p: any) => {
+        let category = 'Tham quan';
+        const typeData = Array.isArray(p.types) ? p.types[0] : p.types;
+        if (typeData?.categories) {
+          const catData = Array.isArray(typeData.categories)
+            ? typeData.categories[0]
+            : typeData.categories;
+          if (catData?.name) category = catData.name;
+        }
+        let imageUrl =
+          'https://images.unsplash.com/photo-1507525428034-b723cf961d3e?w=600&q=80';
+        if (Array.isArray(p.image_url) && p.image_url.length > 0) {
+          imageUrl = p.image_url[0];
+        } else if (
+          typeof p.image_url === 'string' &&
+          p.image_url.trim().length > 0
+        ) {
+          imageUrl = p.image_url;
+        }
+        return {
+          id: p.id,
+          name: p.name,
+          address: p.address || '',
+          category,
+          rating: p.average_rating || 0,
+          reviewCount: p.review_count || 0,
+          imageUrl,
+          distanceKm: null,
+          latitude: p.latitude,
+          longitude: p.longitude,
+          isSameCategory: false,
+          openHourCompressed: p.open_hour_compressed || null,
+        };
+      });
   }
 
   // ════════════════════════════════════════════════════════════════
@@ -2156,6 +2273,7 @@ export class ItineraryService {
           longitude,
           open_time,
           close_time,
+          slot_type,
           types (name, categories (id, name))
         )
       `,
@@ -2189,7 +2307,14 @@ export class ItineraryService {
             close_time: a.places?.close_time ?? '22:00',
             estimated_cost: a.estimated_cost ?? 0,
             category: this.extractCategoryName(a.places) ?? null,
-            is_restaurant: this.isRestaurant(this.extractCategoryName(a.places), a.locked_arrive_time || a.arrival_time),
+            is_restaurant: this.isRestaurant(
+              a.places?.slot_type,
+              a.locked_arrive_time || a.arrival_time,
+              this.addMinutesToTime(
+                a.locked_arrive_time || a.arrival_time,
+                Number(a.duration_minutes ?? 60),
+              ),
+            ),
             original_arrival_time: a.arrival_time,
             is_new: newActivityId ? a.id === newActivityId : false,
           })),
@@ -2269,6 +2394,7 @@ export class ItineraryService {
           review_count,
           latitude,
           longitude,
+          slot_type,
           types (name, categories (id, name))
         )
       `,
@@ -2344,6 +2470,7 @@ export class ItineraryService {
           rating: a.places?.average_rating ?? 0,
           reviewCount: a.places?.review_count ?? 0,
           category: this.extractCategoryName(a.places) ?? null,
+          placeType: a.places?.slot_type ?? null,
           transportInfo,
         };
       }),
@@ -2453,14 +2580,17 @@ export class ItineraryService {
     const { data: currentActs } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('id, arrival_time')
+      .select('id, arrival_time, duration_minutes')
       .eq('itinerary_id', id);
 
-    const currentActMap = new Map<string, string>();
+    const currentActMap = new Map<string, { arrivalTime: string; durationMinutes: number }>();
     if (currentActs) {
       currentActs.forEach((a) => {
         if (a.arrival_time) {
-          currentActMap.set(a.id, a.arrival_time);
+          currentActMap.set(a.id, {
+            arrivalTime: a.arrival_time,
+            durationMinutes: a.duration_minutes ?? 60,
+          });
         }
       });
     }
@@ -2469,13 +2599,13 @@ export class ItineraryService {
     const { data: placesData } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, types(categories(name))')
+      .select('id, slot_type')
       .in('id', incomingPlaceIds);
-      
-    const categoryMap = new Map<string, string | null>();
+
+    const placeTypeMap = new Map<string, string | null>();
     if (placesData) {
       placesData.forEach((p: any) => {
-        categoryMap.set(p.id, this.extractCategoryName(p));
+        placeTypeMap.set(p.id, p.slot_type ?? null);
       });
     }
 
@@ -2519,14 +2649,17 @@ export class ItineraryService {
           };
           if (act.placeId) {
             updatePayload.place_id = act.placeId;
-            const category = categoryMap.get(act.placeId);
-            
+            const placeType = placeTypeMap.get(act.placeId);
+
             // Check if it's currently a restaurant OR if it was previously considered a lunch place
-            const oldArrivalTime = currentActMap.get(act.id);
-            const isRest = this.isRestaurant(category, act.startTime) || 
-                           (oldArrivalTime ? this.isRestaurant(category, oldArrivalTime) : false);
-                           
-            if (isRest && (startMin < 11 * 60 + 30 || startMin > 13 * 60 + 30)) {
+            const oldState = currentActMap.get(act.id);
+            const oldDepartureTime = oldState
+              ? this.addMinutesToTime(oldState.arrivalTime, oldState.durationMinutes)
+              : null;
+            const isRest = this.isRestaurant(placeType, act.startTime, act.endTime) ||
+                           (oldState ? this.isRestaurant(placeType, oldState.arrivalTime, oldDepartureTime) : false);
+
+            if (isRest && (startMin < LUNCH_START_MIN || endMin > LUNCH_END_MIN)) {
               updatePayload.is_locked = true;
               updatePayload.locked_arrive_time = act.startTime;
             }
@@ -3342,46 +3475,30 @@ export class ItineraryService {
     return DEFAULT;
   }
 
-  private isRestaurant(category: string | null | undefined, arrivalTimeStr?: string | null): boolean {
-    const lower = category ? category.toLowerCase() : '';
-    const isFoodPlace = (
-      lower.includes('nhà hàng') ||
-      lower.includes('quán ăn') ||
-      lower.includes('nhà ăn') ||
-      lower.includes('restaurant') ||
-      lower.includes('cafe') ||
-      lower.includes('cà phê') ||
-      lower.includes('quán bar') ||
-      lower.includes('bar') ||
-      lower.includes('ẩm thực') ||
-      lower.includes('trà') ||
-      lower.includes('lẩu') ||
-      lower.includes('lẫu') ||
-      lower.includes('đồ uống') ||
-      lower.includes('thức uống') ||
-      lower.includes('ăn vặt') ||
-      lower.includes('bbq') ||
-      lower.includes('buffet') ||
-      lower.includes('nước') ||
-      lower.includes('giải khát')
-    );
+  /**
+   * Một activity chỉ được coi là "địa điểm ăn trưa" khi thỏa cả 2 điều kiện (AND):
+   * 1. place_type (travel.places.slot_type — cùng nguồn với lúc tạo lịch trình) = 'restaurant'.
+   * 2. CẢ giờ đến VÀ giờ rời đều nằm trong khung giờ ăn trưa (LUNCH_START_MIN..LUNCH_END_MIN)
+   *    — khớp đúng ràng buộc cứng solver dùng khi tối ưu lại (itinerary_optimizer.py:
+   *    `arrival >= LUNCH_START AND departure <= LUNCH_END`), không chỉ riêng giờ đến.
+   */
+  private isRestaurant(
+    placeType: string | null | undefined,
+    arrivalTimeStr?: string | null,
+    departureTimeStr?: string | null,
+  ): boolean {
+    const isFoodPlace = (placeType ?? '').trim().toLowerCase() === 'restaurant';
+    if (!isFoodPlace) return false;
 
-    if (arrivalTimeStr) {
+    if (arrivalTimeStr && departureTimeStr) {
       try {
-        const [h, m] = arrivalTimeStr.split(':').map(Number);
-        const mins = h * 60 + (m || 0);
-        // Chỉ áp dụng khung giờ cho các địa điểm thực sự là ăn uống
-        // Không tự động đoán tất cả mọi thứ lúc 11:30 là nhà hàng!
-
-        // Còn nếu nó là địa điểm ăn uống nhưng bị đẩy ra ngoài khung 10h - 15h thì không tính là bữa trưa.
-        if (isFoodPlace) {
-          if (mins < 600 || mins > 900) {
-            return false;
-          }
-          return true;
-        }
+        const [ah, am] = arrivalTimeStr.split(':').map(Number);
+        const [dh, dm] = departureTimeStr.split(':').map(Number);
+        const arrivalMin = ah * 60 + (am || 0);
+        const departureMin = dh * 60 + (dm || 0);
+        return arrivalMin >= LUNCH_START_MIN && departureMin <= LUNCH_END_MIN;
       } catch (e) {
-        // Ignore parse errors
+        // Ignore parse errors, fall back to place_type only
       }
     }
 
@@ -3391,12 +3508,12 @@ export class ItineraryService {
   private extractCategoryName(places: any): string | null {
     if (!places) return null;
     let result = '';
-    
+
     if (places.categories?.name) {
       result += places.categories.name + ' ';
     }
-    
-    const typeData = places.types;
+
+    const typeData = Array.isArray(places.types) ? places.types[0] : places.types;
     if (typeData) {
       const catData = Array.isArray(typeData.categories) ? typeData.categories[0] : typeData.categories;
       if (catData?.name) {
@@ -3420,6 +3537,24 @@ export class ItineraryService {
 
     const resolvedVisitDate =
       visitDate ?? new Date().toISOString().split('T')[0];
+
+    // ─── Tra place_type (travel.places.slot_type) theo placeId ──
+    // Dùng để nhận diện địa điểm ăn trưa — cùng cơ chế với lúc tạo lịch trình,
+    // thay vì đoán qua từ khóa category do client gửi lên.
+    const incomingPlaceIds = activities
+      .map((a: any) => a.placeId)
+      .filter(Boolean);
+    const placeTypeMap = new Map<string, string | null>();
+    if (incomingPlaceIds.length > 0) {
+      const { data: placesData } = await supabase
+        .schema('travel')
+        .from('places')
+        .select('id, slot_type')
+        .in('id', incomingPlaceIds);
+      (placesData || []).forEach((p: any) =>
+        placeTypeMap.set(p.id, p.slot_type ?? null),
+      );
+    }
 
     try {
       // ─── Chuẩn bị payload cho TSPTW optimizer (đầy đủ ràng buộc) ─
@@ -3459,7 +3594,14 @@ export class ItineraryService {
             close_time,
             estimated_cost: a.price ?? 0,
             category: a.category ?? null,
-            is_restaurant: this.isRestaurant(a.category, a.lockedArriveTime || a.startTime),
+            is_restaurant: this.isRestaurant(
+              a.placeId ? placeTypeMap.get(a.placeId) : null,
+              a.lockedArriveTime || a.startTime,
+              this.addMinutesToTime(
+                a.lockedArriveTime || a.startTime,
+                a.durationMinutes ?? duration,
+              ),
+            ),
             original_arrival_time: a.startTime ?? null,
             // Flutter đánh dấu activity mới bằng isNew: true → optimizer chèn vào vị trí tối ưu
             is_new: a.isNew ?? false,

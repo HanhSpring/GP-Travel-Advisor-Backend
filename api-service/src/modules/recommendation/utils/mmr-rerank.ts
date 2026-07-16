@@ -1,3 +1,5 @@
+import { LUNCH_START_MIN, LUNCH_END_MIN } from '../../../common/constants/lunch-window.constant';
+
 export interface PlaceCandidate {
   place_id: string;
   place_name: string;
@@ -278,7 +280,7 @@ export function getPlannerTargets(
   const end = parseTimeToMinutes(dailyEndTime) ?? 1260;
   const availableMinutes = Math.max(0, end - start);
   const baseQuota = getDailyQuota(tripIntent);
-  const hasLunchWindow = overlaps(start, end, 11 * 60 + 30, 13 * 60 + 30);
+  const hasLunchWindow = overlaps(start, end, LUNCH_START_MIN, LUNCH_END_MIN);
   const restaurantTarget = hasLunchWindow ? 1 : 0;
 
   // This only sizes the candidate pool. The GA still uses DB visit_duration,
