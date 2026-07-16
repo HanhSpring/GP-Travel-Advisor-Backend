@@ -7,6 +7,7 @@ import {
 import axios from 'axios';
 import { createHmac, randomUUID, timingSafeEqual } from 'crypto';
 import { supabase } from '../../../config/supabase';
+import { toVietnamTimestamp } from '../../activity/activity-time';
 import { CreateOrderDto } from './dto/create-order.dto';
 
 interface PlaceRow {
@@ -755,7 +756,9 @@ export class OrdersService {
       0,
     );
 
-    const orderedAt = new Date().toISOString();
+    // order_sys.orders.ordered_at is `timestamp without time zone`, so write
+    // Vietnam wall-clock time without a trailing UTC timezone marker.
+    const orderedAt = toVietnamTimestamp();
 
     const orderId = randomUUID();
     const orderInsertVariants = [
