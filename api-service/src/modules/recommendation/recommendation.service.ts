@@ -644,6 +644,12 @@ export class RecommendationService {
                 ),
                 candidate_rank: hotelSelection.candidateRank,
               },
+              // Used by ItineraryService.getAddPlaceSuggestions later.
+              leftover_candidate_ids: this.computeLeftoverCandidateIds(
+                details,
+                plan,
+                hotelSelection.hotelId,
+              ),
             }
           : plan;
       this.logItineraryRunJson({
@@ -671,6 +677,35 @@ export class RecommendationService {
       const detail = err?.message ?? String(err);
       throw new ServiceUnavailableException(`AI Service error: ${detail}`);
     }
+  }
+
+  /**
+   * Hydrated candidates minus what the planner actually scheduled (all days
+   * + hotel), minus 'hotel'/'restaurant'/'cafe' — add-place suggestions are
+   * attractions/entertainment only.
+   */
+  private computeLeftoverCandidateIds(
+    details: ItineraryPlanPayload['places'],
+    plan: any,
+    hotelId?: string | null,
+  ): string[] {
+    const chosenIds = new Set<string>();
+    if (hotelId) chosenIds.add(hotelId);
+    const days = Array.isArray(plan?.days) ? plan.days : [];
+    for (const day of days) {
+      const schedule = Array.isArray(day?.schedule) ? day.schedule : [];
+      for (const entry of schedule) {
+        if (entry?.location_id) chosenIds.add(entry.location_id);
+      }
+    }
+    const excludedTypes = new Set(['hotel', 'restaurant', 'cafe']);
+    return details
+      .filter(
+        (place) =>
+          !excludedTypes.has(place.place_type ?? '') &&
+          !chosenIds.has(place.id),
+      )
+      .map((place) => place.id);
   }
 
   // ── Helpers ────────────────────────────────────────────────────────────────

@@ -76,6 +76,13 @@ export class ActivityCustomizeResultDto {
 
   @ApiProperty({ example: 1200, description: 'Tổng số đánh giá' })
   reviewCount: number;
+
+  @ApiPropertyOptional({
+    example: 'restaurant',
+    description:
+      'Loại địa điểm (travel.places.slot_type) — cùng nguồn dùng lúc tạo lịch trình, dùng để nhận diện địa điểm ăn trưa kết hợp với khung giờ',
+  })
+  placeType?: string | null;
 }
 
 /**
@@ -122,14 +129,20 @@ export class SuggestedPlaceDto {
   @ApiProperty({ example: 'Nhà thờ Đức Bà', description: 'Tên địa điểm' })
   name: string;
 
-  @ApiProperty({ example: 'Tham quan', description: 'Danh mục' })
-  category: string;
-
   @ApiProperty({
     example: '1 Công xã Paris, Bến Nghé, Quận 1',
     description: 'Địa chỉ',
   })
   address: string;
+
+  @ApiProperty({ example: 'Tham quan', description: 'Danh mục' })
+  category: string;
+
+  @ApiProperty({ example: 4.7, description: 'Điểm đánh giá' })
+  rating: number;
+
+  @ApiProperty({ example: 128, description: 'Số lượt đánh giá' })
+  reviewCount: number;
 
   @ApiProperty({
     example: 'https://storage.example.com/places/nha-tho-duc-ba.jpg',
@@ -137,20 +150,31 @@ export class SuggestedPlaceDto {
   })
   imageUrl: string;
 
-  @ApiProperty({ example: 4.7, description: 'Điểm đánh giá' })
-  rating: number;
+  @ApiPropertyOptional({
+    example: 1.2,
+    description: 'Khoảng cách (km) so với địa điểm đang thay thế',
+    nullable: true,
+  })
+  distanceKm: number | null;
 
-  @ApiProperty({ example: 0, description: 'Chi phí ước tính (0 = miễn phí)' })
-  estimatedCost: number;
+  @ApiPropertyOptional({ example: 10.7769 })
+  latitude: number | null;
 
-  @ApiProperty({ example: true, description: 'Miễn phí không' })
-  isFree: boolean;
+  @ApiPropertyOptional({ example: 106.7009 })
+  longitude: number | null;
 
   @ApiProperty({
-    example: '+5 phút so với vị trí hiện tại',
-    description: 'Ước tính thời gian di chuyển thêm so với địa điểm gốc',
+    example: false,
+    description: 'Có cùng danh mục với địa điểm đang thay thế không',
   })
-  timeDiffLabel: string;
+  isSameCategory: boolean;
+
+  @ApiPropertyOptional({
+    example: '[Mon-Sun]:[07:30-21:00]',
+    description: 'Giờ mở cửa dạng nén',
+    nullable: true,
+  })
+  openHourCompressed: string | null;
 }
 
 export class SuggestionsResponseDto {

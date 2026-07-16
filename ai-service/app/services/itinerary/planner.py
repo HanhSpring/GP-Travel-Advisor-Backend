@@ -113,8 +113,8 @@ TRAVEL_CACHE_PATH = os.getenv(
     "ITINERARY_TRAVEL_CACHE",
     os.path.join(SERVICE_DIR, "data", "travel_matrix_cache.json"),
 )
-LUNCH_START = 11 * 60 + 30
-LUNCH_END = 13 * 60 + 30
+LUNCH_START = 10 * 60 + 30  # 10:30 — nguồn duy nhất cho khung giờ ăn trưa trong ai-service
+LUNCH_END = 14 * 60  # 14:00
 # Infeasibility penalty cho hard constraint an trua.
 # Gia tri nay lon hon can tren cac thanh phan fitness mem trong mot ngay tour,
 # nen chromosome thieu an trua gan nhu khong duoc chon lam parent.
