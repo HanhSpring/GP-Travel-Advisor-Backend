@@ -12,10 +12,14 @@ import * as XLSX from 'xlsx';
 import { GetOrdersDto } from './dto/get-orders.dto';
 import { randomUUID } from 'crypto';
 
+import { CommonNotificationsService } from '../common/notifications/notifications.service';
+
 @Injectable()
 export class BusinessService {
   private supabaseUrl = process.env.SUPABASE_URL || '';
   private supabaseAnonKey = process.env.SUPABASE_KEY || '';
+
+  constructor(private readonly notificationsService: CommonNotificationsService) {}
 
   private normalizeText(value: string): string {
     return value
@@ -272,7 +276,7 @@ export class BusinessService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, description, address, email, phone, city_id, cities(name), latitude, longitude, open_time, close_time, image_url, is_approved, is_active, average_rating, review_count, type_id, estimated_preparation_time, types(id, name, categories(id, name))',
+        'id, name, description, address, email, phone, city_id, cities(name), latitude, longitude, open_time, close_time, image_url, is_approved, rejection_reason, is_active, average_rating, review_count, type_id, estimated_preparation_time, types(id, name, categories(id, name))',
       )
       .eq('id', placeId)
       .maybeSingle();
@@ -376,12 +380,29 @@ export class BusinessService {
       .update(updatePayload)
       .eq('id', normalizedPlaceId)
       .eq('vendor_id', normalizedVendorId)
-      .select('id')
+      .select('id, name')
       .maybeSingle();
 
     if (error) throw new InternalServerErrorException(error.message);
     if (!data)
       throw new NotFoundException('Không tìm thấy địa điểm thuộc đối tác này');
+
+    const { data: vendorData } = await supabase
+      .schema('public')
+      .from('users')
+      .select('full_name')
+      .eq('id', vendorId)
+      .maybeSingle();
+    
+    const vendorName = vendorData?.full_name || 'Một đối tác';
+
+    await this.notificationsService.notifyAdmins(
+      'Cập nhật địa điểm',
+      `Đối tác ${vendorName} vừa cập nhật thông tin địa điểm "${data.name}".`,
+      'admin_alert',
+      'place_updated',
+      { place_id: data.id, vendor_id: vendorId }
+    );
 
     return {
       message: 'Cập nhật địa điểm thành công',
@@ -826,6 +847,23 @@ export class BusinessService {
     } else {
       await this.addMenuItems(createdPlaceId, menu);
     }
+
+    const { data: vendorData } = await supabase
+      .schema('public')
+      .from('users')
+      .select('full_name')
+      .eq('id', vendorId)
+      .maybeSingle();
+      
+    const vendorName = vendorData?.full_name || 'Một đối tác';
+
+    await this.notificationsService.notifyAdmins(
+      'Địa điểm mới đăng ký',
+      `Đối tác ${vendorName} vừa đăng ký địa điểm mới: "${name}"`,
+      'admin_alert',
+      'place_registered',
+      { place_id: createdPlaceId, vendor_id: vendorId }
+    );
 
     return {
       message: 'Tao thanh cong',

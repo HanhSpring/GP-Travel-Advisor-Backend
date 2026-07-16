@@ -46,6 +46,7 @@ interface PlaceDetailRow {
   latitude: number | null;
   longitude: number | null;
   is_approved: boolean | null;
+  rejection_reason: string | null;
   vendor_id: string | null;
   registered_date: string | null;
   types: TypeRow | TypeRow[] | null;
@@ -76,8 +77,11 @@ interface ResolvedPlaceType {
 type PlaceStatus = 'all' | 'pending' | 'approved' | 'rejected';
 type SupabaseCountAlgorithm = 'exact' | 'planned' | 'estimated';
 
+import { CommonNotificationsService } from '../../common/notifications/notifications.service';
+
 @Injectable()
 export class AdminPlacesService {
+  constructor(private readonly notificationsService: CommonNotificationsService) {}
   private readonly metadataCacheTtlMs = Number(
     process.env.ADMIN_PLACES_METADATA_CACHE_TTL_MS ?? '300000',
   );
@@ -1010,7 +1014,7 @@ export class AdminPlacesService {
       .schema('travel')
       .from('places')
       .select(
-        'id, image_url, name, description, address, email, phone, city_id, cities(name), latitude, longitude, is_approved, vendor_id, registered_date, estimated_preparation_time, types(id, name, categories(id, name))',
+        'id, image_url, name, description, address, email, phone, city_id, cities(name), latitude, longitude, is_approved, rejection_reason, vendor_id, registered_date, estimated_preparation_time, types(id, name, categories(id, name))',
       )
       .eq('id', id)
       .eq('is_deleted', false)
@@ -1063,6 +1067,7 @@ export class AdminPlacesService {
       category,
       registered_date: place.registered_date ?? '',
       status: this.mapStatus(place.is_approved),
+      rejection_reason: place.rejection_reason ?? null,
       contact_phone: place.phone ?? vendor?.phone_number ?? '',
       contact_email: place.email ?? vendor?.email ?? '',
       vendor: vendor
@@ -1103,14 +1108,30 @@ export class AdminPlacesService {
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
-      .update({ is_approved: true, is_active: true, updated_at: new Date().toISOString() })
+      .update({
+        is_approved: true,
+        is_active: true,
+        rejection_reason: null,
+        updated_at: new Date().toISOString(),
+      })
       .eq('id', id)
-      .select('id, name, is_approved')
-      .single<{ id: string; name: string; is_approved: boolean }>();
+      .select('id, name, is_approved, vendor_id')
+      .single<{ id: string; name: string; is_approved: boolean; vendor_id: string | null }>();
 
     if (error || !data) {
       throw new InternalServerErrorException(
         `Failed to approve place: ${error?.message || 'Unknown error'}`,
+      );
+    }
+
+    if (data.vendor_id) {
+      await this.notificationsService.createNotification(
+        [data.vendor_id],
+        'Địa điểm đã được duyệt',
+        `Địa điểm "${data.name}" của bạn đã được quản trị viên phê duyệt.`,
+        'success',
+        'place_approved',
+        { place_id: data.id }
       );
     }
 
@@ -1195,17 +1216,34 @@ export class AdminPlacesService {
   }
 
   async rejectPlace(id: string, note?: string) {
+    const rejectionReason = note?.trim() || null;
+
     const { data, error } = await supabase
       .schema('travel')
       .from('places')
-      .update({ is_approved: false, updated_at: new Date().toISOString() })
+      .update({
+        is_approved: false,
+        rejection_reason: rejectionReason,
+        updated_at: new Date().toISOString(),
+      })
       .eq('id', id)
-      .select('id, name, is_approved')
-      .single<{ id: string; name: string; is_approved: boolean }>();
+      .select('id, name, is_approved, vendor_id')
+      .single<{ id: string; name: string; is_approved: boolean; vendor_id: string | null }>();
 
     if (error || !data) {
       throw new InternalServerErrorException(
         `Failed to reject place: ${error?.message || 'Unknown error'}`,
+      );
+    }
+
+    if (data.vendor_id) {
+      await this.notificationsService.createNotification(
+        [data.vendor_id],
+        'Địa điểm bị từ chối',
+        `Địa điểm "${data.name}" của bạn đã bị từ chối.${rejectionReason ? `\nLý do: ${rejectionReason}` : ''}`,
+        'error',
+        'place_rejected',
+        { place_id: data.id }
       );
     }
 
@@ -1214,8 +1252,7 @@ export class AdminPlacesService {
       name: data.name,
       status: 'rejected',
       message: 'Place rejected successfully',
-      note: note ?? null,
-      note_saved: false,
+      note: rejectionReason,
     };
   }
 }

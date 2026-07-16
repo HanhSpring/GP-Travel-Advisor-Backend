@@ -83,9 +83,11 @@ interface OrderRow {
 
 type FoodCategory = 'all' | 'main' | 'drink';
 
+import { CommonNotificationsService } from '../../common/notifications/notifications.service';
+
 @Injectable()
 export class OrdersService {
-  constructor() {}
+  constructor(private readonly notificationsService: CommonNotificationsService) {}
 
   private readonly validOrderStatuses = [
     'pending',
@@ -688,9 +690,9 @@ export class OrdersService {
     const { data: place, error: placeError } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, name, estimated_preparation_time')
+      .select('id, name, estimated_preparation_time, vendor_id')
       .eq('id', placeId)
-      .maybeSingle<{ id: string; name: string; estimated_preparation_time: number | null }>();
+      .maybeSingle<{ id: string; name: string; estimated_preparation_time: number | null; vendor_id: string | null }>();
 
     if (placeError) {
       throw new InternalServerErrorException(placeError.message);
@@ -881,6 +883,17 @@ export class OrdersService {
       });
     } catch (emailError) {
       console.error('Failed to send order action email:', emailError);
+    }
+
+    if (place.vendor_id) {
+      await this.notificationsService.createNotification(
+        [place.vendor_id],
+        'Đơn đặt món mới',
+        `Bạn có một đơn đặt món mới tại "${place.name}" với tổng tiền ${totalAmount.toLocaleString('vi-VN')}đ.`,
+        'success',
+        'new_order',
+        { order_id: orderId, place_id: placeId }
+      );
     }
 
     return {
