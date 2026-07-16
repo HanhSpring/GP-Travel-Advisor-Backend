@@ -411,6 +411,8 @@ Tạo file `.env` từ `.env.example`:
 | `API_SERVICE_URL` | `http://localhost:3000` | URL của NestJS backend |
 | `HF_HOME` | `.cache/huggingface` | Cache Hugging Face models |
 | `PRELOAD_BGE_M3` | `false` | `false`: lazy-load BGE-M3 khi gọi `/embedding`, giảm RAM cho review-filter; `true`: preload để giảm độ trễ embedding đầu tiên, chỉ dùng khi máy đủ RAM. |
+| `PIPELINE_OUTPUT_DIR` | `./output` | Thư mục chứa output JSON của mỗi lần chạy Lọc đánh giá. |
+| `PIPELINE_SAVE_JSON` | `false` | Đặt `true` để xuất các file kết quả của ba thuật toán. Cần khởi động lại AI service sau khi thay đổi. |
 | `TWO_TOWER_VOCAB_PATH` | `weights/vocab.pkl` | Đường dẫn vocab Two-Tower |
 | `TWO_TOWER_WEIGHTS_PATH` | `weights/best_model.weights.h5` | Đường dẫn weights Two-Tower |
 | `TF_ENABLE_ONEDNN_OPTS` | `0` | Tắt TensorFlow oneDNN (tránh warning) |

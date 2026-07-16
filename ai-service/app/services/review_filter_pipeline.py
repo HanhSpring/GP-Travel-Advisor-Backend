@@ -1911,6 +1911,7 @@ class ReviewFilteringPipeline:
         self.classifier_provider.confidence_threshold = config.classifier_confidence_threshold
         self.classifier_provider.ambiguity_margin = config.classifier_ambiguity_margin
         self.algorithm3_historical_updates: List[Dict[str, Any]] = []
+        self.algorithm3_result: Dict[str, Any] = {}
 
     def _table(self, name: str):
         if self.supabase is None:
@@ -1928,6 +1929,10 @@ class ReviewFilteringPipeline:
         contents = self.algorithm_1_classify_reviews(reviews)
         conflicts, algorithm2_meta = self.algorithm_2_detect_conflicts(contents)
         time_result = self.algorithm_small_time_management(contents, conflicts, algorithm2_meta)
+        # Keep the detailed Algorithm 3 decisions available to the service
+        # layer. The public run response only contains aggregate counters, but
+        # persistence needs the exact expired, hidden and promoted content IDs.
+        self.algorithm3_result = time_result
 
         if owns_io:
             self._upsert_review_contents(contents)
@@ -4512,6 +4517,140 @@ def write_contents_to_db(client, contents: List[Dict[str, Any]]) -> None:
             .upsert(chunk, on_conflict="id")
             .execute()
         )
+
+
+def _content_review_ids(client, content_ids: List[str]) -> List[str]:
+    """Resolve review IDs for review_content IDs in bounded REST requests."""
+    unique_content_ids = list(dict.fromkeys(str(value) for value in content_ids if value))
+    review_ids: List[str] = []
+    resolved_content_ids = set()
+    for i in range(0, len(unique_content_ids), _DB_BATCH):
+        chunk = unique_content_ids[i : i + _DB_BATCH]
+        response = (
+            client
+            .schema("review_ai")
+            .from_("review_contents")
+            .select("id,review_id")
+            .in_("id", chunk)
+            .execute()
+        )
+        for row in response.data or []:
+            if row.get("id") and row.get("review_id"):
+                resolved_content_ids.add(str(row["id"]))
+                review_ids.append(str(row["review_id"]))
+
+    unresolved = set(unique_content_ids) - resolved_content_ids
+    if unresolved:
+        raise RuntimeError(
+            "Cannot resolve review_id for review_contents: "
+            + ", ".join(sorted(unresolved))
+        )
+    return list(dict.fromkeys(review_ids))
+
+
+def _expired_short_term_review_ids(client, now_iso: str) -> List[str]:
+    """Load every expired short-term review, including old processed rows."""
+    review_ids: List[str] = []
+    offset = 0
+    while True:
+        response = (
+            client
+            .schema("review_ai")
+            .from_("review_contents")
+            .select("review_id")
+            .eq("time_label", "short-term")
+            .lte("expiration_date", now_iso)
+            .range(offset, offset + _DB_BATCH - 1)
+            .execute()
+        )
+        rows = response.data or []
+        review_ids.extend(
+            str(row["review_id"])
+            for row in rows
+            if row.get("review_id")
+        )
+        if len(rows) < _DB_BATCH:
+            break
+        offset += _DB_BATCH
+    return list(dict.fromkeys(review_ids))
+
+
+def apply_algorithm3_db_updates(
+    client,
+    result: Dict[str, Any],
+    now_iso: str,
+) -> Dict[str, int]:
+    """Persist Algorithm 3 visibility and promotion decisions."""
+    promoted_content_ids = list(
+        dict.fromkeys(
+            str(value)
+            for value in result.get("promoted_review_content_ids", [])
+            if value
+        )
+    )
+    hidden_long_term_content_ids = list(
+        dict.fromkeys(
+            str(value)
+            for value in result.get("hidden_long_term_review_ids", [])
+            if value
+        )
+    )
+
+    # Make promotion persistence explicit. This also covers historical
+    # short-term contents that were not part of the current pending batch.
+    for i in range(0, len(promoted_content_ids), _DB_BATCH):
+        chunk = promoted_content_ids[i : i + _DB_BATCH]
+        (
+            client
+            .schema("review_ai")
+            .from_("review_contents")
+            .update({
+                "time_label": "long-term",
+                "expiration_date": None,
+                "is_temporary": False,
+            })
+            .in_("id", chunk)
+            .execute()
+        )
+
+    expired_review_ids = _expired_short_term_review_ids(client, now_iso)
+    hidden_long_term_review_ids = _content_review_ids(
+        client, hidden_long_term_content_ids
+    )
+    hidden_review_ids = list(
+        dict.fromkeys([*expired_review_ids, *hidden_long_term_review_ids])
+    )
+
+    for i in range(0, len(hidden_review_ids), _DB_BATCH):
+        chunk = hidden_review_ids[i : i + _DB_BATCH]
+        (
+            client
+            .schema("review_ai")
+            .from_("reviews")
+            .update({"status": "hidden"})
+            .in_("id", chunk)
+            .execute()
+        )
+
+    promoted_review_ids = _content_review_ids(client, promoted_content_ids)
+    for i in range(0, len(promoted_review_ids), _DB_BATCH):
+        chunk = promoted_review_ids[i : i + _DB_BATCH]
+        (
+            client
+            .schema("review_ai")
+            .from_("reviews")
+            .update({"status": "approved"})
+            .eq("status", "hidden")
+            .in_("id", chunk)
+            .execute()
+        )
+
+    return {
+        "expired_reviews_hidden": len(expired_review_ids),
+        "long_term_reviews_hidden": len(hidden_long_term_review_ids),
+        "contents_promoted": len(promoted_content_ids),
+        "promoted_reviews_checked": len(promoted_review_ids),
+    }
 
 
 def write_conflicts_to_db(client, conflicts: List[Dict[str, Any]]) -> None:

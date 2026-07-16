@@ -44,6 +44,7 @@ class Settings(BaseSettings):
 
     # Pipeline output
     pipeline_output_dir: str = "./output"
+    pipeline_save_json: bool = False
 
     # PhoBERT path (optional)
     phobert_time_model_path: Optional[str] = None

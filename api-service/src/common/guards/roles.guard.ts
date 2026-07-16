@@ -42,12 +42,14 @@ export class RolesGuard implements CanActivate {
 
     const { data: dbUser, error } = await supabaseAdmin
       .from('users')
-      .select('role, is_active, is_deleted')
+      // `users` has no `is_deleted` column. Selecting it makes PostgREST
+      // reject the entire authorization query with error 42703.
+      .select('role, is_active')
       .eq('id', user.userId)
       .single();
 
     // 4. KIỂM TRA TÀI KHOẢN CÓ TỒN TẠI HOẶC BỊ XÓA KHÔNG
-    if (error || !dbUser || dbUser.is_deleted === '1') {
+    if (error || !dbUser) {
       throw new ForbiddenException(
         'Tài khoản không tồn tại hoặc đã bị xóa khỏi hệ thống',
       );

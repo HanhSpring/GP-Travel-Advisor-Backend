@@ -23,6 +23,7 @@ from app.services.review_filter_pipeline import (
     PipelineConfig,
     ReviewFilteringPipeline,
     _create_supabase_client,
+    apply_algorithm3_db_updates,
     fetch_pending_reviews,
     mark_conflicted_contents,
     utc_now,
@@ -132,7 +133,21 @@ def _run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
     }
 
     if not reviews:
-        logger.info("[pipeline] Không có review pending. Kết thúc.")
+        if not request.dry_run:
+            algorithm3_updates = apply_algorithm3_db_updates(
+                supabase,
+                {},
+                now.isoformat(),
+            )
+            empty_result["hidden_reviews"] = algorithm3_updates[
+                "expired_reviews_hidden"
+            ]
+            logger.info(
+                "[pipeline] Không có review pending; đã cập nhật short-term hết hạn: %s",
+                algorithm3_updates,
+            )
+        else:
+            logger.info("[pipeline] Không có review pending; dry_run bỏ qua ghi DB.")
         return empty_result
 
     phobert_time_model_path = _resolve_phobert_time_model_path()
@@ -158,6 +173,7 @@ def _run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         observation_rules=request.observation_rules,
         lookback_multiplier_by_topic=request.lookback_multiplier_by_topic,
         phobert_time_model_path=phobert_time_model_path,
+        save_json=settings.pipeline_save_json,
     )
 
     cache_key = "|".join([
@@ -193,6 +209,7 @@ def _run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         )
     report, contents, conflicts = pipeline.run(reviews)
 
+    algorithm3_updates = None
     if not request.dry_run:
         contents_to_write = [*contents, *pipeline.algorithm3_historical_updates]
         contents_to_write = list(
@@ -207,6 +224,15 @@ def _run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         logger.info(f"[pipeline] Ghi {len(conflicts)} conflicts về Supabase...")
         write_conflicts_to_db(supabase, conflicts)
         mark_conflicted_contents(supabase, conflicts)
+        algorithm3_updates = apply_algorithm3_db_updates(
+            supabase,
+            pipeline.algorithm3_result,
+            now.isoformat(),
+        )
+        logger.info(
+            "[pipeline] Da ap dung ket qua Algorithm 3 vao Supabase: %s",
+            algorithm3_updates,
+        )
     else:
         logger.info("[pipeline] dry_run=True — bỏ qua ghi DB.")
 
@@ -216,7 +242,12 @@ def _run_pipeline(request: PipelineRunRequest) -> Dict[str, Any]:
         "contents_processed": report["algorithm1_total_contents"],
         "conflicts_detected": report["algorithm2_total_conflicts"],
         "long_term_summaries": report["algorithm3_total_long_term_summaries"],
-        "hidden_reviews": report["algorithm3_total_hidden_reviews"],
+        "hidden_reviews": (
+            algorithm3_updates["expired_reviews_hidden"]
+            + algorithm3_updates["long_term_reviews_hidden"]
+            if algorithm3_updates is not None
+            else report["algorithm3_total_hidden_reviews"]
+        ),
         "output_dir": str(batch_output_dir),
         "embedding_model_active": report["embedding_model"]["active"],
         "sentiment_model_active": report["classifier_models"]["sentiment"]["active"],
