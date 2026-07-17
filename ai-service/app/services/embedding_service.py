@@ -1,17 +1,15 @@
 from app.api.deps import get_model
 from app.core.logger import get_logger
-from app.core.model_resources import heavy_model_lock
+from app.core.config import settings
+from app.core.model_resources import heavy_model_coordinator
 
 logger = get_logger(__name__)
 
 
 def encode_texts(texts: list[str], normalize: bool = True) -> tuple[list[list[float]], str]:
-    with heavy_model_lock:
-        # Evict review-filter weights only when switching to the BGE workload.
-        # Repeated embedding requests continue to reuse the loaded BGE model.
-        from app.api.v1.endpoints.review_pipeline import discard_pipeline_executor
-        discard_pipeline_executor()
-
+    # Multiple BGE requests may encode concurrently. The gate only excludes the
+    # incompatible review-transformer workload and has a bounded wait.
+    with heavy_model_coordinator.embedding(settings.embedding_wait_timeout_seconds):
         model = get_model("bge_m3")
         if model is None:
             raise RuntimeError("BGE-M3 model chưa được load")
