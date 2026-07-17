@@ -73,6 +73,8 @@ interface ReviewRow {
   created_at: string;
   provider: string | null;
   status: string;
+  reply: string | null;
+  replied_at: string | null;
 }
 
 interface RatingRow {
@@ -120,6 +122,8 @@ interface ReviewPageResult {
     status: string;
     time_label: string | null;
     time_ago: string;
+    reply: string | null;
+    replied_at: string | null;
   }>;
   breakdown: Record<number, number>;
   average: number;
@@ -307,7 +311,9 @@ export class PlacesService {
     let reviewsQuery = supabase
       .schema('review_ai')
       .from('reviews')
-      .select('id, tourist_id, rating, created_at, provider, status')
+      .select(
+        'id, tourist_id, rating, created_at, provider, status, reply, replied_at',
+      )
       .eq('place_id', placeId)
       .order('created_at', { ascending: false });
 
@@ -403,6 +409,8 @@ export class PlacesService {
         status: review.status,
         time_label: content?.time_label ?? null,
         time_ago: this.formatReviewAge(review.created_at),
+        reply: review.reply ?? null,
+        replied_at: review.replied_at ?? null,
       };
     });
     const filteredList =

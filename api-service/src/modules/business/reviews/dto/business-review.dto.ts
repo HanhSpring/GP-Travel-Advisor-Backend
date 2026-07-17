@@ -1,4 +1,5 @@
 import { ApiProperty } from '@nestjs/swagger';
+import { IsNotEmpty, IsString, MaxLength } from 'class-validator';
 
 export class BusinessReviewDto {
   @ApiProperty()
@@ -21,6 +22,31 @@ export class BusinessReviewDto {
 
   @ApiProperty()
   created_at: string;
+
+  @ApiProperty({ nullable: true, required: false })
+  reply?: string | null;
+
+  @ApiProperty({ nullable: true, required: false })
+  replied_at?: string | null;
+}
+
+export class ReplyToReviewDto {
+  @ApiProperty()
+  @IsString()
+  @IsNotEmpty()
+  @MaxLength(2000)
+  content: string;
+}
+
+export class ReplyToReviewResponseDto {
+  @ApiProperty()
+  id: string;
+
+  @ApiProperty()
+  reply: string;
+
+  @ApiProperty()
+  replied_at: string;
 }
 
 export class BusinessReviewBreakdownItemDto {
