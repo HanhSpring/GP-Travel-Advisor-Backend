@@ -27,6 +27,12 @@ export class ReviewItemDto {
 
   @ApiProperty({ required: false, nullable: true })
   time_ago?: string | null;
+
+  @ApiProperty({ required: false, nullable: true })
+  reply?: string | null;
+
+  @ApiProperty({ required: false, nullable: true })
+  replied_at?: string | null;
 }
 
 export class PlaceFoodItemDto {

@@ -1,10 +1,35 @@
-import { Controller, Get, Param, Query } from '@nestjs/common';
-import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
+import {
+  Body,
+  Controller,
+  Get,
+  Param,
+  Put,
+  Query,
+  UseGuards,
+} from '@nestjs/common';
+import {
+  ApiBearerAuth,
+  ApiOperation,
+  ApiQuery,
+  ApiResponse,
+  ApiTags,
+} from '@nestjs/swagger';
 import { BusinessReviewsService } from './business-reviews.service';
-import { BusinessReviewsResponseDto } from './dto/business-review.dto';
+import {
+  BusinessReviewsResponseDto,
+  ReplyToReviewDto,
+  ReplyToReviewResponseDto,
+} from './dto/business-review.dto';
+import { Roles } from '../../../common/decorators/roles.decorator';
+import { Role } from '../../../common/enum/role.enum';
+import { RolesGuard } from '../../../common/guards/roles.guard';
+import { JwtAuthGuard } from '../../auth/jwt-auth.guard';
 
 @ApiTags('Business - Reviews')
+@ApiBearerAuth('access-token')
 @Controller('business/reviews')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(Role.BUSINESS)
 export class BusinessReviewsController {
   constructor(private readonly service: BusinessReviewsService) {}
 
@@ -53,5 +78,20 @@ export class BusinessReviewsController {
       topic,
       parsedHasImages,
     );
+  }
+
+  @Put(':place_id/:review_id/reply')
+  @ApiOperation({
+    summary: 'Reply to a customer review as the owning business',
+  })
+  @ApiQuery({ name: 'vendor_id', required: true })
+  @ApiResponse({ status: 200, type: ReplyToReviewResponseDto })
+  replyToReview(
+    @Param('place_id') placeId: string,
+    @Param('review_id') reviewId: string,
+    @Query('vendor_id') vendorId: string,
+    @Body() dto: ReplyToReviewDto,
+  ) {
+    return this.service.replyToReview(placeId, reviewId, vendorId, dto.content);
   }
 }
