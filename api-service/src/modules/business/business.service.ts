@@ -12,10 +12,14 @@ import * as XLSX from 'xlsx';
 import { GetOrdersDto } from './dto/get-orders.dto';
 import { randomUUID } from 'crypto';
 
+import { CommonNotificationsService } from '../common/notifications/notifications.service';
+
 @Injectable()
 export class BusinessService {
   private supabaseUrl = process.env.SUPABASE_URL || '';
   private supabaseAnonKey = process.env.SUPABASE_KEY || '';
+
+  constructor(private readonly notificationsService: CommonNotificationsService) {}
 
   private normalizeText(value: string): string {
     return value
@@ -25,17 +29,20 @@ export class BusinessService {
       .trim();
   }
 
-  private isAccommodationType(values: Array<string | null | undefined>): boolean {
+  private isAccommodationType(
+    values: Array<string | null | undefined>,
+  ): boolean {
     return values
       .filter((value): value is string => typeof value === 'string')
       .map((value) => this.normalizeText(value))
-      .some((value) =>
-        value.includes('luu tru') ||
-        value.includes('khach san') ||
-        value.includes('hotel') ||
-        value.includes('accommodation') ||
-        value.includes('homestay') ||
-        value.includes('resort'),
+      .some(
+        (value) =>
+          value.includes('luu tru') ||
+          value.includes('khach san') ||
+          value.includes('hotel') ||
+          value.includes('accommodation') ||
+          value.includes('homestay') ||
+          value.includes('resort'),
       );
   }
 
@@ -269,7 +276,7 @@ export class BusinessService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, description, address, email, phone, city_id, cities(name), latitude, longitude, open_time, close_time, image_url, is_approved, is_active, average_rating, review_count, type_id, estimated_preparation_time, types(id, name, categories(id, name))',
+        'id, name, description, address, email, phone, city_id, cities(name), latitude, longitude, open_time, close_time, image_url, is_approved, rejection_reason, is_active, average_rating, review_count, type_id, estimated_preparation_time, types(id, name, categories(id, name))',
       )
       .eq('id', placeId)
       .maybeSingle();
@@ -355,9 +362,11 @@ export class BusinessService {
       );
     }
 
-    const prepTime = dto.estimated_preparation_time ?? dto.p_estimated_preparation_time;
+    const prepTime =
+      dto.estimated_preparation_time ?? dto.p_estimated_preparation_time;
     if (prepTime !== undefined) {
-      updatePayload.estimated_preparation_time = prepTime === null || prepTime === '' ? null : Number(prepTime) || null;
+      updatePayload.estimated_preparation_time =
+        prepTime === null || prepTime === '' ? null : Number(prepTime) || null;
     }
 
     const cityName = typeof dto.city === 'string' ? dto.city.trim() : '';
@@ -371,12 +380,29 @@ export class BusinessService {
       .update(updatePayload)
       .eq('id', normalizedPlaceId)
       .eq('vendor_id', normalizedVendorId)
-      .select('id')
+      .select('id, name')
       .maybeSingle();
 
     if (error) throw new InternalServerErrorException(error.message);
     if (!data)
       throw new NotFoundException('Không tìm thấy địa điểm thuộc đối tác này');
+
+    const { data: vendorData } = await supabase
+      .schema('public')
+      .from('users')
+      .select('full_name')
+      .eq('id', vendorId)
+      .maybeSingle();
+    
+    const vendorName = vendorData?.full_name || 'Một đối tác';
+
+    await this.notificationsService.notifyAdmins(
+      'Cập nhật địa điểm',
+      `Đối tác ${vendorName} vừa cập nhật thông tin địa điểm "${data.name}".`,
+      'admin_alert',
+      'place_updated',
+      { place_id: data.id, vendor_id: vendorId }
+    );
 
     return {
       message: 'Cập nhật địa điểm thành công',
@@ -406,7 +432,7 @@ export class BusinessService {
       })
       .eq('id', normalizedPlaceId)
       .eq('vendor_id', normalizedVendorId)
-      .or('is_deleted.is.null,is_deleted.eq.false')
+      .eq('is_deleted', false)
       .select('id')
       .maybeSingle();
 
@@ -484,7 +510,11 @@ export class BusinessService {
       const freeServices: any[] = [];
       const paidServices: any[] = [];
 
-      if (placeServices && Array.isArray(placeServices) && placeServices.length > 0) {
+      if (
+        placeServices &&
+        Array.isArray(placeServices) &&
+        placeServices.length > 0
+      ) {
         const serviceIds = placeServices.map((ps: any) => ps.service_id);
         const { data: services, error: sError } = await supabase
           .schema('travel')
@@ -525,9 +555,7 @@ export class BusinessService {
         name: item.name,
         description: item.description,
         price:
-          typeof item.price === 'string'
-            ? parseFloat(item.price)
-            : item.price,
+          typeof item.price === 'string' ? parseFloat(item.price) : item.price,
         image_url: Array.isArray(item.image_url)
           ? item.image_url[0]
           : (item.image_url ?? null),
@@ -537,9 +565,7 @@ export class BusinessService {
         id: room.id,
         name: room.name,
         price:
-          typeof room.price === 'string'
-            ? parseFloat(room.price)
-            : room.price,
+          typeof room.price === 'string' ? parseFloat(room.price) : room.price,
         quantity:
           typeof room.quantity === 'string'
             ? parseInt(room.quantity, 10)
@@ -551,7 +577,11 @@ export class BusinessService {
         paidServices,
         menuItems,
         rooms,
-        total: freeServices.length + paidServices.length + menuItems.length + rooms.length,
+        total:
+          freeServices.length +
+          paidServices.length +
+          menuItems.length +
+          rooms.length,
       };
     } catch (error) {
       console.error('Error in getPlaceServicesByType:', error);
@@ -559,12 +589,107 @@ export class BusinessService {
     }
   }
   async getDashboard(vendorId: string) {
-    const { data, error } = await supabase
-      .schema('travel')
-      .rpc('get_business_dashboard', { p_vendor_id: vendorId });
+    const normalizedVendorId = vendorId?.trim();
+    if (!normalizedVendorId) {
+      throw new BadRequestException('vendorId is required');
+    }
 
-    if (error) throw new InternalServerErrorException(error.message);
-    return data;
+    const { data: places, error: placesError } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, average_rating')
+      .eq('vendor_id', normalizedVendorId)
+      .eq('is_deleted', false);
+
+    if (placesError) {
+      throw new InternalServerErrorException(placesError.message);
+    }
+
+    const placeRows = (places ?? []) as Array<{
+      id: string;
+      average_rating: number | string | null;
+    }>;
+    const placeIds = placeRows.map((place) => place.id);
+
+    if (placeIds.length === 0) {
+      return {
+        total_places: 0,
+        total_orders: 0,
+        pending_orders: 0,
+        total_food_items: 0,
+        average_rating: 0,
+      };
+    }
+
+    const [foodItemsResult, itineraryDetailsResult] = await Promise.all([
+      supabase
+        .schema('order_sys')
+        .from('food_items')
+        .select('id', { count: 'estimated', head: true })
+        .in('place_id', placeIds),
+      supabase
+        .schema('travel')
+        .from('itinerary_details')
+        .select('id')
+        .in('place_id', placeIds),
+    ]);
+
+    if (foodItemsResult.error) {
+      throw new InternalServerErrorException(foodItemsResult.error.message);
+    }
+
+    if (itineraryDetailsResult.error) {
+      throw new InternalServerErrorException(
+        itineraryDetailsResult.error.message,
+      );
+    }
+
+    const itineraryDetailIds = (itineraryDetailsResult.data ?? [])
+      .map((detail: { id: string | null }) => detail.id)
+      .filter((id): id is string => Boolean(id));
+
+    let totalOrders = 0;
+    let pendingOrders = 0;
+    if (itineraryDetailIds.length > 0) {
+      const { data: orders, error: ordersError } = await supabase
+        .schema('order_sys')
+        .from('orders')
+        .select('id, status')
+        .in('itinerary_detail_id', itineraryDetailIds);
+
+      if (ordersError) {
+        throw new InternalServerErrorException(ordersError.message);
+      }
+
+      const orderRows = (orders ?? []) as Array<{ status: string | null }>;
+      totalOrders = orderRows.filter(
+        (order) => order.status !== 'completed',
+      ).length;
+      pendingOrders = orderRows.filter(
+        (order) => order.status === 'pending',
+      ).length;
+    }
+
+    const ratings = placeRows
+      .map((place) => Number(place.average_rating ?? 0))
+      .filter((rating) => Number.isFinite(rating) && rating > 0);
+    const averageRating =
+      ratings.length > 0
+        ? Number(
+            (
+              ratings.reduce((total, rating) => total + rating, 0) /
+              ratings.length
+            ).toFixed(1),
+          )
+        : 0;
+
+    return {
+      total_places: placeRows.length,
+      total_orders: totalOrders,
+      pending_orders: pendingOrders,
+      total_food_items: foodItemsResult.count ?? 0,
+      average_rating: averageRating,
+    };
   }
 
   parseExcel(file: any) {
@@ -692,9 +817,14 @@ export class BusinessService {
         review_count: 0,
         registered_date: new Date().toISOString().slice(0, 10),
         source: 'business',
-        estimated_preparation_time: (dto.p_estimated_preparation_time ?? dto.estimated_preparation_time) != null
-          ? Number(dto.p_estimated_preparation_time ?? dto.estimated_preparation_time) || null
-          : null,
+        estimated_preparation_time:
+          (dto.p_estimated_preparation_time ??
+            dto.estimated_preparation_time) != null
+            ? Number(
+                dto.p_estimated_preparation_time ??
+                  dto.estimated_preparation_time,
+              ) || null
+            : null,
       })
       .select('id')
       .single();
@@ -717,6 +847,23 @@ export class BusinessService {
     } else {
       await this.addMenuItems(createdPlaceId, menu);
     }
+
+    const { data: vendorData } = await supabase
+      .schema('public')
+      .from('users')
+      .select('full_name')
+      .eq('id', vendorId)
+      .maybeSingle();
+      
+    const vendorName = vendorData?.full_name || 'Một đối tác';
+
+    await this.notificationsService.notifyAdmins(
+      'Địa điểm mới đăng ký',
+      `Đối tác ${vendorName} vừa đăng ký địa điểm mới: "${name}"`,
+      'admin_alert',
+      'place_registered',
+      { place_id: createdPlaceId, vendor_id: vendorId }
+    );
 
     return {
       message: 'Tao thanh cong',
@@ -1092,12 +1239,85 @@ export class BusinessService {
   }
 
   async getFoodPerformance(vendorId: string) {
-    const { data, error } = await supabase
-      .schema('order_sys')
-      .rpc('get_food_performance', { p_vendor_id: vendorId });
+    const normalizedVendorId = vendorId?.trim();
+    if (!normalizedVendorId) {
+      throw new BadRequestException('vendorId is required');
+    }
 
-    if (error) throw new InternalServerErrorException(error.message);
-    return data ?? [];
+    const { data: places, error: placesError } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id, name')
+      .eq('vendor_id', normalizedVendorId)
+      .eq('is_deleted', false);
+
+    if (placesError) {
+      throw new InternalServerErrorException(placesError.message);
+    }
+
+    const placeRows = (places ?? []) as Array<{ id: string; name: string }>;
+    const placeIds = placeRows.map((place) => place.id);
+    if (placeIds.length === 0) {
+      return [];
+    }
+
+    const placeNameById = new Map(
+      placeRows.map((place) => [place.id, place.name]),
+    );
+
+    const { data: foods, error: foodsError } = await supabase
+      .schema('order_sys')
+      .from('food_items')
+      .select('id, name, price, place_id')
+      .in('place_id', placeIds);
+
+    if (foodsError) {
+      throw new InternalServerErrorException(foodsError.message);
+    }
+
+    const foodRows = (foods ?? []) as Array<{
+      id: string;
+      name: string;
+      price: number | string | null;
+      place_id: string | null;
+    }>;
+    const foodIds = foodRows.map((food) => food.id);
+    if (foodIds.length === 0) {
+      return [];
+    }
+
+    const { data: orderItems, error: orderItemsError } = await supabase
+      .schema('order_sys')
+      .from('order_items')
+      .select('food_item_id')
+      .in('food_item_id', foodIds);
+
+    if (orderItemsError) {
+      throw new InternalServerErrorException(orderItemsError.message);
+    }
+
+    const orderCountByFoodId = new Map<string, number>();
+    for (const item of (orderItems ?? []) as Array<{
+      food_item_id: string | null;
+    }>) {
+      if (!item.food_item_id) continue;
+      orderCountByFoodId.set(
+        item.food_item_id,
+        (orderCountByFoodId.get(item.food_item_id) ?? 0) + 1,
+      );
+    }
+
+    return foodRows
+      .map((food) => ({
+        food_id: food.id,
+        food_name: food.name,
+        place_name: food.place_id
+          ? (placeNameById.get(food.place_id) ?? '')
+          : '',
+        price: food.price,
+        order_count: orderCountByFoodId.get(food.id) ?? 0,
+      }))
+      .sort((a, b) => b.order_count - a.order_count);
   }
 
   async updateOrderStatus(orderId: string, status: string) {
@@ -1116,19 +1336,226 @@ export class BusinessService {
     return { message: 'Cập nhật trạng thái thành công', order: data };
   }
 
+  async getFilteredOrdersForVendor(dto: GetOrdersDto, vendorId: string) {
+    const normalizedVendorId = vendorId?.trim();
+    if (!normalizedVendorId) {
+      throw new BadRequestException('vendorId is required');
+    }
+
+    const safePage =
+      Number.isFinite(Number(dto.page)) && Number(dto.page) > 0
+        ? Math.floor(Number(dto.page))
+        : 1;
+    const safeLimit =
+      Number.isFinite(Number(dto.limit)) && Number(dto.limit) > 0
+        ? Math.min(Math.floor(Number(dto.limit)), 100)
+        : 10;
+    const offset = (safePage - 1) * safeLimit;
+    const status = dto.status && dto.status !== 'all' ? dto.status : null;
+    const restaurant =
+      dto.restaurant && dto.restaurant !== 'all' ? dto.restaurant : null;
+    const placeId =
+      dto.placeId && dto.placeId !== 'all' ? dto.placeId.trim() : null;
+
+    let placeQuery = supabase
+      .schema('travel')
+      .from('places')
+      .select('id, name')
+      .eq('vendor_id', normalizedVendorId)
+      .eq('is_deleted', false);
+
+    if (placeId) placeQuery = placeQuery.eq('id', placeId);
+    if (restaurant) placeQuery = placeQuery.eq('name', restaurant);
+
+    const { data: places, error: placesError } = await placeQuery;
+    if (placesError) {
+      throw new InternalServerErrorException(placesError.message);
+    }
+
+    const placeRows = (places ?? []) as Array<{ id: string; name: string }>;
+    if (placeRows.length === 0) {
+      return { data: [], total: 0, page: safePage, limit: safeLimit };
+    }
+
+    const placeNameById = new Map(
+      placeRows.map((place) => [place.id, place.name]),
+    );
+    const { data: details, error: detailsError } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select('id, place_id')
+      .in(
+        'place_id',
+        placeRows.map((place) => place.id),
+      );
+
+    if (detailsError) {
+      throw new InternalServerErrorException(detailsError.message);
+    }
+
+    const detailRows = (details ?? []) as Array<{
+      id: string;
+      place_id: string | null;
+    }>;
+    if (detailRows.length === 0) {
+      return { data: [], total: 0, page: safePage, limit: safeLimit };
+    }
+
+    const placeIdByDetailId = new Map(
+      detailRows.map((detail) => [detail.id, detail.place_id]),
+    );
+    let ordersQuery = supabase
+      .schema('order_sys')
+      .from('orders')
+      .select(
+        'id, ordered_at, total_amount, status, tourist_id, itinerary_detail_id',
+        { count: 'exact' },
+      )
+      .in(
+        'itinerary_detail_id',
+        detailRows.map((detail) => detail.id),
+      );
+
+    if (status) ordersQuery = ordersQuery.eq('status', status);
+
+    const {
+      data: orders,
+      error: ordersError,
+      count,
+    } = await ordersQuery
+      .order('ordered_at', { ascending: false })
+      .range(offset, offset + safeLimit - 1);
+
+    if (ordersError) {
+      throw new InternalServerErrorException(ordersError.message);
+    }
+
+    const orderRows = (orders ?? []) as Array<{
+      id: string;
+      ordered_at: string | null;
+      total_amount: number | string | null;
+      status: string | null;
+      tourist_id: string | null;
+      itinerary_detail_id: string | null;
+    }>;
+    if (orderRows.length === 0) {
+      return { data: [], total: count ?? 0, page: safePage, limit: safeLimit };
+    }
+
+    const touristIds = Array.from(
+      new Set(
+        orderRows
+          .map((order) => order.tourist_id)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
+    const orderIds = orderRows.map((order) => order.id);
+    const [usersResult, orderItemsResult] = await Promise.all([
+      touristIds.length > 0
+        ? supabase
+            .from('users')
+            .select('id, full_name, email')
+            .in('id', touristIds)
+        : Promise.resolve({ data: [], error: null }),
+      supabase
+        .schema('order_sys')
+        .from('order_items')
+        .select('order_id, food_item_id')
+        .in('order_id', orderIds),
+    ]);
+
+    if (usersResult.error) {
+      throw new InternalServerErrorException(usersResult.error.message);
+    }
+    if (orderItemsResult.error) {
+      throw new InternalServerErrorException(orderItemsResult.error.message);
+    }
+
+    const userNameById = new Map(
+      (
+        (usersResult.data ?? []) as Array<{
+          id: string;
+          full_name: string | null;
+          email: string | null;
+        }>
+      ).map((user) => [user.id, user.full_name || user.email || '']),
+    );
+    const orderItemRows = (orderItemsResult.data ?? []) as Array<{
+      order_id: string | null;
+      food_item_id: string | null;
+    }>;
+    const foodIds = Array.from(
+      new Set(
+        orderItemRows
+          .map((item) => item.food_item_id)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    );
+
+    const foodNameById = new Map<string, string>();
+    if (foodIds.length > 0) {
+      const { data: foods, error: foodsError } = await supabase
+        .schema('order_sys')
+        .from('food_items')
+        .select('id, name')
+        .in('id', foodIds);
+      if (foodsError) {
+        throw new InternalServerErrorException(foodsError.message);
+      }
+      for (const food of (foods ?? []) as Array<{ id: string; name: string }>) {
+        foodNameById.set(food.id, food.name);
+      }
+    }
+
+    const foodNamesByOrderId = new Map<string, string[]>();
+    for (const item of orderItemRows) {
+      if (!item.order_id || !item.food_item_id) continue;
+      const foodName = foodNameById.get(item.food_item_id);
+      if (!foodName) continue;
+      const names = foodNamesByOrderId.get(item.order_id) ?? [];
+      names.push(foodName);
+      foodNamesByOrderId.set(item.order_id, names);
+    }
+
+    const total = count ?? orderRows.length;
+    return {
+      data: orderRows.map((order) => {
+        const orderPlaceId = order.itinerary_detail_id
+          ? placeIdByDetailId.get(order.itinerary_detail_id)
+          : null;
+        return {
+          order_id: order.id,
+          place_id: orderPlaceId,
+          place_name: orderPlaceId
+            ? (placeNameById.get(orderPlaceId) ?? '')
+            : '',
+          customer_name: order.tourist_id
+            ? (userNameById.get(order.tourist_id) ?? '')
+            : '',
+          foods: (foodNamesByOrderId.get(order.id) ?? []).join(', '),
+          status: order.status,
+          ordered_time: order.ordered_at,
+          total_amount: order.total_amount,
+          total_count: total,
+        };
+      }),
+      total,
+      page: safePage,
+      limit: safeLimit,
+    };
+  }
+
   async getFilteredOrders(dto: GetOrdersDto) {
     const { placeId, status, restaurant, page, limit } = dto;
 
     // Gọi stored procedure từ Supabase
-    const { data, error } = await supabase
-      .schema('order_sys')
-      .rpc('get_orders', {
-        p_place_id: placeId,
-        p_status: status || 'all',
-        p_restaurant: restaurant || 'all',
-        p_page: page || 1,
-        p_limit: limit || 10,
-      });
+    const { data, error } = await supabase.rpc('get_orders', {
+      p_place_id: placeId,
+      p_status: status || 'all',
+      p_restaurant: restaurant || 'all',
+      p_page: page || 1,
+      p_limit: limit || 10,
+    });
 
     if (error) throw new InternalServerErrorException(error.message);
 
@@ -1140,4 +1567,3 @@ export class BusinessService {
     };
   }
 }
-

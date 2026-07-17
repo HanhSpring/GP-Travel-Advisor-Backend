@@ -12,7 +12,14 @@ def load_all_models():
     # Download artifact từ Cloudflare R2 nếu chưa có local.
     _ensure_remote_artifacts()
 
-    _load_bge_m3()
+    # BGE-M3 is large and unrelated to review filtering. On memory-constrained
+    # hosts it is loaded lazily by get_model(); deployments that prioritize the
+    # /embedding cold-start latency can explicitly preload it.
+    from app.core.config import settings
+    if settings.preload_bge_m3:
+        _load_bge_m3()
+    else:
+        logger.info("BGE-M3 preload disabled; it will be loaded on first /embedding request")
     _load_two_tower()
     _load_content_based()
     _load_collaborative()
@@ -67,7 +74,8 @@ def reload_hybrid_recommender() -> bool:
         if not fresh.load():
             logger.error("Hot reload rejected: new recommender artifact is incomplete")
             return False
-        _models["hybrid_recommender"] = fresh
+        with _models_lock:
+            _models["hybrid_recommender"] = fresh
         logger.info("✅ Hybrid Recommender hot-reloaded")
         return True
     except Exception as exc:
@@ -246,7 +254,32 @@ def _load_review_classifier():
 
 
 def get_model(name: str):
+    if name == "bge_m3" and name not in _models:
+        with _models_lock:
+            if name not in _models:
+                logger.info("Lazy-loading BGE-M3 for the first embedding request")
+                _load_bge_m3()
     return _models.get(name)
+
+
+def unload_model(name: str) -> bool:
+    """Drop a cached model and return whether an instance was released."""
+    with _models_lock:
+        model = _models.pop(name, None)
+    if model is None:
+        return False
+
+    del model
+    import gc
+    gc.collect()
+    try:
+        import torch
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+    logger.info("Unloaded model: %s", name)
+    return True
 
 
 def reload_two_tower(weights_r2_key: str, vocab_r2_key: str) -> None:

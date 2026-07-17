@@ -19,6 +19,8 @@ interface ReviewRow {
   tourist_id: string;
   rating: number;
   created_at: string;
+  reply: string | null;
+  replied_at: string | null;
 }
 
 interface ReviewContentRow {
@@ -189,7 +191,9 @@ export class BusinessReviewsService {
     let reviewQuery = supabase
       .schema('review_ai')
       .from('reviews')
-      .select('id, tourist_id, rating, created_at', { count: 'exact' })
+      .select('id, tourist_id, rating, created_at, reply, replied_at', {
+        count: 'exact',
+      })
       .eq('place_id', placeId);
 
     if (typeof rating === 'number') {
@@ -272,6 +276,8 @@ export class BusinessReviewsService {
         main_topic: content?.main_topic ?? null,
         images: [],
         created_at: review.created_at,
+        reply: review.reply ?? null,
+        replied_at: review.replied_at ?? null,
       };
     });
 
@@ -310,5 +316,60 @@ export class BusinessReviewsService {
         pages: Math.ceil((count || 0) / limit),
       },
     };
+  }
+
+  async replyToReview(
+    placeId: string,
+    reviewId: string,
+    vendorId: string,
+    content: string,
+  ) {
+    const resolvedVendorId = await this.resolveVendorId(vendorId);
+
+    const { data: place, error: placeError } = await supabase
+      .schema('travel')
+      .from('places')
+      .select('id')
+      .eq('id', placeId)
+      .eq('vendor_id', resolvedVendorId)
+      .maybeSingle<{ id: string }>();
+
+    if (placeError) {
+      throw new InternalServerErrorException(placeError.message);
+    }
+
+    if (!place) {
+      throw new NotFoundException('Place not found for this vendor');
+    }
+
+    const { data: review, error: reviewError } = await supabase
+      .schema('review_ai')
+      .from('reviews')
+      .select('id')
+      .eq('id', reviewId)
+      .eq('place_id', placeId)
+      .maybeSingle<{ id: string }>();
+
+    if (reviewError) {
+      throw new InternalServerErrorException(reviewError.message);
+    }
+
+    if (!review) {
+      throw new NotFoundException('Review not found for this place');
+    }
+
+    const repliedAt = new Date().toISOString();
+
+    const { error: updateError } = await supabase
+      .schema('review_ai')
+      .from('reviews')
+      .update({ reply: content, replied_at: repliedAt })
+      .eq('id', reviewId);
+
+    if (updateError) {
+      throw new InternalServerErrorException(updateError.message);
+    }
+
+    return { id: reviewId, reply: content, replied_at: repliedAt };
   }
 }

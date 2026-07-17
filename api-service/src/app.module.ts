@@ -58,6 +58,7 @@ import { AiTestModule } from './modules/ai-test/ai-test.module';
 import { CitiesModule } from './modules/city/city.module';
 import { PlaceTypesModule } from './modules/place-type/place-type.module';
 import { RecommendationModule } from './modules/recommendation/recommendation.module';
+import { CommonNotificationsModule } from './modules/common/notifications/notifications.module';
 
 @Module({
   imports: [
@@ -73,6 +74,8 @@ import { RecommendationModule } from './modules/recommendation/recommendation.mo
     AuthModule,
     ProfileModule,
     AdminUserModule,
+
+    CommonNotificationsModule,
 
     /*
     Tourist

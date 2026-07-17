@@ -8,5 +8,6 @@ import { RecommendationsService } from './recommendations.service';
   imports: [HttpModule],
   controllers: [PlacesController],
   providers: [PlacesService, RecommendationsService],
+  exports: [RecommendationsService],
 })
 export class PlacesModule {}

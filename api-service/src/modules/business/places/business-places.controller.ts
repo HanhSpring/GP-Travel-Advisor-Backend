@@ -1,10 +1,23 @@
-import { Controller, Get, Query } from '@nestjs/common';
-import { ApiOperation, ApiQuery, ApiResponse, ApiTags } from '@nestjs/swagger';
+import { Controller, Get, Query, UseGuards } from '@nestjs/common';
+import {
+  ApiBearerAuth,
+  ApiOperation,
+  ApiQuery,
+  ApiResponse,
+  ApiTags,
+} from '@nestjs/swagger';
 import { BusinessPlacesService } from './business-places.service';
 import { BusinessPlaceListResponseDto } from './dto/business-place.dto';
+import { Roles } from '../../../common/decorators/roles.decorator';
+import { Role } from '../../../common/enum/role.enum';
+import { RolesGuard } from '../../../common/guards/roles.guard';
+import { JwtAuthGuard } from '../../auth/jwt-auth.guard';
 
 @ApiTags('Business - Places')
+@ApiBearerAuth('access-token')
 @Controller('business/places')
+@UseGuards(JwtAuthGuard, RolesGuard)
+@Roles(Role.BUSINESS)
 export class BusinessPlacesController {
   constructor(private readonly service: BusinessPlacesService) {}
 

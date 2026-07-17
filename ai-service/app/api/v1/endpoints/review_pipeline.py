@@ -7,13 +7,18 @@ FastAPI endpoints để kích hoạt và theo dõi pipeline phân loại review 
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 import time
+from concurrent.futures import ProcessPoolExecutor
+from concurrent.futures.process import BrokenProcessPool
 from datetime import datetime, timezone
 from typing import List
 
 from fastapi import APIRouter, HTTPException
 
 from app.core.logger import get_logger
+from app.core.config import settings
+from app.core.model_resources import ModelResourceBusyError, heavy_model_coordinator
 from app.schemas.review_pipeline import (
     PipelineHistoryItem,
     PipelineHistoryResponse,
@@ -29,6 +34,13 @@ router = APIRouter(prefix="/review-pipeline", tags=["Review Pipeline"])
 _run_history: List[dict] = []
 
 
+def _execute_pipeline_in_worker(request_data: dict) -> dict:
+    """Process-pool entry point; must remain top-level for Windows spawn."""
+    from app.services.review_filter_service import run_pipeline
+
+    return run_pipeline(PipelineRunRequest(**request_data))
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -41,15 +53,40 @@ async def run_review_pipeline(request: PipelineRunRequest) -> PipelineRunRespons
     - Phân loại topic, time_label, sentiment (3 thuật toán)
     - Ghi kết quả về review_ai.review_contents và review_ai.review_conflicts
     """
-    from app.services.review_filter_service import run_pipeline
-
     start_time = time.time()
     started_at = _utc_now_iso()
     logger.info(f"[endpoint] Pipeline run requested: limit={request.limit}, pretrained={not request.no_pretrained}")
 
     try:
-        loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, run_pipeline, request)
+        # Acquire off the event loop. The bounded writer gate waits for active
+        # embeddings, then prevents BGE from being reloaded during this job.
+        gate = heavy_model_coordinator.pipeline(settings.review_pipeline_wait_timeout_seconds)
+        await asyncio.to_thread(gate.__enter__)
+        try:
+            from app.api.deps import unload_model
+            unload_model("bge_m3")
+
+            loop = asyncio.get_running_loop()
+            executor = ProcessPoolExecutor(
+                max_workers=1,
+                mp_context=multiprocessing.get_context("spawn"),
+            )
+            try:
+                result = await loop.run_in_executor(
+                    executor,
+                    _execute_pipeline_in_worker,
+                    request.model_dump(),
+                )
+            except BrokenProcessPool:
+                raise RuntimeError(
+                    "Review-filter ML worker stopped unexpectedly; retry the pipeline once."
+                )
+            finally:
+                # Cleanup belongs to the admin job, after its work has finished;
+                # embedding requests never shut down or wait on this executor.
+                executor.shutdown(wait=True, cancel_futures=True)
+        finally:
+            gate.__exit__(None, None, None)
 
         completed_at = _utc_now_iso()
         duration = round(time.time() - start_time, 2)
@@ -90,7 +127,8 @@ async def run_review_pipeline(request: PipelineRunRequest) -> PipelineRunRespons
             "error": str(exc),
         }
         _run_history.insert(0, record)
-        raise HTTPException(status_code=500, detail=str(exc))
+        status_code = 503 if isinstance(exc, ModelResourceBusyError) else 500
+        raise HTTPException(status_code=status_code, detail=str(exc))
 
 
 @router.get("/history", response_model=PipelineHistoryResponse, summary="Lịch sử chạy pipeline")

@@ -144,10 +144,9 @@ export class BusinessPlacesService {
       .from('places')
       .select(
         'id, name, address, image_url, is_approved, average_rating, review_count, registered_date, type_id, city_id, cities(name)',
-        { count: 'exact' },
       )
       .eq('vendor_id', resolvedVendorId)
-      .or('is_deleted.is.null,is_deleted.eq.false');
+      .eq('is_deleted', false);
 
     if (status === 'pending') {
       query = query.is('is_approved', null);
@@ -161,15 +160,20 @@ export class BusinessPlacesService {
       query = query.ilike('name', `%${search}%`);
     }
 
-    if (sort === 'popular') {
-      query = query
-        .order('average_rating', { ascending: false })
-        .order('review_count', { ascending: false });
-    } else {
-      query = query.order('registered_date', { ascending: false });
+    const useOrderedQuery =
+      process.env.BUSINESS_PLACES_USE_ORDERED_QUERY === 'true';
+
+    if (useOrderedQuery) {
+      if (sort === 'popular') {
+        query = query
+          .order('average_rating', { ascending: false })
+          .order('review_count', { ascending: false });
+      } else {
+        query = query.order('registered_date', { ascending: false });
+      }
     }
 
-    const { data, error, count } = await query.range(
+    const { data, error } = await query.range(
       offset,
       offset + limit - 1,
     );
@@ -282,8 +286,11 @@ export class BusinessPlacesService {
       pagination: {
         page,
         limit,
-        total: count || 0,
-        pages: Math.ceil((count || 0) / limit),
+        total: offset + places.length + (places.length === limit ? limit : 0),
+        pages: Math.ceil(
+          (offset + places.length + (places.length === limit ? limit : 0)) /
+            limit,
+        ),
       },
     };
   }
