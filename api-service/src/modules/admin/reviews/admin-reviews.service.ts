@@ -33,6 +33,7 @@ interface ReviewContentData {
   processing_status?: string | null;
   time_label?: string | null;
   expiration_date?: string | null;
+  error_info?: unknown;
 }
 
 type ReviewStatus = 'pending' | 'approved' | 'violation' | 'hidden';
@@ -613,13 +614,37 @@ export class AdminReviewsService {
       const { data: contentData } = (await supabase
         .schema('review_ai')
         .from('review_contents')
-        .select('content, main_topic, time_label')
+        .select('content, main_topic, time_label, error_info')
         .eq('review_id', reviewId)
         .maybeSingle()) as { data: ReviewContentData | null };
 
       const reviewContent = contentData?.content ?? null;
       const mainTopic = contentData?.main_topic ?? null;
       const timeLabel = contentData?.time_label ?? null;
+      let errorInfo: Record<string, unknown> | null = null;
+      if (timeLabel === 'amb' && contentData?.error_info) {
+        if (typeof contentData.error_info === 'string') {
+          try {
+            const parsed = JSON.parse(contentData.error_info);
+            if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+              errorInfo = parsed as Record<string, unknown>;
+            }
+          } catch {
+            errorInfo = null;
+          }
+        } else if (typeof contentData.error_info === 'object' && !Array.isArray(contentData.error_info)) {
+          errorInfo = contentData.error_info as Record<string, unknown>;
+        }
+      }
+      const classificationReason =
+        typeof errorInfo?.message === 'string' ? errorInfo.message.trim() || null : null;
+      const rawPredictedTimeLabel =
+        errorInfo?.predicted_label ??
+        errorInfo?.predicted_time_label ??
+        errorInfo?.['predicted time_label'] ??
+        errorInfo?.preditec_time_label;
+      const predictedTimeLabel =
+        typeof rawPredictedTimeLabel === 'string' ? rawPredictedTimeLabel : null;
 
       return {
         id: review.id,
@@ -638,6 +663,8 @@ export class AdminReviewsService {
         review_type: review.review_type,
         main_topic: mainTopic,
         time_label: timeLabel,
+        classification_reason: classificationReason,
+        predicted_time_label: predictedTimeLabel,
         review_content: reviewContent,
         images: [],
         status: review.status,
