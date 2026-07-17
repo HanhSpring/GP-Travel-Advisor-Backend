@@ -53,6 +53,12 @@ export class AdminReviewDetailDto {
   time_label: string | null;
 
   @ApiProperty({ nullable: true, type: String })
+  classification_reason: string | null;
+
+  @ApiProperty({ nullable: true, type: String })
+  predicted_time_label: string | null;
+
+  @ApiProperty({ nullable: true, type: String })
   review_content: string | null;
 
   @ApiProperty({ type: [AdminReviewImageDto] })
