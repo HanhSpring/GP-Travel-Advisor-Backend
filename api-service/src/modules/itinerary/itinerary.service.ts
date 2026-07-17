@@ -2871,8 +2871,14 @@ export class ItineraryService {
           open_hour_compressed: place?.open_hour_compressed ?? null,
           latitude: place?.latitude,
           longitude: place?.longitude,
-          rating: place?.average_rating || 4.5,
-          reviewCount: place?.review_count || 100,
+          // Không tự tạo điểm đánh giá khi nguồn dữ liệu chưa có rating.
+          // Client sẽ chỉ hiển thị khi cả rating và số lượt đánh giá là hợp lệ.
+          rating:
+            place?.average_rating != null
+              ? Number(place.average_rating)
+              : null,
+          reviewCount:
+            place?.review_count != null ? Number(place.review_count) : 0,
           status: visitStatusByDetailId.get(act.id) ?? 'chuaDi',
         };
       });
