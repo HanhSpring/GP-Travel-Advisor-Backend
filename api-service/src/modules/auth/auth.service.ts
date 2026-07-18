@@ -13,11 +13,11 @@ import { supabase } from 'src/config/supabase';
 import { UpdatePasswordDto } from './dto/reset-password.dto';
 import { ChangePasswordDto } from './dto/changePassword.dto';
 import axios from 'axios';
-import { createLimitedFetch } from 'src/config/supabase-http';
 
 @Injectable()
 export class AuthService {
   private supabase: SupabaseClient;
+  private supabaseAdmin: SupabaseClient;
   private readonly invalidLoginMessage = 'Tài khoản hoặc mật khẩu không đúng.';
 
   constructor() {
@@ -40,8 +40,14 @@ export class AuthService {
         autoRefreshToken: false,
         persistSession: false,
       },
-      global: { fetch: createLimitedFetch() },
-    }) as SupabaseClient;
+    });
+
+    this.supabaseAdmin = createClient(supabaseUrl, supabaseKey, {
+      auth: {
+        autoRefreshToken: false,
+        persistSession: false,
+      },
+    });
   }
 
   async updatePassword(updateDto: UpdatePasswordDto) {
@@ -123,7 +129,7 @@ export class AuthService {
 
     // 2. Nếu là Số điện thoại -> Truy vấn vào public.users để lấy Email tương ứng
     if (!isEmail) {
-      const { data: userData, error: dbError } = await this.supabase
+      const { data: userData, error: dbError } = await this.supabaseAdmin
         .from('users')
         .select('email')
         .eq('phone_number', emailOrPhone)
@@ -228,7 +234,7 @@ export class AuthService {
 
   async updateUserMetadata(userId: string, metadata: any) {
     // DÙNG SUPABASE ADMIN Ở ĐÂY
-    const { data, error } = await this.supabase.auth.admin.updateUserById(
+    const { data, error } = await this.supabaseAdmin.auth.admin.updateUserById(
       userId,
       { user_metadata: metadata },
     );
@@ -272,7 +278,7 @@ export class AuthService {
       full_name: finalFullName,
     });
 
-    const { error: userError } = await this.supabase.from('users').upsert(
+    const { error: userError } = await this.supabaseAdmin.from('users').upsert(
       {
         id: userId,
         email: email,
@@ -290,8 +296,8 @@ export class AuthService {
 
     // 3. XỬ LÝ PHÂN LUỒNG & DỌN DẸP DỮ LIỆU THỪA DO TRIGGER
     if (role === 'BUSINESS') {
-      await this.supabase.from('tourists').delete().eq('id', userId);
-      const { error: businessError } = await this.supabase
+      await this.supabaseAdmin.from('tourists').delete().eq('id', userId);
+      const { error: businessError } = await this.supabaseAdmin
         .from('businesses')
         .upsert(
           {
@@ -308,10 +314,10 @@ export class AuthService {
         );
       }
     } else if (role === 'TOURIST') {
-      await this.supabase.from('businesses').delete().eq('id', userId);
+      await this.supabaseAdmin.from('businesses').delete().eq('id', userId);
 
       // 3.4 Đảm bảo có record trong bảng tourists
-      await this.supabase
+      await this.supabaseAdmin
         .from('tourists')
         .upsert({ id: userId }, { onConflict: 'id' });
     }
@@ -351,7 +357,7 @@ export class AuthService {
 
     // 3. Nếu mật khẩu cũ đúng, tiến hành cập nhật mật khẩu mới bằng Admin API
     const { error: updateError } =
-      await this.supabase.auth.admin.updateUserById(user.id, {
+      await this.supabaseAdmin.auth.admin.updateUserById(user.id, {
         password: newPassword,
       });
 
