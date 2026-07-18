@@ -3,6 +3,7 @@ import { OnEvent } from '@nestjs/event-emitter';
 import { createClient } from '@supabase/supabase-js';
 import { ModerationService } from './moderation.service';
 import { NotificationsService } from '../tourist/notifications/notifications.service';
+import { createLimitedFetch } from 'src/config/supabase-http';
 
 export interface ReviewSubmittedPayload {
   reviewIds?: string[];
@@ -41,6 +42,7 @@ export class ReviewModerationCronService {
     this.supabase = createClient(
       process.env.SUPABASE_URL || '',
       process.env.SUPABASE_KEY || '',
+      { global: { fetch: createLimitedFetch() } },
     );
   }
 
@@ -86,8 +88,7 @@ export class ReviewModerationCronService {
     review: any,
   ) {
     try {
-      const content =
-        review.overall_content || review.content || review.comment || '';
+      const content = review.content || '';
 
       const url_image = review.url_image || [];
 
@@ -101,7 +102,9 @@ export class ReviewModerationCronService {
       let violationReason = '';
       if (finalStatus === 'violation') {
         if (result.textViolations.length > 0) {
-          violationReason = translateCategories(result.textViolations).join(', ');
+          violationReason = translateCategories(result.textViolations).join(
+            ', ',
+          );
         } else {
           violationReason = `Hình ảnh/Video vi phạm tiêu chuẩn cộng đồng`;
         }
