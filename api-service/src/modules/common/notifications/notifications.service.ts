@@ -2,6 +2,7 @@ import { Injectable, InternalServerErrorException, Logger } from '@nestjs/common
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { randomUUID } from 'crypto';
 import { NotificationsGateway } from './notifications.gateway';
+import { createLimitedFetch } from 'src/config/supabase-http';
 
 @Injectable()
 export class CommonNotificationsService {
@@ -14,7 +15,9 @@ export class CommonNotificationsService {
     if (!supabaseUrl || !supabaseKey) {
       throw new Error('Missing Supabase URL or Anon Key');
     }
-    this.supabase = createClient(supabaseUrl, supabaseKey);
+    this.supabase = createClient(supabaseUrl, supabaseKey, {
+      global: { fetch: createLimitedFetch() },
+    }) as SupabaseClient;
   }
 
   async createNotification(

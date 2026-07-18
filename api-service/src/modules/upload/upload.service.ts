@@ -15,6 +15,7 @@ import sharp from 'sharp';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { randomUUID } from 'crypto';
 import { CreateReviewPresignedUrlsDto } from './dto/create-review-presigned-urls.dto';
+import { createLimitedFetch } from 'src/config/supabase-http';
 
 type ReviewMediaType = 'image' | 'video';
 
@@ -45,7 +46,9 @@ export class UploadService {
       );
     }
 
-    this.supabase = createClient(supabaseUrl, supabaseKey);
+    this.supabase = createClient(supabaseUrl, supabaseKey, {
+      global: { fetch: createLimitedFetch() },
+    }) as SupabaseClient;
   }
 
   // --- HÀM 1: UPLOAD AVATAR (Cắt vuông, tập trung vào tâm) ---

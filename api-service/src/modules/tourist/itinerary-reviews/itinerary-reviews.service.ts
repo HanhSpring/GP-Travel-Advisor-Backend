@@ -47,16 +47,11 @@ interface ItineraryReviewRow {
 
 interface ItineraryFullReviewRow {
   id: string;
-  overall_rating?: number | null;
-  overall_content?: string | null;
   rating?: number | null;
   content?: string | null;
-  score?: number | null;
-  comment?: string | null;
   tags?: string[] | null;
   url_image?: string[] | null;
   created_at: string | null;
-  updated_at?: string | null;
 }
 
 interface PlaceReviewRow {
@@ -254,7 +249,6 @@ export class ItineraryReviewsService {
     itineraryId: string,
     overallRating: number | null,
     overallContent: string | null,
-    applyAllPlaces: boolean,
     tags: string[] | null,
     mediaUrls: string[],
   ): Promise<string | null> {
@@ -324,76 +318,42 @@ export class ItineraryReviewsService {
     overall_content: string | null;
     apply_all_places: boolean;
   }> {
-    const selectVariants = [
-      'id, itinerary_id, tourist_id, overall_rating, overall_content, apply_all_places',
-      'id, itinerary_id, tourist_id, rating, content, apply_all_places',
-      'id, itinerary_id, tourist_id, rating, content',
-      'id, itinerary_id, tourist_id, score, comment',
-    ];
+    for (const byTourist of [true, false]) {
+      let query = supabase
+        .schema('review_ai')
+        .from('itinerary_reviews')
+        .select('id, itinerary_id, tourist_id, rating, content')
+        .eq('itinerary_id', itineraryId)
+        .order('created_at', { ascending: false })
+        .limit(1);
 
-    for (const fields of selectVariants) {
-      for (const byTourist of [true, false]) {
-        let query = supabase
-          .schema('review_ai')
-          .from('itinerary_reviews')
-          .select(fields)
-          .eq('itinerary_id', itineraryId)
-          .order('created_at', { ascending: false })
-          .limit(1);
-
-        if (byTourist) {
-          query = query.eq('tourist_id', touristId);
-        }
-
-        const { data: rows, error } =
-          await query.returns<Record<string, unknown>[]>();
-
-        if (error) {
-          const isUnknownColumn =
-            error.code === '42703' ||
-            error.code === 'PGRST204' ||
-            error.code === 'PGRST205' ||
-            (error.message || '').includes('Could not find the') ||
-            ((error.message || '').includes('column') &&
-              (error.message || '').includes('does not exist'));
-
-          if (isUnknownColumn) {
-            break;
-          }
-
-          throw new InternalServerErrorException(error.message);
-        }
-
-        const data = rows != null && rows.length > 0 ? rows[0] : null;
-
-        if (!data) {
-          continue;
-        }
-
-        const overallRatingRaw =
-          (data['overall_rating'] as number | null | undefined) ??
-          (data['rating'] as number | null | undefined) ??
-          (data['score'] as number | null | undefined) ??
-          null;
-
-        const overallContentRaw =
-          (data['overall_content'] as string | null | undefined) ??
-          (data['content'] as string | null | undefined) ??
-          (data['comment'] as string | null | undefined) ??
-          null;
-
-        const applyAllRaw =
-          (data['apply_all_places'] as boolean | null | undefined) ?? false;
-
-        return {
-          overall_rating:
-            overallRatingRaw !== null && overallRatingRaw !== undefined
-              ? Number(overallRatingRaw)
-              : null,
-          overall_content: overallContentRaw,
-          apply_all_places: Boolean(applyAllRaw),
-        };
+      if (byTourist) {
+        query = query.eq('tourist_id', touristId);
       }
+
+      const { data: rows, error } =
+        await query.returns<
+          Array<{ rating: number | null; content: string | null }>
+        >();
+
+      if (error) {
+        throw new InternalServerErrorException(error.message);
+      }
+
+      const data = rows != null && rows.length > 0 ? rows[0] : null;
+
+      if (!data) {
+        continue;
+      }
+
+      return {
+        overall_rating:
+          data.rating !== null && data.rating !== undefined
+            ? Number(data.rating)
+            : null,
+        overall_content: data.content ?? null,
+        apply_all_places: false,
+      };
     }
 
     return {
@@ -402,7 +362,6 @@ export class ItineraryReviewsService {
       apply_all_places: false,
     };
   }
-
   private getReviewMediaCount(payload: SubmitItineraryReviewDto) {
     return (
       (payload.media?.length ?? 0) +
@@ -557,18 +516,8 @@ export class ItineraryReviewsService {
     itineraryId: string,
   ): Promise<ItineraryFullReviewRow | null> {
     const selectVariants = [
-      'id, overall_rating, overall_content, tags, url_image, created_at, updated_at',
-      'id, overall_rating, overall_content, tags, url_image, created_at',
-      'id, overall_rating, overall_content, created_at, updated_at',
-      'id, overall_rating, overall_content, created_at',
-      'id, rating, content, tags, url_image, created_at, updated_at',
       'id, rating, content, tags, url_image, created_at',
-      'id, rating, content, created_at, updated_at',
       'id, rating, content, created_at',
-      'id, score, comment, tags, url_image, created_at, updated_at',
-      'id, score, comment, tags, url_image, created_at',
-      'id, score, comment, created_at, updated_at',
-      'id, score, comment, created_at',
     ];
 
     const isUnknownColumnError = (error: { code?: string; message?: string }) =>
@@ -804,22 +753,13 @@ export class ItineraryReviewsService {
         cover_image: this.getFirstPlaceImageUrl(places[0]),
       },
       overall: {
-        rating:
-          overallReview?.overall_rating ??
-          overallReview?.rating ??
-          overallReview?.score ??
-          null,
-        content:
-          overallReview?.overall_content ??
-          overallReview?.content ??
-          overallReview?.comment ??
-          null,
+        rating: overallReview?.rating ?? null,
+        content: overallReview?.content ?? null,
         tags: Array.isArray(overallReview?.tags) ? overallReview.tags : [],
         media_urls: Array.isArray(overallReview?.url_image)
           ? overallReview.url_image
           : [],
-        reviewed_at:
-          overallReview?.updated_at ?? overallReview?.created_at ?? null,
+        reviewed_at: overallReview?.created_at ?? null,
       },
       places: details.map((detail) => {
         const place = placeMap.get(detail.place_id);
@@ -1040,7 +980,6 @@ export class ItineraryReviewsService {
       itineraryId,
       hasOverallRating ? (payload.overall_rating as number) : null,
       normalizedOverallContent,
-      payload.apply_all_places ?? false,
       normalizedOverallTags,
       overallMediaUrls,
     );
