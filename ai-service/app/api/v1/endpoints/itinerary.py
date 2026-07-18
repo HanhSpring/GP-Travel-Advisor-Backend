@@ -57,8 +57,6 @@ async def optimize_itinerary(request: OptimizeRequest) -> OptimizeResponse:
         f"visit_date={request.visit_date}, "
         f"số hoạt động={len(request.activities)}"
     )
-    with open("payload_debug.json", "w", encoding="utf-8") as f:
-        f.write(request.model_dump_json(indent=2))
 
     from starlette.concurrency import run_in_threadpool
 
@@ -68,7 +66,9 @@ async def optimize_itinerary(request: OptimizeRequest) -> OptimizeResponse:
             activities=request.activities,
             day_start_time=request.day_start_time,
             day_end_time=request.day_end_time,
-            allow_reduce_time=request.allow_reduce_time
+            allow_reduce_time=request.allow_reduce_time,
+            use_goong=request.use_goong,
+            travel_vehicle=request.travel_vehicle,
         )
 
         # Tính tổng chi phí trong ngày

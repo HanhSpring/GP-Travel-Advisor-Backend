@@ -1725,29 +1725,15 @@ export class ItineraryService {
 
     const nextSequence = maxSeqData ? (maxSeqData.sequence_order ?? 0) + 1 : 1;
 
-    // ─── Bước 5: Xác định thời gian và ghim giờ (nếu user có yêu cầu hoặc auto-assign) ─
+    // ─── Bước 5: Xác định thời gian và ghim giờ (chỉ khi user tự chọn giờ) ─
     const durationMinutes = dto.durationMinutes ?? 60; // Mặc định 60 phút
-    let preferredTime = dto.preferredTime;
-    let isLocked = !!dto.preferredTime;
-
-    // Tự động gán giờ cho các loại địa điểm đặc thù nếu người dùng chưa chọn giờ
-    if (!preferredTime && place.categories && (place.categories as any).name) {
-      const catName = ((place.categories as any).name as string).toLowerCase();
-      if (catName.includes('bãi biển') || catName.includes('bãi tắm')) {
-        // Gán giờ sáng hoặc chiều mát. Ưu tiên 15:30 chiều.
-        preferredTime = '15:30:00';
-      } else if (catName.includes('chợ đêm') || catName.includes('phố đi bộ')) {
-        preferredTime = '19:00:00';
-      } else if (catName.includes('khu du lịch sinh thái')) {
-        preferredTime = '08:00:00';
-      } else if (catName.includes('chùa') || catName.includes('đền')) {
-        preferredTime = '08:30:00';
-      }
-
-      if (preferredTime) {
-        isLocked = true;
-      }
-    }
+    const preferredTime = dto.preferredTime;
+    const isLocked = !!dto.preferredTime;
+    // Không còn tự động ghim cứng giờ theo category (bãi biển/chợ đêm/chùa/
+    // khu sinh thái...) — các category này giờ được ràng buộc bằng KHUNG
+    // giờ (buổi sáng/trưa/chiều/tối) ngay trong CP-SAT optimizer
+    // (ai-service/itinerary_optimizer.py), linh hoạt hơn thay vì khoá cứng
+    // một phút cụ thể.
 
     // ─── Bước 6: Chèn bản ghi mới vào itinerary_details ─────────
     const { data: inserted, error: insertErr } = await supabase
@@ -1977,7 +1963,8 @@ export class ItineraryService {
           id,
           city_id,
           latitude,
-          longitude
+          longitude,
+          types (category_id)
         )
       `,
       )
@@ -1992,6 +1979,11 @@ export class ItineraryService {
     }
 
     const currentPlace = (current as any).places;
+    const currentTypeData = Array.isArray(currentPlace?.types)
+      ? currentPlace.types[0]
+      : currentPlace?.types;
+    const currentCategoryId: string | null =
+      currentTypeData?.category_id ?? null;
 
     const { data: itineraryInfo } = await supabase
       .schema('travel')
@@ -2022,11 +2014,18 @@ export class ItineraryService {
       latitude,
       longitude,
       open_hour_compressed,
-      types (name, categories (id, name))
+      types (id, name, category_id, categories (id, name))
     `;
+    // Fallback query cần inner-join để `.eq('types.category_id', ...)` lọc
+    // được ở top-level row (PostgREST bỏ qua filter embed nếu không !inner).
+    const selectQueryInnerType = selectQuery.replace(
+      'types (',
+      'types!inner(',
+    );
 
     const format = (rows: any[]) =>
       rows.map((p: any) => {
+        const typeData = Array.isArray(p.types) ? p.types[0] : p.types;
         const dist =
           currentPlace.latitude &&
           currentPlace.longitude &&
@@ -2060,7 +2059,9 @@ export class ItineraryService {
           distanceKm: dist != null ? Number(dist.toFixed(1)) : null,
           latitude: p.latitude,
           longitude: p.longitude,
-          isSameCategory: false,
+          isSameCategory:
+            currentCategoryId != null &&
+            typeData?.category_id === currentCategoryId,
           openHourCompressed: p.open_hour_compressed || null,
         };
       });
@@ -2092,20 +2093,25 @@ export class ItineraryService {
     }
 
     if (suggestions.length === 0) {
-      let query = supabase
-        .schema('travel')
-        .from('places')
-        .select(selectQuery)
-        .eq('city_id', currentPlace.city_id)
-        .neq('slot_type', 'accommodation');
+      const buildFallbackQuery = (withCategoryFilter: boolean) => {
+        let query = supabase
+          .schema('travel')
+          .from('places')
+          .select(withCategoryFilter ? selectQueryInnerType : selectQuery)
+          .eq('city_id', currentPlace.city_id)
+          .neq('slot_type', 'accommodation');
 
-      if (excludedPlaceIds.length > 0) {
-        query = query.not('id', 'in', `(${excludedPlaceIds.join(',')})`);
-      }
+        if (excludedPlaceIds.length > 0) {
+          query = query.not('id', 'in', `(${excludedPlaceIds.join(',')})`);
+        }
+        if (withCategoryFilter && currentCategoryId) {
+          query = query.eq('types.category_id', currentCategoryId);
+        }
+        return query.order('average_rating', { ascending: false }).limit(10);
+      };
 
-      const { data: fallbackData, error: suggestErr } = await query
-        .order('average_rating', { ascending: false })
-        .limit(10);
+      const { data: sameCategoryData, error: suggestErr } =
+        await buildFallbackQuery(currentCategoryId != null);
 
       if (suggestErr) {
         console.error(
@@ -2115,7 +2121,24 @@ export class ItineraryService {
         return { suggestions: [] };
       }
 
-      suggestions = fallbackData ?? [];
+      if (sameCategoryData && sameCategoryData.length > 0) {
+        suggestions = sameCategoryData;
+      } else if (currentCategoryId != null) {
+        // Không còn địa điểm nào cùng danh mục trong thành phố — nới lỏng
+        // để vẫn có gợi ý thay vì trả rỗng.
+        const { data: anyCategoryData, error: anyErr } =
+          await buildFallbackQuery(false);
+        if (anyErr) {
+          console.error(
+            '[ItineraryService] getSuggestions fallback (any category) error:',
+            anyErr,
+          );
+          return { suggestions: [] };
+        }
+        suggestions = anyCategoryData ?? [];
+      } else {
+        suggestions = [];
+      }
     }
 
     return { suggestions: format(suggestions) };
@@ -2377,12 +2400,17 @@ export class ItineraryService {
         `
         id,
         place_id,
+        visit_date,
+        detail_type,
         arrival_time,
         duration_minutes,
         is_locked,
         locked_arrive_time,
         sequence_order,
         estimated_cost,
+        travel_distance_km,
+        travel_minutes,
+        transport_cost,
         user_notes,
         added_by,
         places:place_id (
@@ -2409,7 +2437,7 @@ export class ItineraryService {
     const { data: itn } = await supabase
       .schema('travel')
       .from('itineraries')
-      .select('start_date')
+      .select('start_date, travel_mode, adult_count, children_count')
       .eq('id', itineraryId)
       .single();
 
@@ -2423,31 +2451,28 @@ export class ItineraryService {
         ) + 1;
     }
 
+    // Dùng đúng nguồn distance_matrix như getItineraryDetail() /
+    // calculateTripCostBreakdown(), thay vì Haversine cục bộ — tránh 3 nơi
+    // hiển thị 3 con số phút di chuyển khác nhau cho cùng 1 chặng.
+    await this.hydrateMissingTravelSnapshots(
+      list,
+      itn?.travel_mode,
+      Math.max(
+        1,
+        Number(itn?.adult_count ?? 0) + Number(itn?.children_count ?? 0),
+      ),
+    );
+
     return {
       success: true,
       message: 'Lịch trình đã được cập nhật và sắp xếp lại',
       affectedDay,
       updatedActivities: list.map((a: any, idx: number) => {
         const nextA: any = list[idx + 1];
-        let transportInfo: string | null = null;
-        if (nextA) {
-          const p1 = a.places;
-          const p2 = nextA.places;
-          if (
-            p1?.latitude != null &&
-            p1?.longitude != null &&
-            p2?.latitude != null &&
-            p2?.longitude != null
-          ) {
-            const dist = this._haversineKm(
-              p1.latitude,
-              p1.longitude,
-              p2.latitude,
-              p2.longitude,
-            );
-            transportInfo = `${this._transitMinutes(dist)} phút di chuyển`;
-          }
-        }
+        const transportInfo: string | null =
+          nextA && Number(nextA.travel_minutes ?? 0) > 0
+            ? `${nextA.travel_minutes} phút di chuyển (~${Number(nextA.travel_distance_km ?? 0).toFixed(1)} km)`
+            : null;
         return {
           id: a.id,
           placeId: a.place_id,
@@ -2535,12 +2560,13 @@ export class ItineraryService {
   }
 
   /**
-   * Ước tính thời gian di chuyển xe máy (phút) từ khoảng cách Haversine.
-   * Công thức: đường thực tế ≈ dist × 1.3, tốc độ ~30 km/h → dist × 2.0 + 2
-   * Ví dụ: 2km → 6 phút (khớp Google Maps), 5km → 12 phút.
+   * Ước tính thời gian di chuyển (phút) từ khoảng cách Haversine.
+   * Đồng bộ với công thức Haversine fallback dùng lúc TẠO lịch trình
+   * (ai-service/planner.py: build_travel_times_haversine, speed_kmh=30).
+   * phút = km / 30 × 60 = km × 2.0
    */
   private _transitMinutes(distKm: number): number {
-    return Math.max(3, Math.ceil(distKm * 2.0 + 2));
+    return Math.max(1, Math.round(distKm * 2.0));
   }
 
   async updateActivities(id: string, days: any[]) {

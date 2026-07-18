@@ -35,3 +35,6 @@ artifacts_session_cf_warmstart/
 
 # PhoBERT model
 app/models/phobert_timelabel/
+
+# Debug dump ghi đè mỗi lần gọi /api/v1/itinerary/optimize
+payload_debug.json

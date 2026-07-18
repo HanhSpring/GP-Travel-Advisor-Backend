@@ -7,8 +7,9 @@ Thuật toán: Google OR-Tools CP-SAT Solver
 
 import math
 import logging
-from typing import Optional, Tuple, List
+from typing import Dict, Optional, Tuple, List
 from ortools.sat.python import cp_model
+from app.core.config import settings
 from app.schemas.optimize import ActivityInput, OptimizedActivity
 from app.services.itinerary import planner
 
@@ -37,31 +38,104 @@ def haversine_km(lat1: Optional[float], lng1: Optional[float],
     )
     return R * 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
 
+def round_travel_minutes(minutes) -> int:
+    """Làm tròn lên bội số 5 phút. Phải khớp hệt scheduler_v2._round_travel_minutes()
+    (dùng ở luồng TẠO lịch trình) — nếu không, cùng 1 quãng đường sẽ hiển thị
+    2 con số phút khác nhau tuỳ lịch trình được tạo mới hay re-optimize sau
+    khi thêm/sửa/thay địa điểm."""
+    value = max(0, math.ceil(float(minutes)))
+    return int(math.ceil(value / 5.0) * 5) if value > 0 else 0
+
 def estimate_transit_minutes(dist_km: float) -> int:
     if dist_km == float("inf"):
         return 15
-    # Mô hình: đường thực tế ≈ Haversine × 1.3, tốc độ xe máy ~30 km/h
-    # → phút = dist × 1.3 / 30 × 60 + 2 ≈ dist × 2.0 + 2
-    # Ví dụ: 2km → 6 phút (khớp Google Maps), 5km → 12 phút
-    return max(3, round(dist_km * 2.0 + 2))
+    # Đồng bộ với công thức Haversine fallback dùng lúc TẠO lịch trình
+    # (planner.py: build_travel_times_haversine, speed_kmh=30 mặc định)
+    # → phút = km / 30 × 60 = km × 2.0
+    return round_travel_minutes(max(1.0, dist_km * 2.0))
 
 def format_transit_label(dist_km: float) -> str:
     if dist_km == float("inf"):
         return "Di chuyển chưa rõ khoảng cách"
     mins = estimate_transit_minutes(dist_km)
-    return f"{mins} phút di chuyển"
+    return f"{mins} phút di chuyển • {dist_km:.1f} km"
+
+
+def build_real_travel_matrix(
+    activities: List[ActivityInput],
+    use_goong: bool = True,
+    vehicle: str = "bike",
+) -> Tuple[Dict[Tuple[str, str], int], Dict[Tuple[str, str], float]]:
+    """
+    Lấy thời gian/khoảng cách di chuyển thực tế cho các cặp địa điểm, dùng
+    đúng nguồn dữ liệu như luồng TẠO lịch trình (planner.build_travel_matrix):
+    ưu tiên cache DB (travel.distance_matrix) → cache file local → gọi Goong
+    Distance Matrix API cho cặp còn thiếu → fallback Haversine nếu không có
+    Goong key hoặc gọi API thất bại.
+
+    Trả về 2 dict rỗng nếu có lỗi bất kỳ — gọi nơi dùng phải tự fallback
+    sang Haversine cho từng cặp (không để một lỗi Goong làm hỏng cả lần
+    tối ưu).
+    """
+    coords: Dict[str, Tuple[float, float]] = {}
+    for act in activities:
+        if act.lat is not None and act.lng is not None:
+            coords[act.place_id] = (act.lng, act.lat)
+
+    if len(coords) < 2:
+        return {}, {}
+
+    goong_key = settings.goong_api_key if use_goong else ""
+
+    try:
+        times, distances, _sources, _reliability = planner.build_travel_matrix(
+            coords,
+            api_key=goong_key,
+            vehicle=vehicle,
+            cache_path=planner.TRAVEL_CACHE_PATH,
+            speed_kmh=30.0,
+        )
+        return times, distances
+    except Exception as exc:
+        logger.warning("[Optimizer] build_real_travel_matrix failed, dùng Haversine thuần: %s", exc)
+        return {}, {}
+
+
+def _transit_for_pair(
+    act_i: ActivityInput,
+    act_j: ActivityInput,
+    real_times: Dict[Tuple[str, str], int],
+    real_distances: Dict[Tuple[str, str], float],
+) -> Tuple[int, float]:
+    """Thời gian (phút) và khoảng cách (km) giữa 2 hoạt động — ưu tiên dữ
+    liệu thật (Goong/cache) đã build sẵn, fallback Haversine nếu thiếu."""
+    if act_i.place_id == act_j.place_id:
+        return 0, 0.0
+
+    pair = (act_i.place_id, act_j.place_id)
+    if pair in real_times and pair in real_distances:
+        return round_travel_minutes(real_times[pair]), real_distances[pair]
+
+    dist = haversine_km(act_i.lat, act_i.lng, act_j.lat, act_j.lng)
+    return estimate_transit_minutes(dist), (dist if dist != float("inf") else 0.0)
 
 
 def optimize_day_schedule(
     activities: List[ActivityInput],
     day_start_time: str,
     day_end_time: str,
-    allow_reduce_time: bool = False
+    allow_reduce_time: bool = False,
+    use_goong: bool = True,
+    travel_vehicle: str = "bike",
 ) -> Tuple[List[OptimizedActivity], List[str], int]:
-    
+
     n = len(activities)
     if n == 0:
         return [], [], 0
+
+    real_times, real_distances = build_real_travel_matrix(
+        activities, use_goong=use_goong, vehicle=travel_vehicle
+    )
 
     model = cp_model.CpModel()
     
@@ -124,10 +198,21 @@ def optimize_day_schedule(
             l_time = time_to_minutes(act.locked_arrive_time)
             model.Add(arrival[i] == l_time)
             
-        # Ràng buộc Category
+        # Ràng buộc Category — khung giờ theo loại địa điểm (buổi sáng/trưa/
+        # chiều/tối), KHÔNG áp dụng nếu hoạt động đã bị user tự ghim giờ cụ
+        # thể (giờ ghim của user luôn được ưu tiên tuyệt đối, không bị ép
+        # theo khung category nữa).
         cat = (act.category or "").lower()
-        if "chợ đêm" in cat or "phố đi bộ" in cat:
-            model.Add(arrival[i] >= 17 * 60 + 30) # >= 17:30
+        if not (act.is_locked and act.locked_arrive_time):
+            if "chợ đêm" in cat or "phố đi bộ" in cat:
+                model.Add(arrival[i] >= 17 * 60 + 30)  # buổi tối: từ 17:30
+            elif "chùa" in cat or "đền" in cat or "nhà thờ" in cat:
+                model.Add(arrival[i] <= planner.LUNCH_END)  # buổi sáng/trưa: trước 14:00
+            elif "bãi biển" in cat or "bãi tắm" in cat:
+                model.Add(arrival[i] >= planner.LUNCH_END)  # buổi chiều: 14:00–17:30
+                model.Add(arrival[i] <= 17 * 60 + 30)
+            elif "khu du lịch sinh thái" in cat:
+                model.Add(arrival[i] <= planner.LUNCH_START)  # buổi sáng: trước 10:30
 
         # Ràng buộc giờ ăn trưa
         if act.is_restaurant:
@@ -149,8 +234,7 @@ def optimize_day_schedule(
             if (i, j) in edge_vars and i != END_NODE and j != START_NODE:
                 t = 0
                 if i < n and j < n:
-                    dist = haversine_km(activities[i].lat, activities[i].lng, activities[j].lat, activities[j].lng)
-                    t = estimate_transit_minutes(dist)
+                    t, _ = _transit_for_pair(activities[i], activities[j], real_times, real_distances)
                 transit_matrix[(i, j)] = t
                 model.Add(arrival[j] >= departure[i] + t).OnlyEnforceIf(edge_vars[(i, j)])
                 
@@ -286,11 +370,11 @@ def optimize_day_schedule(
         
         act1 = next((a for a in activities if a.id == curr_act.id), None)
         act2 = next((a for a in activities if a.id == next_act.id), None)
-        
+
         if act1 and act2:
-            dist = haversine_km(act1.lat, act1.lng, act2.lat, act2.lng)
-            curr_act.transport_to_next = format_transit_label(dist)
-            total_transit += estimate_transit_minutes(dist)
+            mins, dist = _transit_for_pair(act1, act2, real_times, real_distances)
+            curr_act.transport_to_next = f"{mins} phút di chuyển • {dist:.1f} km"
+            total_transit += mins
             
     return optimized_activities, reorder_notes, total_transit
 

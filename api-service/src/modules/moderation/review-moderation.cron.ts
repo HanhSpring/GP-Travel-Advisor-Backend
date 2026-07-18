@@ -69,6 +69,28 @@ export class ReviewModerationCronService {
       return;
     }
 
+    // `reviews` (place reviews) has no `content` column — the text lives in
+    // the separate `review_contents` table, keyed by review_id. Fetch it
+    // here so moderateSingleReview actually sees the text instead of always
+    // falling through to '' and auto-approving.
+    let contentMap = new Map<string, string>();
+    if (tableName === 'reviews') {
+      const reviewIds = pendingReviews.map((r: any) => r.id);
+      const { data: contents, error: contentsError } = await this.supabase
+        .schema('review_ai')
+        .from('review_contents')
+        .select('review_id, content')
+        .in('review_id', reviewIds);
+
+      if (contentsError) {
+        this.logger.error('Error fetching review_contents:', contentsError);
+      } else if (contents) {
+        contentMap = new Map(
+          contents.map((c: any) => [c.review_id, c.content || '']),
+        );
+      }
+    }
+
     // Process reviews in parallel (bounded concurrency) instead of one at a
     // time — a burst of reviews submitted together no longer serializes
     // through OpenAI one-by-one.
@@ -76,7 +98,9 @@ export class ReviewModerationCronService {
     for (let i = 0; i < pendingReviews.length; i += CONCURRENCY) {
       const chunk = pendingReviews.slice(i, i + CONCURRENCY);
       await Promise.all(
-        chunk.map((review) => this.moderateSingleReview(tableName, review)),
+        chunk.map((review) =>
+          this.moderateSingleReview(tableName, review, contentMap),
+        ),
       );
     }
   }
@@ -84,10 +108,13 @@ export class ReviewModerationCronService {
   private async moderateSingleReview(
     tableName: 'reviews' | 'itinerary_reviews',
     review: any,
+    contentMap: Map<string, string>,
   ) {
     try {
       const content =
-        review.overall_content || review.content || review.comment || '';
+        tableName === 'reviews'
+          ? contentMap.get(review.id) || ''
+          : review.overall_content || review.content || review.comment || '';
 
       const url_image = review.url_image || [];
 
