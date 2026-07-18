@@ -105,6 +105,18 @@ class OptimizeRequest(BaseModel):
         description="Cho phép AI tự động giảm bớt duration_minutes của các điểm khác nếu lịch quá kín"
     )
 
+    # Đồng bộ nguồn dữ liệu thời gian di chuyển với luồng TẠO lịch trình:
+    # ưu tiên Goong Distance Matrix API (cache DB/local) trước, chỉ fallback
+    # sang Haversine khi thiếu key hoặc gọi Goong thất bại.
+    use_goong: bool = Field(
+        default=True,
+        description="True = ưu tiên dùng Goong Distance Matrix API (có cache) cho thời gian di chuyển thực tế, giống luồng tạo lịch trình. False = chỉ dùng Haversine."
+    )
+    travel_vehicle: str = Field(
+        default="bike",
+        description="Phương tiện di chuyển: 'bike' (xe máy) hoặc 'car' (ô tô) — quyết định travel_mode khi gọi Goong"
+    )
+
     @field_validator("day_start_time", "day_end_time", mode="before")
     @classmethod
     def validate_day_times(cls, v: str) -> str:

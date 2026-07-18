@@ -65,6 +65,13 @@ import { CommonNotificationsModule } from './modules/common/notifications/notifi
     ConfigModule.forRoot({ isGlobal: true }),
     CacheModule.register({ isGlobal: true, ttl: 60_000, max: 500 }),
     EventEmitterModule.forRoot(),
+
+    // Must be registered before any module that transitively imports the
+    // tourist NotificationsModule (e.g. ItineraryTrackingModule) — otherwise
+    // that module's `GET /notifications/:id` route registers first and
+    // swallows this module's `GET /notifications/me`.
+    CommonNotificationsModule,
+
     ActivityModule,
     SearchModule,
     ItineraryModule,
@@ -74,8 +81,6 @@ import { CommonNotificationsModule } from './modules/common/notifications/notifi
     AuthModule,
     ProfileModule,
     AdminUserModule,
-
-    CommonNotificationsModule,
 
     /*
     Tourist
