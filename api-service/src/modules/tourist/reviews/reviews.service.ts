@@ -198,8 +198,11 @@ export class ReviewsService {
             'Lịch trình của bạn',
           destination: itinerary?.destination ?? null,
           image_url: null,
-          rating: Number(review.rating ?? 0),
-          content: review.content ?? null,
+          rating: Number(
+            review.overall_rating ?? review.rating ?? review.score ?? 0,
+          ),
+          content:
+            review.overall_content ?? review.content ?? review.comment ?? null,
           tags: review.tags ?? [],
           media_urls: this.normalizeMediaUrls(review.url_image),
           review_status: review.status ?? null,
@@ -234,7 +237,7 @@ export class ReviewsService {
                 reviewed_at: placeReview.created_at ?? null,
               };
             }),
-          reviewed_at: review.created_at ?? null,
+          reviewed_at: review.updated_at ?? review.created_at ?? null,
           start_date: itinerary?.start_date ?? null,
           end_date: itinerary?.end_date ?? null,
           visit_date: null,

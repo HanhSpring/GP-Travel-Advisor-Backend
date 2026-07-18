@@ -13,9 +13,6 @@ import {
 } from './dto/get-users-query.dto';
 import { CreateUserByAdminDto } from './dto/create-user-by-admin.dto';
 import { UploadService } from '../upload/upload.service';
-import { createLimitedFetch } from 'src/config/supabase-http';
-
-const adminLimitedFetch = createLimitedFetch();
 
 @Injectable()
 export class AdminService {
@@ -27,16 +24,13 @@ export class AdminService {
     if (!supabaseUrl || !supabaseKey) {
       throw new Error('Missing Supabase URL or Anon Key');
     }
-    this.supabase = createClient(supabaseUrl, supabaseKey, {
-      global: { fetch: adminLimitedFetch },
-    }) as SupabaseClient;
+    this.supabase = createClient(supabaseUrl, supabaseKey);
   }
 
   private getAdminClient() {
     return createClient(
       process.env.SUPABASE_URL as string,
       process.env.SUPABASE_KEY as string,
-      { global: { fetch: adminLimitedFetch } },
     );
   }
 
