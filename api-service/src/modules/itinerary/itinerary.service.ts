@@ -78,10 +78,36 @@ export interface AIPlanResult {
 export class ItineraryService {
   private readonly logger = new Logger(ItineraryService.name);
 
+  // Chống cache-stampede: nhiều lời gọi hydrateMissingTravelSnapshots đồng thời
+  // (nhiều itinerary trong 1 list, nhiều candidate khi generate plan) có thể
+  // cùng phát hiện 1 cặp (origin, destination, mode) chưa có trong
+  // distance_matrix TẠI CÙNG THỜI ĐIỂM — nếu không dedupe, tất cả sẽ tự gọi
+  // Goong riêng cho cùng 1 cặp, dội rate limit (429) dù distance_matrix đã có
+  // sẵn hàng chục nghìn dòng. Map này đảm bảo chỉ 1 request thật sự đi gọi
+  // Goong cho mỗi cặp, các request khác chờ dùng chung kết quả.
+  private readonly pendingGoongLegRequests = new Map<string, Promise<any | null>>();
+
   constructor(
     private readonly tripCostConfig: TripCostConfigService,
     private readonly recommendationsService: RecommendationsService,
   ) {}
+
+  private async mapWithConcurrency<T, R>(
+    items: T[],
+    limit: number,
+    fn: (item: T) => Promise<R>,
+  ): Promise<R[]> {
+    const results: R[] = new Array(items.length);
+    let cursor = 0;
+    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
+      while (cursor < items.length) {
+        const index = cursor++;
+        results[index] = await fn(items[index]);
+      }
+    });
+    await Promise.all(workers);
+    return results;
+  }
 
   async getHotelRooms(placeId: string): Promise<HotelRoomResponseDto[]> {
     const normalizedPlaceId = placeId?.trim();
@@ -131,12 +157,14 @@ export class ItineraryService {
    */
   async getMyItineraries(userId: string, query?: string) {
     const trimmedQuery = query?.trim() || null;
+    const t0 = Date.now();
     const { data, error } = await supabase
       .schema('travel')
       .rpc('get_my_itineraries', {
         p_user_id: userId,
         p_query: trimmedQuery,
       });
+    const tRpc = Date.now();
 
     if (error) {
       console.error('[ItineraryService] getMyItineraries error:', error);
@@ -147,6 +175,7 @@ export class ItineraryService {
       trimmedQuery,
       data?.itineraries ?? [],
     );
+    const tShared = Date.now();
     const merged = await this.enrichListTrackingFlags({
       ...(data ?? {}),
       itineraries: [
@@ -154,7 +183,18 @@ export class ItineraryService {
         ...sharedItineraries,
       ],
     });
-    return this.withEstimatedListCosts(this.withListStats(merged));
+    const tTracking = Date.now();
+    const result = await this.withEstimatedListCosts(this.withListStats(merged));
+    const tCosts = Date.now();
+    const total = tCosts - t0;
+    const itineraryCount = Array.isArray((merged as any)?.itineraries)
+      ? (merged as any).itineraries.length
+      : 0;
+    this.logger.warn(
+      `getMyItineraries timing user=${userId} count=${itineraryCount} total=${total}ms ` +
+        `rpc=${tRpc - t0}ms shared=${tShared - tRpc}ms tracking=${tTracking - tShared}ms costs=${tCosts - tTracking}ms`,
+    );
+    return result;
   }
 
   private async enrichListTrackingFlags(payload: any) {
@@ -439,63 +479,69 @@ export class ItineraryService {
       (itineraryRows ?? []).map((row: any) => [row.id, row]),
     );
 
-    const enriched = await Promise.all(
-      itineraries.map(async (item: any) => {
-        const metadata: any = metadataByItinerary.get(item.id);
-        // itineraries.estimated_cost là NGÂN SÁCH người dùng tự nhập (mức có
-        // thể chi trả) — KHÔNG phải chi phí ước tính thật của kế hoạch, dù
-        // tên cột dễ gây nhầm. Giữ lại field này riêng cho UI nào cần hiện
-        // ngân sách, không dùng để suy ra estimatedCostForGroup nữa.
-        const estimatedCost = Math.max(
-          0,
-          Math.round(
-            Number(metadata?.estimated_cost ?? item.estimated_cost ?? 0),
-          ),
-        );
-        const adultCount = Math.max(
-          0,
-          Math.round(Number(metadata?.adult_count ?? item.adult_count ?? 0)),
-        );
-        const childCount = Math.max(
-          0,
-          Math.round(
-            Number(metadata?.children_count ?? item.children_count ?? 0),
-          ),
-        );
-        const participantCount = Math.max(1, adultCount + childCount);
+    // 1 query duy nhất cho CẢ danh sách (không còn N query/lịch trình như
+    // trước) + childPriceRatio đọc 1 lần (đã cache in-memory 60s ở
+    // TripCostConfigService, nhưng đọc trước cho rõ ràng, không phải đọc lại
+    // trong vòng lặp).
+    const costEstimatesById = await this.getCachedCostBreakdownBatch(itineraryIds);
+    const { childPriceRatio } = await this.tripCostConfig.getConfig();
 
-        // Chi phí hiển thị ở danh sách là TỔNG CẢ CHUYẾN (đã gồm khách sạn +
-        // 10% dự trù) — cùng con số với Sổ chi tiêu (roundedGroupTotal).
-        // Chỉ riêng "số địa điểm" bên cạnh mới không tính khách sạn (khách
-        // sạn không phải "địa điểm tham quan"), 2 con số này khác phạm vi
-        // nhau là có chủ đích, không phải cần khớp nhau.
-        let estimatedCostForGroup = 0;
-        try {
-          const result = await this.computeGroupEstimatedCost(
-            item.id,
-            adultCount,
-            childCount,
-          );
-          estimatedCostForGroup = result.roundedGroupTotal;
-        } catch (err: any) {
-          this.logger.warn(
-            `Cannot compute estimated cost for itinerary ${item.id}: ${err?.message ?? err}`,
-          );
-        }
+    const enriched = itineraries.map((item: any) => {
+      const metadata: any = metadataByItinerary.get(item.id);
+      // itineraries.estimated_cost là NGÂN SÁCH người dùng tự nhập (mức có
+      // thể chi trả) — KHÔNG phải chi phí ước tính thật của kế hoạch, dù
+      // tên cột dễ gây nhầm. Giữ lại field này riêng cho UI nào cần hiện
+      // ngân sách, không dùng để suy ra estimatedCostForGroup nữa.
+      const estimatedCost = Math.max(
+        0,
+        Math.round(
+          Number(metadata?.estimated_cost ?? item.estimated_cost ?? 0),
+        ),
+      );
+      const adultCount = Math.max(
+        0,
+        Math.round(Number(metadata?.adult_count ?? item.adult_count ?? 0)),
+      );
+      const childCount = Math.max(
+        0,
+        Math.round(
+          Number(metadata?.children_count ?? item.children_count ?? 0),
+        ),
+      );
+      const participantCount = Math.max(1, adultCount + childCount);
 
-        return {
-          ...item,
-          estimated_cost: estimatedCost,
-          estimatedCost,
-          estimatedCostForGroup,
-          estimated_cost_for_group: estimatedCostForGroup,
-          adult_count: adultCount,
-          children_count: childCount,
-          participant_count: participantCount,
-          participantCount,
-        };
-      }),
-    );
+      // Chi phí hiển thị ở danh sách là TỔNG CẢ CHUYẾN (đã gồm khách sạn +
+      // 10% dự trù) — cùng con số với Sổ chi tiêu (roundedGroupTotal).
+      // Chỉ riêng "số địa điểm" bên cạnh mới không tính khách sạn (khách
+      // sạn không phải "địa điểm tham quan"), 2 con số này khác phạm vi
+      // nhau là có chủ đích, không phải cần khớp nhau.
+      let estimatedCostForGroup = 0;
+      const breakdown = costEstimatesById.get(item.id);
+      if (breakdown) {
+        estimatedCostForGroup = this.deriveGroupEstimatedCost(
+          breakdown,
+          adultCount,
+          childCount,
+          childPriceRatio,
+        ).roundedGroupTotal;
+      } else {
+        this.logger.warn(
+          `Missing itinerary_cost_estimates for itinerary ${item.id} after batch backfill`,
+        );
+      }
+
+      return {
+        ...item,
+        estimated_cost: estimatedCost,
+        estimatedCost,
+        estimatedCostForGroup,
+        estimated_cost_for_group: estimatedCostForGroup,
+        adult_count: adultCount,
+        children_count: childCount,
+        participant_count: participantCount,
+        participantCount,
+      };
+    });
 
     return {
       ...payload,
@@ -683,6 +729,16 @@ export class ItineraryService {
           'Lỗi khi lưu chi tiết lịch trình: ' + detailsError.message,
         );
       }
+    }
+
+    // Tính + lưu chi phí ước tính đóng băng lần đầu tiên. Không được phép
+    // fail cả request tạo lịch trình nếu bước này lỗi.
+    try {
+      await this.recomputeCostEstimate((itinerary as any).id as string);
+    } catch (err: any) {
+      this.logger.warn(
+        `Cannot compute initial itinerary_cost_estimates for ${(itinerary as any).id}: ${err?.message ?? err}`,
+      );
     }
 
     return {
@@ -1641,7 +1697,15 @@ export class ItineraryService {
 
     // ─── Bước 3: Tối ưu lại ngày bị ảnh hưởng ───────────────────
     const visitDate: string = existing.visit_date;
-    return this._reOptimizeDay(itineraryId, visitDate);
+    const result = await this._reOptimizeDay(itineraryId, visitDate);
+    try {
+      await this.recomputeCostEstimateAfterEdit(itineraryId);
+    } catch (err: any) {
+      this.logger.warn(
+        `Cannot recompute itinerary_cost_estimates after deleteActivity for ${itineraryId}: ${err?.message ?? err}`,
+      );
+    }
+    return result;
   }
 
   /**
@@ -1763,13 +1827,21 @@ export class ItineraryService {
 
     // ─── Bước 7: Tối ưu lại ngày để sắp xếp địa điểm mới vào đúng chỗ ─
     try {
-      return await this._reOptimizeDay(
+      const result = await this._reOptimizeDay(
         itineraryId,
         visitDate,
         inserted.id,
         dto.allowReduceTime || false,
         dto.extendTime || false,
       );
+      try {
+        await this.recomputeCostEstimateAfterEdit(itineraryId);
+      } catch (err: any) {
+        this.logger.warn(
+          `Cannot recompute itinerary_cost_estimates after addActivity for ${itineraryId}: ${err?.message ?? err}`,
+        );
+      }
+      return result;
     } catch (e: any) {
       if (e instanceof ConflictException && e.message === 'SCHEDULE_FULL') {
         // Rollback
@@ -1885,13 +1957,21 @@ export class ItineraryService {
 
     // ─── Bước 4: Tối ưu lại ngày ─────────────────────────────────
     try {
-      return await this._reOptimizeDay(
+      const result = await this._reOptimizeDay(
         itineraryId,
         existing.visit_date,
         undefined,
         dto.allowReduceTime || false,
         dto.extendTime || false,
       );
+      try {
+        await this.recomputeCostEstimateAfterEdit(itineraryId);
+      } catch (err: any) {
+        this.logger.warn(
+          `Cannot recompute itinerary_cost_estimates after replaceActivity for ${itineraryId}: ${err?.message ?? err}`,
+        );
+      }
+      return result;
     } catch (e: any) {
       if (e instanceof ConflictException && e.message === 'SCHEDULE_FULL') {
         // Rollback
@@ -2752,6 +2832,14 @@ export class ItineraryService {
       }),
     );
 
+    try {
+      await this.recomputeCostEstimateAfterEdit(id);
+    } catch (err: any) {
+      this.logger.warn(
+        `Cannot recompute itinerary_cost_estimates after updateActivities for ${id}: ${err?.message ?? err}`,
+      );
+    }
+
     return true;
   }
 
@@ -2793,7 +2881,10 @@ export class ItineraryService {
         sequence_order,
         detail_type,
         user_notes,
-        locked_arrive_time
+        locked_arrive_time,
+        transport_cost,
+        travel_distance_km,
+        travel_minutes
       `,
       )
       .eq('itinerary_id', id)
@@ -2809,7 +2900,7 @@ export class ItineraryService {
       );
     }
 
-    await this.hydrateMissingTravelSnapshots(
+    const hydratedSomething = await this.hydrateMissingTravelSnapshots(
       details ?? [],
       itinerary.travel_mode,
       Math.max(
@@ -2817,6 +2908,22 @@ export class ItineraryService {
         Number(itinerary.adult_count ?? 0) + Number(itinerary.children_count ?? 0),
       ),
     );
+    // Nếu vừa tính + lưu thêm được chặng nào trước đó còn thiếu (thường do
+    // Goong rate-limit lúc tạo lịch trình), itinerary_cost_estimates đang giữ
+    // số CŨ (tính lúc còn thiếu dữ liệu) trong khi chi phí từng ngày ở màn
+    // này đọc trực tiếp itinerary_details nên đã thấy số MỚI — lệch nhau.
+    // Recompute lại NGAY (await) để response này cũng nhất quán luôn, không
+    // phải đợi lần load sau — chỉ xảy ra ở lần đầu 1 chặng được hydrate xong,
+    // các lần đọc sau đã có sẵn dữ liệu nên không tốn thêm gì.
+    if (hydratedSomething) {
+      try {
+        await this.recomputeCostEstimate(id);
+      } catch (err: any) {
+        this.logger.warn(
+          `Cannot recompute itinerary_cost_estimates after hydrate for ${id}: ${err?.message ?? err}`,
+        );
+      }
+    }
 
     const placeIds = Array.from(
       new Set(
@@ -3108,14 +3215,13 @@ export class ItineraryService {
         }
       } catch (_) {}
 
-      // totalActivityCost is already per-adult (see recommendation.service.ts);
-      // totalTransportCost is a real shared cost (fuel for the day's
-      // vehicles), so it's divided by the real headcount once here — never
-      // per-activity — before folding it into the per-adult day total.
-      const dayTransportPerAdult = Math.round(
-        totalTransportCost / participantCount,
-      );
-      const dayBudget = totalActivityCost + dayTransportPerAdult;
+      // "Tổng chi phí" mỗi ngày giờ CHỈ gồm địa điểm tham quan + ăn uống —
+      // xăng xe tách ra hiển thị riêng 1 mục "cả chuyến" (giống khách sạn,
+      // không thuộc về ngày nào cụ thể — xem transportCost ở cuối hàm và
+      // _buildTransportOverviewRow bên mobile). transport_cost/dayBudget cũ
+      // (đã gồm xăng xe) không còn dùng nữa, nhưng vẫn trả transport_cost
+      // riêng của ngày đó để hiển thị thông tin (vd cùng quãng đường/km).
+      const dayBudget = totalActivityCost;
 
       return {
         dateLabel: dateLabel,
@@ -3158,7 +3264,8 @@ export class ItineraryService {
       diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24)) + 1;
     } catch (_) {}
 
-    const priceAdjustmentDeltas = await this.loadPriceAdjustmentDeltasByPlace(id);
+    const baselineAmountsByPlace =
+      await this.loadBaselineExpenseAmountsByPlace(id);
     const costRows = (details || []).map((detail: any) => {
       const place = placesById.get(detail.place_id);
       const typeData = Array.isArray(place?.types)
@@ -3172,8 +3279,8 @@ export class ItineraryService {
         this.isStartPointDetail(detail) ||
         this.isAccommodationCategory(catData?.name);
       const estimatedCost =
-        Number(detail.estimated_cost ?? 0) +
-        (priceAdjustmentDeltas.get(detail.place_id) ?? 0);
+        baselineAmountsByPlace.get(detail.place_id) ??
+        Number(detail.estimated_cost ?? 0);
       return {
         detail,
         isHotel,
@@ -3203,38 +3310,33 @@ export class ItineraryService {
     );
     const rideHailingTransportCost =
       transportCost > 0 ? Math.round(transportCost * 2.5) : 0;
-    // "Chi phí ước tính" luôn tính tươi từ itinerary_details (đã là per-adult
-    // sẵn cho từng dòng — xem recommendation.service.ts — khách sạn xử lý
-    // riêng bằng max ở trên) — không dùng giá trị snapshot lúc tạo, để phản
-    // ánh đúng khi user sửa lịch trình sau này (thêm/xóa/đổi hoạt động).
-    // itinerary.estimated_cost giờ là ngân sách người dùng nhập ban đầu (xem
-    // userBudget bên dưới), không phải chi phí tính toán.
-    const calculatedTripCost = this.perAdultTripTotal(
-      placeCost,
-      hotelCost,
-      transportCost,
-      participantCount,
-    );
-    const estimatedTripCost = calculatedTripCost;
     const hotelNights = Math.max(1, (diffDays || days.length || 1) - 1);
     const hotelCostPerPersonPerNight =
       hotelCost > 0 ? Math.round(hotelCost / hotelNights) : 0;
     const { childPriceRatio } = await this.tripCostConfig.getConfig();
-    // Display-only, computed fresh every time from the canonical per-adult
-    // total — never stored, never divided back (see plan §D).
-    // FIX: trẻ em phải cộng ĐÚNG 3 thành phần (địa điểm × ratio + khách sạn
-    // × ratio + xăng xe KHÔNG nhân ratio, chia đều theo đầu người thật) —
-    // trước đây nhân cả estimatedTripCost (đã gồm xăng xe) theo ratio, làm
-    // phần xăng xe bị nhân ratio sai, y hệt lỗi đã sửa ở
-    // IncurredCostsService.computeCostBreakdown().
+    // Tổng cả chuyến (totalBudget/estimatedCostForGroup) giờ đọc từ bảng chi
+    // phí ước tính ĐÓNG BĂNG (itinerary_cost_estimates) — để khớp tuyệt đối
+    // với Danh sách/Sổ chi tiêu, không còn tính riêng 1 công thức lệch (thiếu
+    // 10% dự trù, vẫn ưu tiên giá đã sửa qua check-in) như trước nữa. Các
+    // field khác bên trên (hotelCostPerPersonPerNight, rideHailingTransportCost,
+    // hotelDetailsCount, nonHotelDetailsCount) vẫn dùng costRows/placeCost/
+    // hotelCost LIVE (phản ánh giá đã sửa qua check-in) — đúng mục đích hiển
+    // thị giá thực tế từng địa điểm trong ngày, không đụng vào.
+    const frozen = await this.getCachedCostBreakdown(id);
+    const calculatedTripCost = this.perAdultTripTotal(
+      frozen.placeCost,
+      frozen.hotelCost,
+      frozen.transportCost,
+      participantCount,
+    );
     const transportPerAdultForChild =
-      Math.round(transportCost / participantCount / 1000) * 1000;
+      Math.round(frozen.transportCost / participantCount / 1000) * 1000;
     const childBaseCost =
-      placeCost * childPriceRatio +
-      hotelCost * childPriceRatio +
+      frozen.placeCost * childPriceRatio +
+      frozen.hotelCost * childPriceRatio +
       transportPerAdultForChild;
     const estimatedCostForGroup = Math.round(
-      estimatedTripCost * adultCount + childBaseCost * childCount,
+      calculatedTripCost * adultCount + childBaseCost * childCount,
     );
 
     return {
@@ -3254,7 +3356,7 @@ export class ItineraryService {
       isPublic: itinerary.is_public || false,
       is_favorite: isFavorite,
       isFavorite,
-      totalBudget: estimatedTripCost,
+      totalBudget: frozen.calculatedTripCost,
       estimatedCostForGroup,
       estimated_cost_for_group: estimatedCostForGroup,
       childPriceRatio,
@@ -3280,13 +3382,13 @@ export class ItineraryService {
       daily_end_time: itinerary.daily_end_time || '22:00',
       durationDays: diffDays || days.length || 1,
       activitiesCount: nonHotelDetailsCount,
-      estimatedBudget: estimatedTripCost,
-      estimated_budget: estimatedTripCost,
+      estimatedBudget: frozen.calculatedTripCost,
+      estimated_budget: frozen.calculatedTripCost,
       // User's original input budget ceiling, stored in itineraries.estimated_cost
       // (repurposed: this column now holds the user's input, not a computed
-      // cost) — separate from estimatedBudget above (always computed fresh
-      // from itinerary_details). Mobile shows both side by side and warns
-      // when estimatedBudget exceeds 90% of this.
+      // cost) — separate from estimatedBudget above (đọc từ bảng chi phí ước
+      // tính đóng băng itinerary_cost_estimates). Mobile shows both side by
+      // side and warns when estimatedBudget exceeds 90% of this.
       userBudget: Number(itinerary.estimated_cost ?? 0),
       user_budget: Number(itinerary.estimated_cost ?? 0),
       // Needed so the mobile map/route-drawing can pass the right vehicle
@@ -3825,14 +3927,17 @@ export class ItineraryService {
    * rounding error across many small divisions.
    */
   /**
-   * Sum of price_adjustment deltas per place_id for this itinerary — folded
-   * into placeCost/hotelCost by both getItineraryDetail() and
-   * calculateTripCostBreakdown() so a price correction is never missed by
-   * one path while showing up in the other (same drift class as the
-   * hydration bug already fixed this session). Also reused directly by
-   * IncurredCostsService for the "spent so far" computation (Card 2).
+   * Giá HIỆU LỰC hiện tại theo place_id — đọc từ dòng "Chi phí kế hoạch" đã
+   * lưu (IncurredCostsService.recordVisitBaselineExpense() ghi lúc check-in,
+   * updatePlaceEffectivePrice() sửa trực tiếp sau đó — không còn cơ chế
+   * "Điều chỉnh giá" dạng delta cộng dồn nữa). Dùng chung bởi cả
+   * getItineraryDetail() và calculateTripCostBreakdown() để 1 giá đã sửa
+   * không bao giờ bị thiếu ở đường này mà lại lộ ra ở đường kia (đúng lớp
+   * bug "2 công thức lệch nhau" đã fix trong phiên này). Địa điểm CHƯA
+   * visited thì chưa có dòng baseline — map sẽ không có key đó, gọi nơi
+   * dùng phải tự fallback về estimated_cost gốc.
    */
-  async loadPriceAdjustmentDeltasByPlace(
+  async loadBaselineExpenseAmountsByPlace(
     itineraryId: string,
   ): Promise<Map<string, number>> {
     const { data, error } = await supabase
@@ -3840,25 +3945,49 @@ export class ItineraryService {
       .from('incurred_costs')
       .select('place_id, amount')
       .eq('itinerary_id', itineraryId)
-      .eq('type', CostType.DIEU_CHINH_GIA);
+      .eq('type', CostType.CHI_PHI_KE_HOACH);
     if (error) {
       throw new InternalServerErrorException(
-        `Failed to load price adjustments: ${error.message}`,
+        `Failed to load baseline expenses: ${error.message}`,
       );
     }
-    const deltasByPlace = new Map<string, number>();
+    const amountsByPlace = new Map<string, number>();
     for (const row of data ?? []) {
       const placeId = (row as any).place_id;
       if (!placeId) continue;
-      deltasByPlace.set(
-        placeId,
-        (deltasByPlace.get(placeId) ?? 0) + Number((row as any).amount ?? 0),
-      );
+      amountsByPlace.set(placeId, Number((row as any).amount ?? 0));
     }
-    return deltasByPlace;
+    return amountsByPlace;
   }
 
-  private perAdultTripTotal(
+  /**
+   * Tổng delta "Điều chỉnh xăng xe" cho cả chuyến — khác loadBaselineExpenseAmountsByPlace
+   * ở chỗ không group theo place_id (điều chỉnh xăng xe áp dụng cho CẢ
+   * CHUYẾN, không gắn 1 địa điểm/ngày cụ thể — xem CostType.DIEU_CHINH_XANG_XE).
+   * Có thể âm (giảm chi phí xăng xe so với ước tính).
+   */
+  async loadTransportAdjustmentDelta(itineraryId: string): Promise<number> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('incurred_costs')
+      .select('amount')
+      .eq('itinerary_id', itineraryId)
+      .eq('type', CostType.DIEU_CHINH_XANG_XE);
+    if (error) {
+      throw new InternalServerErrorException(
+        `Failed to load transport adjustments: ${error.message}`,
+      );
+    }
+    return (data ?? []).reduce(
+      (sum, row: any) => sum + Number(row.amount ?? 0),
+      0,
+    );
+  }
+
+  /** Public: cũng dùng bởi IncurredCostsService.computeCostBreakdown() để suy
+   * lại calculatedTripCost RAW (chưa reserve) từ place/hotel/transport RAW đã
+   * lấy sẵn từ itinerary_cost_estimates. */
+  perAdultTripTotal(
     placeCost: number,
     hotelCost: number,
     transportCost: number,
@@ -3917,22 +4046,17 @@ export class ItineraryService {
   }
 
   /**
-   * "Chi phí gốc theo kế hoạch" tính tươi từ itinerary_details, dùng bởi
-   * IncurredCostsService để cộng với chi phí phát sinh (mục 1.7). Phải dùng
-   * đúng logic hydrate + phân loại isHotel như getItineraryDetail() — trước
-   * đây 2 hàm này duy trì 2 bản sao độc lập và đã lệch nhau thật (thiếu
-   * hydrateMissingTravelSnapshots + thiếu isStartPointDetail trong isHotel),
-   * khiến "Chi phí ước tính" ở màn chi tiết và "basePlanCost" ở Quản lý chi
-   * phí ra 2 số khác nhau cho cùng 1 lịch trình. Tự lấy itinerary (adult
-   * count/children_count/travel_mode) ở đây thay vì nhận qua tham số, để chỉ
-   * có 1 nguồn sự thật duy nhất.
+   * Engine tính chi phí ƯỚC TÍNH đóng băng của 1 lịch trình — nguồn duy nhất
+   * ghi vào travel.itinerary_cost_estimates (xem recomputeCostEstimate()).
+   * placeCost/hotelCost luôn lấy RAW từ itinerary_details.estimated_cost —
+   * KHÔNG bao giờ ưu tiên giá đã sửa qua check-in/"Sửa giá" (đó là luồng
+   * "đã chi/thực tế" hoàn toàn tách biệt, xem IncurredCostsService).
+   * transportCost chỉ tính từ khoảng cách thật (distance_matrix/Goong) —
+   * KHÔNG cộng "Điều chỉnh xăng xe" (khoản đó cũng chỉ tồn tại trong
+   * incurred_costs, không đụng vào số ước tính đóng băng này).
    */
   async calculateTripCostBreakdown(
     itineraryId: string,
-    /** When provided, only detail rows whose id is in this set count toward
-     * placeCost/hotelCost — used by IncurredCostsService's "spent so far"
-     * (Card 2), which only counts places actually visited so far. */
-    onlyDetailIds?: Set<string>,
   ): Promise<{
     placeCost: number;
     hotelCost: number;
@@ -3960,7 +4084,7 @@ export class ItineraryService {
       .schema('travel')
       .from('itinerary_details')
       .select(
-        'id, place_id, detail_type, estimated_cost, duration_minutes, sequence_order, visit_date',
+        'id, place_id, detail_type, estimated_cost, duration_minutes, sequence_order, visit_date, transport_cost, travel_distance_km, travel_minutes',
       )
       .eq('itinerary_id', itineraryId);
     if (detailError) {
@@ -3969,10 +4093,6 @@ export class ItineraryService {
       );
     }
 
-    // Không select transport_cost/travel_distance_km/travel_minutes — giống
-    // getItineraryDetail(), luôn để hydrateMissingTravelSnapshots tính tươi
-    // thay vì tin vào cột đã lưu (có thể thiếu/lệch dữ liệu distance_matrix
-    // lúc tạo lịch trình).
     await this.hydrateMissingTravelSnapshots(
       details ?? [],
       (itinerary as any)?.travel_mode,
@@ -3999,12 +4119,7 @@ export class ItineraryService {
       }
     }
 
-    const priceAdjustmentDeltas =
-      await this.loadPriceAdjustmentDeltasByPlace(itineraryId);
-    const relevantDetails = onlyDetailIds
-      ? (details ?? []).filter((detail: any) => onlyDetailIds.has(detail.id))
-      : (details ?? []);
-    const costRows = relevantDetails.map((detail: any) => {
+    const costRows = (details ?? []).map((detail: any) => {
       const place = placesById.get(detail.place_id);
       const typeData = Array.isArray(place?.types)
         ? place.types[0]
@@ -4016,12 +4131,9 @@ export class ItineraryService {
         detail.detail_type === 'HOTEL' ||
         this.isStartPointDetail(detail) ||
         this.isAccommodationCategory(catData?.name);
-      const estimatedCost =
-        Number(detail.estimated_cost ?? 0) +
-        (priceAdjustmentDeltas.get(detail.place_id) ?? 0);
       return {
         isHotel,
-        estimatedCost,
+        estimatedCost: Number(detail.estimated_cost ?? 0),
         transportCost: Number(detail.transport_cost ?? 0),
       };
     });
@@ -4049,6 +4161,133 @@ export class ItineraryService {
     };
   }
 
+  /** Ghi/upsert 1 dòng travel.itinerary_cost_estimates — lỗi ghi cache không
+   * được làm fail thao tác gốc (tạo/sửa lịch trình), chỉ log warn. */
+  private async upsertCostEstimate(
+    itineraryId: string,
+    breakdown: {
+      placeCost: number;
+      hotelCost: number;
+      transportCost: number;
+      calculatedTripCost: number;
+    },
+  ): Promise<void> {
+    try {
+      const roundedCalculatedTripCost =
+        Math.round((breakdown.calculatedTripCost * 1.1) / 100000) * 100000;
+      const { error } = await supabase
+        .schema('travel')
+        .from('itinerary_cost_estimates')
+        .upsert(
+          {
+            itinerary_id: itineraryId,
+            place_cost: breakdown.placeCost,
+            hotel_cost: breakdown.hotelCost,
+            transport_cost: breakdown.transportCost,
+            calculated_trip_cost: roundedCalculatedTripCost,
+            updated_at: new Date().toISOString(),
+          },
+          { onConflict: 'itinerary_id' },
+        );
+      if (error) {
+        this.logger.warn(
+          `Cannot upsert itinerary_cost_estimates for ${itineraryId}: ${error.message}`,
+        );
+      }
+    } catch (err: any) {
+      this.logger.warn(
+        `Cannot upsert itinerary_cost_estimates for ${itineraryId}: ${err?.message ?? err}`,
+      );
+    }
+  }
+
+  /** Tính lại (từ nguồn) + ghi đè travel.itinerary_cost_estimates — gọi ở mọi
+   * điểm sửa cấu trúc lịch trình (tạo mới/thêm/xóa/đổi hoạt động). KHÔNG gọi
+   * từ check-in/"Sửa giá"/"Điều chỉnh xăng xe" — các luồng đó không được
+   * phép đụng vào số ước tính đóng băng. */
+  async recomputeCostEstimate(itineraryId: string): Promise<{
+    placeCost: number;
+    hotelCost: number;
+    transportCost: number;
+    calculatedTripCost: number;
+  }> {
+    const breakdown = await this.calculateTripCostBreakdown(itineraryId);
+    await this.upsertCostEstimate(itineraryId, breakdown);
+    return breakdown;
+  }
+
+  /** Đọc chi phí ước tính đóng băng; nếu lịch trình chưa từng có dòng cache
+   * (tạo trước khi có bảng này) thì tính + backfill 1 lần rồi trả về. */
+  async getCachedCostBreakdown(itineraryId: string): Promise<{
+    placeCost: number;
+    hotelCost: number;
+    transportCost: number;
+    calculatedTripCost: number;
+  }> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itinerary_cost_estimates')
+      .select('place_cost, hotel_cost, transport_cost, calculated_trip_cost')
+      .eq('itinerary_id', itineraryId)
+      .maybeSingle();
+    if (error) {
+      this.logger.warn(
+        `Cannot read itinerary_cost_estimates for ${itineraryId}: ${error.message}`,
+      );
+    }
+    if (data) {
+      return {
+        placeCost: Number((data as any).place_cost ?? 0),
+        hotelCost: Number((data as any).hotel_cost ?? 0),
+        transportCost: Number((data as any).transport_cost ?? 0),
+        calculatedTripCost: Number((data as any).calculated_trip_cost ?? 0),
+      };
+    }
+    return this.recomputeCostEstimate(itineraryId);
+  }
+
+  /** Xóa snapshot khoảng cách/chi phí xăng đã lưu trên itinerary_details của
+   * CẢ lịch trình — gọi khi sửa cấu trúc lịch trình làm đổi thứ tự chặng
+   * (thêm/xóa/đổi/sắp xếp lại hoạt động), vì "điểm trước đó" của nhiều dòng
+   * đã đổi nên số cũ không còn đúng nữa. hydrateMissingTravelSnapshots() sẽ
+   * tự tính + lưu lại ở lần đọc kế tiếp (bên trong recomputeCostEstimate()). */
+  private async resetTravelSnapshots(itineraryId: string): Promise<void> {
+    try {
+      const { error } = await supabase
+        .schema('travel')
+        .from('itinerary_details')
+        .update({
+          transport_cost: null,
+          travel_distance_km: null,
+          travel_minutes: null,
+        })
+        .eq('itinerary_id', itineraryId);
+      if (error) {
+        this.logger.warn(
+          `Cannot reset travel snapshots for itinerary ${itineraryId}: ${error.message}`,
+        );
+      }
+    } catch (err: any) {
+      this.logger.warn(
+        `Cannot reset travel snapshots for itinerary ${itineraryId}: ${err?.message ?? err}`,
+      );
+    }
+  }
+
+  /** Gọi ở mọi điểm sửa cấu trúc lịch trình sau khi tạo (thêm/xóa/đổi hoạt
+   * động): reset snapshot chặng cũ rồi tính lại + ghi đè chi phí ước tính
+   * đóng băng. Không dùng cho lần tạo lịch trình đầu tiên (chưa có snapshot
+   * cũ nào để reset — gọi thẳng recomputeCostEstimate()). */
+  async recomputeCostEstimateAfterEdit(itineraryId: string): Promise<{
+    placeCost: number;
+    hotelCost: number;
+    transportCost: number;
+    calculatedTripCost: number;
+  }> {
+    await this.resetTravelSnapshots(itineraryId);
+    return this.recomputeCostEstimate(itineraryId);
+  }
+
   /**
    * "Chi phí ước tính của tất cả thành viên" — NGUỒN DUY NHẤT dùng bởi cả
    * danh sách lịch trình (withEstimatedListCosts) và Sổ chi tiêu
@@ -4074,19 +4313,56 @@ export class ItineraryService {
     estimatedCostPerChild: number;
     roundedGroupTotal: number;
   }> {
-    const { calculatedTripCost, placeCost, hotelCost, transportCost } =
-      await this.calculateTripCostBreakdown(itineraryId);
+    const breakdown = await this.getCachedCostBreakdown(itineraryId);
     const { childPriceRatio } = await this.tripCostConfig.getConfig();
+    return this.deriveGroupEstimatedCost(
+      breakdown,
+      adultCount,
+      childCount,
+      childPriceRatio,
+    );
+  }
 
+  /** Phần tính THUẦN (không I/O) của computeGroupEstimatedCost — tách riêng
+   * để withEstimatedListCosts() có thể batch-fetch breakdown cho CẢ danh
+   * sách bằng 1 query (getCachedCostBreakdownBatch) rồi gọi hàm này trong bộ
+   * nhớ cho từng lịch trình, thay vì mỗi lịch trình tự query riêng. */
+  private deriveGroupEstimatedCost(
+    breakdown: {
+      placeCost: number;
+      hotelCost: number;
+      transportCost: number;
+      calculatedTripCost: number;
+    },
+    adultCount: number,
+    childCount: number,
+    childPriceRatio: number,
+  ): {
+    estimatedCostForGroup: number;
+    estimatedCostPerAdult: number;
+    estimatedCostPerChild: number;
+    roundedGroupTotal: number;
+  } {
+    // calculatedTripCost ở đây là bản ĐÃ reserve/round (đọc thẳng từ
+    // itinerary_cost_estimates.calculated_trip_cost) — dùng luôn làm
+    // roundedCostPerAdult, không tính lại reserve/round cho người lớn nữa.
+    const { calculatedTripCost: roundedCostPerAdult, placeCost, hotelCost, transportCost } =
+      breakdown;
     const participantCount = Math.max(1, adultCount + childCount);
+    // Bản RAW (chưa reserve) chỉ dùng cho estimatedCostForGroup/estimatedCostPerAdult
+    // (số tham chiếu, không hiển thị chính).
+    const rawCalculatedTripCost = this.perAdultTripTotal(
+      placeCost,
+      hotelCost,
+      transportCost,
+      participantCount,
+    );
     const transportPerAdult =
       Math.round(transportCost / participantCount / 1000) * 1000;
     const childBaseCost =
       placeCost * childPriceRatio + hotelCost * childPriceRatio + transportPerAdult;
 
     const reserveRate = 0.1;
-    const roundedCostPerAdult =
-      Math.round((calculatedTripCost * (1 + reserveRate)) / 100000) * 100000;
     const roundedCostPerChild =
       childCount > 0
         ? Math.round((childBaseCost * (1 + reserveRate)) / 100000) * 100000
@@ -4094,13 +4370,80 @@ export class ItineraryService {
 
     return {
       estimatedCostForGroup: Math.round(
-        calculatedTripCost * adultCount + childBaseCost * childCount,
+        rawCalculatedTripCost * adultCount + childBaseCost * childCount,
       ),
-      estimatedCostPerAdult: Math.round(calculatedTripCost),
+      estimatedCostPerAdult: Math.round(rawCalculatedTripCost),
       estimatedCostPerChild: Math.round(childBaseCost),
       roundedGroupTotal:
         roundedCostPerAdult * adultCount + roundedCostPerChild * childCount,
     };
+  }
+
+  /** Batch-fetch itinerary_cost_estimates cho CẢ danh sách bằng 1 query duy
+   * nhất (WHERE itinerary_id IN (...)) — thay vì gọi getCachedCostBreakdown()
+   * riêng cho từng lịch trình (N query, dù chạy song song vẫn là N round-trip
+   * mạng). Lịch trình nào chưa có dòng cache (hiếm, tạo trước khi có bảng
+   * này) mới backfill riêng, không kéo cả danh sách xuống N query như cũ. */
+  private async getCachedCostBreakdownBatch(
+    itineraryIds: string[],
+  ): Promise<
+    Map<
+      string,
+      {
+        placeCost: number;
+        hotelCost: number;
+        transportCost: number;
+        calculatedTripCost: number;
+      }
+    >
+  > {
+    const result = new Map<
+      string,
+      {
+        placeCost: number;
+        hotelCost: number;
+        transportCost: number;
+        calculatedTripCost: number;
+      }
+    >();
+    if (itineraryIds.length === 0) return result;
+
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itinerary_cost_estimates')
+      .select(
+        'itinerary_id, place_cost, hotel_cost, transport_cost, calculated_trip_cost',
+      )
+      .in('itinerary_id', itineraryIds);
+    if (error) {
+      this.logger.warn(
+        `Cannot batch-read itinerary_cost_estimates: ${error.message}`,
+      );
+    }
+    for (const row of data ?? []) {
+      result.set((row as any).itinerary_id, {
+        placeCost: Number((row as any).place_cost ?? 0),
+        hotelCost: Number((row as any).hotel_cost ?? 0),
+        transportCost: Number((row as any).transport_cost ?? 0),
+        calculatedTripCost: Number((row as any).calculated_trip_cost ?? 0),
+      });
+    }
+
+    const missingIds = itineraryIds.filter((id) => !result.has(id));
+    if (missingIds.length > 0) {
+      await Promise.all(
+        missingIds.map(async (id) => {
+          try {
+            result.set(id, await this.recomputeCostEstimate(id));
+          } catch (err: any) {
+            this.logger.warn(
+              `Cannot backfill itinerary_cost_estimates for ${id}: ${err?.message ?? err}`,
+            );
+          }
+        }),
+      );
+    }
+    return result;
   }
 
   private formatDuration(totalMinutes: number): string {
@@ -4153,12 +4496,17 @@ export class ItineraryService {
     );
   }
 
+  /** Trả về true nếu có ít nhất 1 chặng vừa được tính + ghi lại vào
+   * itinerary_details (trước đó thiếu/0) — gọi nơi dùng phải tự recompute lại
+   * itinerary_cost_estimates nếu true, nếu không cache sẽ giữ số CŨ (tính lúc
+   * còn thiếu dữ liệu, thường do Goong rate-limit) trong khi các nơi đọc trực
+   * tiếp itinerary_details (vd chi phí từng ngày) đã thấy số MỚI — lệch nhau. */
   private async hydrateMissingTravelSnapshots(
     details: any[],
     travelMode?: string | null,
     headcount = 1,
-  ): Promise<void> {
-    if (!Array.isArray(details) || details.length === 0) return;
+  ): Promise<boolean> {
+    if (!Array.isArray(details) || details.length === 0) return false;
 
     const hotel = details.find((detail) => this.isStartPointDetail(detail));
     const activitiesByDate = new Map<string, any[]>();
@@ -4190,7 +4538,7 @@ export class ItineraryService {
       }
     }
 
-    if (legs.length === 0) return;
+    if (legs.length === 0) return false;
 
     const originIds = [...new Set(legs.map((leg) => leg.originId))];
     const destinationIds = [
@@ -4198,6 +4546,7 @@ export class ItineraryService {
     ];
 
     const matrixMode = this.normalizeMatrixTravelMode(travelMode);
+    let anyChanged = false;
     try {
       const { data, error } = await supabase
         .schema('travel')
@@ -4213,7 +4562,7 @@ export class ItineraryService {
         this.logger.warn(
           `Distance matrix fallback unavailable: ${error.message}`,
         );
-        return;
+        return false;
       }
 
       const matrix = new Map<string, any>(
@@ -4235,34 +4584,64 @@ export class ItineraryService {
         }
       }
 
-      for (const leg of legs) {
-        const row = matrix.get(
-          `${leg.originId}:${leg.destination.place_id}`,
-        ) as any;
-        if (!row) continue;
-        if (Number(leg.destination.travel_distance_km ?? 0) <= 0) {
-          leg.destination.travel_distance_km =
-            Number(row.distance_meters ?? 0) / 1000;
-        }
-        if (Number(leg.destination.travel_minutes ?? 0) <= 0) {
-          leg.destination.travel_minutes = this.roundTravelMinutes(
-            Math.ceil(Number(row.duration_seconds ?? 0) / 60),
-          );
-        }
-        if (Number(leg.destination.transport_cost ?? 0) <= 0) {
-          leg.destination.transport_cost =
-            await this.estimateSelfDriveTransportCost(
-              leg.destination.travel_distance_km,
-              matrixMode === 'MOTORBIKE'
-                ? TransportMode.MOTORBIKE
-                : TransportMode.CAR,
-              headcount,
+      await Promise.all(
+        legs.map(async (leg) => {
+          const row = matrix.get(
+            `${leg.originId}:${leg.destination.place_id}`,
+          ) as any;
+          if (!row) return;
+          let changed = false;
+          if (Number(leg.destination.travel_distance_km ?? 0) <= 0) {
+            leg.destination.travel_distance_km =
+              Number(row.distance_meters ?? 0) / 1000;
+            changed = true;
+          }
+          if (Number(leg.destination.travel_minutes ?? 0) <= 0) {
+            leg.destination.travel_minutes = this.roundTravelMinutes(
+              Math.ceil(Number(row.duration_seconds ?? 0) / 60),
             );
-        }
-      }
+            changed = true;
+          }
+          if (Number(leg.destination.transport_cost ?? 0) <= 0) {
+            leg.destination.transport_cost =
+              await this.estimateSelfDriveTransportCost(
+                leg.destination.travel_distance_km,
+                matrixMode === 'MOTORBIKE'
+                  ? TransportMode.MOTORBIKE
+                  : TransportMode.CAR,
+                headcount,
+              );
+            changed = true;
+          }
+          // Persist snapshot lên chính dòng itinerary_details — để lần đọc
+          // sau (bất kỳ hàm/user nào) không cần query distance_matrix lại.
+          // Bị reset về null mỗi khi sửa cấu trúc lịch trình làm đổi thứ tự
+          // chặng (xem resetTravelSnapshots()).
+          if (changed && leg.destination.id) {
+            const { error: persistError } = await supabase
+              .schema('travel')
+              .from('itinerary_details')
+              .update({
+                travel_distance_km: leg.destination.travel_distance_km,
+                travel_minutes: leg.destination.travel_minutes,
+                transport_cost: leg.destination.transport_cost,
+              })
+              .eq('id', leg.destination.id);
+            if (persistError) {
+              this.logger.warn(
+                `Cannot persist travel snapshot for detail ${leg.destination.id}: ${persistError.message}`,
+              );
+            } else {
+              anyChanged = true;
+            }
+          }
+        }),
+      );
     } catch (error) {
       this.logger.warn(`Distance matrix fallback failed: ${String(error)}`);
+      return false;
     }
+    return anyChanged;
   }
 
   private normalizeMatrixTravelMode(
@@ -4273,16 +4652,30 @@ export class ItineraryService {
       : 'DRIVING';
   }
 
+  // Số request Goong chạy song song tối đa cho các cặp THẬT SỰ mới (chưa ai
+  // đang resolve). Goong rate-limit theo giây nên không thể để loop này chạy
+  // không giới hạn khi 1 itinerary/candidate có hàng chục chặng mới cùng lúc.
+  private static readonly GOONG_CONCURRENCY = 3;
+
   private async fetchAndCacheGoongLegs(
     legs: Array<{ originId: string; destination: any }>,
     travelMode: 'DRIVING' | 'MOTORBIKE',
   ): Promise<any[]> {
-    const apiKey = process.env.GOONG_API_KEY?.trim();
     if (legs.length === 0) return [];
+
+    // Dedupe trong phạm vi 1 lệnh gọi — 1 itinerary có thể ghé lại cùng 1 cặp
+    // điểm nhiều lần (đi rồi quay lại) nhưng chỉ cần tra/gọi Goong 1 lần.
+    const uniqueLegs = new Map<string, { originId: string; destination: any }>();
+    for (const leg of legs) {
+      uniqueLegs.set(`${leg.originId}:${leg.destination.place_id}`, leg);
+    }
 
     const placeIds = [
       ...new Set(
-        legs.flatMap((leg) => [leg.originId, leg.destination.place_id]),
+        [...uniqueLegs.values()].flatMap((leg) => [
+          leg.originId,
+          leg.destination.place_id,
+        ]),
       ),
     ];
     const { data: places, error } = await supabase
@@ -4309,70 +4702,39 @@ export class ItineraryService {
           `${Number(place.latitude)},${Number(place.longitude)}`,
         ]),
     );
-    const rows: any[] = [];
-    const goongRows: any[] = [];
-    const vehicle = travelMode === 'MOTORBIKE' ? 'bike' : 'car';
 
-    for (const leg of legs) {
-      const origin = coordinates.get(leg.originId);
-      const destination = coordinates.get(leg.destination.place_id);
-      if (!origin || !destination) continue;
-      try {
-        if (!apiKey) throw new Error('GOONG_API_KEY is not configured');
-        const response = await axios.get(
-          'https://rsapi.goong.io/v2/distancematrix',
-          {
-            params: {
-              origins: origin,
-              destinations: destination,
-              vehicle,
-              api_key: apiKey,
-            },
-            timeout: 10000,
-          },
-        );
-        const element = response.data?.rows?.[0]?.elements?.[0];
-        if (element?.status !== 'OK') continue;
-        const row = {
-          origin_place_id: leg.originId,
-          destination_place_id: leg.destination.place_id,
-          travel_mode: travelMode,
-          distance_meters: Math.max(
-            0,
-            Math.round(Number(element.distance?.value ?? 0)),
-          ),
-          duration_seconds: Math.max(
-            0,
-            Math.round(Number(element.duration?.value ?? 0)),
-          ),
-          updated_at: new Date().toISOString(),
-        };
-        rows.push(row);
-        goongRows.push(row);
-      } catch (error) {
-        this.logger.warn(
-          `Goong fallback failed for ${leg.originId} -> ${leg.destination.place_id}: ${String(error)}`,
-        );
-        const [originLat, originLng] = origin.split(',').map(Number);
-        const [destinationLat, destinationLng] = destination
-          .split(',')
-          .map(Number);
-        const distanceKm = this.haversineDistanceKm(
-          originLat,
-          originLng,
-          destinationLat,
-          destinationLng,
-        );
-        rows.push({
-          origin_place_id: leg.originId,
-          destination_place_id: leg.destination.place_id,
-          travel_mode: travelMode,
-          distance_meters: Math.round(distanceKm * 1000),
-          duration_seconds: Math.max(60, Math.ceil((distanceKm / 30) * 3600)),
-        });
-      }
-    }
+    const entries = [...uniqueLegs.entries()].filter(([, leg]) =>
+      coordinates.has(leg.originId) && coordinates.has(leg.destination.place_id),
+    );
 
+    // Mỗi cặp (origin, destination, mode) chỉ có TỐI ĐA 1 request Goong đang
+    // bay trong toàn bộ process tại 1 thời điểm — request thứ 2 trở đi cho
+    // cùng 1 cặp (đến từ itinerary khác, hoặc request đồng thời khác) sẽ chờ
+    // và dùng chung kết quả thay vì tự gọi Goong riêng (chống cache-stampede).
+    const resolved = await this.mapWithConcurrency(
+      entries,
+      ItineraryService.GOONG_CONCURRENCY,
+      async ([key, leg]) => {
+        const lockKey = `${key}:${travelMode}`;
+        const pending = this.pendingGoongLegRequests.get(lockKey);
+        if (pending) return pending;
+
+        const promise = this.resolveSingleGoongLeg(leg, travelMode, coordinates).finally(
+          () => this.pendingGoongLegRequests.delete(lockKey),
+        );
+        this.pendingGoongLegRequests.set(lockKey, promise);
+        return promise;
+      },
+    );
+
+    const rows = resolved.filter((row): row is any => row !== null);
+    // Chỉ cache dòng đến TỪ Goong thật (source đường đi chính xác). Ước lượng
+    // haversine chỉ dùng tạm cho response hiện tại — không ghi vào
+    // distance_matrix, để lần đọc sau vẫn thử gọi Goong thật thay vì giữ mãi
+    // 1 con số ước lượng kém chính xác.
+    const goongRows = rows
+      .filter((row) => row.source === 'GOONG')
+      .map(({ source, ...row }) => row);
     if (goongRows.length > 0) {
       const { error: upsertError } = await supabase
         .schema('travel')
@@ -4387,6 +4749,78 @@ export class ItineraryService {
       }
     }
     return rows;
+  }
+
+  private async resolveSingleGoongLeg(
+    leg: { originId: string; destination: any },
+    travelMode: 'DRIVING' | 'MOTORBIKE',
+    coordinates: Map<string, string>,
+  ): Promise<any | null> {
+    const apiKey = process.env.GOONG_API_KEY?.trim();
+    const origin = coordinates.get(leg.originId)!;
+    const destination = coordinates.get(leg.destination.place_id)!;
+    const vehicle = travelMode === 'MOTORBIKE' ? 'bike' : 'car';
+
+    try {
+      if (!apiKey) throw new Error('GOONG_API_KEY is not configured');
+      const response = await axios.get(
+        'https://rsapi.goong.io/v2/distancematrix',
+        {
+          params: {
+            origins: origin,
+            destinations: destination,
+            vehicle,
+            api_key: apiKey,
+          },
+          timeout: 10000,
+        },
+      );
+      const element = response.data?.rows?.[0]?.elements?.[0];
+      if (element?.status !== 'OK') {
+        throw new Error(`Goong element status ${element?.status ?? 'unknown'}`);
+      }
+      return {
+        origin_place_id: leg.originId,
+        destination_place_id: leg.destination.place_id,
+        travel_mode: travelMode,
+        distance_meters: Math.max(
+          0,
+          Math.round(Number(element.distance?.value ?? 0)),
+        ),
+        duration_seconds: Math.max(
+          0,
+          Math.round(Number(element.duration?.value ?? 0)),
+        ),
+        source: 'GOONG',
+        updated_at: new Date().toISOString(),
+      };
+    } catch (error) {
+      this.logger.warn(
+        `Goong fallback failed for ${leg.originId} -> ${leg.destination.place_id}: ${String(error)}`,
+      );
+      // Vẫn cache lại ước lượng đường chim bay (đánh dấu source=HAVERSINE) —
+      // nếu không cache, cặp này sẽ mãi bị coi là "thiếu" và gọi lại Goong ở
+      // MỌI lần đọc sau, kể cả khi Goong đang bị rate-limit (429) ngay lúc đó.
+      const [originLat, originLng] = origin.split(',').map(Number);
+      const [destinationLat, destinationLng] = destination
+        .split(',')
+        .map(Number);
+      const distanceKm = this.haversineDistanceKm(
+        originLat,
+        originLng,
+        destinationLat,
+        destinationLng,
+      );
+      return {
+        origin_place_id: leg.originId,
+        destination_place_id: leg.destination.place_id,
+        travel_mode: travelMode,
+        distance_meters: Math.round(distanceKm * 1000),
+        duration_seconds: Math.max(60, Math.ceil((distanceKm / 30) * 3600)),
+        source: 'HAVERSINE',
+        updated_at: new Date().toISOString(),
+      };
+    }
   }
 
   private haversineDistanceKm(

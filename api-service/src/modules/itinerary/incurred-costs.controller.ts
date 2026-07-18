@@ -14,6 +14,7 @@ import { ApiOperation, ApiParam, ApiQuery, ApiTags } from '@nestjs/swagger';
 import { IncurredCostsService } from './incurred-costs.service';
 import { CreateIncurredCostDto } from './dto/create-incurred-cost.dto';
 import { UpdateIncurredCostDto } from './dto/update-incurred-cost.dto';
+import { UpdatePlacePriceDto } from './dto/update-place-price.dto';
 
 @ApiTags('Itinerary — Chi phí phát sinh')
 @Controller('itinerary/:id/incurred-costs')
@@ -25,15 +26,18 @@ export class IncurredCostsController {
   @ApiParam({ name: 'id', description: 'ID lịch trình' })
   @ApiQuery({ name: 'user_id', required: true })
   @ApiQuery({ name: 'place_id', required: false })
+  @ApiQuery({ name: 'day_number', required: false })
   @ApiQuery({ name: 'filter_user_id', required: false })
   list(
     @Param('id') itineraryId: string,
     @Query('user_id') userId: string,
     @Query('place_id') placeId?: string,
+    @Query('day_number') dayNumber?: string,
     @Query('filter_user_id') filterUserId?: string,
   ) {
     return this.service.listIncurredCosts(itineraryId, userId, {
       placeId,
+      dayNumber: dayNumber ? parseInt(dayNumber, 10) : undefined,
       userId: filterUserId,
     });
   }
@@ -61,6 +65,22 @@ export class IncurredCostsController {
     return this.service.computeCostBreakdown(itineraryId);
   }
 
+  @Get('day-breakdown')
+  @ApiOperation({
+    summary: 'Mỗi người phải trả bao nhiêu CHỈ TÍNH CHO 1 NGÀY (chi tiết ngày N)',
+  })
+  @ApiParam({ name: 'id', description: 'ID lịch trình' })
+  @ApiQuery({ name: 'day_number', required: true })
+  getDayBreakdown(
+    @Param('id') itineraryId: string,
+    @Query('day_number') dayNumber: string,
+  ) {
+    return this.service.computeDayCostBreakdown(
+      itineraryId,
+      parseInt(dayNumber, 10),
+    );
+  }
+
   @Post()
   @HttpCode(HttpStatus.CREATED)
   @ApiOperation({ summary: 'Ghi nhận 1 khoản chi phí phát sinh' })
@@ -70,6 +90,24 @@ export class IncurredCostsController {
     @Body() dto: CreateIncurredCostDto,
   ) {
     return this.service.createIncurredCost(itineraryId, dto);
+  }
+
+  @Patch('place-price')
+  @ApiOperation({
+    summary:
+      'Sửa giá HIỆU LỰC của 1 địa điểm đã visited (cập nhật thẳng lên dòng "Chi phí kế hoạch") — chỉ chủ lịch trình',
+  })
+  @ApiParam({ name: 'id', description: 'ID lịch trình' })
+  updatePlacePrice(
+    @Param('id') itineraryId: string,
+    @Body() dto: UpdatePlacePriceDto,
+  ) {
+    return this.service.updatePlaceEffectivePrice(
+      itineraryId,
+      dto.placeId,
+      dto.amount,
+      dto.userId,
+    );
   }
 
   @Patch(':costId')

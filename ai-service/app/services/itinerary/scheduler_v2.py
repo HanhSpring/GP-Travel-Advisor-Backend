@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import datetime
 import math
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -257,6 +259,25 @@ class SchedulerV2Planner:
     Khi infeasible → fallback chain: relax lunch → bỏ lunch → greedy.
     """
 
+    @property
+    def daily_budget_soft(self) -> float:
+        """Per-day soft budget cap, backed by threading.local() so each day
+        can solve concurrently (run() dispatches days on a ThreadPoolExecutor)
+        without racing on a shared instance attribute — every existing read
+        site in the solve chain (_solve_day_core, _greedy_fallback, etc.)
+        keeps working unchanged since they all go through this property.
+        Lazily creates the threading.local() on first access (via __dict__,
+        not a plain attribute check, to avoid recursing through this same
+        property) so instances built via __new__() + manual attrs (see test
+        helpers) don't need to know about this implementation detail."""
+        local = self.__dict__.setdefault("_daily_budget_local", threading.local())
+        return getattr(local, "value", 0.0)
+
+    @daily_budget_soft.setter
+    def daily_budget_soft(self, value: float) -> None:
+        local = self.__dict__.setdefault("_daily_budget_local", threading.local())
+        local.value = value
+
     def __init__(self, config: SchedulerV2Config):
         if cp_model is None:
             raise RuntimeError(
@@ -362,6 +383,7 @@ class SchedulerV2Planner:
         )
         residual_budget = max(0.0, self.trip_budget - self.hotel_total_cost)
         self.trip_residual_budget = residual_budget
+        self._daily_budget_local = threading.local()
         self.daily_budget_soft = residual_budget
 
         # ── Cluster ──
@@ -502,24 +524,25 @@ class SchedulerV2Planner:
             hotel=self.hotel_place,
         )
 
-        remaining_budget = self.trip_residual_budget
+        # Ngân sách/ngày: chia đều theo số ngày, tính 1 lần trước khi giải —
+        # KHÔNG còn kiểu "dồn toa" tuần tự (ngày 1 dùng nguyên ngân sách còn
+        # lại, ngày cuối chỉ còn phần dư), vì lúc giải song song không còn
+        # biết "các ngày khác đã tiêu bao nhiêu" tại thời điểm giải. Ngân
+        # sách vốn là ràng buộc MỀM có chủ đích (xem comment đầu file: hard
+        # cap từng bị revert) — bảo đảm thật nằm ở validator.py's
+        # budget_exceeded trên TỔNG cả chuyến, không phụ thuộc cách chia
+        # soft-budget đầu vào này — nên xấp xỉ đều theo ngày là an toàn.
+        per_day_budget = self.trip_residual_budget / max(1, self.num_days)
 
-        # Chạy song song các ngày
-        day_results: list[planner.DayResult] = []
-        global_visited = set()
-        
         def solve_one_day(day_idx: int) -> planner.DayResult:
+            # daily_budget_soft là threading.local()-backed property — mỗi
+            # thread set giá trị riêng, không race với các ngày khác đang
+            # giải đồng thời.
+            self.daily_budget_soft = per_day_budget
             pool = self.assignment_result.day_pools[day_idx]
             daily_places = [
                 *pool["attractions"], *pool["restaurants"], *pool.get("cafes", [])
             ]
-            
-            # Filter out places already visited in previous days (except hotels)
-            daily_places = [
-                p for p in daily_places
-                if str(p.id) not in global_visited or p.place_type == "hotel"
-            ]
-            
             weekday_idx = (start_day_idx + day_idx) % 7
             day_pois = [
                 place.to_poi_for_day(weekday_idx) for place in daily_places
@@ -535,30 +558,64 @@ class SchedulerV2Planner:
                 day=day_idx + 1, pois=day_pois, ga_result=day_result
             )
 
-        # Chạy song song các ngày
-        day_results: list[planner.DayResult] = []
-        for day_idx in range(self.num_days):
-            self.daily_budget_soft = max(0.0, remaining_budget)
-            day_result = solve_one_day(day_idx)
-            day_results.append(day_result)
-            
-            # Record visited non-hotel places to ensure global uniqueness across
-            # days. Read ids straight off the schedule rather than resolving
-            # visited_poi_indices against day_result.pois: PRE-PRUNING inside
-            # _solve_day_with_fallback can drop candidates before solving,
-            # which shifts those indices out of sync with the pre-prune pois
-            # list and silently tags the wrong POI (or none) as visited --
-            # letting the real one slip back into a later day's pool.
+        # Chạy song song các ngày. CP-SAT's solver.Solve() là lời gọi C++
+        # native, nhả GIL khi solve nên threading cho song song thật (không
+        # cần ProcessPoolExecutor/pickling). max_workers giới hạn bảo thủ:
+        # mỗi ngày đã tự dùng num_search_workers=8 nội bộ, giải quá nhiều
+        # ngày cùng lúc sẽ quá tải CPU thay vì tăng tốc.
+        max_workers = max(1, min(self.num_days, 4))
+        day_results_by_idx: Dict[int, planner.DayResult] = {}
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(solve_one_day, day_idx): day_idx
+                for day_idx in range(self.num_days)
+            }
+            for future in as_completed(futures):
+                day_idx = futures[future]
+                day_results_by_idx[day_idx] = future.result()
+        day_results: list[planner.DayResult] = [
+            day_results_by_idx[day_idx] for day_idx in range(self.num_days)
+        ]
+
+        # Đối chiếu sau khi giải xong: day_pools vốn được thiết kế tách biệt
+        # theo địa điểm (geo_clustering._inject_restaurants/_inject_cafes đảm
+        # bảo 1 nhà hàng/quán chỉ thuộc đúng 1 ngày gần nhất — không còn kiểu
+        # "ứng viên cho nhiều ngày"; attraction đến từ clustering cứng nên
+        # cũng tách biệt theo cụm), nên trùng lặp ở đây lẽ ra không nên xảy
+        # ra — đây chỉ là lưới an toàn rẻ, KHÔNG giải lại khi phát hiện
+        # trùng, chỉ bỏ dòng lặp lại (chấp nhận ngày đó thiếu 1 chỗ, giống
+        # cách fallback chain hiện tại đã chấp nhận ở nơi khác).
+        global_visited: set[str] = set()
+        for day_result in day_results:
+            kept_entries = []
+            duplicates_dropped = 0
             for entry in day_result.ga_result.schedule:
                 if entry.is_return_to_hotel or entry.place_type == "hotel":
+                    kept_entries.append(entry)
                     continue
-                global_visited.add(str(entry.location_id))
-                        
-            remaining_budget = max(
-                0.0,
-                remaining_budget
-                - max(0.0, float(day_result.ga_result.total_day_cost or 0)),
-            )
+                location_id = str(entry.location_id)
+                if location_id in global_visited:
+                    duplicates_dropped += 1
+                    day_result.ga_result.total_activity_cost = max(
+                        0.0,
+                        day_result.ga_result.total_activity_cost
+                        - entry.estimated_cost,
+                    )
+                    day_result.ga_result.total_day_cost = max(
+                        0.0,
+                        day_result.ga_result.total_day_cost - entry.estimated_cost,
+                    )
+                    day_result.ga_result.skipped_count += 1
+                    continue
+                global_visited.add(location_id)
+                kept_entries.append(entry)
+            if duplicates_dropped:
+                day_result.ga_result.schedule = kept_entries
+                self.assignment_result.warnings.append(
+                    f"day {day_result.day}: dropped {duplicates_dropped} "
+                    "POI(s) already scheduled on an earlier day "
+                    "(cross-day dedup after parallel solve)"
+                )
 
         # Final stage: what actually got scheduled after CP-SAT solved each
         # day, as opposed to the pre-solve candidate pools recorded above.

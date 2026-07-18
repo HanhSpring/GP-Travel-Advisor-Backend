@@ -2,10 +2,12 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsArray,
   IsEnum,
+  IsInt,
   IsNotEmpty,
   IsNumber,
   IsOptional,
   IsString,
+  Min,
 } from 'class-validator';
 import { CostType } from './cost-type.enum';
 
@@ -20,7 +22,7 @@ export class CreateIncurredCostDto {
 
   @ApiPropertyOptional({
     description:
-      'Loại chi phí: "Điều chỉnh giá" (chỉ chủ lịch trình, bắt buộc kèm placeId, amount là chênh lệch có thể âm), "Nước uống", "Quà tặng", "Mua sắm", "Phí gửi xe", "Khác" (mặc định).',
+      'Loại chi phí: "Nước uống", "Quà tặng", "Mua sắm", "Phí gửi xe", "Khác" (mặc định), "Điều chỉnh xăng xe" (chỉ chủ lịch trình, amount là chênh lệch có thể âm, không gắn placeId/dayNumber). "Chi phí kế hoạch"/"Điều chỉnh giá" KHÔNG tạo tay được — "Chi phí kế hoạch" do hệ thống tự ghi khi check-in, sửa giá 1 địa điểm dùng API riêng (updatePlaceEffectivePrice).',
     enum: CostType,
     example: CostType.PHI_GUI_XE,
   })
@@ -38,7 +40,7 @@ export class CreateIncurredCostDto {
 
   @ApiProperty({
     description:
-      'Số tiền (VND), tối thiểu 1.000đ (trị tuyệt đối), server sẽ làm tròn đến đơn vị nghìn. Với type="Điều chỉnh giá" đây là CHÊNH LỆCH so với giá ước tính của hệ thống, có thể âm. Với các type khác phải > 0.',
+      'Số tiền (VND), tối thiểu 1.000đ (trị tuyệt đối), server sẽ làm tròn đến đơn vị nghìn. Với type="Điều chỉnh xăng xe" đây là CHÊNH LỆCH so với chi phí xăng xe ước tính, có thể âm. Với các type khác phải > 0.',
     example: 20000,
   })
   @IsNumber()
@@ -52,6 +54,16 @@ export class CreateIncurredCostDto {
   @IsOptional()
   @IsString()
   placeId?: string;
+
+  @ApiPropertyOptional({
+    description:
+      'Ngày thứ N (1-indexed) của chuyến, dùng khi khoản chi không gắn địa điểm cụ thể nhưng vẫn biết rơi vào ngày nào. Không dùng cùng lúc với placeId, và không áp dụng cho type "Chi phí kế hoạch"/"Điều chỉnh xăng xe".',
+    example: 3,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  dayNumber?: number;
 
   @ApiPropertyOptional({
     description:

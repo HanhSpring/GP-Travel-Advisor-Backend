@@ -959,18 +959,17 @@ def refresh_travel_matrix_for_day_pools(
         )
     refreshed_pairs: set[Tuple[str, str]] = set()
     processed_subsets: set[Tuple[str, ...]] = set()
-    goong_unavailable = False
 
     for pool in day_pools:
-        if goong_unavailable:
-            break
         # BUGFIX 2026-07-12: cafes were missing from this list, so any
         # cafe leg was structurally never eligible for a live Goong refresh
         # here — it stayed Haversine forever regardless of API budget.
+        # BUGFIX: entertainment had the same gap — added alongside cafes.
         places = [
             *(pool.get("attractions") or []),
             *(pool.get("restaurants") or []),
             *(pool.get("cafes") or []),
+            *(pool.get("entertainment") or []),
         ]
         ids = [hotel_id, *[place.id for place in places if place.id in coords]]
         ids = list(dict.fromkeys(ids))
@@ -1014,24 +1013,29 @@ def refresh_travel_matrix_for_day_pools(
 
         subset_coords = {place_id: coords[place_id] for place_id in ids}
         try:
+            # max_workers>1 routes through the resilient multi-threaded path
+            # (_fetch_goong_distance_batch_resilient), which retries/splits
+            # failing sub-batches instead of aborting on the first bad one,
+            # and only raises when EVERY batch for this day's subset failed.
             goong_times, goong_distances = build_travel_data_goong(
                 subset_coords,
                 api_key,
                 vehicle=vehicle,
-                max_workers=1,
+                max_workers=4,
             )
         except Exception as exc:
             if require_goong:
                 raise
             # The matrix already contains Haversine/cache values for every
-            # pair. On 429/timeout, keep those values and stop calling Goong
-            # again during this request.
-            goong_unavailable = True
+            # pair. Keep those values for THIS day and move on — a failure
+            # here (e.g. a transient 429 on this day's specific coordinate
+            # set) doesn't mean every other day's Goong call will also fail,
+            # so don't disable Goong for the rest of the request.
             print(
-                "  [WARNING] Goong refresh unavailable; using existing "
-                f"matrix/Haversine values: {_safe_console_text(exc)}"
+                "  [WARNING] Goong refresh unavailable for this day pool; "
+                f"using existing matrix/Haversine values: {_safe_console_text(exc)}"
             )
-            break
+            continue
         for pair, minutes in goong_times.items():
             travel_times[pair] = minutes
             if goong_distances.get(pair, 0) > 0:
@@ -1069,6 +1073,8 @@ def refresh_travel_matrix_for_day_pools(
             places = [
                 *(pool.get("attractions") or []),
                 *(pool.get("restaurants") or []),
+                *(pool.get("cafes") or []),
+                *(pool.get("entertainment") or []),
             ]
             ids = [hotel_id, *[place.id for place in places if place.id in coords]]
             ids = list(dict.fromkeys(ids))

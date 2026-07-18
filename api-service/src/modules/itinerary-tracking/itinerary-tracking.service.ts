@@ -195,7 +195,7 @@ export class ItineraryTrackingService {
       )
       .eq('itinerary_id', itineraryId)
       .eq('visit_date', date)
-      .eq('detail_type', 'ACTIVITY')
+      .in('detail_type', ['ACTIVITY', 'HOTEL'])
       .order('sequence_order', { ascending: true })
       .order('arrival_time', { ascending: true })
       .returns<DetailRow[]>();
@@ -307,7 +307,7 @@ export class ItineraryTrackingService {
         .eq('itinerary_id', args.itineraryId)
         .eq('place_id', args.placeId)
         .eq('visit_date', this.resolveDate(args.date))
-        .eq('detail_type', 'ACTIVITY')
+        .in('detail_type', ['ACTIVITY', 'HOTEL'])
         .limit(1)
         .returns<{ id: string }[]>();
       if (error) this.dbError(error, 'resolveVisit.detail');
@@ -961,6 +961,11 @@ export class ItineraryTrackingService {
         placeName: name,
       });
       this.emitVisited(dto.touristId, row.geofences?.place_id ?? null);
+      await this.recordVisitBaselineExpenseSafely(
+        row.itinerary_id,
+        row.itinerary_detail_id,
+        dto.touristId,
+      );
       return this.eventResponse(
         updated,
         name,
@@ -1028,6 +1033,11 @@ export class ItineraryTrackingService {
       placeName: name,
     });
     this.emitVisited(dto.touristId, row.geofences?.place_id ?? null);
+    await this.recordVisitBaselineExpenseSafely(
+      row.itinerary_id,
+      row.itinerary_detail_id,
+      dto.touristId,
+    );
 
     return this.eventResponse(
       updated,
@@ -1279,6 +1289,29 @@ export class ItineraryTrackingService {
       action_type: 'visited',
       place_id: placeId,
     });
+  }
+
+  /** Ghi "Chi phí kế hoạch" tự động cho địa điểm/khách sạn vừa check-in —
+   * không để lỗi ở đây chặn luồng check-in chính (side effect, không phải
+   * điều kiện thành công của check-in). */
+  private async recordVisitBaselineExpenseSafely(
+    itineraryId: string | null,
+    itineraryDetailId: string,
+    touristId: string,
+  ): Promise<void> {
+    if (!itineraryId) return;
+    try {
+      await this.incurredCostsService.recordVisitBaselineExpense(
+        itineraryId,
+        itineraryDetailId,
+        touristId,
+      );
+    } catch (err: any) {
+      console.error(
+        `[ItineraryTrackingService] recordVisitBaselineExpense failed for ` +
+          `detail ${itineraryDetailId}: ${err?.message ?? err}`,
+      );
+    }
   }
 
   private eventResponse(
