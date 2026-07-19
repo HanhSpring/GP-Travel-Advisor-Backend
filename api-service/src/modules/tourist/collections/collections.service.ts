@@ -53,6 +53,11 @@ interface ItineraryDetailPlaceRow {
     | null;
 }
 
+interface ItineraryRatingStat {
+  rating: number;
+  reviewCount: number;
+}
+
 @Injectable()
 export class CollectionsService {
   private readonly defaultImageUrl =
@@ -137,9 +142,11 @@ export class CollectionsService {
       .filter((item) => item.itineraries)
       .map((item) => item.itineraries);
 
-    const itineraryImages = await this.getItineraryImageMap(
-      itineraryRows.map((item) => item.id),
-    );
+    const itineraryIds = itineraryRows.map((item) => item.id);
+    const [itineraryImages, itineraryRatings] = await Promise.all([
+      this.getItineraryImageMap(itineraryIds),
+      this.getItineraryRatingStats(itineraryIds),
+    ]);
 
     const itinerariesData = itineraryRows
       .map((item) => {
@@ -152,6 +159,7 @@ export class CollectionsService {
         const imageGallery = itineraryImages.get(it.id) ?? [
           this.defaultImageUrl,
         ];
+        const ratingStat = itineraryRatings.get(it.id);
 
         return {
           id: it.id,
@@ -160,6 +168,8 @@ export class CollectionsService {
           days: days || 1,
           participant_count: this.toParticipantCount(it),
           status: it.status,
+          rating: ratingStat?.rating ?? 0,
+          review_count: ratingStat?.reviewCount ?? 0,
           image: imageGallery[0],
           image_gallery: imageGallery,
         };
@@ -243,9 +253,11 @@ export class CollectionsService {
       .filter((item) => item.itineraries)
       .map((item) => item.itineraries);
 
-    const itineraryImages = await this.getItineraryImageMap(
-      itineraryRows.map((item) => item.id),
-    );
+    const itineraryIds = itineraryRows.map((item) => item.id);
+    const [itineraryImages, itineraryRatings] = await Promise.all([
+      this.getItineraryImageMap(itineraryIds),
+      this.getItineraryRatingStats(itineraryIds),
+    ]);
 
     const itinerariesData = itineraryRows.map((item) => {
       const it = item;
@@ -255,6 +267,7 @@ export class CollectionsService {
         (endDate.getTime() - startDate.getTime()) / (1000 * 60 * 60 * 24),
       );
       const imageGallery = itineraryImages.get(it.id) ?? [this.defaultImageUrl];
+      const ratingStat = itineraryRatings.get(it.id);
 
       return {
         id: it.id,
@@ -263,6 +276,8 @@ export class CollectionsService {
         days: days || 1,
         participant_count: this.toParticipantCount(it),
         status: it.status,
+        rating: ratingStat?.rating ?? 0,
+        review_count: ratingStat?.reviewCount ?? 0,
         image: imageGallery[0],
         image_gallery: imageGallery,
       };
@@ -563,5 +578,41 @@ export class CollectionsService {
     }
 
     return imageMap;
+  }
+
+  private async getItineraryRatingStats(
+    itineraryIds: string[],
+  ): Promise<Map<string, ItineraryRatingStat>> {
+    const result = new Map<string, ItineraryRatingStat>();
+    if (itineraryIds.length === 0) return result;
+
+    const { data, error } = await supabase
+      .schema('review_ai')
+      .from('itinerary_reviews')
+      .select('itinerary_id, rating')
+      .in('itinerary_id', itineraryIds)
+      .returns<Array<{ itinerary_id: string; rating: number }>>();
+
+    if (error) {
+      throw new InternalServerErrorException(error.message);
+    }
+
+    const sums = new Map<string, number>();
+    const counts = new Map<string, number>();
+    for (const row of data ?? []) {
+      const rating = Number(row.rating);
+      if (!Number.isFinite(rating) || rating <= 0) continue;
+      sums.set(row.itinerary_id, (sums.get(row.itinerary_id) ?? 0) + rating);
+      counts.set(row.itinerary_id, (counts.get(row.itinerary_id) ?? 0) + 1);
+    }
+
+    for (const [itineraryId, sum] of sums) {
+      const reviewCount = counts.get(itineraryId) ?? 0;
+      result.set(itineraryId, {
+        rating: reviewCount > 0 ? Math.round((sum / reviewCount) * 10) / 10 : 0,
+        reviewCount,
+      });
+    }
+    return result;
   }
 }

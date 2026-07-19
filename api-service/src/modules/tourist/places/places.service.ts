@@ -4,6 +4,7 @@ import {
   NotFoundException,
 } from '@nestjs/common';
 import { supabase } from '../../../config/supabase';
+import { getRoomsByPlaceId } from '../../itinerary/room-catalog';
 import { RecommendationsService } from './recommendations.service';
 
 interface PlaceRow {
@@ -417,15 +418,18 @@ export class PlacesService {
       ratingFilter && ratingFilter >= 1 && ratingFilter <= 5
         ? list.filter(
             (review) =>
-              Math.min(5, Math.max(1, Math.round(Number(review.rating) || 0))) ===
-              ratingFilter,
+              Math.min(
+                5,
+                Math.max(1, Math.round(Number(review.rating) || 0)),
+              ) === ratingFilter,
           )
         : list;
 
     return {
       list: filteredList,
       breakdown,
-      average: visibleReviews.length > 0 ? ratingTotal / visibleReviews.length : 0,
+      average:
+        visibleReviews.length > 0 ? ratingTotal / visibleReviews.length : 0,
       total: filteredList.length,
     } satisfies ReviewPageResult;
   }
@@ -484,10 +488,11 @@ export class PlacesService {
 
     const place = placeResult.data;
     // ── Group 2: queries that depend on group-1 results ──────────────────────
-    const [reviewPage, foodItems, vendorResult, relatedPlaces] =
+    const [reviewPage, foodItems, hotelRooms, vendorResult, relatedPlaces] =
       await Promise.all([
         this.fetchPlaceReviews(placeId, touristId),
         this.fetchPlaceFoodItems(placeId),
+        getRoomsByPlaceId(placeId),
         place.vendor_id
           ? supabase
               .schema('public')
@@ -533,6 +538,7 @@ export class PlacesService {
       open_hour_compressed: place.open_hour_compressed,
       is_open_now: this.isOpenNowFromCompressed(place.open_hour_compressed),
       phone: vendor?.phone_number ?? null,
+      min_price: hotelRooms[0]?.price ?? null,
       food_items: foodItems.slice(0, 5),
       reviews: {
         average: placeAverageRating,
