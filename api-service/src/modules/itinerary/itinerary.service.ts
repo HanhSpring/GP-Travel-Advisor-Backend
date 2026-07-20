@@ -1875,22 +1875,16 @@ export class ItineraryService {
       endDate.setDate(endDate.getDate() + 1);
       visitDate = endDate.toISOString().split('T')[0];
 
-      const { data: itin2 } = await supabase
+      const { error: extendError } = await supabase
         .schema('travel')
         .from('itineraries')
-        .select('duration_days')
-        .eq('id', itineraryId)
-        .single();
-      const newDuration = (itin2?.duration_days || 1) + 1;
-
-      await supabase
-        .schema('travel')
-        .from('itineraries')
-        .update({
-          end_date: visitDate,
-          duration_days: newDuration,
-        })
+        .update({ end_date: visitDate })
         .eq('id', itineraryId);
+      if (extendError) {
+        throw new InternalServerErrorException(
+          `Không thể mở rộng lịch trình: ${extendError.message}`,
+        );
+      }
     } else {
       startDate.setDate(startDate.getDate() + (dto.dayNumber - 1));
       visitDate = startDate.toISOString().split('T')[0]; // 'YYYY-MM-DD'
@@ -1901,7 +1895,7 @@ export class ItineraryService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, address, image_url, average_rating, estimated_cost, category_id, categories(name)',
+        'id, name, address, image_url, average_rating, price, category_id, categories(name)',
       )
       .eq('id', dto.placeId)
       .single();
@@ -1945,11 +1939,10 @@ export class ItineraryService {
         visit_date: visitDate,
         duration_minutes: durationMinutes,
         sequence_order: nextSequence,
-        estimated_cost: place.estimated_cost ?? 0,
+        estimated_cost: place.price ?? 0,
         is_locked: isLocked,
         locked_arrive_time: preferredTime ?? null,
         arrival_time: preferredTime ?? null, // Sẽ được optimizer ghi đè nếu không ghim
-        added_by: 'user', // Đánh dấu user tự thêm (khác với 'ai' do hệ thống tạo)
       })
       .select()
       .single();
@@ -2060,7 +2053,7 @@ export class ItineraryService {
     const { data: newPlace, error: placeErr } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, estimated_cost')
+      .select('id, price')
       .eq('id', dto.newPlaceId)
       .single();
 
@@ -2076,7 +2069,7 @@ export class ItineraryService {
       .from('itinerary_details')
       .update({
         place_id: dto.newPlaceId,
-        estimated_cost: newPlace.estimated_cost ?? 0,
+        estimated_cost: newPlace.price ?? 0,
         // Giữ nguyên: sequence_order, is_locked, locked_arrive_time, duration_minutes
       })
       .eq('id', activityId);
@@ -2384,7 +2377,7 @@ export class ItineraryService {
         `
         place_id,
         places:place_id (
-          id, name, address, average_rating, review_count, image_url,
+          id, name, address, average_rating, review_count, price, image_url,
           latitude, longitude, open_hour_compressed, slot_type,
           types (id, category_id, categories (id, name))
         )
@@ -2435,6 +2428,7 @@ export class ItineraryService {
           category,
           rating: p.average_rating || 0,
           reviewCount: p.review_count || 0,
+          estimatedCost: Number(p.price ?? 0),
           imageUrl,
           distanceKm: null,
           latitude: p.latitude,
@@ -2499,7 +2493,6 @@ export class ItineraryService {
         sequence_order,
         estimated_cost,
         user_notes,
-        added_by,
         places:place_id (
           id,
           name,
@@ -2628,7 +2621,6 @@ export class ItineraryService {
         travel_minutes,
         transport_cost,
         user_notes,
-        added_by,
         places:place_id (
           id,
           name,
@@ -2786,14 +2778,50 @@ export class ItineraryService {
   }
 
   async updateActivities(id: string, days: any[]) {
-    const { data: itinerary } = await supabase
+    const { data: itinerary, error: itineraryError } = await supabase
       .schema('travel')
       .from('itineraries')
-      .select('start_date')
+      .select('start_date, end_date')
       .eq('id', id)
-      .single();
+      .maybeSingle();
 
-    if (!itinerary) throw new Error('Itinerary not found');
+    if (itineraryError) {
+      this.logger.error(
+        `updateActivities itinerary lookup error id=${id}: ${itineraryError.message}`,
+      );
+      throw new InternalServerErrorException(
+        `Không thể kiểm tra lịch trình trước khi lưu: ${itineraryError.message}`,
+      );
+    }
+    if (!itinerary) {
+      throw new NotFoundException(`Itinerary not found: ${id}`);
+    }
+
+    if (!Array.isArray(days) || days.length === 0) {
+      throw new BadRequestException(
+        'Danh sách ngày của lịch trình không hợp lệ',
+      );
+    }
+
+    const incomingDayNumbers = days.map((day) => Number(day?.dayNumber));
+    if (
+      incomingDayNumbers.some(
+        (dayNumber) => !Number.isInteger(dayNumber) || dayNumber < 1,
+      )
+    ) {
+      throw new BadRequestException(
+        'Số thứ tự ngày của lịch trình không hợp lệ',
+      );
+    }
+    const currentDurationDays = this.getItineraryDurationDays(
+      itinerary.start_date,
+      itinerary.end_date,
+    );
+    const newDurationDays = Math.max(
+      currentDurationDays,
+      ...incomingDayNumbers,
+    );
+    const newEndDate = this.addDays(itinerary.start_date, newDurationDays - 1);
 
     const allActivities: Array<{
       id: string;
@@ -2868,17 +2896,34 @@ export class ItineraryService {
       ...editableActivities.map((a) => a.placeId),
       ...currentEditableActs.map((a) => a.place_id),
     ].filter(Boolean);
-    const { data: placesData } = await supabase
+    const { data: placesData, error: placesError } = await supabase
       .schema('travel')
       .from('places')
-      .select('id, slot_type')
+      .select('id, slot_type, price')
       .in('id', incomingPlaceIds);
 
+    if (placesError) {
+      throw new InternalServerErrorException(
+        `Không thể kiểm tra địa điểm trước khi lưu: ${placesError.message}`,
+      );
+    }
+
     const placeTypeMap = new Map<string, string | null>();
+    const placeEstimatedCostMap = new Map<string, number>();
     if (placesData) {
       placesData.forEach((p: any) => {
         placeTypeMap.set(p.id, p.slot_type ?? null);
+        placeEstimatedCostMap.set(p.id, Number(p.price ?? 0));
       });
+    }
+
+    const invalidPlaceActivity = editableActivities.find(
+      (act) => act.placeId && !placeTypeMap.has(act.placeId),
+    );
+    if (invalidPlaceActivity?.placeId) {
+      throw new NotFoundException(
+        `Không tìm thấy địa điểm với id: ${invalidPlaceActivity.placeId}`,
+      );
     }
 
     // Chặn toàn bộ payload trước khi ghi để không tạo lịch trình dở dang:
@@ -2974,7 +3019,7 @@ export class ItineraryService {
     );
 
     if (toDelete.length > 0) {
-      await supabase
+      const { error: deleteError } = await supabase
         .schema('travel')
         .from('itinerary_details')
         .delete()
@@ -2982,6 +3027,11 @@ export class ItineraryService {
           'id',
           toDelete.map((a) => a.id),
         );
+      if (deleteError) {
+        throw new InternalServerErrorException(
+          `Không thể xóa hoạt động cũ: ${deleteError.message}`,
+        );
+      }
     }
 
     await Promise.all(
@@ -3017,8 +3067,11 @@ export class ItineraryService {
             .eq('id', act.id);
 
           if (error) {
-            console.warn(
-              `[Supabase] Không thể cập nhật activity ${act.id}: ${error.message}`,
+            this.logger.error(
+              `updateActivities update failed for activity ${act.id}: ${error.message}`,
+            );
+            throw new InternalServerErrorException(
+              `Không thể cập nhật địa điểm: ${error.message}`,
             );
           }
         } else {
@@ -3032,24 +3085,7 @@ export class ItineraryService {
           const endMin = this.toMinutes(act.endTime);
           const duration = endMin - startMin > 0 ? endMin - startMin : 60;
 
-          // ─── Validate place_id tồn tại trong bảng places trước khi INSERT ───
-          // Tránh lỗi FK constraint "itinerary_details_place_id_fkey"
-          // khi placeId là ID tạm thời hoặc không tồn tại trong travel.places
-          const { data: placeExists } = await supabase
-            .schema('travel')
-            .from('places')
-            .select('id')
-            .eq('id', act.placeId)
-            .single();
-
-          if (!placeExists) {
-            console.warn(
-              `[Supabase] Bỏ qua activity ${act.id}: place_id "${act.placeId}" không tồn tại trong bảng places`,
-            );
-            return;
-          }
-
-          const { error } = await supabase
+          const { data: insertedActivity, error } = await supabase
             .schema('travel')
             .from('itinerary_details')
             .insert({
@@ -3060,19 +3096,36 @@ export class ItineraryService {
               duration_minutes: duration,
               sequence_order: act.sequenceOrder,
               detail_type: 'ACTIVITY',
-            });
+              estimated_cost: placeEstimatedCostMap.get(act.placeId) ?? 0,
+              is_locked: false,
+              locked_arrive_time: null,
+            })
+            .select('id')
+            .single();
 
-          if (error) {
+          if (error || !insertedActivity) {
             this.logger.error(
-              `updateActivities insert failed for temporary activity ${act.id}: ${error.message}`,
+              `updateActivities insert failed for temporary activity ${act.id}: ${error?.message ?? 'no row returned'}`,
             );
             throw new InternalServerErrorException(
-              `Không thể lưu địa điểm mới: ${error.message}`,
+              `Không thể lưu địa điểm mới: ${error?.message ?? 'không nhận được dữ liệu xác nhận từ DB'}`,
             );
           }
         }
       }),
     );
+
+    const { error: metadataError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .update({ end_date: newEndDate })
+      .eq('id', id);
+
+    if (metadataError) {
+      throw new InternalServerErrorException(
+        `Không thể cập nhật thời gian lịch trình: ${metadataError.message}`,
+      );
+    }
 
     try {
       await this.recomputeCostEstimateAfterEdit(id);
@@ -3264,7 +3317,17 @@ export class ItineraryService {
       daysMap.set(dateStr, list);
     }
 
-    const sortedDates = Array.from(daysMap.keys()).sort();
+    const expectedDurationDays = this.getItineraryDurationDays(
+      itinerary.start_date,
+      itinerary.end_date,
+    );
+    const expectedDates = Array.from(
+      { length: expectedDurationDays },
+      (_, index) => this.addDays(itinerary.start_date, index),
+    );
+    const sortedDates = Array.from(
+      new Set([...expectedDates, ...daysMap.keys()]),
+    ).sort();
 
     const days = sortedDates.map((dateStr, index) => {
       const dayNumber = index + 1;
@@ -3960,7 +4023,9 @@ export class ItineraryService {
 
           return {
             id: a.id,
-            place_id: a.id, // dùng id làm place_id
+            // `id` dùng để map kết quả về đúng itinerary_details; `place_id`
+            // phải là ID travel.places để distance_matrix cache được tái sử dụng.
+            place_id: a.placeId ?? a.id,
             duration_minutes: a.durationMinutes ?? duration,
             is_locked: a.isLocked ?? false,
             locked_arrive_time: a.lockedArriveTime ?? null,
@@ -4000,11 +4065,13 @@ export class ItineraryService {
       reorderNotes = reorderNotes.map((note) => {
         let newNote = note;
         for (const a of activities) {
-          if (newNote.includes(a.id)) {
-            newNote = newNote.replace(
-              a.id,
-              a.title || a.locationName || 'địa điểm',
-            );
+          const displayName = a.title || a.locationName || 'địa điểm';
+          const identifiers = [a.id, a.placeId].filter(
+            (value): value is string =>
+              typeof value === 'string' && value.length > 0,
+          );
+          for (const identifier of identifiers) {
+            newNote = newNote.split(identifier).join(displayName);
           }
         }
         return newNote;
@@ -5134,6 +5201,20 @@ export class ItineraryService {
     const d = new Date(dateStr);
     d.setUTCDate(d.getUTCDate() + days);
     return d.toISOString().split('T')[0];
+  }
+
+  private getItineraryDurationDays(
+    startDate: string,
+    endDate?: string | null,
+  ): number {
+    const start = new Date(`${startDate}T00:00:00.000Z`).getTime();
+    const end = new Date(
+      `${endDate || startDate}T00:00:00.000Z`,
+    ).getTime();
+    if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
+      return 1;
+    }
+    return Math.floor((end - start) / 86_400_000) + 1;
   }
 
 }

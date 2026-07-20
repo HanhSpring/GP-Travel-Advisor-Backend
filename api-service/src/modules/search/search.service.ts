@@ -933,7 +933,7 @@ export class SearchService {
       .schema('travel')
       .from('places')
       .select(
-        'id, name, address, average_rating, review_count, image_url, latitude, longitude, open_hour_compressed, types(id, category_id, categories(id, name))',
+        'id, name, address, average_rating, review_count, price, image_url, latitude, longitude, open_hour_compressed, types(id, category_id, categories(id, name))',
       )
       .eq('is_approved', true)
       .eq('is_active', true)
@@ -1004,6 +1004,7 @@ export class SearchService {
         category,
         rating: place.average_rating || 0,
         reviewCount: place.review_count || 0,
+        estimatedCost: Number(place.price ?? 0),
         imageUrl: parsedImageUrl,
         distanceKm: distance === Infinity ? null : Number(distance.toFixed(1)),
         latitude: place.latitude,
