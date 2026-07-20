@@ -16,6 +16,7 @@ interface ReviewRow {
   review_type: string;
   status: 'pending' | 'approved' | 'violation' | 'hidden';
   violation_reason?: string | null;
+  url_image?: unknown;
 }
 
 interface PlaceData {
@@ -59,6 +60,35 @@ interface SearchScopeIds {
 
 @Injectable()
 export class AdminReviewsService {
+  private normalizeMediaUrls(value: unknown): string[] {
+    let values: unknown[] = [];
+
+    if (Array.isArray(value)) {
+      values = value;
+    } else if (typeof value === 'string' && value.trim()) {
+      try {
+        const parsed = JSON.parse(value) as unknown;
+        values = Array.isArray(parsed) ? parsed : [value];
+      } catch {
+        values = [value];
+      }
+    }
+
+    const publicUrl = (process.env.CLOUDFLARE_R2_PUBLIC_URL ?? '').replace(
+      /\/+$/,
+      '',
+    );
+
+    return values
+      .map((item) => String(item ?? '').trim())
+      .filter(Boolean)
+      .map((url) => {
+        if (/^(https?:|data:|blob:)/i.test(url)) return url;
+        return publicUrl ? `${publicUrl}/${url.replace(/^\/+/, '')}` : url;
+      })
+      .filter((url, index, all) => all.indexOf(url) === index);
+  }
+
   private normalizeForSearch(value?: string | null): string {
     if (!value) {
       return '';
@@ -289,7 +319,7 @@ export class AdminReviewsService {
         .schema('review_ai')
         .from('reviews')
         .select(
-          'id, tourist_id, place_id, rating, created_at, review_type, status',
+          'id, tourist_id, place_id, rating, created_at, review_type, status, url_image',
           { count: 'exact' },
         );
 
@@ -526,7 +556,7 @@ export class AdminReviewsService {
           time_label: content?.time_label ?? null,
           status: review.status,
           created_at: review.created_at,
-          has_images: false,
+          has_images: this.normalizeMediaUrls(review.url_image).length > 0,
         };
       });
 
@@ -555,7 +585,7 @@ export class AdminReviewsService {
         .schema('review_ai')
         .from('reviews')
         .select(
-          'id, tourist_id, place_id, rating, created_at, review_type, status, violation_reason',
+          'id, tourist_id, place_id, rating, created_at, review_type, status, violation_reason, url_image',
         )
         .eq('id', reviewId)
         .single();
@@ -666,7 +696,7 @@ export class AdminReviewsService {
         classification_reason: classificationReason,
         predicted_time_label: predictedTimeLabel,
         review_content: reviewContent,
-        images: [],
+        images: this.normalizeMediaUrls(review.url_image).map((url) => ({ url })),
         status: review.status,
         violation_reason: review.violation_reason ?? null,
         created_at: review.created_at,
