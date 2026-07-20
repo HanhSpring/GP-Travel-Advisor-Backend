@@ -21,9 +21,14 @@ import { LUNCH_START_MIN, LUNCH_END_MIN } from '../../common/constants/lunch-win
 import { CreateItineraryDto, TransportMode } from './dto/create-itinerary.dto';
 import { HotelRoomResponseDto } from './dto/hotel-room-response.dto';
 import { getRoomsByPlaceId } from './room-catalog';
-import { TripCostConfigService } from '../recommendation/trip-cost-config.service';
+import {
+  TripCostConfig,
+  TripCostConfigService,
+} from '../recommendation/trip-cost-config.service';
 import { RecommendationsService } from '../tourist/places/recommendations.service';
 import { CostType } from './dto/cost-type.enum';
+import { normalizeCategory } from '../recommendation/utils/mmr-rerank';
+import { resolvePlannerPlaceType } from '../recommendation/utils/place-type.util';
 
 // ─── Địa chỉ FastAPI optimizer (đọc từ env hoặc dùng mặc định) ───
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL ?? 'http://localhost:8000';
@@ -678,26 +683,58 @@ export class ItineraryService {
       dto.dailyStartTime,
       hotelTotalCost,
     );
+    // ai-service đã resolve xong travel_minutes/distance_km cho từng chặng
+    // (cache distance_matrix → Goong → Haversine, xem planner.py) và trả về
+    // ngay trong schedule entry — đọc thẳng ra đây thay vì để NULL rồi để
+    // recomputeCostEstimate() bên dưới tưởng chặng nào cũng "thiếu dữ liệu"
+    // và gọi lại Goong theo từng chặng một lúc persist (chính là nguồn gây
+    // chậm persist đã đo được, ~36s cho 1 lịch trình 8 ngày/51 chặng).
+    // transport_cost thì AI không tính (không có trong ScheduleEntryResponse
+    // Python) nên vẫn phải tính ở đây — nhưng chỉ cần await getConfig() một
+    // lần cho toàn bộ chuyến, không phải mỗi chặng một lần.
+    const tripCostConfig = await this.tripCostConfig.getConfig();
+    const headcount = Math.max(1, Number(dto.adultCount ?? 0) + Number(dto.childCount ?? 0));
+    const travelMode = this.normalizeMatrixTravelMode(dto.transportMode);
     const activityRows = plan.days.flatMap((day) => {
       const schedule = Array.isArray(day.schedule) ? day.schedule : [];
       const visitDate = this.addDays(dto.startDate, day.day - 1);
       return schedule
         .filter((entry) => this.shouldPersistScheduleEntry(entry))
-        .map((entry, index) => ({
-          itinerary_id: (itinerary as any).id,
-          place_id: entry.location_id,
-          visit_date: visitDate,
-          // itinerary_details.arrival_time is the time shown as the activity
-          // start on mobile. A traveller may physically arrive earlier and
-          // wait for opening/meal windows, so persist service_start_time.
-          arrival_time: entry.service_start_time || entry.arrival_time,
-          duration_minutes: entry.active_duration_minutes,
-          estimated_cost:
-            entry.estimated_cost ?? placeCostById.get(entry.location_id) ?? 0,
-          sequence_order: index + 1,
-          detail_type: 'ACTIVITY',
-          is_locked: false,
-        }));
+        .map((entry, index) => {
+          const travelDistanceKm =
+            Number.isFinite(entry.distance_km) && entry.distance_km > 0
+              ? entry.distance_km
+              : null;
+          const travelMinutes =
+            Number.isFinite(entry.travel_minutes) && entry.travel_minutes > 0
+              ? entry.travel_minutes
+              : null;
+          return {
+            itinerary_id: (itinerary as any).id,
+            place_id: entry.location_id,
+            visit_date: visitDate,
+            // itinerary_details.arrival_time is the time shown as the activity
+            // start on mobile. A traveller may physically arrive earlier and
+            // wait for opening/meal windows, so persist service_start_time.
+            arrival_time: entry.service_start_time || entry.arrival_time,
+            duration_minutes: entry.active_duration_minutes,
+            estimated_cost:
+              entry.estimated_cost ?? placeCostById.get(entry.location_id) ?? 0,
+            sequence_order: index + 1,
+            detail_type: 'ACTIVITY',
+            is_locked: false,
+            travel_distance_km: travelDistanceKm,
+            travel_minutes: travelMinutes,
+            transport_cost: travelDistanceKm
+              ? this.computeSelfDriveTransportCostSync(
+                  travelDistanceKm,
+                  travelMode,
+                  headcount,
+                  tripCostConfig,
+                )
+              : null,
+          };
+        });
     });
     const detailRows = [hotelRow, ...activityRows];
 
@@ -741,11 +778,110 @@ export class ItineraryService {
       );
     }
 
+    // Đối chiếu lại DỮ LIỆU THẬT vừa lưu (không tin lunch_unavailable_reason
+    // ai-service trả về — chỉ dùng nội bộ để tắt ràng buộc CP-SAT, có thể
+    // không khớp 100% với những gì thực sự được persist, và chỉ áp dụng cho
+    // scheduler_v2, không có ở ga_v1): đếm số nhà hàng thật theo từng ngày,
+    // ngày nào 0 nhà hàng thì ghi chú thẳng vào notes của hoạt động đầu
+    // ngày đó — không cần đổi schema, không phụ thuộc engine nào tạo ra plan.
+    try {
+      await this.annotateDaysMissingRestaurant((itinerary as any).id as string);
+    } catch (err: any) {
+      this.logger.warn(
+        `Cannot annotate days missing restaurant for ${(itinerary as any).id}: ${err?.message ?? err}`,
+      );
+    }
+
     return {
       id: (itinerary as any).id as string,
       totalDetails: detailRows.length,
       status: 'pending',
     };
+  }
+
+  private static readonly NO_LUNCH_NOTE =
+    'Khu vực này không có quán ăn phù hợp gần lịch trình vì thời gian và ' +
+    'tuyến đường không đủ thuận tiện — bạn có thể ăn nhẹ trên xe.';
+
+  /**
+   * Đếm số nhà hàng THẬT đã lưu cho từng ngày (không tin dữ liệu ai-service
+   * trả về lúc lập kế hoạch — đối chiếu lại đúng những gì vừa persist).
+   * Ngày nào 0 nhà hàng thì gắn NO_LUNCH_NOTE vào cột `notes` sẵn có của
+   * hoạt động đầu tiên trong ngày đó — không đè lên note đã có sẵn (VD user
+   * tự thêm ghi chú riêng cho hoạt động đó).
+   */
+  private async annotateDaysMissingRestaurant(
+    itineraryId: string,
+  ): Promise<void> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select(
+        'id, visit_date, sequence_order, notes, place_id, places(slot_type, types(name, categories(id,name)))',
+      )
+      .eq('itinerary_id', itineraryId)
+      .eq('detail_type', 'ACTIVITY')
+      .order('visit_date', { ascending: true })
+      .order('sequence_order', { ascending: true });
+
+    if (error) {
+      this.logger.warn(`annotateDaysMissingRestaurant read error: ${error.message}`);
+      return;
+    }
+    if (!data || data.length === 0) return;
+
+    const rowsByDate = new Map<string, any[]>();
+    for (const row of data) {
+      const rows = rowsByDate.get(row.visit_date) ?? [];
+      rows.push(row);
+      rowsByDate.set(row.visit_date, rows);
+    }
+
+    const updates: Array<{ id: string; notes: string }> = [];
+    for (const rows of rowsByDate.values()) {
+      const hasRestaurant = rows.some((row: any) => {
+        const place = row.places;
+        const typeData = Array.isArray(place?.types) ? place.types[0] : place?.types;
+        const categoryData = Array.isArray(typeData?.categories)
+          ? typeData.categories[0]
+          : typeData?.categories;
+        const candidateCategory = normalizeCategory(
+          place?.slot_type ?? '',
+          typeData?.name ?? '',
+        );
+        return (
+          resolvePlannerPlaceType(
+            candidateCategory,
+            categoryData?.id ?? null,
+            categoryData?.name ?? null,
+            typeData?.name ?? '',
+          ) === 'restaurant'
+        );
+      });
+      if (hasRestaurant) continue;
+
+      const first = rows[0];
+      if (!first || first.notes) continue;
+      updates.push({ id: first.id, notes: ItineraryService.NO_LUNCH_NOTE });
+    }
+
+    if (updates.length === 0) return;
+    await Promise.all(
+      updates.map(({ id, notes }) =>
+        supabase
+          .schema('travel')
+          .from('itinerary_details')
+          .update({ notes })
+          .eq('id', id)
+          .then(({ error: updateError }) => {
+            if (updateError) {
+              this.logger.warn(
+                `Cannot write no-lunch note for detail ${id}: ${updateError.message}`,
+              );
+            }
+          }),
+      ),
+    );
   }
 
   /** Tạo lịch trình mới */
@@ -3179,6 +3315,9 @@ export class ItineraryService {
               : null,
           reviewCount:
             place?.review_count != null ? Number(place.review_count) : 0,
+          // Hệ thống tự ghi (VD annotateDaysMissingRestaurant() cảnh báo
+          // "không có quán ăn gần") — khác user_notes (người dùng tự nhập).
+          notes: act.notes ?? null,
           status: visitStatusByDetailId.get(act.id) ?? 'chuaDi',
         };
       });
@@ -3864,10 +4003,11 @@ export class ItineraryService {
       detail_type: 'HOTEL',
       estimated_cost: estimatedCost,
       is_locked: true,
-      notes:
-        estimatedCost > 0
-          ? 'Estimated hotel cost for the full group and stay'
-          : 'Hotel/start point; hotel cost is recorded on the first day',
+      // Không ghi note mô tả cho dòng khách sạn nữa — mobile không hiển thị
+      // banner cho detail_type=HOTEL (xem timeline_activity_card.dart), và
+      // notes ở đây chỉ để trống cho annotateDaysMissingRestaurant() dùng
+      // sau này nếu cần (dòng HOTEL không nằm trong phạm vi hàm đó).
+      notes: null,
     };
   }
 
@@ -3899,15 +4039,22 @@ export class ItineraryService {
     );
   }
 
-  private async estimateSelfDriveTransportCost(
+  /**
+   * Phần thuần đồng bộ của estimateSelfDriveTransportCost — tách riêng để
+   * createGeneratedItinerary() có thể tính transport_cost cho hàng chục
+   * activity row cùng lúc mà chỉ cần `await getConfig()` đúng 1 lần (TTL
+   * cache 60s, xem trip-cost-config.service.ts) thay vì spawn hàng chục
+   * promise chỉ để đọc lại đúng 1 config đã cache.
+   */
+  private computeSelfDriveTransportCostSync(
     distanceKm: number | null | undefined,
-    transportMode?: string,
-    headcount = 1,
-  ): Promise<number> {
+    transportMode: string | undefined,
+    headcount: number,
+    config: TripCostConfig,
+  ): number {
     const km = Number(distanceKm ?? 0);
     if (!Number.isFinite(km) || km <= 0) return 0;
     const mode = (transportMode ?? '').toUpperCase();
-    const config = await this.tripCostConfig.getConfig();
     // Same canonical keys as trip_cost_config_service.py: ROAD has always
     // been priced the same as CAR here, so it maps onto "car".
     const capacityMode = mode === TransportMode.MOTORBIKE ? 'motorbike' : 'car';
@@ -3920,6 +4067,20 @@ export class ItineraryService {
     // Rounded to the nearest 1,000đ (not the nearest đ) — gasoline cost is an
     // estimate, showing exact-đồng precision reads as falsely precise.
     return Math.round((km * costPerKm * vehicles) / 1000) * 1000;
+  }
+
+  private async estimateSelfDriveTransportCost(
+    distanceKm: number | null | undefined,
+    transportMode?: string,
+    headcount = 1,
+  ): Promise<number> {
+    const config = await this.tripCostConfig.getConfig();
+    return this.computeSelfDriveTransportCostSync(
+      distanceKm,
+      transportMode,
+      headcount,
+      config,
+    );
   }
 
   /**

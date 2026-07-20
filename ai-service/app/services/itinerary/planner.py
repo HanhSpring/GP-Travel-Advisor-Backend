@@ -947,9 +947,27 @@ def refresh_travel_matrix_for_day_pools(
             raise RuntimeError("GOONG_API_KEY is required when require_goong=True.")
         return 0
 
+    # `coords` is still the full topK candidate set (needed by the caller for
+    # clustering earlier), but the cache read below only ever gets queried
+    # for pairs INSIDE a day pool's own subset (see the `for from_id in ids`
+    # loop further down) — reading it for every one of the ~160 candidates
+    # was pure waste (e.g. a request with 51 places actually scheduled still
+    # paid for a 160x160 chunked read). Scope the read to the ids that will
+    # genuinely appear in some day pool (+ hotel) instead.
+    relevant_ids: set[str] = {hotel_id}
+    for pool in day_pools:
+        for place in (
+            *(pool.get("attractions") or []),
+            *(pool.get("restaurants") or []),
+            *(pool.get("cafes") or []),
+            *(pool.get("entertainment") or []),
+        ):
+            if place.id in coords:
+                relevant_ids.add(place.id)
+
     cache = {}
     try:
-        database_cache = _load_distance_matrix_db(list(coords.keys()), vehicle)
+        database_cache = _load_distance_matrix_db(list(relevant_ids), vehicle)
         for pair, entry in database_cache.items():
             cache[f"{vehicle}:{pair[0]}:{pair[1]}"] = entry
     except Exception as exc:
@@ -1437,6 +1455,7 @@ class Place:
     price_inferred: Optional[bool] = None
     best_time: str = "ALL_DAY"
     best_time_source: str = "default_all_day"
+    district_old: str = ""
 
     def _get_normalized_type(self) -> str:
         normalized = (self.place_type or "").strip().lower()
@@ -1698,6 +1717,12 @@ class GAResult:
     # Indices (into the GA's pois list) actually visited, in visit order.
     # Populated only when TSP_TW_GA is run with greedy_fit=True.
     visited_poi_indices: List[int] = field(default_factory=list)
+    # Set by SchedulerV2Planner.solve_one_day() when this day's area has no
+    # real restaurant candidate even after _ensure_restaurant_coverage()'s
+    # widened search — enforce_lunch was turned off for this day, and this
+    # message explains why to the traveller instead of silently missing
+    # lunch with no context. Empty string when the day has normal coverage.
+    lunch_unavailable_reason: str = ""
 
 
 @dataclass

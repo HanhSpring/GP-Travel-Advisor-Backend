@@ -35,10 +35,16 @@ class ItineraryPlaceInput(BaseModel):
     best_time: str | None = None
     best_time_source: str | None = None
     planner_source: str | None = None
+    district_old: str | None = None
 
 
 class ItineraryPlanRequest(BaseModel):
     places: list[ItineraryPlaceInput]
+    # Pool nhà hàng dự phòng quanh điểm đến, KHÔNG lọc theo sở thích/two-tower
+    # (api-service.recommendation.service.ts:fetchFallbackRestaurants) — chỉ
+    # dùng khi 1 ngày sau khi cluster địa lý bị thiếu ứng viên nhà hàng, xem
+    # SchedulerV2Planner._ensure_restaurant_coverage().
+    fallback_restaurants: list[ItineraryPlaceInput] = Field(default_factory=list)
     num_days: int = Field(..., ge=1)
     daily_start_time: str = Field(default="08:00", pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$")
     daily_end_time: str = Field(default="21:00", pattern=r"^([0-1]?[0-9]|2[0-3]):[0-5][0-9]$")
@@ -215,6 +221,12 @@ class ItineraryDayResponse(BaseModel):
     best_time_penalty_minutes: int = 0
     fitness: float
     stopped_reason: str
+    # Đặt khi _ensure_restaurant_coverage() (scheduler_v2) xác nhận khu vực
+    # ngày này thực sự không có quán ăn nào gần (kể cả sau khi mở rộng tìm
+    # từ fallback_restaurants) — enforce_lunch đã tự tắt cho ngày này, lý do
+    # này để hiển thị cho người dùng thay vì lịch trình thiếu bữa trưa mà
+    # không giải thích gì.
+    lunch_unavailable_reason: str | None = None
     schedule: list[ScheduleEntryResponse]
 
 
@@ -258,9 +270,15 @@ class RegionInfo(BaseModel):
     place_ids: list[str]
     place_names: list[str]
     max_days: int
+    suggested_days: int = 0
     total_visit_minutes: int
     travel_minutes_from_central: int
     is_remote: bool
+    centroid_lat: float | None = None
+    centroid_lng: float | None = None
+    # Convex hull (đã nới nhẹ ra ngoài) quanh các điểm của vùng, dạng
+    # [[lat, lng], ...] — None nếu vùng có < 3 điểm phân biệt để dựng hull.
+    boundary: list[list[float]] | None = None
 
 
 class RegionDetectionResponse(BaseModel):

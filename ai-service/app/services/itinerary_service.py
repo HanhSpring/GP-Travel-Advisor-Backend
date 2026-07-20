@@ -63,19 +63,39 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
     if not any(place.place_type == "hotel" for place in places):
         raise ValueError("No real hotel/accommodation place provided for itinerary planning.")
 
+    # Pool nhà hàng dự phòng (không lọc theo sở thích) — chỉ dùng bởi
+    # scheduler_v2 khi 1 ngày sau khi cluster địa lý bị thiếu ứng viên nhà
+    # hàng, xem SchedulerV2Planner._ensure_restaurant_coverage(). KHÔNG trộn
+    # vào `places`/`attractions`/`restaurants` bên dưới — nếu trộn, bước
+    # cluster/inject theo sở thích (geo_clustering.py) có thể tự chọn nhầm
+    # các quán dự phòng này ngay từ đầu, làm mất tác dụng "chỉ dùng khi cần".
+    fallback_restaurants = [
+        _to_planner_place(item.model_dump(), day_idx=0, start_date=trip_start_date)
+        for item in req.fallback_restaurants
+    ]
+
     hotels = [place for place in places if place.place_type == "hotel"]
     restaurants = [place for place in places if place.place_type == "restaurant"]
     attractions = [place for place in places if place.place_type == "attraction"]
     logger.info(
-        "[Planner] input_places=%s hotels=%s restaurants=%s attractions=%s days=%s",
+        "[Planner] input_places=%s hotels=%s restaurants=%s attractions=%s "
+        "fallback_restaurants=%s days=%s",
         len(places),
         len(hotels),
         len(restaurants),
         len(attractions),
+        len(fallback_restaurants),
         req.num_days,
     )
 
-    coords = {place.id: (place.longitude, place.latitude) for place in places}
+    # Toạ độ của pool dự phòng cũng cần nằm trong travel matrix ngay từ đầu
+    # (cache DB/Haversine) — nếu không, lúc _ensure_restaurant_coverage()
+    # chèn 1 quán dự phòng vào ngày nào đó, CP-SAT sẽ không có
+    # travel_times/travel_distances cho các cặp liên quan tới quán đó.
+    coords = {
+        place.id: (place.longitude, place.latitude)
+        for place in places + fallback_restaurants
+    }
     travel_cache = req.travel_cache_path or planner.TRAVEL_CACHE_PATH
 
     # Fallback to settings if not provided in request
@@ -121,6 +141,7 @@ def plan_itinerary(req: ItineraryPlanRequest) -> ItineraryPlanResponse:
             travel_sources,
             travel_reliability,
             goong_key,
+            fallback_restaurants,
         )
     )
     result.validation_result = validation
@@ -189,9 +210,13 @@ def _dispatch_planner_engine(
     travel_sources: dict,
     travel_reliability: dict,
     goong_api_key: str,
+    fallback_restaurants: list[planner.Place] | None = None,
 ) -> tuple[planner.MultiDayResult, int, int, ValidationResult, str]:
     """Run exactly one planner engine for the request."""
     if engine_name == "ga_v1":
+        # GA (ga_v1) là engine cũ, không nhận pool nhà hàng dự phòng —
+        # _ensure_restaurant_coverage() chỉ có ở scheduler_v2 (xem quyết định
+        # thiết kế: tập trung OR-Tools/CP-SAT, GA không đầu tư thêm).
         result, ga_ms, validation = _run_ga_engine(
             req,
             places,
@@ -210,6 +235,7 @@ def _dispatch_planner_engine(
         travel_sources,
         travel_reliability,
         goong_api_key,
+        fallback_restaurants or [],
     )
     return result, 0, solver_ms, validation, "scheduler_v2"
 
@@ -331,6 +357,7 @@ def _run_scheduler_v2_engine(
     travel_sources: dict,
     travel_reliability: dict,
     goong_api_key: str,
+    fallback_restaurants: list[planner.Place] | None = None,
 ) -> tuple[planner.MultiDayResult, int, ValidationResult]:
     started_at = time.perf_counter()
     engine = SchedulerV2Planner(
@@ -354,13 +381,17 @@ def _run_scheduler_v2_engine(
             trip_start_date=req.trip_start_date,
             check_in_time=planner.time_to_minutes(req.check_in_time) if req.check_in_time else None,
             region_day_allocations=req.region_day_allocations,
+            fallback_restaurants=fallback_restaurants or [],
         )
     )
     try:
         planner.refresh_travel_matrix_for_day_pools(
             coords={
                 place.id: (place.longitude, place.latitude)
-                for place in places
+                # + fallback_restaurants: nếu _ensure_restaurant_coverage()
+                # đã chèn 1 quán dự phòng vào day_pools, ngày đó vẫn cần
+                # được refresh Goong thật cho quán đó, không chỉ Haversine.
+                for place in places + (fallback_restaurants or [])
             },
             day_pools=engine.assignment_result.day_pools,
             hotel_id=engine.hotel.id,
@@ -765,6 +796,7 @@ def _to_planner_place(
         price_inferred=raw.get("price_inferred"),
         best_time=best_time,
         best_time_source=best_time_source,
+        district_old=str(raw.get("district_old") or ""),
     )
 
 
@@ -1013,6 +1045,7 @@ def _serialize_day(day_result: planner.DayResult) -> ItineraryDayResponse:
         **best_time_metrics,
         fitness=round(ga.fitness, 4),
         stopped_reason=f"{ga.stopped_reason}@{ga.generations_run}",
+        lunch_unavailable_reason=ga.lunch_unavailable_reason or None,
         schedule=schedule,
     )
 

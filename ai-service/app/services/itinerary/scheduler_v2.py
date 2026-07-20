@@ -4,7 +4,7 @@ import datetime
 import math
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
 from app.services.itinerary.assignment import (
@@ -16,6 +16,7 @@ from app.services.itinerary.assignment import (
 from app.services.itinerary.clustering_debug_viz import ClusteringDebugRecorder
 from app.services.itinerary.geo_clustering import GeoClusteringAssignment
 from app.services.itinerary.weekday_matching import match_pools_to_weekdays
+from app.services.itinerary import utils
 
 _WEEKDAY_NAMES_VI = ["Thứ 2", "Thứ 3", "Thứ 4", "Thứ 5", "Thứ 6", "Thứ 7", "Chủ Nhật"]
 
@@ -103,25 +104,6 @@ MEAL_MIN_GAP_MINUTES = 210
 # still push "lunch" as late as 18:00 (effectively dinner) rather than drop
 # it, since the accumulated penalty was cheaper than the alternative.
 LUNCH_HARD_WINDOW = (planner.LUNCH_START, planner.LUNCH_END)  # nguồn giá trị: planner.py
-
-# Positive nudge (added straight into effective_reward, not a standalone
-# penalty) for a restaurant candidate whose hours genuinely overlap
-# LUNCH_HARD_WINDOW. The hard lunch window itself only constrains a selected
-# restaurant's start time — it does nothing to make selecting one attractive
-# in the first place, so a lunch stop competed on equal footing against
-# every other POI despite also carrying its own travel_terms cost (the
-# detour to reach it).
-#
-# Calibrated directly against travel_terms' own weight (2 pts/min, see
-# below) rather than picked freestanding: LUNCH_BONUS = 60 min * 2 pts/min
-# = 120. A restaurant reachable within a normal ~60-minute travel budget
-# comes out net-positive (bonus outweighs the travel_terms cost of
-# reaching it) and tends to get kept; one that requires materially more
-# detour than that stays net-negative and still loses out to a better use
-# of that time — "keep lunch unless it costs over ~1 hour of extra travel",
-# using the same points-based tradeoff the rest of the objective runs on,
-# not a hard distance cutoff.
-LUNCH_BONUS = 120
 
 # Penalty for idle time specifically at the beginning of the day, beyond a
 # grace period (HEAD_IDLE_GRACE_MINUTES) — mirrors TAIL_IDLE_GRACE_MINUTES on
@@ -243,6 +225,13 @@ class SchedulerV2Config:
     # days each detected geo-region gets (see GeoClusteringAssignment.
     # detect_regions) — force those day-pools instead of re-clustering.
     region_day_allocations: Optional[List[Dict[str, object]]] = None
+    # Pool nhà hàng dự phòng quanh điểm đến, KHÔNG lọc theo sở thích/two-tower
+    # (api-service: recommendation.service.ts:fetchFallbackRestaurants) —
+    # chỉ dùng bởi _ensure_restaurant_coverage() khi 1 ngày sau cluster địa
+    # lý bị thiếu ứng viên nhà hàng. Không đưa vào `places` ở trên vì sẽ bị
+    # geo_clustering._inject_restaurants() tự chọn nhầm ngay từ đầu, làm mất
+    # tác dụng "chỉ dùng khi cần".
+    fallback_restaurants: List[planner.Place] = field(default_factory=list)
 
 
 # ── Planner ─────────────────────────────────────────────────────────────
@@ -258,6 +247,17 @@ class SchedulerV2Planner:
     Budget là soft constraint trên trip_budget tổng, linh hoạt giữa các ngày.
     Khi infeasible → fallback chain: relax lunch → bỏ lunch → greedy.
     """
+
+    # CP-SAT không thể CHỨNG MINH infeasible nhanh (đặc biệt với AddCircuit +
+    # time-window) — 1 lần solve infeasible có thể ngốp trọn
+    # max_solve_seconds_per_day trước khi trả UNKNOWN. Trước đây
+    # _solve_day_with_fallback thử TUẦN TỰ từng target_min từ
+    # initial_target_min giảm dần về 1 (worst case ~10 lần solve/ngày), rất
+    # tốn thời gian cho 1 ngày "khó" (POI thưa/xa nhau khiến target ước lượng
+    # ban đầu không khả thi thật). Giới hạn số lần thử — vẫn giữ tinh thần
+    # "thử lạc quan trước, hạ dần" nhưng chỉ ở vài mốc rải đều thay vì mọi giá
+    # trị nguyên.
+    MAX_TARGET_MIN_ATTEMPTS = 3
 
     @property
     def daily_budget_soft(self) -> float:
@@ -291,6 +291,7 @@ class SchedulerV2Planner:
         self.num_days = config.num_days
         self.region_day_allocations = config.region_day_allocations
         self.places = config.places
+        self.fallback_restaurants = config.fallback_restaurants
         self.travel_times = config.travel_times
         self.travel_distances = config.travel_distances or {}
         self.travel_sources = config.travel_sources or {}
@@ -388,6 +389,90 @@ class SchedulerV2Planner:
 
         # ── Cluster ──
         self.assignment_result = self._preallocate_days()
+        self._ensure_restaurant_coverage()
+
+    # Mỗi ngày nên có dư hơn 1 ứng viên nhà hàng — không chỉ đủ cho bữa
+    # trưa, mà còn có lựa chọn cho bữa tối nếu lịch tham quan rơi vào
+    # khoảng chiều/tối (xem _ensure_restaurant_coverage()).
+    MIN_RESTAURANT_CANDIDATES_PER_DAY = 2
+    # Bán kính tìm quán ăn dự phòng (km), tăng dần — luôn ưu tiên quán gần
+    # trước, chỉ nới rộng ra khi bán kính nhỏ hơn không tìm đủ số lượng cần.
+    RESTAURANT_FALLBACK_RADII_KM = (3.0, 7.0, 15.0)
+    NO_LUNCH_MESSAGE = (
+        "Khu vực này không có quán ăn phù hợp gần lịch trình vì thời gian và "
+        "tuyến đường không đủ thuận tiện — bạn có thể ăn nhẹ trên xe."
+    )
+    # Khác NO_LUNCH_MESSAGE (thiếu ỨNG VIÊN nhà hàng gần đó) — trường hợp này
+    # là khung giờ tham quan trong ngày không đủ chỗ cho bữa ăn đúng giờ (bắt
+    # đầu trễ hơn giờ ăn trưa, hoặc kết thúc trước giờ ăn tối), dù vùng đó có
+    # thể vẫn có quán ăn bình thường.
+    MEAL_TIME_UNAVAILABLE_MESSAGE = (
+        "Khung giờ tham quan ngày này không đủ để sắp xếp bữa ăn đúng giờ — "
+        "bạn có thể tự sắp xếp ăn uống linh hoạt trong ngày."
+    )
+
+    def _ensure_restaurant_coverage(self) -> None:
+        """Đảm bảo mỗi day_pool có tối thiểu MIN_RESTAURANT_CANDIDATES_PER_DAY
+        ứng viên nhà hàng.
+
+        geo_clustering._inject_restaurants() chỉ gán nhà hàng theo sở thích/
+        gần nhất — nếu sở thích quá hẹp, có ngày hoàn toàn không có ứng viên
+        nào dù vẫn còn quán ăn khác gần đó không khớp sở thích. Bổ sung ở đây
+        từ self.fallback_restaurants (pool KHÔNG lọc sở thích — xem
+        SchedulerV2Config) theo bán kính tăng dần quanh tâm cụm của ngày,
+        trong mỗi mốc bán kính ưu tiên rating cao nhất trước.
+
+        Ngày nào vẫn 0 quán ăn sau khi thử hết mọi bán kính + toàn bộ pool dự
+        phòng (khu vực thực sự không có quán ăn nào gần) thì gắn
+        `lunch_unavailable_reason` lên chính pool đó — _solve_day_with_fallback
+        đọc field này để KHÔNG ép ràng buộc ăn trưa cứng cho ngày đó, và
+        response trả về lý do để hiển thị cho người dùng thay vì lịch trình cứ
+        thế infeasible.
+        """
+        used_ids: set[str] = {
+            p.id
+            for pool in self.assignment_result.day_pools
+            for p in (pool.get("restaurants") or [])
+        }
+        remaining = [p for p in self.fallback_restaurants if p.id not in used_ids]
+
+        for pool in self.assignment_result.day_pools:
+            existing = pool.get("restaurants") or []
+            need = self.MIN_RESTAURANT_CANDIDATES_PER_DAY - len(existing)
+            if need <= 0:
+                continue
+
+            centroid = utils.compute_centroid(
+                [*(pool.get("attractions") or []), *existing]
+            )
+            picked: List[planner.Place] = []
+            if centroid is not None and remaining:
+                anchor = type(
+                    "_Centroid", (), {"latitude": centroid[0], "longitude": centroid[1]}
+                )()
+                for radius_km in self.RESTAURANT_FALLBACK_RADII_KM:
+                    in_range = [
+                        r
+                        for r in remaining
+                        if r not in picked
+                        and utils.haversine_km_places(anchor, r) <= radius_km
+                    ]
+                    if not in_range:
+                        continue
+                    in_range.sort(key=lambda r: -float(r.rating or 0))
+                    for r in in_range:
+                        if len(picked) >= need:
+                            break
+                        picked.append(r)
+                    if len(picked) >= need:
+                        break
+
+            for r in picked:
+                pool.setdefault("restaurants", []).append(r)
+                remaining.remove(r)
+
+            if len(existing) + len(picked) == 0:
+                pool["lunch_unavailable_reason"] = self.NO_LUNCH_MESSAGE
 
     def _apply_restaurant_constraints(
         self,
@@ -396,50 +481,72 @@ class SchedulerV2Planner:
         selected: dict,
         start_var: dict,
         scope_tag: str,
-    ) -> dict:
-        """Returns {node: dinner_flag} for every restaurant node capable of
-        serving dinner — the caller (_add_objective) needs this to exempt a
-        dinner-flagged assignment from the lunch hard window (see the
-        dinner_flag_by_node parameter there); a restaurant open long enough
-        to cover both meals must not be hard-locked into the lunch window
-        the moment it's selected at all, or it could never be used for
-        dinner without an unsatisfiable start_var >= DINNER_START AND
-        start_var <= LUNCH_HARD_WINDOW[1] conflict."""
+        enforce_lunch: bool = False,
+        enforce_dinner: bool = False,
+    ) -> None:
+        """HARD constraints for restaurant selection/timing.
+
+        Mỗi node nhà hàng được gán tối đa 1 trong 2 cờ loại trừ lẫn nhau:
+        `lunch_flag` (giờ mở cửa phủ LUNCH_START..LUNCH_END) hoặc
+        `dinner_flag` (phủ DINNER_START..DINNER_END) — 1 lần ghé chỉ có thể
+        là 1 bữa, dù quán đó mở cả ngày và về lý thuyết đủ điều kiện cho cả
+        2 khung giờ. Khi cờ bật, start_var của node đó bị khoá cứng vào đúng
+        khung giờ tương ứng — không phải gợi ý/thưởng điểm mềm nữa.
+
+        enforce_lunch/enforce_dinner (đã được _solve_day_with_fallback tính
+        toán — tự tắt khi ngày không đủ thời gian hoặc khu vực không có quán
+        ăn nào) buộc PHẢI có ít nhất 1 node được gắn đúng cờ tương ứng, nếu
+        không model sẽ INFEASIBLE (đúng ý muốn — để
+        _solve_day_with_fallback nới lỏng dần thay vì âm thầm bỏ bữa)."""
         restaurant_nodes = [
             idx + 1
             for idx, poi in enumerate(pois)
             if poi.place_type == "restaurant"
         ]
         if not restaurant_nodes:
-            return {}
+            return
 
         model.Add(sum(selected[i] for i in restaurant_nodes) <= 2)
 
+        lunch_flags = []
         dinner_flags = []
-        dinner_flag_by_node: dict = {}
         for node in restaurant_nodes:
             poi = pois[node - 1]
-            if poi.open_time <= DINNER_END and poi.close_time >= DINNER_START:
+            lunch_eligible = (
+                poi.open_time <= planner.LUNCH_END
+                and poi.close_time >= planner.LUNCH_START
+            )
+            dinner_eligible = (
+                poi.open_time <= DINNER_END and poi.close_time >= DINNER_START
+            )
+
+            lunch_flag = None
+            if lunch_eligible:
+                lunch_flag = model.NewBoolVar(f"{scope_tag}_lunch_{node}")
+                model.Add(start_var[node] >= planner.LUNCH_START).OnlyEnforceIf(lunch_flag)
+                model.Add(start_var[node] <= planner.LUNCH_END).OnlyEnforceIf(lunch_flag)
+                model.AddImplication(lunch_flag, selected[node])
+                lunch_flags.append(lunch_flag)
+
+            dinner_flag = None
+            if dinner_eligible:
                 dinner_flag = model.NewBoolVar(f"{scope_tag}_dinner_{node}")
                 model.Add(start_var[node] >= DINNER_START).OnlyEnforceIf(dinner_flag)
                 model.Add(start_var[node] <= DINNER_END).OnlyEnforceIf(dinner_flag)
                 model.AddImplication(dinner_flag, selected[node])
                 dinner_flags.append(dinner_flag)
-                dinner_flag_by_node[node] = dinner_flag
+
+            if lunch_flag is not None and dinner_flag is not None:
+                # Quán mở đủ dài cho cả 2 khung giờ — 1 lần ghé chỉ được
+                # TÍNH là 1 trong 2 bữa, không phải cả 2.
+                model.Add(lunch_flag + dinner_flag <= 1)
+
+        if enforce_lunch and lunch_flags:
+            model.Add(sum(lunch_flags) >= 1)
+        if enforce_dinner and dinner_flags:
+            model.Add(sum(dinner_flags) >= 1)
 
         if len(restaurant_nodes) >= 2:
-            second_meal = model.NewBoolVar(f"{scope_tag}_second_meal")
-            model.Add(sum(selected[i] for i in restaurant_nodes) >= 2).OnlyEnforceIf(
-                second_meal
-            )
-            model.Add(sum(selected[i] for i in restaurant_nodes) <= 1).OnlyEnforceIf(
-                second_meal.Not()
-            )
-            if dinner_flags:
-                model.Add(sum(dinner_flags) >= 1).OnlyEnforceIf(second_meal)
-            else:
-                model.Add(second_meal == 0)
-
             for left_idx in range(len(restaurant_nodes)):
                 for right_idx in range(left_idx + 1, len(restaurant_nodes)):
                     left = restaurant_nodes[left_idx]
@@ -462,8 +569,6 @@ class SchedulerV2Planner:
                     model.Add(
                         start_var[left] >= start_var[right] + MEAL_MIN_GAP_MINUTES
                     ).OnlyEnforceIf([pair_selected, left_before_right.Not()])
-
-        return dinner_flag_by_node
 
     # ────────────────────────────────────────────────────────────────────
     # PUBLIC: run
@@ -554,6 +659,13 @@ class SchedulerV2Planner:
                     ga_result=self._empty_day_result("no_daily_pois"),
                 )
             day_result = self._solve_day(day_idx + 1, day_pois)
+            # Ưu tiên lý do từ pool (_ensure_restaurant_coverage() — khu vực
+            # thực sự không có quán ăn nào) nếu có; _solve_day_with_fallback
+            # có thể đã tự set 1 lý do khác (khung giờ ngày không đủ chỗ cho
+            # bữa ăn) — KHÔNG ghi đè về rỗng nếu pool không có gì để nói.
+            pool_reason = pool.get("lunch_unavailable_reason", "")
+            if pool_reason:
+                day_result.lunch_unavailable_reason = pool_reason
             return planner.DayResult(
                 day=day_idx + 1, pois=day_pois, ga_result=day_result
             )
@@ -715,40 +827,76 @@ class SchedulerV2Planner:
             pruned_pois.append(p)
         pois = pruned_pois
         
-        # enforce_lunch_base gates whether lunch is even *relevant* to this
-        # day (e.g. a day-1 check-in after LUNCH_ENFORCE_CUTOFF means lunch
-        # has already passed) — it's a soft objective signal now (see
-        # _add_objective's lunch penalty), not a hard requirement, so a
-        # missing/late lunch can no longer make the model infeasible.
-        if is_day_1:
-            day1_start = self.config.check_in_time or self.day_start_time
-            enforce_lunch_base = day1_start <= LUNCH_ENFORCE_CUTOFF
-        else:
-            enforce_lunch_base = True
-
-        lunch_win = LUNCH_HARD_WINDOW
+        # Ràng buộc cứng cho từng bữa (xem _apply_restaurant_constraints), NHƯNG
+        # chỉ áp dụng khi bữa đó còn khả thi trong khung giờ hoạt động của
+        # ngày — bắt đầu trễ hơn giờ ăn trưa, hoặc kết thúc trước giờ ăn tối,
+        # thì tự tắt cờ tương ứng thay vì để CP-SAT rơi vào infeasible.
+        # _ensure_restaurant_coverage() đã xác nhận trước khi vào đây nếu khu
+        # vực này hoàn toàn không có ứng viên nhà hàng nào (kể cả sau khi mở
+        # rộng tìm kiếm) — trường hợp đó tắt CẢ HAI cờ luôn, không cần xét giờ.
+        day_pool_idx = day_number - 1
+        no_restaurant_area = bool(
+            0 <= day_pool_idx < len(self.assignment_result.day_pools)
+            and self.assignment_result.day_pools[day_pool_idx].get(
+                "lunch_unavailable_reason"
+            )
+        )
         day_start = (
             self.config.check_in_time
             if is_day_1 and self.config.check_in_time is not None
             else self.day_start_time
         )
+        day_end = self.day_end_time
+
+        if no_restaurant_area:
+            enforce_lunch_base = False
+            enforce_dinner_base = False
+        else:
+            enforce_lunch_base = day_start <= LUNCH_ENFORCE_CUTOFF and day_end >= planner.LUNCH_START
+            enforce_dinner_base = day_start <= DINNER_END and day_end >= DINNER_START
+
+        lunch_win = LUNCH_HARD_WINDOW
         initial_target_min, _ = self._calculate_target_bounds(
             len(pois),
             day_start,
         )
+        if initial_target_min <= 0:
+            return self._greedy_fallback(day_number, pois, is_day_1)
 
-        # target_min is the only remaining hard constraint that can make a
-        # day infeasible (budget/time/candidate scarcity). Lower it smoothly
-        # before falling back to greedy so sparse, remote, or low-budget days
-        # survive.
-        for target_min in range(initial_target_min, 0, -1):
-            result = self._solve_day_core(
-                day_number, pois, is_day_1,
-                enforce_lunch=enforce_lunch_base, lunch_window=lunch_win,
-                target_min=target_min,
-            )
-            if result is not None:
-                return result
+        # target_min: chỉ thử 1 vài mốc rải đều (lạc quan → giữa → tối
+        # thiểu), không quét hết từng giá trị nguyên — xem MAX_TARGET_MIN_ATTEMPTS.
+        step = max(1, initial_target_min // max(1, self.MAX_TARGET_MIN_ATTEMPTS - 1))
+        target_attempts = sorted(
+            {initial_target_min, 1, *range(initial_target_min, 0, -step)},
+            reverse=True,
+        )[: self.MAX_TARGET_MIN_ATTEMPTS]
+
+        # Nới lỏng ĐÚNG bữa gây infeasible trước khi rơi về greedy, không nới
+        # cả 2 cùng lúc ngay từ đầu. Bữa tối nới trước — thực tế khách có thể
+        # tự sắp xếp ăn tối ngoài lịch trình dễ hơn là bỏ bữa trưa giữa ngày
+        # tham quan. Chỉ thêm mốc nới lỏng khi bữa đó ĐANG được enforce ở mốc
+        # trước — tránh thử lại 1 tổ hợp đã biết chắc giống hệt mốc trước.
+        relaxation_levels = [(enforce_lunch_base, enforce_dinner_base)]
+        if enforce_dinner_base:
+            relaxation_levels.append((enforce_lunch_base, False))
+        if enforce_lunch_base:
+            relaxation_levels.append((False, False))
+
+        for enforce_lunch, enforce_dinner in relaxation_levels:
+            for target_min in target_attempts:
+                result = self._solve_day_core(
+                    day_number, pois, is_day_1,
+                    enforce_lunch=enforce_lunch,
+                    enforce_dinner=enforce_dinner,
+                    lunch_window=lunch_win,
+                    target_min=target_min,
+                )
+                if result is not None:
+                    if no_restaurant_area:
+                        result.lunch_unavailable_reason = self.NO_LUNCH_MESSAGE
+                    elif not enforce_lunch or not enforce_dinner:
+                        result.lunch_unavailable_reason = self.MEAL_TIME_UNAVAILABLE_MESSAGE
+                    return result
 
         return self._greedy_fallback(day_number, pois, is_day_1)
 
@@ -762,7 +910,8 @@ class SchedulerV2Planner:
         pois: List[planner.POI],
         is_day_1: bool,
         enforce_lunch: bool,
-        lunch_window: Optional[Tuple[int, int]],
+        enforce_dinner: bool = False,
+        lunch_window: Optional[Tuple[int, int]] = None,
         target_min: Optional[int] = None,
     ) -> Optional[planner.GAResult]:
         """
@@ -795,12 +944,12 @@ class SchedulerV2Planner:
 
         if is_day_1:
             return self._build_day1_model(
-                pois, helper, day_start, enforce_lunch, lunch_window,
-                target_min
+                pois, helper, day_start, enforce_lunch, enforce_dinner,
+                lunch_window, target_min
             )
         return self._build_circuit_model(
-            day_number, pois, helper, day_start, enforce_lunch, lunch_window,
-            target_min
+            day_number, pois, helper, day_start, enforce_lunch, enforce_dinner,
+            lunch_window, target_min
         )
 
     # ────────────────────────────────────────────────────────────────────
@@ -813,6 +962,7 @@ class SchedulerV2Planner:
         helper,
         day_start: int,
         enforce_lunch: bool,
+        enforce_dinner: bool,
         lunch_window: Optional[Tuple[int, int]],
         target_min: Optional[int],
     ) -> Optional[planner.GAResult]:
@@ -955,12 +1105,14 @@ class SchedulerV2Planner:
         model.Add(return_time <= self.day_end_time)
 
         # ── Restaurant constraint ──
-        dinner_flag_by_node = self._apply_restaurant_constraints(
+        self._apply_restaurant_constraints(
             model,
             pois,
             selected,
             start_var,
             "day1",
+            enforce_lunch=enforce_lunch,
+            enforce_dinner=enforce_dinner,
         )
         cafe_nodes = [
             i for i in range(1, n + 1) if pois[i - 1].place_type == "cafe"
@@ -986,9 +1138,6 @@ class SchedulerV2Planner:
             arc_vars, travel_minutes, travel_distance, helper,
             return_time=return_time,
             day_start=day_start,
-            lunch_window=lunch_window,
-            enforce_lunch=enforce_lunch,
-            dinner_flag_by_node=dinner_flag_by_node,
         )
 
         # ── Solve ──
@@ -1051,6 +1200,7 @@ class SchedulerV2Planner:
         helper,
         day_start: int,
         enforce_lunch: bool,
+        enforce_dinner: bool,
         lunch_window: Optional[Tuple[int, int]],
         target_min: Optional[int],
     ) -> Optional[planner.GAResult]:
@@ -1154,12 +1304,14 @@ class SchedulerV2Planner:
         model.Add(return_time <= self.day_end_time)
 
         # ── Restaurant constraint ──
-        dinner_flag_by_node = self._apply_restaurant_constraints(
+        self._apply_restaurant_constraints(
             model,
             pois,
             selected,
             start_var,
             "day1",
+            enforce_lunch=enforce_lunch,
+            enforce_dinner=enforce_dinner,
         )
         cafe_nodes = [
             i for i in range(1, n + 1) if pois[i - 1].place_type == "cafe"
@@ -1185,9 +1337,6 @@ class SchedulerV2Planner:
             arc_vars, travel_minutes, travel_distance, helper,
             return_time=return_time,
             day_start=day_start,
-            lunch_window=lunch_window,
-            enforce_lunch=enforce_lunch,
-            dinner_flag_by_node=dinner_flag_by_node,
         )
 
         # ── Solve ──
@@ -1254,9 +1403,6 @@ class SchedulerV2Planner:
         helper,
         return_time,
         day_start: int = None,
-        lunch_window: Optional[Tuple[int, int]] = None,
-        enforce_lunch: bool = False,
-        dinner_flag_by_node: Optional[dict] = None,
     ) -> None:
         effective_day_start = day_start if day_start is not None else self.day_start_time
 
@@ -1290,16 +1436,10 @@ class SchedulerV2Planner:
             # already differs per POI regardless of the multiplier applied.
             poi_reward = int(round(two_tower_score * 1000))
             stay_penalty = int(poi.visit_duration)
-            lunch_bonus = 0
-            if (
-                enforce_lunch
-                and lunch_window
-                and poi.place_type == "restaurant"
-                and poi.open_time <= lunch_window[1]
-                and poi.close_time >= lunch_window[0]
-            ):
-                lunch_bonus = LUNCH_BONUS
-            effective_reward = poi_reward - cost_penalty - stay_penalty + lunch_bonus
+            # lunch_bonus/dinner_bonus removed: chọn quán ăn giờ là ràng buộc
+            # CỨNG (xem _apply_restaurant_constraints), không cần thưởng điểm
+            # mềm để "khuyến khích" 1 việc đã bắt buộc.
+            effective_reward = poi_reward - cost_penalty - stay_penalty
 
             utility_terms.append(effective_reward * selected[i])
             skipped_terms.append(SKIPPED_POI_PENALTY * selected[i].Not())
@@ -1348,46 +1488,10 @@ class SchedulerV2Planner:
         # are reintroduced later, re-add a best_time-tag-based safeguard
         # rather than reviving this keyword-matching mechanism.
 
-        # Hard lunch window: a restaurant capable of serving lunch (hours
-        # overlap the window at all) may ONLY be scheduled inside
-        # LUNCH_HARD_WINDOW if selected — no soft drift beyond it. A
-        # restaurant that can't fit is simply left unselected for that day
-        # (still a genuinely optional stop — enforce_lunch/lunch_window being
-        # None entirely skips this, and skipping is never infeasible thanks
-        # to the existing SKIPPED_POI_PENALTY-based soft treatment).
-        #
-        # BUGFIX 2026-07-12: this used to apply unconditionally whenever
-        # selected[i], with no exception for a restaurant also being used as
-        # dinner. A restaurant open long enough to overlap BOTH the lunch
-        # window and DINNER_START/DINNER_END (i.e. open most of the day) got
-        # hard-locked into the lunch window the moment it was selected at
-        # all — so _apply_restaurant_constraints's dinner_flag (which forces
-        # start_var >= DINNER_START, itself >= 18:00 > lunch_window[1]=14:00)
-        # could never be true for that node without an immediate
-        # start_var>=18:00 AND start_var<=14:00 contradiction, making that
-        # assignment INFEASIBLE. In practice this meant an all-day restaurant
-        # could only ever be scheduled as lunch, never dinner — only a
-        # restaurant whose hours don't overlap lunch at all (a dinner-only
-        # place) was assignable as dinner. Now exempted: when a dinner_flag
-        # exists for this node, the lunch window only applies if that flag
-        # is false (i.e. this particular assignment isn't the dinner slot).
-        if enforce_lunch and lunch_window:
-            for i, poi in enumerate(pois, start=1):
-                if poi.place_type != "restaurant":
-                    continue
-                if not (poi.open_time <= lunch_window[1] and poi.close_time >= lunch_window[0]):
-                    continue
-                dinner_flag = (dinner_flag_by_node or {}).get(i)
-                if dinner_flag is not None:
-                    model.Add(start_var[i] >= lunch_window[0]).OnlyEnforceIf(
-                        [selected[i], dinner_flag.Not()]
-                    )
-                    model.Add(start_var[i] <= lunch_window[1]).OnlyEnforceIf(
-                        [selected[i], dinner_flag.Not()]
-                    )
-                else:
-                    model.Add(start_var[i] >= lunch_window[0]).OnlyEnforceIf(selected[i])
-                    model.Add(start_var[i] <= lunch_window[1]).OnlyEnforceIf(selected[i])
+        # Khoá giờ nhà hàng (lunch/dinner window) giờ nằm trực tiếp trong
+        # _apply_restaurant_constraints's lunch_flag/dinner_flag — không cần
+        # 1 block "blanket rule" riêng ở đây nữa (trước đây phải né dinner_flag
+        # thủ công để không tạo mâu thuẫn, xem lịch sử qua git blame nếu cần).
 
         for (i, j), var in arc_vars.items():
             tm = travel_minutes.get((i, j), 0)
