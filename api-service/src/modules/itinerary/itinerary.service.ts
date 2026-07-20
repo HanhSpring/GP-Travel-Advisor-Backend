@@ -2822,14 +2822,41 @@ export class ItineraryService {
     const { data: currentActs } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('id, arrival_time, duration_minutes')
+      .select(
+        'id, place_id, visit_date, arrival_time, duration_minutes, sequence_order, detail_type',
+      )
       .eq('itinerary_id', id);
 
-    const currentActMap = new Map<string, { arrivalTime: string; durationMinutes: number }>();
-    if (currentActs) {
-      currentActs.forEach((a) => {
+    // Khách sạn được chèn vào days.activities từ ngày 2 để hiển thị như điểm
+    // xuất phát, nhưng không phải activity có thời lượng. Không validate hoặc
+    // ghi ngược các bản sao hiển thị này vào itinerary_details.
+    const hotelDetailIds = new Set(
+      (currentActs ?? [])
+        .filter((act: any) => this.isStartPointDetail(act))
+        .map((act: any) => act.id),
+    );
+    const editableActivities = allActivities.filter(
+      (act) => !hotelDetailIds.has(act.id),
+    );
+    const currentEditableActs = (currentActs ?? []).filter(
+      (act: any) => !this.isStartPointDetail(act),
+    );
+
+    const currentActMap = new Map<
+      string,
+      {
+        placeId: string | null;
+        visitDate: string | null;
+        arrivalTime: string;
+        durationMinutes: number;
+      }
+    >();
+    if (currentEditableActs.length > 0) {
+      currentEditableActs.forEach((a) => {
         if (a.arrival_time) {
           currentActMap.set(a.id, {
+            placeId: a.place_id ?? null,
+            visitDate: a.visit_date ?? null,
             arrivalTime: a.arrival_time,
             durationMinutes: a.duration_minutes ?? 60,
           });
@@ -2837,7 +2864,10 @@ export class ItineraryService {
       });
     }
 
-    const incomingPlaceIds = allActivities.map((a) => a.placeId).filter(Boolean);
+    const incomingPlaceIds = [
+      ...editableActivities.map((a) => a.placeId),
+      ...currentEditableActs.map((a) => a.place_id),
+    ].filter(Boolean);
     const { data: placesData } = await supabase
       .schema('travel')
       .from('places')
@@ -2851,8 +2881,95 @@ export class ItineraryService {
       });
     }
 
-    const incomingIds = allActivities.map((a) => a.id);
-    const toDelete = (currentActs || []).filter(
+    // Chặn toàn bộ payload trước khi ghi để không tạo lịch trình dở dang:
+    // địa điểm đang đóng vai trò ăn trưa phải luôn nằm trọn trong 10:30-14:00.
+    for (const act of editableActivities) {
+      const oldState = currentActMap.get(act.id);
+      if (!oldState) continue;
+
+      const oldPlaceType = oldState.placeId
+        ? placeTypeMap.get(oldState.placeId)
+        : null;
+      const currentPlaceType = act.placeId
+        ? placeTypeMap.get(act.placeId)
+        : oldPlaceType;
+      const oldDepartureTime = this.addMinutesToTime(
+        oldState.arrivalTime,
+        oldState.durationMinutes,
+      );
+      const wasLunch = this.isRestaurant(
+        oldPlaceType,
+        oldState.arrivalTime,
+        oldDepartureTime,
+      );
+      if (
+        wasLunch &&
+        !this.isRestaurant(currentPlaceType, act.startTime, act.endTime)
+      ) {
+        throw new BadRequestException({
+          code: 'LUNCH_CONFLICT',
+          message:
+            'Địa điểm ăn trưa phải nằm trọn trong khung 10:30 - 14:00',
+        });
+      }
+    }
+
+    const activitiesByDay = new Map<number, typeof editableActivities>();
+    for (const act of editableActivities) {
+      const start = this.toMinutes(act.startTime);
+      const end = this.toMinutes(act.endTime);
+      if (end <= start) {
+        throw new BadRequestException({
+          code: 'INVALID_ACTIVITY_TIME',
+          message: 'Giờ kết thúc phải sau giờ bắt đầu',
+        });
+      }
+      const dayActivities = activitiesByDay.get(act.dayNumber) ?? [];
+      dayActivities.push(act);
+      activitiesByDay.set(act.dayNumber, dayActivities);
+    }
+
+    for (const dayActivities of activitiesByDay.values()) {
+      dayActivities.sort(
+        (a, b) => this.toMinutes(a.startTime) - this.toMinutes(b.startTime),
+      );
+      for (let i = 0; i < dayActivities.length; i++) {
+        const left = dayActivities[i];
+        for (let j = i + 1; j < dayActivities.length; j++) {
+          const right = dayActivities[j];
+          if (this.toMinutes(right.startTime) >= this.toMinutes(left.endTime)) {
+            break;
+          }
+
+          const oldLeft = currentActMap.get(left.id);
+          const oldRight = currentActMap.get(right.id);
+          const oldLeftEnd = oldLeft
+            ? this.toMinutes(oldLeft.arrivalTime) + oldLeft.durationMinutes
+            : null;
+          const oldRightEnd = oldRight
+            ? this.toMinutes(oldRight.arrivalTime) + oldRight.durationMinutes
+            : null;
+          const overlapAlreadyExisted = Boolean(
+            oldLeft &&
+              oldRight &&
+              oldLeft.visitDate === oldRight.visitDate &&
+              oldLeftEnd != null &&
+              oldRightEnd != null &&
+              this.toMinutes(oldLeft.arrivalTime) < oldRightEnd &&
+              this.toMinutes(oldRight.arrivalTime) < oldLeftEnd,
+          );
+          if (overlapAlreadyExisted) continue;
+
+          throw new ConflictException({
+            code: 'ACTIVITY_OVERLAP',
+            message: 'Các địa điểm trong cùng ngày không được chồng giờ',
+          });
+        }
+      }
+    }
+
+    const incomingIds = editableActivities.map((a) => a.id);
+    const toDelete = currentEditableActs.filter(
       (a) => !incomingIds.includes(a.id),
     );
 
@@ -2868,7 +2985,7 @@ export class ItineraryService {
     }
 
     await Promise.all(
-      allActivities.map(async (act) => {
+      editableActivities.map(async (act) => {
         const isUUID =
           /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(
             act.id,
@@ -2891,20 +3008,6 @@ export class ItineraryService {
           };
           if (act.placeId) {
             updatePayload.place_id = act.placeId;
-            const placeType = placeTypeMap.get(act.placeId);
-
-            // Check if it's currently a restaurant OR if it was previously considered a lunch place
-            const oldState = currentActMap.get(act.id);
-            const oldDepartureTime = oldState
-              ? this.addMinutesToTime(oldState.arrivalTime, oldState.durationMinutes)
-              : null;
-            const isRest = this.isRestaurant(placeType, act.startTime, act.endTime) ||
-                           (oldState ? this.isRestaurant(placeType, oldState.arrivalTime, oldDepartureTime) : false);
-
-            if (isRest && (startMin < LUNCH_START_MIN || endMin > LUNCH_END_MIN)) {
-              updatePayload.is_locked = true;
-              updatePayload.locked_arrive_time = act.startTime;
-            }
           }
 
           const { error } = await supabase
@@ -2954,14 +3057,17 @@ export class ItineraryService {
               place_id: act.placeId,
               visit_date: visitDate,
               arrival_time: act.startTime,
-              departure_time: act.endTime,
               duration_minutes: duration,
               sequence_order: act.sequenceOrder,
+              detail_type: 'ACTIVITY',
             });
 
           if (error) {
-            console.warn(
-              `[Supabase] Không thể thêm mới activity ${act.id}: ${error.message}`,
+            this.logger.error(
+              `updateActivities insert failed for temporary activity ${act.id}: ${error.message}`,
+            );
+            throw new InternalServerErrorException(
+              `Không thể lưu địa điểm mới: ${error.message}`,
             );
           }
         }
