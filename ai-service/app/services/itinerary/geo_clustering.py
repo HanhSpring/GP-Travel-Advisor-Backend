@@ -233,13 +233,16 @@ class GeoClusteringAssignment:
                         virtual_hotel, centroid
                     )
                 regions.append({
-                    "region_name": self._region_display_name(idx, points, centroid),
+                    "region_name": self._region_display_name(idx, points),
                     "place_ids": [str(p.id) for p in points],
                     "place_names": sorted(getattr(p, "name", "") for p in points),
                     "max_days": max_days,
                     "total_visit_minutes": total_visit_minutes,
                     "travel_minutes_from_central": travel_minutes_from_central,
                     "is_remote": travel_minutes_from_central > self.REMOTE_CONFIRM_THRESHOLD_MINUTES,
+                    "centroid_lat": centroid[0] if centroid else None,
+                    "centroid_lng": centroid[1] if centroid else None,
+                    "boundary": self._compute_boundary(points, centroid),
                 })
         finally:
             self.config.hotel = previous_hotel
@@ -286,28 +289,71 @@ class GeoClusteringAssignment:
             "shortfall_days": max(0, num_days - total_suggested_days),
         }
 
-    _REGION_NAME_ADMIN_KEYWORDS = (
-        "Phường ", "Xã ", "Thị trấn ", "Quận ", "Huyện ", "Thị xã ", "Thành phố ",
-    )
+    # Above this many distinct district_old values, listing every one makes
+    # the region name unreadable — show the most common ones (by point count)
+    # and summarize the rest instead.
+    _MAX_LISTED_DISTRICTS = 3
 
-    def _region_display_name(self, idx: int, points: List[Any], centroid: Optional[Tuple[float, float]]) -> str:
-        """Real, human-meaningful region name derived from the address of the
-        POI nearest the region's centroid (no external geocoding call — just
-        parses the ward/district segment out of the address already stored on
-        the place, e.g. "..., Phường Vĩnh Ninh, Thành phố Huế" -> "Phường Vĩnh
-        Ninh"). Falls back to the old generic "Vùng N" label when the nearest
-        POI has no usable address segment, so this never breaks the wizard.
+    def _region_display_name(self, idx: int, points: List[Any]) -> str:
+        """Real, human-meaningful region name built from `district_old` (a
+        real column on travel.places, not a parsed/derived field) of the
+        points in this cluster — no external geocoding call. One district ->
+        just that name (e.g. "Quận 1"). A few districts -> "Khu vực: A, B, C"
+        (most-represented first). Falls back to the old generic "Vùng N"
+        label when no point in the cluster has a district_old, so this never
+        breaks the wizard.
         """
         fallback = f"Vùng {idx + 1}"
-        if not points or not centroid:
+        counts: Dict[str, int] = {}
+        for p in points:
+            district = (getattr(p, "district_old", "") or "").strip()
+            if district:
+                counts[district] = counts.get(district, 0) + 1
+        if not counts:
             return fallback
-        anchor = type("_C", (), {"latitude": centroid[0], "longitude": centroid[1]})()
-        nearest = min(points, key=lambda p: self._haversine_km(anchor, p))
-        address = getattr(nearest, "address", None) or ""
-        for segment in (s.strip() for s in address.split(",")):
-            if any(segment.startswith(kw) for kw in self._REGION_NAME_ADMIN_KEYWORDS):
-                return segment
-        return fallback
+
+        ordered = sorted(counts, key=lambda d: -counts[d])
+        if len(ordered) == 1:
+            return ordered[0]
+        if len(ordered) <= self._MAX_LISTED_DISTRICTS:
+            return "Khu vực: " + ", ".join(ordered)
+        shown = ordered[: self._MAX_LISTED_DISTRICTS]
+        remaining = len(ordered) - self._MAX_LISTED_DISTRICTS
+        return f"Khu vực: {', '.join(shown)} và {remaining} khu vực khác"
+
+    def _compute_boundary(
+        self, points: List[Any], centroid: Optional[Tuple[float, float]]
+    ) -> Optional[List[List[float]]]:
+        """Convex hull of the cluster's points, nudged outward from the
+        centroid so the drawn zone doesn't hug the outermost marker icons.
+        Returns None when there aren't enough distinct coordinates (<3) to
+        form a hull — the caller (mobile Map View) falls back to a plain pin
+        in that case instead of a polygon.
+        """
+        if not centroid or len(points) < 3:
+            return None
+        coords = np.array(
+            [[float(p.latitude), float(p.longitude)] for p in points]
+        )
+        unique_coords = np.unique(coords, axis=0)
+        if len(unique_coords) < 3:
+            return None
+        try:
+            from scipy.spatial import ConvexHull
+
+            hull = ConvexHull(unique_coords)
+        except Exception:
+            return None
+
+        centroid_lat, centroid_lng = centroid
+        inflate = 1.15
+        return [
+            [
+                centroid_lat + (lat - centroid_lat) * inflate,
+                centroid_lng + (lng - centroid_lng) * inflate,
+            ]
+            for lat, lng in unique_coords[hull.vertices]
+        ]
 
     def _empty_result(self) -> AssignmentResult:
         pools = [

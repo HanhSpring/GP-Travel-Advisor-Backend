@@ -37,6 +37,12 @@ export class FavoriteItineraryCardDto {
     example: 'pending',
   })
   status: string;
+
+  @ApiProperty({ description: 'Average itinerary rating', example: 4.6 })
+  rating: number;
+
+  @ApiProperty({ description: 'Number of itinerary reviews', example: 12 })
+  review_count: number;
 }
 
 export class FavoritePlaceCardDto {

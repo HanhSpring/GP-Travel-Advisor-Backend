@@ -947,9 +947,27 @@ def refresh_travel_matrix_for_day_pools(
             raise RuntimeError("GOONG_API_KEY is required when require_goong=True.")
         return 0
 
+    # `coords` is still the full topK candidate set (needed by the caller for
+    # clustering earlier), but the cache read below only ever gets queried
+    # for pairs INSIDE a day pool's own subset (see the `for from_id in ids`
+    # loop further down) — reading it for every one of the ~160 candidates
+    # was pure waste (e.g. a request with 51 places actually scheduled still
+    # paid for a 160x160 chunked read). Scope the read to the ids that will
+    # genuinely appear in some day pool (+ hotel) instead.
+    relevant_ids: set[str] = {hotel_id}
+    for pool in day_pools:
+        for place in (
+            *(pool.get("attractions") or []),
+            *(pool.get("restaurants") or []),
+            *(pool.get("cafes") or []),
+            *(pool.get("entertainment") or []),
+        ):
+            if place.id in coords:
+                relevant_ids.add(place.id)
+
     cache = {}
     try:
-        database_cache = _load_distance_matrix_db(list(coords.keys()), vehicle)
+        database_cache = _load_distance_matrix_db(list(relevant_ids), vehicle)
         for pair, entry in database_cache.items():
             cache[f"{vehicle}:{pair[0]}:{pair[1]}"] = entry
     except Exception as exc:
@@ -959,18 +977,17 @@ def refresh_travel_matrix_for_day_pools(
         )
     refreshed_pairs: set[Tuple[str, str]] = set()
     processed_subsets: set[Tuple[str, ...]] = set()
-    goong_unavailable = False
 
     for pool in day_pools:
-        if goong_unavailable:
-            break
         # BUGFIX 2026-07-12: cafes were missing from this list, so any
         # cafe leg was structurally never eligible for a live Goong refresh
         # here — it stayed Haversine forever regardless of API budget.
+        # BUGFIX: entertainment had the same gap — added alongside cafes.
         places = [
             *(pool.get("attractions") or []),
             *(pool.get("restaurants") or []),
             *(pool.get("cafes") or []),
+            *(pool.get("entertainment") or []),
         ]
         ids = [hotel_id, *[place.id for place in places if place.id in coords]]
         ids = list(dict.fromkeys(ids))
@@ -1014,24 +1031,29 @@ def refresh_travel_matrix_for_day_pools(
 
         subset_coords = {place_id: coords[place_id] for place_id in ids}
         try:
+            # max_workers>1 routes through the resilient multi-threaded path
+            # (_fetch_goong_distance_batch_resilient), which retries/splits
+            # failing sub-batches instead of aborting on the first bad one,
+            # and only raises when EVERY batch for this day's subset failed.
             goong_times, goong_distances = build_travel_data_goong(
                 subset_coords,
                 api_key,
                 vehicle=vehicle,
-                max_workers=1,
+                max_workers=4,
             )
         except Exception as exc:
             if require_goong:
                 raise
             # The matrix already contains Haversine/cache values for every
-            # pair. On 429/timeout, keep those values and stop calling Goong
-            # again during this request.
-            goong_unavailable = True
+            # pair. Keep those values for THIS day and move on — a failure
+            # here (e.g. a transient 429 on this day's specific coordinate
+            # set) doesn't mean every other day's Goong call will also fail,
+            # so don't disable Goong for the rest of the request.
             print(
-                "  [WARNING] Goong refresh unavailable; using existing "
-                f"matrix/Haversine values: {_safe_console_text(exc)}"
+                "  [WARNING] Goong refresh unavailable for this day pool; "
+                f"using existing matrix/Haversine values: {_safe_console_text(exc)}"
             )
-            break
+            continue
         for pair, minutes in goong_times.items():
             travel_times[pair] = minutes
             if goong_distances.get(pair, 0) > 0:
@@ -1069,6 +1091,8 @@ def refresh_travel_matrix_for_day_pools(
             places = [
                 *(pool.get("attractions") or []),
                 *(pool.get("restaurants") or []),
+                *(pool.get("cafes") or []),
+                *(pool.get("entertainment") or []),
             ]
             ids = [hotel_id, *[place.id for place in places if place.id in coords]]
             ids = list(dict.fromkeys(ids))
@@ -1431,6 +1455,7 @@ class Place:
     price_inferred: Optional[bool] = None
     best_time: str = "ALL_DAY"
     best_time_source: str = "default_all_day"
+    district_old: str = ""
 
     def _get_normalized_type(self) -> str:
         normalized = (self.place_type or "").strip().lower()
@@ -1692,6 +1717,12 @@ class GAResult:
     # Indices (into the GA's pois list) actually visited, in visit order.
     # Populated only when TSP_TW_GA is run with greedy_fit=True.
     visited_poi_indices: List[int] = field(default_factory=list)
+    # Set by SchedulerV2Planner.solve_one_day() when this day's area has no
+    # real restaurant candidate even after _ensure_restaurant_coverage()'s
+    # widened search — enforce_lunch was turned off for this day, and this
+    # message explains why to the traveller instead of silently missing
+    # lunch with no context. Empty string when the day has normal coverage.
+    lunch_unavailable_reason: str = ""
 
 
 @dataclass

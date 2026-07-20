@@ -2,10 +2,12 @@ import { ApiProperty, ApiPropertyOptional } from '@nestjs/swagger';
 import {
   IsArray,
   IsEnum,
+  IsInt,
   IsNotEmpty,
   IsNumber,
   IsOptional,
   IsString,
+  Min,
 } from 'class-validator';
 import { CostType } from './cost-type.enum';
 
@@ -33,7 +35,7 @@ export class UpdateIncurredCostDto {
 
   @ApiPropertyOptional({
     description:
-      'Số tiền mới, tối thiểu 1.000đ (trị tuyệt đối), server sẽ làm tròn đến đơn vị nghìn. Với "Điều chỉnh giá" đây là chênh lệch, có thể âm; các type khác phải > 0.',
+      'Số tiền mới, tối thiểu 1.000đ (trị tuyệt đối), server sẽ làm tròn đến đơn vị nghìn. Với "Điều chỉnh xăng xe" hoặc đính chính 1 dòng "Điều chỉnh giá" cũ, đây là chênh lệch, có thể âm; các type khác phải > 0.',
     example: 20000,
   })
   @IsOptional()
@@ -58,4 +60,14 @@ export class UpdateIncurredCostDto {
   @IsArray()
   @IsString({ each: true })
   chargedTo?: string[];
+
+  @ApiPropertyOptional({
+    description: 'Ngày thứ N (1-indexed) mới (truyền null để gỡ khỏi ngày hiện tại).',
+    example: 3,
+    nullable: true,
+  })
+  @IsOptional()
+  @IsInt()
+  @Min(1)
+  dayNumber?: number | null;
 }

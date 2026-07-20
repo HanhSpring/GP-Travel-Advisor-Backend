@@ -214,6 +214,9 @@ export class ItineraryController {
           totalVisitMinutes: region.total_visit_minutes,
           travelMinutesFromCentral: region.travel_minutes_from_central,
           isRemote: region.is_remote,
+          centroidLat: region.centroid_lat,
+          centroidLng: region.centroid_lng,
+          boundary: region.boundary,
         })),
       });
     }
@@ -225,54 +228,68 @@ export class ItineraryController {
       config,
     );
     this.logPlanSummary(plan as any, plannerEngine);
-    if (plan?.validation_is_feasible === false) {
+
+    const requestedBudget = Number(body.budget ?? 0);
+    const adultCount = Number(body.adultCount ?? 0);
+    const childCount = Number(body.childCount ?? 0);
+
+    if (plan?.validation_is_feasible === false && requestedBudget > 0) {
       // A hard budget can leave the solver with zero activities, which the
       // validator reports as no_feasible_activities instead of
-      // budget_exceeded. Confirm the cause by retrying without the cap.
-      if (Number(body.budget ?? 0) > 0) {
-        const unconstrainedBody = { ...body, budget: 0 };
-        const unconstrainedPlan: any =
-          await this.recommendationService.planItinerary(
-            unconstrainedBody,
-            k,
-            plannerEngine,
-            config,
-          );
-        if (
-          unconstrainedPlan?.validation_is_feasible !== false &&
-          !body.proceedWithOverBudget
-        ) {
-          const adultCount = Number(body.adultCount ?? 0);
-          const childCount = Number(body.childCount ?? 0);
-          const calculatedCost = this.service.calculatePlanEstimatedCost(
-            unconstrainedPlan as any,
-            adultCount,
-            childCount,
-          );
-          const recommendedBudget = this.service.calculateRecommendedBudget(
-            unconstrainedPlan as any,
-            adultCount,
-            childCount,
-          );
-          const participantCount = Math.max(1, adultCount + childCount);
-          throw new UnprocessableEntityException({
-            code: 'BUDGET_CONFIRMATION_REQUIRED',
-            message:
-              'Ngân sách đã nhập chưa đủ cho một lịch trình phù hợp. Bạn có muốn dùng mức ngân sách ước tính được đề xuất không?',
-            userBudget: Number(body.budget),
-            calculatedCost,
-            reserveRate: 0.1,
-            recommendedBudget,
-            participantCount,
-          });
-        }
-        // Either the unconstrained plan is feasible and the user already
-        // confirmed proceeding over budget (no extra AI call needed beyond
-        // the one above), or it's still infeasible even without a budget
-        // cap — in both cases this is the "least bad" plan available.
-        plan = unconstrainedPlan;
+      // budget_exceeded. Confirm the cause by retrying without the cap —
+      // either way, this is the "least bad" plan available, so it becomes
+      // the plan we validate/persist from here on.
+      const unconstrainedBody = { ...body, budget: 0 };
+      plan = await this.recommendationService.planItinerary(
+        unconstrainedBody,
+        k,
+        plannerEngine,
+        config,
+      );
+    }
+
+    // Ngân sách chỉ có thể biết CHÍNH XÁC sau khi đã có 1 plan feasible thật
+    // — Python tự báo "feasible" dựa trên chi phí nó tự ước tính nội bộ
+    // (bảng cost-per-km của ai-service chỉ đồng bộ 1 lần lúc khởi động,
+    // trong khi NestJS đọc cùng bảng đó mỗi 60s — 2 bên có thể lệch nhau
+    // sau khi đổi cấu hình mà chưa restart ai-service). Vì vậy KHÔNG được
+    // tin validation_is_feasible của Python là "chắc chắn trong ngân sách
+    // thật" — luôn tự đối chiếu lại bằng calculatePlanEstimatedCost(), đúng
+    // công thức NestJS dùng để persist, trước khi coi là an toàn để tạo
+    // lịch trình. Áp dụng cho MỌI plan feasible (lần đầu lẫn lần retry
+    // unconstrained ở trên), không chỉ nhánh Python báo infeasible như
+    // trước — đó là lỗ hổng khiến lịch trình "vừa đủ ngân sách" theo Python
+    // đôi khi vượt ngân sách thật khi lưu mà không có cảnh báo nào.
+    if (
+      requestedBudget > 0 &&
+      plan?.validation_is_feasible !== false &&
+      !body.proceedWithOverBudget
+    ) {
+      const calculatedCost = this.service.calculatePlanEstimatedCost(
+        plan as any,
+        adultCount,
+        childCount,
+      );
+      if (calculatedCost > requestedBudget) {
+        const recommendedBudget = this.service.calculateRecommendedBudget(
+          plan as any,
+          adultCount,
+          childCount,
+        );
+        const participantCount = Math.max(1, adultCount + childCount);
+        throw new UnprocessableEntityException({
+          code: 'BUDGET_CONFIRMATION_REQUIRED',
+          message:
+            'Ngân sách đã nhập chưa đủ cho một lịch trình phù hợp. Bạn có muốn dùng mức ngân sách ước tính được đề xuất không?',
+          userBudget: requestedBudget,
+          calculatedCost,
+          reserveRate: 0.1,
+          recommendedBudget,
+          participantCount,
+        });
       }
     }
+
     const planTimeMs = Date.now() - planStartedAt;
     if (!body.proceedWithOverBudget) {
       this.assertPlanFeasible(plan, plannerEngine);

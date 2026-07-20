@@ -109,7 +109,7 @@ describe('distributeCosts — sharing không được chia nhỏ theo số tài 
       0,
       childPriceRatio,
       basePlanCost,
-      [{ amount: 50_000, chargedTo: ['member-2'] }],
+      [{ amount: 50_000, chargedTo: ['member-2'], type: CostType.NUOC_UONG }],
     );
     expect(totals.get('member-2')).toBe(basePlanCost + 50_000);
     expect(totals.get('owner-1')).toBe(basePlanCost);
@@ -122,10 +122,28 @@ describe('distributeCosts — sharing không được chia nhỏ theo số tài 
       0,
       childPriceRatio,
       basePlanCost,
-      [{ amount: 100_000, chargedTo: [] }],
+      [{ amount: 100_000, chargedTo: [], type: CostType.KHAC }],
     );
     expect(totals.get('owner-1')).toBe(basePlanCost + 50_000);
     expect(totals.get('member-2')).toBe(basePlanCost + 50_000);
+  });
+
+  it('chi phí phát sinh chargedTo=[] có trẻ em: chia theo TỔNG NGƯỜI THẬT (tài khoản + trẻ em), phần trẻ em dồn vào childrenShare', () => {
+    // 2 tài khoản thật + 2 trẻ em, chi phí 100k "cả nhóm" -> chia đều /4 = 25k
+    // mỗi "suất", 2 tài khoản thật nhận 25k mỗi người, 2 trẻ em (50k) dồn vào
+    // childrenShare — KHÔNG còn bị chia hết cho 2 tài khoản thật như trước
+    // (báo cáo: "hiện tại ko nhân gì hết", bỏ sót hẳn trẻ em).
+    const { totals, childrenShare } = distributeCosts(
+      memberIds,
+      'owner-1',
+      2,
+      childPriceRatio,
+      0,
+      [{ amount: 100_000, chargedTo: [], type: CostType.NUOC_UONG }],
+    );
+    expect(totals.get('owner-1')).toBe(25_000);
+    expect(totals.get('member-2')).toBe(25_000);
+    expect(childrenShare).toBe(50_000);
   });
 
   it('chi phí phát sinh chargedTo=[nhiều người] chia đều cho đúng những người đó', () => {
@@ -136,7 +154,7 @@ describe('distributeCosts — sharing không được chia nhỏ theo số tài 
       0,
       childPriceRatio,
       basePlanCost,
-      [{ amount: 90_000, chargedTo: ['owner-1', 'member-2'] }],
+      [{ amount: 90_000, chargedTo: ['owner-1', 'member-2'], type: CostType.MUA_SAM }],
     );
     expect(totals.get('owner-1')).toBe(basePlanCost + 45_000);
     expect(totals.get('member-2')).toBe(basePlanCost + 45_000);
@@ -149,11 +167,41 @@ describe('distributeCosts — sharing không được chia nhỏ theo số tài 
     expect(result.childrenShare).toBe(0);
     expect(result.childrenAssignedTo).toBeNull();
   });
+
+  it('categoryTotals chia theo đúng CostType cho từng người, không gồm basePlanCost', () => {
+    const threeMembers = ['owner-1', 'member-2', 'member-3'];
+    const { categoryTotals } = distributeCosts(
+      threeMembers,
+      'owner-1',
+      0,
+      childPriceRatio,
+      basePlanCost,
+      [
+        { amount: 90_000, chargedTo: ['owner-1', 'member-2'], type: CostType.MUA_SAM },
+        { amount: 30_000, chargedTo: [], type: CostType.NUOC_UONG },
+      ],
+    );
+    // MUA_SAM chia đôi cho owner-1/member-2 (45k mỗi người), NUOC_UONG chia đều 3 người (10k mỗi người).
+    expect(categoryTotals.get('owner-1')).toEqual({
+      [CostType.MUA_SAM]: 45_000,
+      [CostType.NUOC_UONG]: 10_000,
+    });
+    expect(categoryTotals.get('member-2')).toEqual({
+      [CostType.MUA_SAM]: 45_000,
+      [CostType.NUOC_UONG]: 10_000,
+    });
+    // member-3 không nằm trong chargedTo của MUA_SAM nên chỉ có NUOC_UONG.
+    expect(categoryTotals.get('member-3')).toEqual({
+      [CostType.NUOC_UONG]: 10_000,
+    });
+  });
 });
 
 describe('IncurredCostsService — phân quyền, khoá sau khi hoàn thành, validate số tiền', () => {
   let service: IncurredCostsService;
-  let itineraryService: { getItineraryMemberProfiles: jest.Mock };
+  let itineraryService: {
+    getItineraryMemberProfiles: jest.Mock;
+  };
   let tripCostConfig: { getConfig: jest.Mock };
 
   const baseItinerary = {
@@ -183,20 +231,7 @@ describe('IncurredCostsService — phân quyền, khoá sau khi hoàn thành, va
     );
   });
 
-  it('price_adjustment: thành viên không phải chủ lịch trình bị từ chối tạo', async () => {
-    mockTables({ itineraries: { data: baseItinerary, error: null } });
-    await expect(
-      service.createIncurredCost('itin-1', {
-        userId: 'member-2',
-        type: CostType.DIEU_CHINH_GIA,
-        note: 'Sửa giá vé',
-        amount: 5000,
-        placeId: 'place-1',
-      } as any),
-    ).rejects.toThrow(ForbiddenException);
-  });
-
-  it('price_adjustment: bắt buộc phải gắn placeId', async () => {
+  it('không cho tạo tay type "Điều chỉnh giá" nữa — dùng updatePlaceEffectivePrice() thay thế', async () => {
     mockTables({ itineraries: { data: baseItinerary, error: null } });
     await expect(
       service.createIncurredCost('itin-1', {
@@ -204,6 +239,133 @@ describe('IncurredCostsService — phân quyền, khoá sau khi hoàn thành, va
         type: CostType.DIEU_CHINH_GIA,
         note: 'Sửa giá vé',
         amount: 5000,
+        placeId: 'place-1',
+      } as any),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it('updatePlaceEffectivePrice: thành viên không phải chủ lịch trình bị từ chối', async () => {
+    mockTables({ itineraries: { data: baseItinerary, error: null } });
+    await expect(
+      service.updatePlaceEffectivePrice('itin-1', 'place-1', 60_000, 'member-2'),
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('updatePlaceEffectivePrice: địa điểm chưa visited (chưa có dòng Chi phí kế hoạch) bị từ chối', async () => {
+    mockTables({
+      itineraries: { data: baseItinerary, error: null },
+      incurred_costs: { data: null, error: null },
+    });
+    await expect(
+      service.updatePlaceEffectivePrice('itin-1', 'place-1', 60_000, 'owner-1'),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it('updatePlaceEffectivePrice: chủ lịch trình sửa giá thành công khi đã có dòng Chi phí kế hoạch', async () => {
+    mockTables({
+      itineraries: { data: baseItinerary, error: null },
+      incurred_costs: {
+        data: {
+          id: 'cost-baseline',
+          itinerary_id: 'itin-1',
+          place_id: 'place-1',
+          day_number: null,
+          type: CostType.CHI_PHI_KE_HOACH,
+          note: 'Chi phí kế hoạch (tự động khi check-in)',
+          amount: 50_000,
+          charged_to: [],
+          created_by: 'owner-1',
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+          updated_by: null,
+        },
+        error: null,
+      },
+    });
+    await expect(
+      service.updatePlaceEffectivePrice('itin-1', 'place-1', 60_000, 'owner-1'),
+    ).resolves.toBeDefined();
+  });
+
+  it('không cho tạo tay type "Chi phí kế hoạch" (chỉ hệ thống tự ghi)', async () => {
+    mockTables({ itineraries: { data: baseItinerary, error: null } });
+    await expect(
+      service.createIncurredCost('itin-1', {
+        userId: 'owner-1',
+        type: CostType.CHI_PHI_KE_HOACH,
+        note: 'Vé vào cổng',
+        amount: 50_000,
+        placeId: 'place-1',
+      } as any),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it('Điều chỉnh xăng xe: thành viên không phải chủ lịch trình bị từ chối tạo', async () => {
+    mockTables({ itineraries: { data: baseItinerary, error: null } });
+    await expect(
+      service.createIncurredCost('itin-1', {
+        userId: 'member-2',
+        type: CostType.DIEU_CHINH_XANG_XE,
+        note: 'Xăng xe tăng giá',
+        amount: 50_000,
+      } as any),
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('Điều chỉnh xăng xe: không được gắn kèm placeId', async () => {
+    mockTables({ itineraries: { data: baseItinerary, error: null } });
+    await expect(
+      service.createIncurredCost('itin-1', {
+        userId: 'owner-1',
+        type: CostType.DIEU_CHINH_XANG_XE,
+        note: 'Xăng xe tăng giá',
+        amount: 50_000,
+        placeId: 'place-1',
+      } as any),
+    ).rejects.toThrow(BadRequestException);
+  });
+
+  it('Điều chỉnh xăng xe: amount âm vẫn hợp lệ (delta có thể giảm)', async () => {
+    mockTables({
+      itineraries: { data: baseItinerary, error: null },
+      incurred_costs: {
+        data: {
+          id: 'cost-xang-xe',
+          itinerary_id: 'itin-1',
+          place_id: null,
+          day_number: null,
+          type: CostType.DIEU_CHINH_XANG_XE,
+          note: 'Xăng xe giảm',
+          amount: -20_000,
+          charged_to: [],
+          created_by: 'owner-1',
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+          updated_by: null,
+        },
+        error: null,
+      },
+    });
+    await expect(
+      service.createIncurredCost('itin-1', {
+        userId: 'owner-1',
+        type: CostType.DIEU_CHINH_XANG_XE,
+        note: 'Xăng xe giảm',
+        amount: -20_000,
+      } as any),
+    ).resolves.toBeDefined();
+  });
+
+  it('không được gắn khoản chi CẢ placeId LẪN dayNumber cùng lúc', async () => {
+    mockTables({ itineraries: { data: baseItinerary, error: null } });
+    await expect(
+      service.createIncurredCost('itin-1', {
+        userId: 'owner-1',
+        type: CostType.KHAC,
+        note: 'Ăn vặt',
+        amount: 20_000,
+        placeId: 'place-1',
+        dayNumber: 2,
       } as any),
     ).rejects.toThrow(BadRequestException);
   });
@@ -310,7 +472,38 @@ describe('IncurredCostsService — phân quyền, khoá sau khi hoàn thành, va
     ).resolves.toBeDefined();
   });
 
-  it('chủ lịch trình được sửa price_adjustment dù không phải chính mình tạo', async () => {
+  it('người tạo được đính chính 1 dòng "Điều chỉnh giá" cũ (lịch sử, không còn cộng vào tổng nào)', async () => {
+    mockTables({
+      itineraries: { data: baseItinerary, error: null },
+      incurred_costs: {
+        data: {
+          id: 'cost-2',
+          itinerary_id: 'itin-1',
+          place_id: 'place-1',
+          type: CostType.DIEU_CHINH_GIA,
+          note: 'Điều chỉnh giá',
+          amount: -5000,
+          charged_to: [],
+          created_by: 'owner-1',
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+          updated_by: null,
+        },
+        error: null,
+      },
+    });
+    // Mọi dòng "Điều chỉnh giá" trước giờ đều do owner tạo (chỉ owner mới
+    // tạo được type này) — nên isCreator ở đây trùng owner, không phải
+    // owner-only riêng nữa.
+    await expect(
+      service.updateIncurredCost('itin-1', 'cost-2', {
+        userId: 'owner-1',
+        amount: -8000,
+      } as any),
+    ).resolves.toBeDefined();
+  });
+
+  it('người KHÔNG PHẢI người tạo dòng "Điều chỉnh giá" cũ thì không sửa được', async () => {
     mockTables({
       itineraries: { data: baseItinerary, error: null },
       incurred_costs: {
@@ -332,10 +525,38 @@ describe('IncurredCostsService — phân quyền, khoá sau khi hoàn thành, va
     });
     await expect(
       service.updateIncurredCost('itin-1', 'cost-2', {
-        userId: 'owner-1',
+        userId: 'member-2',
         amount: -8000,
       } as any),
-    ).resolves.toBeDefined();
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('không cho ĐỔI 1 dòng khác SANG type "Điều chỉnh giá" qua update', async () => {
+    mockTables({
+      itineraries: { data: baseItinerary, error: null },
+      incurred_costs: {
+        data: {
+          id: 'cost-3',
+          itinerary_id: 'itin-1',
+          place_id: null,
+          type: CostType.KHAC,
+          note: 'Ăn vặt',
+          amount: 20_000,
+          charged_to: [],
+          created_by: 'owner-1',
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+          updated_by: null,
+        },
+        error: null,
+      },
+    });
+    await expect(
+      service.updateIncurredCost('itin-1', 'cost-3', {
+        userId: 'owner-1',
+        type: CostType.DIEU_CHINH_GIA,
+      } as any),
+    ).rejects.toThrow(BadRequestException);
   });
 
   it('lịch trình đã completed thì không cho sửa/xoá chi phí nữa', async () => {
@@ -348,5 +569,78 @@ describe('IncurredCostsService — phân quyền, khoá sau khi hoàn thành, va
     await expect(
       service.deleteIncurredCost('itin-1', 'cost-1', 'owner-1'),
     ).rejects.toThrow(ConflictException);
+  });
+
+  it('không ai (kể cả chủ lịch trình) sửa/xoá được "Chi phí kế hoạch"', async () => {
+    mockTables({
+      itineraries: { data: baseItinerary, error: null },
+      incurred_costs: {
+        data: {
+          id: 'cost-baseline',
+          itinerary_id: 'itin-1',
+          place_id: 'place-1',
+          day_number: null,
+          type: CostType.CHI_PHI_KE_HOACH,
+          note: 'Chi phí kế hoạch (tự động khi check-in)',
+          amount: 50_000,
+          charged_to: [],
+          created_by: 'owner-1',
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+          updated_by: null,
+        },
+        error: null,
+      },
+    });
+    await expect(
+      service.updateIncurredCost('itin-1', 'cost-baseline', {
+        userId: 'owner-1',
+        amount: 60_000,
+      } as any),
+    ).rejects.toThrow(ForbiddenException);
+  });
+
+  it('recordVisitBaselineExpense: idempotent — đã có dòng cho địa điểm này thì không tạo thêm', async () => {
+    mockTables({
+      itinerary_details: {
+        data: { place_id: 'place-1', estimated_cost: 50_000 },
+        error: null,
+      },
+      incurred_costs: {
+        data: { id: 'existing-baseline' },
+        error: null,
+      },
+    });
+    await expect(
+      service.recordVisitBaselineExpense('itin-1', 'detail-1', 'owner-1'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('recordVisitBaselineExpense: chưa có dòng nào thì tạo mới, không lỗi', async () => {
+    mockTables({
+      itinerary_details: {
+        data: { place_id: 'place-1', estimated_cost: 50_000 },
+        error: null,
+      },
+      incurred_costs: {
+        data: null,
+        error: null,
+      },
+    });
+    await expect(
+      service.recordVisitBaselineExpense('itin-1', 'detail-1', 'owner-1'),
+    ).resolves.toBeUndefined();
+  });
+
+  it('recordVisitBaselineExpense: không có place_id (điểm ảo) thì bỏ qua', async () => {
+    mockTables({
+      itinerary_details: {
+        data: { place_id: null, estimated_cost: 0 },
+        error: null,
+      },
+    });
+    await expect(
+      service.recordVisitBaselineExpense('itin-1', 'detail-1', 'owner-1'),
+    ).resolves.toBeUndefined();
   });
 });

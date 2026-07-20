@@ -32,37 +32,44 @@ export interface SessionRerankedCandidate extends SessionRerankCandidate {
   is_cold_start?: boolean;
 }
 
+export interface ItineraryPlaceCandidate {
+  id: string;
+  name: string;
+  longitude: number;
+  latitude: number;
+  district_old?: string | null;
+  place_type?: string;
+  slot_type?: string;
+  category?: string;
+  source?: string;
+  type_id?: string;
+  type_name?: string;
+  category_id?: string | null;
+  category_name?: string | null;
+  open_hour?: string | null;
+  open_hour_compressed?: string | null;
+  visit_duration?: number | null;
+  average_rating?: number | null;
+  review_count?: number | null;
+  retrieval_score?: number | null;
+  candidate_rank?: number | null;
+  candidate_total?: number | null;
+  estimated_cost?: number | null;
+  price_min?: number | null;
+  price_max?: number | null;
+  price_basis?: string | null;
+  price_inferred?: boolean | null;
+  best_time?: 'MORNING' | 'AFTERNOON' | 'NIGHT' | 'ALL_DAY' | null;
+  best_time_source?: string | null;
+  planner_source?: string | null;
+}
+
 export interface ItineraryPlanPayload {
-  places: Array<{
-    id: string;
-    name: string;
-    longitude: number;
-    latitude: number;
-    place_type?: string;
-    slot_type?: string;
-    category?: string;
-    source?: string;
-    type_id?: string;
-    type_name?: string;
-    category_id?: string | null;
-    category_name?: string | null;
-    open_hour?: string | null;
-    open_hour_compressed?: string | null;
-    visit_duration?: number | null;
-    average_rating?: number | null;
-    review_count?: number | null;
-    retrieval_score?: number | null;
-    candidate_rank?: number | null;
-    candidate_total?: number | null;
-    estimated_cost?: number | null;
-    price_min?: number | null;
-    price_max?: number | null;
-    price_basis?: string | null;
-    price_inferred?: boolean | null;
-    best_time?: 'MORNING' | 'AFTERNOON' | 'NIGHT' | 'ALL_DAY' | null;
-    best_time_source?: string | null;
-    planner_source?: string | null;
-  }>;
+  places: ItineraryPlaceCandidate[];
+  // Pool nhà hàng dự phòng quanh điểm đến, KHÔNG lọc theo sở thích/two-tower
+  // — ai-service chỉ dùng khi 1 ngày sau khi cluster địa lý bị thiếu ứng
+  // viên nhà hàng (xem SchedulerV2Planner._ensure_restaurant_coverage()).
+  fallback_restaurants?: ItineraryPlaceCandidate[];
   num_days: number;
   daily_start_time: string;
   daily_end_time: string;
@@ -101,6 +108,12 @@ export interface RegionDetectionResult {
     travel_minutes_from_central: number;
     is_remote: boolean;
     suggested_days: number;
+    centroid_lat: number | null;
+    centroid_lng: number | null;
+    // Đường viền vùng (convex hull đã nới rộng nhẹ quanh centroid) — mảng
+    // các cặp [lat, lng] theo thứ tự vẽ polygon; null nếu vùng có < 3 điểm
+    // phân biệt (không đủ để tính hull).
+    boundary: Array<[number, number]> | null;
   }>;
   estimated_total_days: number;
   num_days: number;

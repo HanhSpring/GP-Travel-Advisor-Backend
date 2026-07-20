@@ -6,6 +6,7 @@ import {
   OnModuleInit,
 } from '@nestjs/common';
 import { supabase } from '../../../config/supabase';
+import { getRoomsByPlaceIds } from '../../itinerary/room-catalog';
 
 interface ItineraryRow {
   id: string;
@@ -20,6 +21,16 @@ interface ItineraryRow {
   created_at: string;
   is_public: boolean | null;
   trip_intent: string | null;
+}
+
+interface RankedCityRow {
+  id: string;
+  name: string;
+  image_url: string | null;
+  rating: number | null;
+  review_count: number | null;
+  quality_score: number | null;
+  total_count: number | null;
 }
 
 interface ItineraryTimeRow {
@@ -231,10 +242,10 @@ export class ExploreService implements OnModuleInit {
   }
 
   private getCacheTtlMs(): number {
-    // Default 5 minutes — long enough to avoid thundering-herd timeouts while
-    // still refreshing data at a reasonable cadence.
-    const parsed = Number(process.env.EXPLORE_CACHE_TTL_MS ?? '300000');
-    if (!Number.isFinite(parsed) || parsed <= 0) return 300000;
+    // The ranked-city RPC is cheap, so keep Explore cache short enough for a
+    // newly approved rating to become visible without a long stale window.
+    const parsed = Number(process.env.EXPLORE_CACHE_TTL_MS ?? '60000');
+    if (!Number.isFinite(parsed) || parsed <= 0) return 60000;
     return Math.floor(parsed);
   }
 
@@ -642,7 +653,7 @@ export class ExploreService implements OnModuleInit {
 
     // Top-level cache — 60 s TTL so repeated home visits (tab switch, back nav)
     // return instantly. Pull-to-refresh bypasses this via forceRefresh.
-    const homeCacheKey = `explore:home:${touristId}`;
+    const homeCacheKey = `explore:home:v2:${touristId}`;
 
     const cachedHome = this.getFromCache<any>(homeCacheKey);
     if (cachedHome) return cachedHome;
@@ -652,7 +663,7 @@ export class ExploreService implements OnModuleInit {
     // for the home carousel, but the cached result is reused instantly for
     // "Xem tất cả" without an extra DB round-trip.
     const PAGE_SIZE = 10;
-    const publicKey = `explore:public_itineraries:1:${PAGE_SIZE}`;
+    const publicKey = `explore:public_itineraries:v2:1:${PAGE_SIZE}`;
     const featuredKey = `explore:featured_places:1:${PAGE_SIZE}`;
 
     const emptyItineraries: ExplorePublicItinerariesResponse = {
@@ -741,6 +752,7 @@ export class ExploreService implements OnModuleInit {
               ),
               rating: (item as { rating?: number }).rating ?? 0,
               review_count: (item as { reviewCount?: number }).reviewCount ?? 0,
+              min_price: (item as { priceValue?: number }).priceValue ?? 0,
               city: cityOverview.city.name,
               category: 'lưu trú',
             }));
@@ -788,6 +800,7 @@ export class ExploreService implements OnModuleInit {
       )
       .eq('creator_id', touristId)
       .eq('status', 'ongoing')
+      .eq('is_deleted', false)
       .order('created_at', { ascending: false })
       .limit(1)
       .maybeSingle<ItineraryWithDetailsRow>();
@@ -876,14 +889,14 @@ export class ExploreService implements OnModuleInit {
     touristId?: string,
   ): Promise<ExplorePublicItinerariesResponse> {
     // Per-user cache (includes is_favorite) — instant on repeat visits.
-    const userCacheKey = `explore:public_itineraries:${page}:${limit}:${touristId ?? 'anon'}`;
+    const userCacheKey = `explore:public_itineraries:v3:${page}:${limit}:${touristId ?? 'anon'}`;
     const userCached =
       this.getFromCache<ExplorePublicItinerariesResponse>(userCacheKey);
     if (userCached) return userCached;
 
     // Shared cache (no is_favorite) — reused across all users so the expensive
     // sub-queries (image join, ratings, creator names) only run once per page.
-    const sharedCacheKey = `explore:public_itineraries_shared:${page}:${limit}`;
+    const sharedCacheKey = `explore:public_itineraries_shared:v3:${page}:${limit}`;
     type SharedItem = Omit<ExplorePublicItineraryItem, 'is_favorite'>;
     type SharedResponse = { data: SharedItem[]; pagination: ExplorePagination };
     let sharedData = this.getFromCache<SharedResponse>(sharedCacheKey);
@@ -901,27 +914,37 @@ export class ExploreService implements OnModuleInit {
           { count: 'exact' },
         )
         .eq('is_public', true)
+        .eq('is_deleted', false)
         .order('created_at', { ascending: false })
-        .range(offset, offset + safeLimit - 1)
+        .limit(1000)
         .returns<ItineraryRow[]>();
 
       if (error) {
         throw new InternalServerErrorException(error.message);
       }
 
-      const itineraryIds = (data ?? []).map((item) => item.id);
-      const creatorIds = (data ?? []).map((item) => item.creator_id);
+      const favoriteCountMap = await this.getFavoriteCountMap(
+        (data ?? []).map((item) => item.id),
+      );
+      const rankedData = [...(data ?? [])].sort((left, right) => {
+        const favoriteDifference =
+          (favoriteCountMap.get(right.id) ?? 0) -
+          (favoriteCountMap.get(left.id) ?? 0);
+        if (favoriteDifference !== 0) return favoriteDifference;
+        return right.created_at.localeCompare(left.created_at);
+      });
+      const pageData = rankedData.slice(offset, offset + safeLimit);
+      const itineraryIds = pageData.map((item) => item.id);
+      const creatorIds = pageData.map((item) => item.creator_id);
 
       // Run all non-user-specific sub-queries in parallel.
-      const [creatorInfoMap, itineraryImages, favoriteCountMap, ratingMap] =
-        await Promise.all([
-          this.getCreatorInfoMap(creatorIds),
-          this.getItineraryImageMap(itineraryIds),
-          this.getFavoriteCountMap(itineraryIds),
-          this.getItineraryRatingMap(itineraryIds),
-        ]);
+      const [creatorInfoMap, itineraryImages, ratingMap] = await Promise.all([
+        this.getCreatorInfoMap(creatorIds),
+        this.getItineraryImageMap(itineraryIds),
+        this.getItineraryRatingMap(itineraryIds),
+      ]);
 
-      const mapped: SharedItem[] = (data ?? []).map((item) => {
+      const mapped: SharedItem[] = pageData.map((item) => {
         const gallery = itineraryImages.get(item.id) ?? [];
         const imageGallery =
           gallery.length > 0 ? gallery.slice(0, 3) : [this.defaultImageUrl];
@@ -1014,6 +1037,35 @@ export class ExploreService implements OnModuleInit {
     return name.includes('lưu trú') || name.includes('khách sạn');
   }
 
+  /** Rank rating together with its statistical confidence. */
+  private getPlaceQualityScore(place: PlaceRow): number {
+    const rating = Math.max(0, Number(place.average_rating) || 0);
+    const reviewCount = Math.max(0, Number(place.review_count) || 0);
+    const priorMean = 4;
+    const priorWeight = 50;
+
+    return (
+      (reviewCount * rating + priorWeight * priorMean) /
+      (reviewCount + priorWeight)
+    );
+  }
+
+  private sortPlacesByQuality<T extends PlaceRow>(places: T[]): T[] {
+    return [...places].sort((left, right) => {
+      const scoreDifference =
+        this.getPlaceQualityScore(right) - this.getPlaceQualityScore(left);
+      if (Math.abs(scoreDifference) > Number.EPSILON) return scoreDifference;
+
+      const reviewDifference =
+        (Number(right.review_count) || 0) - (Number(left.review_count) || 0);
+      if (reviewDifference !== 0) return reviewDifference;
+
+      return (
+        (Number(right.average_rating) || 0) - (Number(left.average_rating) || 0)
+      );
+    });
+  }
+
   private isActivityCategory(name: string): boolean {
     return (
       name.includes('tham quan & khám phá') ||
@@ -1065,8 +1117,46 @@ export class ExploreService implements OnModuleInit {
     const safeLimit = limit > 0 ? limit : 5;
     const offset = (safePage - 1) * safeLimit;
 
-    // Run 3 lightweight queries in parallel to reduce total latency
-    const [citiesResult, placeCityResult, favoriteResult] = await Promise.all([
+    // Preferred path: PostgreSQL aggregates every active place before
+    // pagination. This is both deterministic and much cheaper than sending
+    // thousands of place rows to Node for aggregation.
+    const { data: rankedCities, error: rankedCitiesError } = await supabase
+      .schema('travel')
+      .rpc('get_featured_cities_ranked', {
+        p_offset: offset,
+        p_limit: safeLimit,
+      })
+      .returns<RankedCityRow[]>();
+
+    if (!rankedCitiesError) {
+      const rankedRows = (rankedCities ?? []) as unknown as RankedCityRow[];
+      const total = Number(rankedRows[0]?.total_count) || 0;
+      const result: ExplorePlacesResponse = {
+        category: null,
+        data: rankedRows.map((item) => ({
+          id: item.id,
+          name: item.name,
+          image_url: (item.image_url ?? '').trim() || this.defaultImageUrl,
+          image: (item.image_url ?? '').trim() || this.defaultImageUrl,
+          rating: Number(item.rating) || 0,
+          review_count: Number(item.review_count) || 0,
+          city: item.name,
+          category: null,
+        })),
+        pagination: {
+          page: safePage,
+          limit: safeLimit,
+          total,
+          pages: Math.ceil(total / safeLimit),
+        },
+      };
+
+      this.setCache(cacheKey, result);
+      return result;
+    }
+
+    // Compatibility fallback while the SQL migration is not installed.
+    const [citiesResult, placeCityResult] = await Promise.all([
       supabase
         .schema('travel')
         .from('cities')
@@ -1078,7 +1168,8 @@ export class ExploreService implements OnModuleInit {
         .select('id, city_id, average_rating, review_count')
         .eq('is_approved', true)
         .eq('is_active', true)
-        .limit(3000)
+        .order('id', { ascending: true })
+        .limit(10000)
         .returns<
           {
             id: string;
@@ -1087,12 +1178,6 @@ export class ExploreService implements OnModuleInit {
             review_count: number | null;
           }[]
         >(),
-      supabase
-        .schema('travel')
-        .from('favorite_places')
-        .select('place_id')
-        .limit(3000)
-        .returns<FavoritePlaceRow[]>(),
     ]);
 
     if (citiesResult.error) {
@@ -1103,31 +1188,13 @@ export class ExploreService implements OnModuleInit {
     if (placeCityResult.error) {
       throw new InternalServerErrorException(placeCityResult.error.message);
     }
-    if (favoriteResult.error) {
-      throw new InternalServerErrorException(favoriteResult.error.message);
-    }
 
     const cities = citiesResult.data;
     const count = citiesResult.count;
     const placeCityRows = placeCityResult.data;
-    const favoritePlaces = favoriteResult.data;
-
-    const favoriteCountByPlace = new Map<string, number>();
-    for (const item of favoritePlaces ?? []) {
-      if (!item.place_id) {
-        continue;
-      }
-
-      favoriteCountByPlace.set(
-        item.place_id,
-        (favoriteCountByPlace.get(item.place_id) ?? 0) + 1,
-      );
-    }
-
-    const favoriteCountByCity = new Map<string, number>();
     const ratingByCity = new Map<
       string,
-      { sumRating: number; ratedCount: number; sumReviews: number }
+      { weightedRatingSum: number; ratingWeight: number; sumReviews: number }
     >();
 
     for (const item of placeCityRows ?? []) {
@@ -1135,35 +1202,41 @@ export class ExploreService implements OnModuleInit {
         continue;
       }
 
-      const placeFavoriteCount = favoriteCountByPlace.get(item.id) ?? 0;
-      favoriteCountByCity.set(
-        item.city_id,
-        (favoriteCountByCity.get(item.city_id) ?? 0) + placeFavoriteCount,
-      );
-
       const entry = ratingByCity.get(item.city_id) ?? {
-        sumRating: 0,
-        ratedCount: 0,
+        weightedRatingSum: 0,
+        ratingWeight: 0,
         sumReviews: 0,
       };
       const rating = Number(item.average_rating) || 0;
       const reviews = Number(item.review_count) || 0;
       if (rating > 0) {
-        entry.sumRating += rating;
-        entry.ratedCount += 1;
+        const weight = Math.max(reviews, 1);
+        entry.weightedRatingSum += rating * weight;
+        entry.ratingWeight += weight;
       }
       entry.sumReviews += reviews;
       ratingByCity.set(item.city_id, entry);
     }
 
-    const sortedCities = (cities ?? []).slice().sort((left, right) => {
-      const favoriteDiff =
-        (favoriteCountByCity.get(right.id) ?? 0) -
-        (favoriteCountByCity.get(left.id) ?? 0);
+    // Rank all cities before pagination. A Bayesian score prevents a city with
+    // one perfect review from outranking a consistently well-reviewed city.
+    const cityQuality = (cityId: string) => {
+      const entry = ratingByCity.get(cityId);
+      if (!entry || entry.ratingWeight === 0) return 0;
+      const rating = entry.weightedRatingSum / entry.ratingWeight;
+      const reviews = entry.sumReviews;
+      const confidence = reviews / (reviews + 20);
+      return confidence * rating + (1 - confidence) * 3.5;
+    };
 
-      if (favoriteDiff !== 0) {
-        return favoriteDiff;
-      }
+    const sortedCities = (cities ?? []).slice().sort((left, right) => {
+      const qualityDiff = cityQuality(right.id) - cityQuality(left.id);
+      if (qualityDiff !== 0) return qualityDiff;
+
+      const reviewDiff =
+        (ratingByCity.get(right.id)?.sumReviews ?? 0) -
+        (ratingByCity.get(left.id)?.sumReviews ?? 0);
+      if (reviewDiff !== 0) return reviewDiff;
 
       return left.name.localeCompare(right.name, 'vi', { sensitivity: 'base' });
     });
@@ -1173,9 +1246,10 @@ export class ExploreService implements OnModuleInit {
     const mapped = pagedCities.map((item) => {
       const ratingEntry = ratingByCity.get(item.id);
       const avgRating =
-        ratingEntry && ratingEntry.ratedCount > 0
-          ? Math.round((ratingEntry.sumRating / ratingEntry.ratedCount) * 100) /
-            100
+        ratingEntry && ratingEntry.ratingWeight > 0
+          ? Math.round(
+              (ratingEntry.weightedRatingSum / ratingEntry.ratingWeight) * 100,
+            ) / 100
           : 0;
       const totalReviews = ratingEntry?.sumReviews ?? 0;
       const image = (item.image_url ?? '').trim() || this.defaultImageUrl;
@@ -1206,12 +1280,45 @@ export class ExploreService implements OnModuleInit {
     return result;
   }
 
+  private async getAllCityPlaces(cityId: string): Promise<PlaceWithTypeRow[]> {
+    const pageSize = 1000;
+    const allPlaces: PlaceWithTypeRow[] = [];
+
+    for (let offset = 0; ; offset += pageSize) {
+      const { data, error } = await supabase
+        .schema('travel')
+        .from('places')
+        .select(
+          'id, name, address, city_id, cities(id, name), average_rating, review_count, image_url, open_time, close_time, open_hour_compressed, type_id, types(id, category_id, categories(id, name))',
+        )
+        .eq('city_id', cityId)
+        .eq('is_approved', true)
+        .eq('is_active', true)
+        .order('average_rating', { ascending: false })
+        .order('review_count', { ascending: false })
+        .range(offset, offset + pageSize - 1)
+        .returns<PlaceWithTypeRow[]>();
+
+      if (error) {
+        throw new InternalServerErrorException(
+          `getCityOverview.city_places: ${error.message}`,
+        );
+      }
+
+      const page = data ?? [];
+      allPlaces.push(...page);
+      if (page.length < pageSize) break;
+    }
+
+    return allPlaces;
+  }
+
   async getCityOverview(cityId: string) {
     if (!cityId || !cityId.trim()) {
       throw new BadRequestException('city_id is required');
     }
 
-    const ovCacheKey = `explore:city_overview:${cityId}`;
+    const ovCacheKey = `explore:city_overview:v3:${cityId}`;
 
     const cachedOverview = this.getFromCache<any>(ovCacheKey);
     if (cachedOverview) return cachedOverview;
@@ -1238,24 +1345,18 @@ export class ExploreService implements OnModuleInit {
       await this.getCategoryIdsByKeywords(['lưu trú', 'khách sạn']),
     );
 
-    const { data: places, error: placesError } = await supabase
-      .schema('travel')
-      .from('places')
-      .select(
-        'id, name, address, city_id, cities(id, name), average_rating, review_count, image_url, open_time, close_time, open_hour_compressed, type_id, types(id, category_id, categories(id, name))',
-      )
-      .eq('city_id', cityId)
-      .eq('is_approved', true)
-      .eq('is_active', true)
-      .order('average_rating', { ascending: false })
-      .order('review_count', { ascending: false })
-      .returns<PlaceWithTypeRow[]>();
+    const places = await this.getAllCityPlaces(cityId);
 
-    if (placesError) {
-      throw new InternalServerErrorException(
-        `getCityOverview.city_places: ${placesError.message}`,
-      );
-    }
+    const hotelRoomMap = await getRoomsByPlaceIds(
+      (places ?? [])
+        .filter((item) => {
+          const typeData = Array.isArray(item.types)
+            ? item.types?.[0]
+            : item.types;
+          return this.hasAnyCategoryId(typeData?.category_id, hotelCategoryIds);
+        })
+        .map((item) => item.id),
+    );
 
     const placeCategoriesByPlace = new Map<string, string[]>();
 
@@ -1280,8 +1381,9 @@ export class ExploreService implements OnModuleInit {
         'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public',
       )
       .eq('is_public', true)
+      .eq('is_deleted', false)
       .order('created_at', { ascending: false })
-      .limit(100)
+      .limit(1000)
       .returns<ItineraryRow[]>();
 
     if (itineraryError) {
@@ -1294,20 +1396,29 @@ export class ExploreService implements OnModuleInit {
 
     let itineraryDetailRows: ItineraryDetailPlaceCityRow[] = [];
     if (publicItineraryIds.length > 0) {
-      const { data: rows, error: itineraryDetailError } = await supabase
-        .schema('travel')
-        .from('itinerary_details')
-        .select('itinerary_id, places:place_id(city_id)')
-        .in('itinerary_id', publicItineraryIds)
-        .returns<ItineraryDetailPlaceCityRow[]>();
+      const batchSize = 100;
+      for (
+        let index = 0;
+        index < publicItineraryIds.length;
+        index += batchSize
+      ) {
+        const { data: rows, error: itineraryDetailError } = await supabase
+          .schema('travel')
+          .from('itinerary_details')
+          .select('itinerary_id, places:place_id(city_id)')
+          .in(
+            'itinerary_id',
+            publicItineraryIds.slice(index, index + batchSize),
+          )
+          .returns<ItineraryDetailPlaceCityRow[]>();
 
-      if (itineraryDetailError) {
-        throw new InternalServerErrorException(
-          `getCityOverview.itinerary_details: ${itineraryDetailError.message}`,
-        );
+        if (itineraryDetailError) {
+          throw new InternalServerErrorException(
+            `getCityOverview.itinerary_details: ${itineraryDetailError.message}`,
+          );
+        }
+        itineraryDetailRows.push(...(rows ?? []));
       }
-
-      itineraryDetailRows = rows ?? [];
     }
 
     const itineraryIdsInCity = new Set<string>();
@@ -1318,8 +1429,18 @@ export class ExploreService implements OnModuleInit {
       }
     }
 
+    const cityFavoriteCountMap = await this.getFavoriteCountMap(
+      Array.from(itineraryIdsInCity),
+    );
     const cityItineraries = (publicItineraries ?? [])
       .filter((item) => itineraryIdsInCity.has(item.id))
+      .sort((left, right) => {
+        const favoriteDifference =
+          (cityFavoriteCountMap.get(right.id) ?? 0) -
+          (cityFavoriteCountMap.get(left.id) ?? 0);
+        if (favoriteDifference !== 0) return favoriteDifference;
+        return right.created_at.localeCompare(left.created_at);
+      })
       .slice(0, 6);
 
     let cityItineraryImages = new Map<string, string[]>();
@@ -1371,7 +1492,7 @@ export class ExploreService implements OnModuleInit {
         imageUrl: imageGallery[0],
         duration: `${this.getDays(item.start_date, item.end_date)} NGÀY`,
         views: String(this.toParticipantCount(item)),
-        likes: String(this.toParticipantCount(item)),
+        likes: String(cityFavoriteCountMap.get(item.id) ?? 0),
       };
     });
 
@@ -1387,7 +1508,10 @@ export class ExploreService implements OnModuleInit {
       'mua sam dich vu',
     ];
 
-    for (const item of places ?? []) {
+    // All three city sections use the same confidence-aware ranking so a 5.0
+    // backed by very few reviews does not outrank a proven 4.8-rated place.
+    const rankedPlaces = this.sortPlacesByQuality(places ?? []);
+    for (const item of rankedPlaces) {
       const categories = placeCategoriesByPlace.get(item.id) ?? [];
       const typeData = Array.isArray(item.types) ? item.types?.[0] : item.types;
       const isRestaurant = this.hasAnyCategoryId(
@@ -1404,17 +1528,23 @@ export class ExploreService implements OnModuleInit {
       );
 
       if (isHotel) {
+        const minimumRoomPrice = hotelRoomMap.get(item.id)?.[0]?.price ?? 0;
         hotels.push({
           id: item.id,
           name: item.name,
           imageUrl: this.resolveImage(item.image_url),
           rating: Number(item.average_rating) || 0,
           reviewCount: item.review_count || 0,
-          price: '0đ',
+          min_price: minimumRoomPrice,
+          price: minimumRoomPrice,
           address: item.address ?? city.name,
-          status: this.getPlaceOpenStatus(item.open_time, item.close_time, item.open_hour_compressed),
+          status: this.getPlaceOpenStatus(
+            item.open_time,
+            item.close_time,
+            item.open_hour_compressed,
+          ),
           starRating: 4,
-          priceValue: 0,
+          priceValue: minimumRoomPrice,
           accommodationType: 'hotel',
           amenities: [] as string[],
         });
@@ -1429,7 +1559,11 @@ export class ExploreService implements OnModuleInit {
           rating: Number(item.average_rating) || 0,
           reviewCount: item.review_count || 0,
           address: item.address ?? city.name,
-          status: this.getPlaceOpenStatus(item.open_time, item.close_time, item.open_hour_compressed),
+          status: this.getPlaceOpenStatus(
+            item.open_time,
+            item.close_time,
+            item.open_hour_compressed,
+          ),
           cuisine: 'vietnamese',
           priceLevel: 'mid_range',
           amenities: [] as string[],
@@ -1448,7 +1582,11 @@ export class ExploreService implements OnModuleInit {
         rating: Number(item.average_rating) || 0,
         reviewCount: item.review_count || 0,
         address: item.address ?? city.name,
-        status: this.getPlaceOpenStatus(item.open_time, item.close_time, item.open_hour_compressed),
+        status: this.getPlaceOpenStatus(
+          item.open_time,
+          item.close_time,
+          item.open_hour_compressed,
+        ),
         category: this.mapActivityEntityCategory(categories),
         priceType: 'free',
         district: this.extractCityName(item.cities) ?? city.name,
@@ -1468,6 +1606,23 @@ export class ExploreService implements OnModuleInit {
 
     this.setCache(ovCacheKey, ovResult);
     return ovResult;
+  }
+
+  private async attachMinimumHotelPrices(
+    items: ExplorePlacesResponse['data'],
+  ): Promise<ExplorePlacesResponse['data']> {
+    if (items.length === 0) return items;
+
+    const roomsByPlace = await getRoomsByPlaceIds(items.map((item) => item.id));
+    return items.map((item) => {
+      const minimumPrice = roomsByPlace.get(item.id)?.[0]?.price ?? 0;
+      return {
+        ...item,
+        min_price: minimumPrice,
+        price: minimumPrice,
+        priceValue: minimumPrice,
+      };
+    });
   }
 
   async getPlacesByCategory(
@@ -1505,7 +1660,7 @@ export class ExploreService implements OnModuleInit {
       ? new Set(await this.getCategoryIdsByKeywords(categoryFilter))
       : new Set<string>();
 
-    const cacheKey = `explore:places:${categoryName}:${safePage}:${safeLimit}:${Array.from(
+    const cacheKey = `explore:places:v2:${categoryName}:${safePage}:${safeLimit}:${Array.from(
       resolvedCategoryIds,
     ).join(',')}:${touristId ?? 'anon'}`;
     const cached = this.getFromCache<ExplorePlacesResponse>(cacheKey);
@@ -1555,6 +1710,10 @@ export class ExploreService implements OnModuleInit {
         }
 
         if (typeIds.length > 0 && typeIds.length <= safeInFilterLimit) {
+          const candidateLimit = Math.min(
+            Math.max(offset + safeLimit * 20, 200),
+            1000,
+          );
           // Simplified SELECT — no types/categories join needed since the
           // category is already known (from the input parameter).
           const { data, error } = await supabase
@@ -1566,24 +1725,25 @@ export class ExploreService implements OnModuleInit {
             .eq('is_approved', true)
             .eq('is_active', true)
             .in('type_id', typeIds)
-            .order('average_rating', { ascending: false })
             .order('review_count', { ascending: false })
-            .range(offset, offset + safeLimit - 1)
+            .order('average_rating', { ascending: false })
+            .range(0, candidateLimit - 1)
             .returns<PlaceRow[]>();
 
           if (error) {
             throw new InternalServerErrorException(error.message);
           }
 
-          const rowCount = (data ?? []).length;
+          const rankedData = this.sortPlacesByQuality(data ?? []);
+          const pagedData = rankedData.slice(offset, offset + safeLimit);
+          const rowCount = pagedData.length;
           const favoritePlaceIds = await this.getFavoritePlaceSet(
             touristId,
-            (data ?? []).map((item) => item.id),
+            pagedData.map((item) => item.id),
           );
 
-          const result: ExplorePlacesResponse = {
-            category: categoryName,
-            data: (data ?? []).map((item) => ({
+          let mappedItems: ExplorePlacesResponse['data'] = pagedData.map(
+            (item) => ({
               id: item.id,
               name: item.name,
               image: this.resolveImage(item.image_url),
@@ -1591,9 +1751,22 @@ export class ExploreService implements OnModuleInit {
               review_count: item.review_count || 0,
               city: this.extractCityName(item.cities),
               category: categoryName,
-              status: this.getPlaceOpenStatus(item.open_time, item.close_time, item.open_hour_compressed),
+              status: this.getPlaceOpenStatus(
+                item.open_time,
+                item.close_time,
+                item.open_hour_compressed,
+              ),
               is_favorite: favoritePlaceIds.has(item.id),
-            })),
+            }),
+          );
+
+          if (categoryName && this.isHotelCategory(categoryName)) {
+            mappedItems = await this.attachMinimumHotelPrices(mappedItems);
+          }
+
+          const result: ExplorePlacesResponse = {
+            category: categoryName,
+            data: mappedItems,
             pagination: {
               page: safePage,
               limit: safeLimit,
@@ -1614,7 +1787,7 @@ export class ExploreService implements OnModuleInit {
       // sliding-window bug where page 2+ could return empty results when fewer
       // than `offset` matches existed inside the candidate window.
       type PlaceItem = ExplorePlacesResponse['data'][number];
-      const fallbackAllKey = `explore:places_all:${categoryName}`;
+      const fallbackAllKey = `explore:places_all:v2:${categoryName}`;
       let allFallbackItems = this.getFromCache<PlaceItem[]>(fallbackAllKey);
 
       if (!allFallbackItems) {
@@ -1626,8 +1799,8 @@ export class ExploreService implements OnModuleInit {
           )
           .eq('is_approved', true)
           .eq('is_active', true)
-          .order('average_rating', { ascending: false })
           .order('review_count', { ascending: false })
+          .order('average_rating', { ascending: false })
           .limit(500)
           .returns<
             Array<
@@ -1657,7 +1830,7 @@ export class ExploreService implements OnModuleInit {
           return this.matchesAnyCategory(categoryNames, categoryFilter);
         });
 
-        allFallbackItems = filtered.map((item) => ({
+        allFallbackItems = this.sortPlacesByQuality(filtered).map((item) => ({
           id: item.id,
           name: item.name,
           image: this.resolveImage(item.image_url),
@@ -1665,8 +1838,17 @@ export class ExploreService implements OnModuleInit {
           review_count: item.review_count || 0,
           city: this.extractCityName(item.cities),
           category: categoryName,
-          status: this.getPlaceOpenStatus(item.open_time, item.close_time, item.open_hour_compressed),
+          status: this.getPlaceOpenStatus(
+            item.open_time,
+            item.close_time,
+            item.open_hour_compressed,
+          ),
         }));
+
+        if (categoryName && this.isHotelCategory(categoryName)) {
+          allFallbackItems =
+            await this.attachMinimumHotelPrices(allFallbackItems);
+        }
 
         this.setCache(fallbackAllKey, allFallbackItems);
       }
@@ -1736,7 +1918,11 @@ export class ExploreService implements OnModuleInit {
       review_count: item.review_count || 0,
       city: this.extractCityName(item.cities),
       category: categoryName,
-      status: this.getPlaceOpenStatus(item.open_time, item.close_time, item.open_hour_compressed),
+      status: this.getPlaceOpenStatus(
+        item.open_time,
+        item.close_time,
+        item.open_hour_compressed,
+      ),
       is_favorite: favoritePlaceIds.has(item.id),
     }));
 
@@ -1841,16 +2027,26 @@ export class ExploreService implements OnModuleInit {
     itineraryIds: string[],
   ): Promise<Map<string, number>> {
     if (itineraryIds.length === 0) return new Map();
-    const { data, error } = await supabase
-      .schema('travel')
-      .from('favorite_itineraries')
-      .select('itinerary_id')
-      .in('itinerary_id', itineraryIds)
-      .returns<Array<{ itinerary_id: string }>>();
-    if (error) return new Map();
     const countMap = new Map<string, number>();
-    for (const row of data ?? []) {
-      countMap.set(row.itinerary_id, (countMap.get(row.itinerary_id) ?? 0) + 1);
+    const uniqueIds = Array.from(new Set(itineraryIds));
+    const batchSize = 100;
+
+    for (let index = 0; index < uniqueIds.length; index += batchSize) {
+      const { data, error } = await supabase
+        .schema('travel')
+        .from('favorite_itineraries')
+        .select('itinerary_id')
+        .in('itinerary_id', uniqueIds.slice(index, index + batchSize))
+        .returns<Array<{ itinerary_id: string }>>();
+      if (error) {
+        throw new InternalServerErrorException(error.message);
+      }
+      for (const row of data ?? []) {
+        countMap.set(
+          row.itinerary_id,
+          (countMap.get(row.itinerary_id) ?? 0) + 1,
+        );
+      }
     }
     return countMap;
   }

@@ -33,6 +33,7 @@ import {
   parseTripIntents,
   dedupeByPlaceIdKeepBestScore,
 } from './utils/mmr-rerank';
+import { resolvePlannerPlaceType } from './utils/place-type.util';
 import { resolveIntentVibe } from './utils/intent-vibe';
 import {
   DEFAULT_TWO_TOWER_RUNTIME_CONFIG,
@@ -78,7 +79,6 @@ interface PriceInfo {
 @Injectable()
 export class RecommendationService {
   private readonly logger = new Logger(RecommendationService.name);
-  private readonly foodCategoryId = '97029cfb-069b-4dba-a152-dfb3d36634d3';
 
   constructor(
     private readonly mlClient: MlClientService,
@@ -591,8 +591,19 @@ export class RecommendationService {
         `candidateRank=${hotelSelection.candidateRank}`,
     );
 
+    const fallbackRestaurants = await this.fetchFallbackRestaurants(
+      dto.destinationLocationId,
+      new Set(details.map((place) => place.id)),
+    );
+    if (fallbackRestaurants.length > 0) {
+      this.logger.warn(
+        `Fallback restaurant pool: ${fallbackRestaurants.length} candidates`,
+      );
+    }
+
     const payload: ItineraryPlanPayload = {
       places: details,
+      fallback_restaurants: fallbackRestaurants,
       num_days: numDays,
       daily_start_time: dto.dailyStartTime,
       daily_end_time: dto.dailyEndTime,
@@ -814,7 +825,7 @@ export class RecommendationService {
       .schema('travel')
       .from('places')
       .select(
-        'id,name,longitude,latitude,open_hour_compressed,source,type_id,slot_type,visit_duration,average_rating,review_count,price,price_inferred,best_time,types(name,categories(id,name))',
+        'id,name,longitude,latitude,district_old,open_hour_compressed,source,type_id,slot_type,visit_duration,average_rating,review_count,price,price_inferred,best_time,types(name,categories(id,name))',
       )
       .in('id', ids);
 
@@ -839,7 +850,7 @@ export class RecommendationService {
           row.slot_type ?? candidate?.category ?? '',
           typeData?.name ?? '',
         );
-        const placeType = this.resolvePlannerPlaceType(
+        const placeType = resolvePlannerPlaceType(
           candidateCategory,
           categoryId,
           categoryName,
@@ -868,6 +879,7 @@ export class RecommendationService {
           name: row.name,
           longitude: Number(row.longitude),
           latitude: Number(row.latitude),
+          district_old: row.district_old ?? null,
           place_type: placeType,
           slot_type: candidateCategory ?? undefined,
           category: candidateCategory ?? undefined,
@@ -904,6 +916,129 @@ export class RecommendationService {
         (a: any, b: any) =>
           (a.candidate_rank ?? 999_999) - (b.candidate_rank ?? 999_999),
       );
+  }
+
+  // Đủ để SchedulerV2Planner._ensure_restaurant_coverage() (ai-service) có
+  // dư lựa chọn bổ sung cho các ngày thiếu quán ăn — không cần nhiều vì chỉ
+  // dùng khi candidate theo sở thích không phủ hết địa lý của chuyến.
+  private static readonly FALLBACK_RESTAURANT_LIMIT = 60;
+
+  /**
+   * Pool nhà hàng dự phòng cho cả điểm đến — KHÔNG lọc theo sở thích/two-tower
+   * (khác hẳn fetchPlannerPlaceDetails/retrieveCandidates), chỉ để ai-service
+   * bổ sung vào ngày nào bị thiếu ứng viên nhà hàng sau khi cluster theo địa
+   * lý (xem geo_clustering.py + SchedulerV2Planner._ensure_restaurant_coverage
+   * ở ai-service). Dùng đúng resolvePlannerPlaceType() đã có sẵn để phân loại
+   * "restaurant" — KHÔNG viết lại logic đó ở phía ai-service (Python), tránh
+   * 2 định nghĩa "thế nào là nhà hàng" lệch nhau theo thời gian.
+   */
+  private async fetchFallbackRestaurants(
+    cityId: string,
+    excludeIds: Set<string>,
+  ): Promise<ItineraryPlanPayload['places']> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('places')
+      .select(
+        'id,name,longitude,latitude,district_old,open_hour_compressed,source,type_id,slot_type,visit_duration,average_rating,review_count,price,price_inferred,best_time,types(name,categories(id,name))',
+      )
+      .eq('city_id', cityId)
+      .eq('is_approved', true)
+      .eq('is_active', true)
+      // Lấy dư ra rồi lọc type ở Node — resolvePlannerPlaceType() cần JOIN
+      // types/categories mới phân loại chính xác, không lọc được thẳng qua
+      // 1 cột duy nhất ở tầng PostgREST.
+      .order('average_rating', { ascending: false, nullsFirst: false })
+      .limit(RecommendationService.FALLBACK_RESTAURANT_LIMIT * 4);
+
+    if (error) {
+      this.logger.warn(`fetchFallbackRestaurants error: ${error.message}`);
+      return [];
+    }
+
+    return (data ?? [])
+      .filter(
+        (row: any) =>
+          row.longitude != null &&
+          row.latitude != null &&
+          !excludeIds.has(row.id),
+      )
+      .map((row: any) => {
+        const typeData = Array.isArray(row.types) ? row.types[0] : row.types;
+        const categoryData = Array.isArray(typeData?.categories)
+          ? typeData.categories[0]
+          : typeData?.categories;
+        const categoryId = categoryData?.id ?? null;
+        const categoryName = categoryData?.name ?? null;
+        const candidateCategory = normalizeCategory(
+          row.slot_type ?? '',
+          typeData?.name ?? '',
+        );
+        const placeType = resolvePlannerPlaceType(
+          candidateCategory,
+          categoryId,
+          categoryName,
+          typeData?.name ?? '',
+        );
+        if (placeType !== 'restaurant') return null;
+
+        const rawPrice =
+          row.price == null || row.price === '' ? null : Number(row.price);
+        const normalizedPrice =
+          rawPrice != null && Number.isFinite(rawPrice) && rawPrice > 0
+            ? Math.round(rawPrice)
+            : 0;
+        const rawBestTime = String(row.best_time ?? '')
+          .trim()
+          .toUpperCase();
+        const bestTime = [
+          'MORNING',
+          'AFTERNOON',
+          'NIGHT',
+          'ALL_DAY',
+        ].includes(rawBestTime)
+          ? (rawBestTime as 'MORNING' | 'AFTERNOON' | 'NIGHT' | 'ALL_DAY')
+          : null;
+
+        return {
+          id: row.id,
+          name: row.name,
+          longitude: Number(row.longitude),
+          latitude: Number(row.latitude),
+          district_old: row.district_old ?? null,
+          place_type: 'restaurant' as const,
+          slot_type: candidateCategory ?? undefined,
+          category: candidateCategory ?? undefined,
+          source: row.source ?? '',
+          type_id: row.type_id ?? '',
+          type_name: typeData?.name ?? '',
+          category_id: categoryId,
+          category_name: categoryName,
+          open_hour: null,
+          open_hour_compressed: this.compactOpenHourCompressed(
+            row.open_hour_compressed,
+          ),
+          visit_duration: row.visit_duration ?? null,
+          average_rating:
+            row.average_rating != null ? Number(row.average_rating) : null,
+          review_count:
+            row.review_count != null ? Number(row.review_count) : null,
+          retrieval_score: null,
+          candidate_rank: null,
+          candidate_total: null,
+          estimated_cost: normalizedPrice,
+          price_min: rawPrice != null && rawPrice > 0 ? normalizedPrice : null,
+          price_max: rawPrice != null && rawPrice > 0 ? normalizedPrice : null,
+          price_basis: 'per_person',
+          price_inferred:
+            typeof row.price_inferred === 'boolean' ? row.price_inferred : null,
+          best_time: bestTime,
+          best_time_source: bestTime ? 'database' : null,
+          planner_source: 'fallback_restaurant_pool',
+        };
+      })
+      .filter((row): row is NonNullable<typeof row> => row !== null)
+      .slice(0, RecommendationService.FALLBACK_RESTAURANT_LIMIT);
   }
 
   private selectHotelByEstimatedPrice(
@@ -1034,38 +1169,6 @@ export class RecommendationService {
     return 6371 * 2 * Math.atan2(Math.sqrt(value), Math.sqrt(1 - value));
   }
 
-  private resolvePlannerPlaceType(
-    candidateCategory?: string | null,
-    categoryId?: string | null,
-    categoryName?: string | null,
-    typeName?: string | null,
-  ): 'hotel' | 'restaurant' | 'cafe' | 'entertainment' | 'attraction' {
-    const category = (candidateCategory ?? '').toLowerCase();
-    const name = (categoryName ?? '').toLowerCase();
-    const type = (typeName ?? '').toLowerCase();
-    if (category === 'accommodation' || category === 'hotel') {
-      return 'hotel';
-    }
-    if (
-      category === 'cafe' ||
-      type.includes('cafe') ||
-      type.includes('coffee')
-    ) {
-      return 'cafe';
-    }
-    if (category === 'entertainment') {
-      return 'entertainment';
-    }
-    if (
-      category === 'restaurant' ||
-      categoryId === this.foodCategoryId ||
-      name.includes('ẩm thực') ||
-      name.includes('am thuc')
-    ) {
-      return 'restaurant';
-    }
-    return 'attraction';
-  }
 
   private compactOpenHourCompressed(value?: string | null): string | null {
     if (!value) return null;

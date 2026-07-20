@@ -76,18 +76,25 @@ export async function getRoomsByPlaceIds(
   );
   if (!uniquePlaceIds.length) return result;
 
-  const { data, error } = await supabase
-    .schema('order_sys')
-    .from('hotel_rooms')
-    .select('id, place_id, name, price, quantity')
-    .in('place_id', uniquePlaceIds);
+  // A city can contain hundreds of hotels. Sending every UUID in one PostgREST
+  // `in` filter can exceed the URL/upstream limit and previously made every
+  // hotel silently fall back to price 0. Keep each request comfortably small.
+  const batchSize = 100;
+  for (let index = 0; index < uniquePlaceIds.length; index += batchSize) {
+    const batch = uniquePlaceIds.slice(index, index + batchSize);
+    const { data, error } = await supabase
+      .schema('order_sys')
+      .from('hotel_rooms')
+      .select('id, place_id, name, price, quantity')
+      .in('place_id', batch);
 
-  if (error) {
-    throw new Error(`order_sys.hotel_rooms query failed: ${error.message}`);
-  }
+    if (error) {
+      throw new Error(`order_sys.hotel_rooms query failed: ${error.message}`);
+    }
 
-  for (const room of normalizeRooms((data ?? []) as HotelRoomDbRow[])) {
-    result.get(room.place_id)?.push(room);
+    for (const room of normalizeRooms((data ?? []) as HotelRoomDbRow[])) {
+      result.get(room.place_id)?.push(room);
+    }
   }
   return result;
 }
