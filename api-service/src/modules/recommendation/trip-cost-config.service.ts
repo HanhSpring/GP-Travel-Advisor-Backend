@@ -23,6 +23,16 @@ export interface TripCostConfig {
   transportCostPerKmDefault: number;
   /** Seats per vehicle, used to compute how many vehicles a group needs. */
   vehicleCapacity: Record<CapacityMode, number>;
+  /** VND/ngày/người lớn — mốc sàn dùng thay cho budget=0 khi retry lịch
+   * trình bị infeasible vì ngân sách quá thấp, để plan retry vẫn hướng tới
+   * rẻ nhất-khả-thi thay vì bỏ qua chi phí hoàn toàn. */
+  minDailyBudgetFloor: number;
+  /** VND/đêm/người — mốc sàn CHỖ Ở, tách riêng khỏi minDailyBudgetFloor
+   * (đó là mốc sàn cho tham quan/ăn uống). Chỉ cộng thêm cho (số ngày - 1)
+   * đêm — chuyến 1 ngày (đi về trong ngày) không qua đêm nên không cần mốc
+   * này. Khớp FALLBACK_HOTEL_COST_PER_NIGHT/ROOM_CAPACITY bên ai-service
+   * (planner.py) — dùng khi 1 khách sạn cụ thể chưa có giá riêng. */
+  minHotelNightFloor: number;
 }
 
 // Same `ai_config` schema already used by TwoTowerConfigService and the
@@ -50,9 +60,24 @@ const CAPACITY_MODES: readonly CapacityMode[] = ['motorbike', 'car'];
 const PARAM_TRANSPORT_PREFIX = 'transport_cost_per_km_';
 const PARAM_TRANSPORT_DEFAULT = 'transport_cost_per_km_default';
 const PARAM_CAPACITY_PREFIX = 'vehicle_capacity_';
+const PARAM_MIN_DAILY_BUDGET_FLOOR = 'min_daily_budget_floor';
+const PARAM_MIN_HOTEL_NIGHT_FLOOR = 'min_hotel_night_floor';
 
 const DEFAULTS: Record<string, number> = {
   [PARAM_CHILD_PRICE_RATIO]: 0.7,
+  // Ban đầu 300k (dựa theo chi phí quán ăn quan sát trong log debug 2026-07:
+  // ~60k-180k/bữa × 2 bữa) — nhưng không tính tới vé vào cửa/hoạt động có
+  // thể rất rẻ (VD Thảo Cầm Viên ~50-60k, Chợ Bến Thành đi dạo miễn phí),
+  // khiến 1 chuyến thực tế ~100k/ngày vẫn hợp lý bị từ chối oan. Hạ xuống
+  // 150k (2026-07-22, theo yêu cầu chủ dự án) — chừa biên an toàn hơn ví dụ
+  // 100k phòng khi có ngày khác đắt hơn trong cùng chuyến, vẫn rẻ hơn hẳn
+  // mức 300k cũ. Admin có thể chỉnh qua current_value không cần deploy lại,
+  // giống mọi param khác trong file này.
+  [PARAM_MIN_DAILY_BUDGET_FLOOR]: 150_000,
+  // Khớp FALLBACK_HOTEL_COST_PER_NIGHT (400_000) / ROOM_CAPACITY (2) bên
+  // ai-service/planner.py — giá phòng tối thiểu giả định khi 1 khách sạn cụ
+  // thể chưa có estimated_cost riêng.
+  [PARAM_MIN_HOTEL_NIGHT_FLOOR]: 200_000,
   // Cập nhật theo yêu cầu chủ dự án (2026-07-14): giá xăng xe/ô tô thực tế
   // đã tăng so với mức cấu hình cũ (450/520). Đây là giá cho MỘT xe — nhân
   // số xe cần dùng ở estimateSelfDriveTransportCost(), không nhân theo đầu
@@ -75,11 +100,17 @@ const DESCRIPTIONS: Record<string, string> = {
   [PARAM_TRANSPORT_DEFAULT]: 'VND/km mặc định khi không rõ phương tiện',
   vehicle_capacity_motorbike: 'Số người tối đa mỗi xe máy',
   vehicle_capacity_car: 'Số người tối đa mỗi ô tô (xe 4 chỗ)',
+  [PARAM_MIN_DAILY_BUDGET_FLOOR]:
+    'VND/ngày/người lớn — mốc sàn chi phí tối thiểu dùng khi ngân sách nhập vào quá thấp để tạo lịch trình',
+  [PARAM_MIN_HOTEL_NIGHT_FLOOR]:
+    'VND/đêm/người — mốc sàn chỗ ở tối thiểu, chỉ áp dụng cho chuyến từ 2 ngày trở lên',
 };
 const MIN_MAX: Partial<Record<string, [number, number]>> = {
   [PARAM_CHILD_PRICE_RATIO]: [0, 1],
   vehicle_capacity_motorbike: [1, 10],
   vehicle_capacity_car: [1, 16],
+  [PARAM_MIN_DAILY_BUDGET_FLOOR]: [1, 10_000_000],
+  [PARAM_MIN_HOTEL_NIGHT_FLOOR]: [1, 10_000_000],
 };
 
 const DEFAULT_CONFIG: TripCostConfig = {
@@ -95,6 +126,8 @@ const DEFAULT_CONFIG: TripCostConfig = {
     motorbike: DEFAULTS.vehicle_capacity_motorbike,
     car: DEFAULTS.vehicle_capacity_car,
   },
+  minDailyBudgetFloor: DEFAULTS[PARAM_MIN_DAILY_BUDGET_FLOOR],
+  minHotelNightFloor: DEFAULTS[PARAM_MIN_HOTEL_NIGHT_FLOOR],
 };
 
 @Injectable()
@@ -244,6 +277,8 @@ export class TripCostConfigService {
     const paramNames = [
       PARAM_CHILD_PRICE_RATIO,
       PARAM_TRANSPORT_DEFAULT,
+      PARAM_MIN_DAILY_BUDGET_FLOOR,
+      PARAM_MIN_HOTEL_NIGHT_FLOOR,
       ...TRANSPORT_MODES.map((mode) => `${PARAM_TRANSPORT_PREFIX}${mode}`),
       ...CAPACITY_MODES.map((mode) => `${PARAM_CAPACITY_PREFIX}${mode}`),
     ];
@@ -274,6 +309,8 @@ export class TripCostConfigService {
         motorbike: Math.max(1, Math.round(readNumber(`${PARAM_CAPACITY_PREFIX}motorbike`))),
         car: Math.max(1, Math.round(readNumber(`${PARAM_CAPACITY_PREFIX}car`))),
       },
+      minDailyBudgetFloor: readNumber(PARAM_MIN_DAILY_BUDGET_FLOOR),
+      minHotelNightFloor: readNumber(PARAM_MIN_HOTEL_NIGHT_FLOOR),
     };
   }
 }

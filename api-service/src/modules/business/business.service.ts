@@ -13,13 +13,17 @@ import { GetOrdersDto } from './dto/get-orders.dto';
 import { randomUUID } from 'crypto';
 
 import { CommonNotificationsService } from '../common/notifications/notifications.service';
+import { IncurredCostsService } from '../itinerary/incurred-costs.service';
 
 @Injectable()
 export class BusinessService {
   private supabaseUrl = process.env.SUPABASE_URL || '';
   private supabaseAnonKey = process.env.SUPABASE_KEY || '';
 
-  constructor(private readonly notificationsService: CommonNotificationsService) {}
+  constructor(
+    private readonly notificationsService: CommonNotificationsService,
+    private readonly incurredCostsService: IncurredCostsService,
+  ) {}
 
   private normalizeText(value: string): string {
     return value
@@ -1326,12 +1330,37 @@ export class BusinessService {
       .from('orders')
       .update({ status })
       .eq('id', orderId)
-      .select('id, status')
+      .select('id, status, place_id, tourist_id, total_amount, itinerary_detail_id')
       .single();
 
     if (error) throw new InternalServerErrorException(error.message);
     if (!data)
       throw new NotFoundException(`Không tìm thấy đơn hàng: ${orderId}`);
+
+    // Chủ quán bấm "Hoàn tất" TAY (khác đường tự động của
+    // OrdersCompletionCron sau auto_complete_at) — trước đây đường này không
+    // hề ghi giá món ăn thật vào "Chi phí kế hoạch" của lịch trình, khiến chi
+    // phí đặt món biến mất hoàn toàn nếu chủ quán hoàn tất đơn tay thay vì để
+    // hệ thống tự động. Lỗi ở bước ghi chi phí không được làm hỏng việc cập
+    // nhật trạng thái đơn đã thành công ở trên.
+    if (status === 'completed') {
+      try {
+        await this.incurredCostsService.recordCompletedOrderExpense(
+          data as {
+            id: string;
+            place_id: string | null;
+            tourist_id: string | null;
+            total_amount: number | null;
+            itinerary_detail_id: string | null;
+          },
+        );
+      } catch (err: any) {
+        console.warn(
+          `Cannot record completed-order expense for order ${orderId}:`,
+          err?.message ?? err,
+        );
+      }
+    }
 
     return { message: 'Cập nhật trạng thái thành công', order: data };
   }

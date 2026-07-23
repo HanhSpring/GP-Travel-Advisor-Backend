@@ -11,8 +11,12 @@ import {
   Query,
   Logger,
   Res,
+  Inject,
   UnprocessableEntityException,
 } from '@nestjs/common';
+import { CACHE_MANAGER } from '@nestjs/cache-manager';
+import type { Cache } from 'cache-manager';
+import { randomUUID } from 'node:crypto';
 import {
   ApiTags,
   ApiOperation,
@@ -24,6 +28,7 @@ import {
 import { ItineraryService } from './itinerary.service';
 import { RecommendationService } from '../recommendation/recommendation.service';
 import { TwoTowerConfigService } from '../recommendation/two-tower-config.service';
+import { TripCostConfigService } from '../recommendation/trip-cost-config.service';
 import { GetItinerariesDto } from './dto/get-itineraries.dto';
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
 import { ItineraryDetailResponseDto } from './dto/itinerary-detail-response.dto';
@@ -49,6 +54,12 @@ import {
   resolvePlannerEngine,
 } from '../../config/planner-engine';
 
+// Cache tạm plan đã tính khi throw BUDGET_CONFIRMATION_REQUIRED, để client
+// xác nhận (gửi lại confirmToken) không phải chạy lại toàn bộ thuật toán —
+// xem nhánh `body.confirmToken` và điểm throw trong plan().
+const ITINERARY_PLAN_CONFIRM_TTL_MS = 10 * 60 * 1000; // 10 phút
+const ITINERARY_PLAN_CONFIRM_PREFIX = 'itinerary_plan_confirm';
+
 @ApiTags('Itinerary')
 @Controller('itinerary')
 export class ItineraryController {
@@ -59,6 +70,8 @@ export class ItineraryController {
     private readonly service: ItineraryService,
     private readonly recommendationService: RecommendationService,
     private readonly twoTowerConfig: TwoTowerConfigService,
+    private readonly tripCostConfig: TripCostConfigService,
+    @Inject(CACHE_MANAGER) private readonly cache: Cache,
     configService: ConfigService,
   ) {
     const configuredValue = configService.get<string>(
@@ -183,9 +196,68 @@ export class ItineraryController {
     const k = topK
       ? Math.min(parseInt(topK, 10) || 60, 200)
       : this.calcRetrievalTopK(requestedDays);
+    const plannerEngine = this.plannerEngine;
+
+    // Xác nhận ngân sách vòng 2: nếu client gửi kèm confirmToken từ lỗi
+    // BUDGET_CONFIRMATION_REQUIRED trước đó, dùng thẳng plan đã cache —
+    // bỏ qua region-detection + planItinerary + budget-check bên dưới,
+    // tránh chạy lại CP-SAT chỉ để tái tạo 1 plan tương đương đã có sẵn.
+    if (body.confirmToken) {
+      const cacheKey = `${ITINERARY_PLAN_CONFIRM_PREFIX}:${body.confirmToken}`;
+      const cachedPlan = await this.cache.get<any>(cacheKey);
+      if (cachedPlan) {
+        await this.cache.del(cacheKey); // single-use, tránh replay
+        return this.persistAndRespond(
+          body,
+          cachedPlan,
+          plannerEngine,
+          startedAt,
+          0,
+          requestedDays,
+          k,
+        );
+      }
+      this.logger.warn(
+        `itinerary/plan confirmToken cache miss (hết hạn hoặc đã dùng): ${body.confirmToken}`,
+      );
+      // rơi xuống flow bình thường bên dưới — không throw, không chặn user
+    }
+
+    // Chặn sớm ngân sách quá thấp — KHÔNG chạy Two-Tower/CP-SAT (tốn thời
+    // gian, xem thảo luận "case 1 chậm") nếu ngân sách nhập vào rõ ràng
+    // không đủ ngay cả ở mức sàn tối thiểu thật sự. Mốc sàn = tham quan/ăn
+    // uống mỗi ngày + chỗ ở mỗi ĐÊM (luôn TỐI THIỂU 1 đêm kể cả chuyến 1
+    // ngày, vì mọi lịch trình đều bắt buộc có khách sạn thật) — dùng
+    // NGUYÊN VĂN đơn vị MỖI NGƯỜI LỚN (minDailyBudgetFloor/minHotelNightFloor
+    // đều tính theo "VND/ngày/người lớn"), so sánh THẲNG với
+    // earlyRequestedBudget (cũng mỗi người lớn) — không nhân/quy đổi qua số
+    // người ở đây, tránh lệch đơn vị.
+    const earlyAdultCount = Math.max(1, Number(body.adultCount ?? 1));
+    const earlyChildCount = Math.max(0, Number(body.childCount ?? 0));
+    const earlyParticipantCount = earlyAdultCount + earlyChildCount;
+    const earlyRequestedBudget = Number(body.budget ?? 0);
+    if (earlyRequestedBudget > 0) {
+      const costConfig = await this.tripCostConfig.getConfig();
+      const earlyNights = Math.max(1, requestedDays - 1);
+      const minSaneBudget =
+        Math.max(1, costConfig.minDailyBudgetFloor) * requestedDays +
+        Math.max(1, costConfig.minHotelNightFloor) * earlyNights;
+      if (earlyRequestedBudget < minSaneBudget) {
+        throw new UnprocessableEntityException({
+          code: 'BUDGET_TOO_LOW',
+          message:
+            `Ngân sách bạn nhập quá thấp cho ${requestedDays} ngày ` +
+            `(mỗi người lớn). Ngân sách tối thiểu nên khoảng ` +
+            `${Math.round(minSaneBudget).toLocaleString('vi-VN')}đ/người lớn.`,
+          requestedBudget: earlyRequestedBudget,
+          minimumBudget: Math.round(minSaneBudget),
+          requestedDays,
+          participantCount: earlyParticipantCount,
+        });
+      }
+    }
 
     const planStartedAt = Date.now();
-    const plannerEngine = this.plannerEngine;
     const config = await this.twoTowerConfig.getConfig();
 
     // Region-allocation wizard, step 1: always runs before the first real
@@ -236,12 +308,18 @@ export class ItineraryController {
     if (plan?.validation_is_feasible === false && requestedBudget > 0) {
       // A hard budget can leave the solver with zero activities, which the
       // validator reports as no_feasible_activities instead of
-      // budget_exceeded. Confirm the cause by retrying without the cap —
-      // either way, this is the "least bad" plan available, so it becomes
+      // budget_exceeded. Retry anchored to a low but non-zero per-day floor
+      // (thay vì budget=0 hoàn toàn bỏ ràng buộc giá) — daily_budget_soft
+      // + pre-pruning theo giá trong scheduler_v2.py vẫn kích hoạt bình
+      // thường với mốc sàn này, nên plan retry hướng tới rẻ nhất-khả-thi
+      // thay vì tối ưu chất lượng bỏ qua chi phí. Either way, this becomes
       // the plan we validate/persist from here on.
-      const unconstrainedBody = { ...body, budget: 0 };
+      const costConfig = await this.tripCostConfig.getConfig();
+      const floorBudget =
+        Math.max(1, costConfig.minDailyBudgetFloor) * requestedDays;
+      const floorAnchoredBody = { ...body, budget: floorBudget };
       plan = await this.recommendationService.planItinerary(
-        unconstrainedBody,
+        floorAnchoredBody,
         k,
         plannerEngine,
         config,
@@ -256,45 +334,105 @@ export class ItineraryController {
     // tin validation_is_feasible của Python là "chắc chắn trong ngân sách
     // thật" — luôn tự đối chiếu lại bằng calculatePlanEstimatedCost(), đúng
     // công thức NestJS dùng để persist, trước khi coi là an toàn để tạo
-    // lịch trình. Áp dụng cho MỌI plan feasible (lần đầu lẫn lần retry
-    // unconstrained ở trên), không chỉ nhánh Python báo infeasible như
-    // trước — đó là lỗ hổng khiến lịch trình "vừa đủ ngân sách" theo Python
-    // đôi khi vượt ngân sách thật khi lưu mà không có cảnh báo nào.
+    // lịch trình.
+    //
+    // hasUsablePlan chỉ nới lỏng cho ĐÚNG lý do budget_exceeded (xem
+    // assertPlanFeasible's allowBudgetExceeded bên dưới) — vượt ngân sách
+    // (kể cả sau retry mức sàn, budget > 0 nên scheduler vẫn tối ưu theo
+    // hướng rẻ nhất-có-thể) thì plan vẫn nên đưa ra gợi ý ngân sách cho user
+    // chọn thay vì chặn cứng vứt bỏ. Mọi lý do infeasible KHÁC (kể cả khi
+    // không giới hạn ngân sách) vẫn bị chặn như cũ — không được vì "có vài
+    // điểm dùng được" mà lờ đi các vi phạm khác không liên quan tới tiền.
+    const hasUsablePlan = Number((plan as any)?.total_visited ?? 0) > 0;
+
     if (
       requestedBudget > 0 &&
-      plan?.validation_is_feasible !== false &&
+      hasUsablePlan &&
       !body.proceedWithOverBudget
     ) {
+      // childPriceRatio/transportMode/tripCostConfig bắt buộc truyền vào —
+      // thiếu childPriceRatio thì bỏ qua tỉ lệ giá trẻ em; thiếu 2 cái sau
+      // thì calculatePlanEstimatedCost không tính lại được transport cost
+      // bằng đúng công thức NestJS dùng lúc persist (xem
+      // derivePlanCostComponents), khiến calculatedCost thấp hơn thật.
+      const costConfigForCalc = await this.tripCostConfig.getConfig();
+      // calculatedCost/requestedBudget đều là đơn vị MỖI NGƯỜI LỚN — so
+      // sánh thẳng, không quy đổi qua tổng nhóm.
       const calculatedCost = this.service.calculatePlanEstimatedCost(
         plan as any,
         adultCount,
         childCount,
+        costConfigForCalc.childPriceRatio,
+        body.transportMode,
+        costConfigForCalc,
       );
       if (calculatedCost > requestedBudget) {
         const recommendedBudget = this.service.calculateRecommendedBudget(
           plan as any,
           adultCount,
           childCount,
+          costConfigForCalc.childPriceRatio,
+          body.transportMode,
+          costConfigForCalc,
         );
         const participantCount = Math.max(1, adultCount + childCount);
+        const confirmToken = randomUUID();
+        await this.cache.set(
+          `${ITINERARY_PLAN_CONFIRM_PREFIX}:${confirmToken}`,
+          plan,
+          ITINERARY_PLAN_CONFIRM_TTL_MS,
+        );
         throw new UnprocessableEntityException({
           code: 'BUDGET_CONFIRMATION_REQUIRED',
-          message:
-            'Ngân sách đã nhập chưa đủ cho một lịch trình phù hợp. Bạn có muốn dùng mức ngân sách ước tính được đề xuất không?',
+          // Câu ngắn, không nhắc lại "mức chi phí khác bên dưới" mơ hồ — số
+          // cụ thể (recommendedBudget) do CLIENT tự chèn vào câu (xem
+          // _showBudgetConfirmationDialog), tránh lặp ý khi ghép 2 câu lại.
+          message: 'Không tìm thấy lịch trình phù hợp với ngân sách bạn đã nhập.',
           userBudget: requestedBudget,
           calculatedCost,
           reserveRate: 0.1,
           recommendedBudget,
           participantCount,
+          confirmToken,
         });
       }
     }
 
     const planTimeMs = Date.now() - planStartedAt;
+    // Luôn gọi assertPlanFeasible — nó tự no-op nếu plan thật sự feasible.
+    // Chỉ nới lỏng riêng cho lý do budget_exceeded khi plan có nội dung
+    // dùng được (đã qua nhánh gợi ý ngân sách ở trên, hoặc requestedBudget=0
+    // nên budget_exceeded không thể xảy ra) — mọi lý do infeasible khác vẫn
+    // bị chặn đúng như trước, không phân biệt có giới hạn ngân sách hay không.
     if (!body.proceedWithOverBudget) {
-      this.assertPlanFeasible(plan, plannerEngine);
+      this.assertPlanFeasible(plan, plannerEngine, {
+        allowBudgetExceeded: hasUsablePlan,
+      });
     }
 
+    return this.persistAndRespond(
+      body,
+      plan,
+      plannerEngine,
+      startedAt,
+      planTimeMs,
+      requestedDays,
+      k,
+    );
+  }
+
+  /** Lưu plan (đã feasible/đã được user xác nhận) và dựng response chung
+   * cho cả flow tạo mới lẫn flow xác nhận qua confirmToken (không chạy lại
+   * planner) — xem nhánh `body.confirmToken` ở đầu plan(). */
+  private async persistAndRespond(
+    body: CreateItineraryDto,
+    plan: any,
+    plannerEngine: PlannerEngine,
+    startedAt: number,
+    planTimeMs: number,
+    requestedDays: number,
+    k: number,
+  ) {
     const persistStartedAt = Date.now();
     const created = await this.service.createGeneratedItinerary(
       body,
@@ -761,7 +899,11 @@ export class ItineraryController {
     return Math.min(200, Math.max(60, numDays * 20));
   }
 
-  private assertPlanFeasible(plan: any, engine: string): void {
+  private assertPlanFeasible(
+    plan: any,
+    engine: string,
+    options?: { allowBudgetExceeded?: boolean },
+  ): void {
     if (plan?.validation_is_feasible !== false) {
       return;
     }
@@ -771,6 +913,19 @@ export class ItineraryController {
     const budgetViolation = violations.find(
       (violation: any) => violation?.violation_type === 'budget_exceeded',
     );
+    // Lý do infeasible DUY NHẤT là vượt ngân sách, và caller đã xử lý (gợi ý
+    // ngân sách đề xuất) hoặc không áp dụng (requestedBudget<=0) — không
+    // chặn ở đây nữa. Mọi lý do khác (kể cả có budgetViolation kèm theo)
+    // vẫn chặn bình thường.
+    if (
+      options?.allowBudgetExceeded &&
+      budgetViolation &&
+      violations.every(
+        (violation: any) => violation?.violation_type === 'budget_exceeded',
+      )
+    ) {
+      return;
+    }
     const emptyViolation = violations.find(
       (violation: any) =>
         violation?.violation_type === 'no_feasible_activities',

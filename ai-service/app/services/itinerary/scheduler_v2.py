@@ -391,13 +391,20 @@ class SchedulerV2Planner:
         self.assignment_result = self._preallocate_days()
         self._ensure_restaurant_coverage()
 
-    # Mỗi ngày nên có dư hơn 1 ứng viên nhà hàng — không chỉ đủ cho bữa
-    # trưa, mà còn có lựa chọn cho bữa tối nếu lịch tham quan rơi vào
-    # khoảng chiều/tối (xem _ensure_restaurant_coverage()).
-    MIN_RESTAURANT_CANDIDATES_PER_DAY = 2
+    # Kích thước POOL ứng viên nhà hàng mỗi ngày (không phải số quán sẽ được
+    # xếp vào lịch — việc đó vẫn giới hạn ≤2/ngày ở _apply_restaurant_
+    # constraints). Pool rộng hơn 2 để pre-pruning theo giá ở
+    # _solve_day_with_fallback() có nhiều lựa chọn giá đa dạng để giữ lại,
+    # thay vì chỉ có đúng 2 ứng viên (dễ bị lọc sạch nếu cả 2 đều hơi đắt).
+    RESTAURANT_CANDIDATE_POOL_SIZE = 5
     # Bán kính tìm quán ăn dự phòng (km), tăng dần — luôn ưu tiên quán gần
     # trước, chỉ nới rộng ra khi bán kính nhỏ hơn không tìm đủ số lượng cần.
     RESTAURANT_FALLBACK_RADII_KM = (3.0, 7.0, 15.0)
+    # Pre-pruning theo giá (xem _solve_day_with_fallback) luôn giữ lại N quán
+    # ăn RẺ NHẤT trong pool của ngày, bất kể có vượt ngưỡng 1.5x ngân sách hay
+    # không — khớp với giới hạn tối đa 2 bữa/ngày, để một ngày không bao giờ
+    # mất sạch ứng viên nhà hàng chỉ vì giá.
+    RESTAURANT_PRICE_PRUNE_MIN_KEEP = 2
     NO_LUNCH_MESSAGE = (
         "Khu vực này không có quán ăn phù hợp gần lịch trình vì thời gian và "
         "tuyến đường không đủ thuận tiện — bạn có thể ăn nhẹ trên xe."
@@ -412,7 +419,7 @@ class SchedulerV2Planner:
     )
 
     def _ensure_restaurant_coverage(self) -> None:
-        """Đảm bảo mỗi day_pool có tối thiểu MIN_RESTAURANT_CANDIDATES_PER_DAY
+        """Đảm bảo mỗi day_pool có tối thiểu RESTAURANT_CANDIDATE_POOL_SIZE
         ứng viên nhà hàng.
 
         geo_clustering._inject_restaurants() chỉ gán nhà hàng theo sở thích/
@@ -438,7 +445,7 @@ class SchedulerV2Planner:
 
         for pool in self.assignment_result.day_pools:
             existing = pool.get("restaurants") or []
-            need = self.MIN_RESTAURANT_CANDIDATES_PER_DAY - len(existing)
+            need = self.RESTAURANT_CANDIDATE_POOL_SIZE - len(existing)
             if need <= 0:
                 continue
 
@@ -536,10 +543,32 @@ class SchedulerV2Planner:
                 model.AddImplication(dinner_flag, selected[node])
                 dinner_flags.append(dinner_flag)
 
+            # Chiều NGƯỢC LẠI — trước đây thiếu: lunch_flag/dinner_flag chỉ
+            # ép "nếu bật cờ thì phải được chọn + đúng khung giờ", nhưng
+            # KHÔNG ép "nếu được chọn thì phải bật 1 trong 2 cờ". Một nhà
+            # hàng vẫn có thể bị chọn mà chẳng gắn cờ nào — solver coi nó như
+            # 1 điểm tham quan bình thường, ghé giờ tuỳ ý (VD 08:05 sáng),
+            # không tính là bữa trưa hay tối nào cả. Thêm ràng buộc 2 chiều
+            # dưới đây để "được chọn" LUÔN đi kèm đúng 1 khung giờ ăn.
             if lunch_flag is not None and dinner_flag is not None:
                 # Quán mở đủ dài cho cả 2 khung giờ — 1 lần ghé chỉ được
-                # TÍNH là 1 trong 2 bữa, không phải cả 2.
+                # TÍNH là 1 trong 2 bữa, không phải cả 2, nhưng bắt buộc phải
+                # là 1 trong 2 nếu đã chọn.
                 model.Add(lunch_flag + dinner_flag <= 1)
+                model.Add(lunch_flag + dinner_flag >= 1).OnlyEnforceIf(
+                    selected[node]
+                )
+            elif lunch_flag is not None:
+                # Chỉ khả thi bữa trưa — được chọn thì bắt buộc đúng khung
+                # trưa (kết hợp AddImplication ở trên thành 2 chiều).
+                model.AddImplication(selected[node], lunch_flag)
+            elif dinner_flag is not None:
+                model.AddImplication(selected[node], dinner_flag)
+            else:
+                # Giờ mở cửa lệch cả 2 khung ăn (VD chỉ mở 14:00-17:00) —
+                # không cho chọn làm "bữa ăn" luôn, tránh ghé tuỳ ý ngoài giờ
+                # ăn mà vẫn tính là đã "có nhà hàng" cho ngày đó.
+                model.Add(selected[node] == 0)
 
         if enforce_lunch and lunch_flags:
             model.Add(sum(lunch_flags) >= 1)
@@ -811,12 +840,34 @@ class SchedulerV2Planner:
     ) -> planner.GAResult:
         """Solve one day while relaxing only constraints that caused failure."""
         # PRE-PRUNING
+        # Quán ăn rẻ nhất trong pool luôn được giữ lại bất kể ngưỡng giá bên
+        # dưới — tránh trường hợp mọi ứng viên nhà hàng của ngày (kể cả các
+        # ứng viên vừa được _ensure_restaurant_coverage() tiêm vào) đều bị
+        # lọc sạch chỉ vì hơi đắt, khiến ngày mất hẳn bữa ăn dù khu vực vẫn
+        # có quán rẻ hơn phù hợp.
+        cheapest_restaurant_ids = {
+            p.id
+            for p in sorted(
+                (p for p in pois if p.place_type == "restaurant"),
+                key=lambda p: getattr(p, "estimated_cost", 0),
+            )[: self.RESTAURANT_PRICE_PRUNE_MIN_KEEP]
+        }
+
         pruned_pois = []
         for p in pois:
             if p.open_time >= self.day_end_time or p.close_time <= self.day_start_time:
                 continue
+            if p.place_type == "restaurant" and p.id in cheapest_restaurant_ids:
+                pruned_pois.append(p)
+                continue
             p_cost = getattr(p, "estimated_cost", 0)
             if self.trip_budget_total > 0 and p_cost > self.daily_budget_soft * 1.5:
+                if p.place_type == "restaurant":
+                    # Quán ăn: chỉ lọc theo bán kính + giá, không exempt theo
+                    # two_tower_score — tiêu chí đó phản ánh chất lượng/xếp
+                    # hạng tham quan nói chung, không liên quan đến việc đảm
+                    # bảo ngày này có bữa ăn.
+                    continue
                 total = max(1, p.candidate_total)
                 bounded_rank = min(max(p.candidate_rank, 0), total - 1)
                 rank_score = 1.0 - (bounded_rank / total)
@@ -2199,6 +2250,9 @@ class SchedulerV2Planner:
             if hotel.estimated_cost > 0
             else planner.FALLBACK_HOTEL_COST_PER_NIGHT / planner.ROOM_CAPACITY
         )
+        # Luôn tính tối thiểu 1 đêm, kể cả chuyến 1 ngày — đảm bảo lịch trình
+        # nào cũng có 1 khoản lưu trú thật (xem planner.py's
+        # TripPlanner._hotel_total_cost, cùng công thức).
         nights = max(1, self.num_days - 1)
         return per_person_nightly * nights * self.full_people
 

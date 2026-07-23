@@ -1180,13 +1180,20 @@ export class ItineraryTrackingService {
     const { data: itinerary, error } = await supabase
       .schema('travel')
       .from('itineraries')
-      .select('id, description, destination')
+      .select('id, description, destination, creator_id')
       .eq('id', itineraryId)
       .maybeSingle();
     if (error || !itinerary) return;
 
-    const breakdown =
-      await this.incurredCostsService.computeCostBreakdown(itineraryId);
+    // computeCostBreakdown() giờ bắt buộc userId để kiểm tra quyền (dữ liệu
+    // chi tiêu cá nhân, chỉ thành viên mới xem được) — cuộc gọi này là tác
+    // vụ HỆ THỐNG (khi lịch trình chuyển "completed"), không gắn với người
+    // dùng cụ thể nào đang request, nên dùng creator_id (luôn là thành viên
+    // hợp lệ) làm danh tính nội bộ, không phải bỏ qua kiểm tra quyền.
+    const breakdown = await this.incurredCostsService.computeCostBreakdown(
+      itineraryId,
+      (itinerary as any).creator_id,
+    );
     const itineraryTitle =
       (itinerary as any).description ||
       (itinerary as any).destination ||
