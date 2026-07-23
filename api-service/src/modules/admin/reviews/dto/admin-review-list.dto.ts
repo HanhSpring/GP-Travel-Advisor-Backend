@@ -43,6 +43,12 @@ export class AdminReviewListItemDto {
   @ApiProperty({ enum: ['pending', 'approved', 'violation', 'hidden'] })
   status: 'pending' | 'approved' | 'violation' | 'hidden';
 
+  @ApiProperty({ nullable: true, type: String })
+  hidden_reason: string | null;
+
+  @ApiProperty({ nullable: true, type: String })
+  hidden_at: string | null;
+
   @ApiProperty()
   created_at: string;
 

@@ -16,6 +16,8 @@ interface ReviewRow {
   review_type: string;
   status: 'pending' | 'approved' | 'violation' | 'hidden';
   violation_reason?: string | null;
+  hidden_reason?: string | null;
+  hidden_at?: string | null;
   url_image?: unknown;
 }
 
@@ -319,7 +321,7 @@ export class AdminReviewsService {
         .schema('review_ai')
         .from('reviews')
         .select(
-          'id, tourist_id, place_id, rating, created_at, review_type, status, url_image',
+          'id, tourist_id, place_id, rating, created_at, review_type, status, hidden_reason, hidden_at, url_image',
           { count: 'exact' },
         );
 
@@ -555,6 +557,8 @@ export class AdminReviewsService {
           main_topic: content?.main_topic ?? null,
           time_label: content?.time_label ?? null,
           status: review.status,
+          hidden_reason: review.hidden_reason ?? null,
+          hidden_at: review.hidden_at ?? null,
           created_at: review.created_at,
           has_images: this.normalizeMediaUrls(review.url_image).length > 0,
         };
@@ -585,7 +589,7 @@ export class AdminReviewsService {
         .schema('review_ai')
         .from('reviews')
         .select(
-          'id, tourist_id, place_id, rating, created_at, review_type, status, violation_reason, url_image',
+          'id, tourist_id, place_id, rating, created_at, review_type, status, violation_reason, hidden_reason, hidden_at, url_image',
         )
         .eq('id', reviewId)
         .single();
@@ -699,6 +703,8 @@ export class AdminReviewsService {
         images: this.normalizeMediaUrls(review.url_image).map((url) => ({ url })),
         status: review.status,
         violation_reason: review.violation_reason ?? null,
+        hidden_reason: review.hidden_reason ?? null,
+        hidden_at: review.hidden_at ?? null,
         created_at: review.created_at,
       };
     } catch (error) {
@@ -722,6 +728,21 @@ export class AdminReviewsService {
     }
 
     try {
+      const { data: currentReview, error: currentReviewError } = await supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('id, status')
+        .eq('id', reviewId)
+        .maybeSingle();
+
+      if (currentReviewError) throw currentReviewError;
+      if (!currentReview) throw new BadRequestException('Review not found');
+      if ((currentReview as Pick<ReviewRow, 'status'>).status === 'hidden') {
+        throw new BadRequestException(
+          'Hidden reviews must be made visible before changing moderation status',
+        );
+      }
+
       const updatePayload: Record<string, unknown> = { status };
       if (status === 'violation' && reason) {
         updatePayload.violation_reason = reason;
@@ -731,7 +752,8 @@ export class AdminReviewsService {
         .schema('review_ai')
         .from('reviews')
         .update(updatePayload)
-        .eq('id', reviewId);
+        .eq('id', reviewId)
+        .neq('status', 'hidden');
 
       if (error) throw error;
 
@@ -740,8 +762,101 @@ export class AdminReviewsService {
         message: `Review ${status === 'approved' ? 'approved' : 'marked as violation'} successfully`,
       };
     } catch (error) {
+      if (error instanceof BadRequestException) throw error;
       console.error('Error updating review status:', error);
       throw new InternalServerErrorException('Failed to update review status');
+    }
+  }
+
+  async hideReview(
+    reviewId: string,
+    reason: string,
+  ): Promise<{ success: boolean; message: string }> {
+    if (!reviewId) throw new BadRequestException('Review ID is required');
+
+    const normalizedReason = reason?.trim();
+    if (!normalizedReason) {
+      throw new BadRequestException('Reason is required to hide a review');
+    }
+
+    try {
+      const { data: review, error: reviewError } = await supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('id, status')
+        .eq('id', reviewId)
+        .maybeSingle();
+
+      if (reviewError) throw reviewError;
+      if (!review) throw new BadRequestException('Review not found');
+      if ((review as Pick<ReviewRow, 'status'>).status === 'hidden') {
+        throw new BadRequestException('Review is already hidden');
+      }
+
+      const { error } = await supabase
+        .schema('review_ai')
+        .from('reviews')
+        .update({
+          status: 'hidden',
+          hidden_reason: normalizedReason,
+          hidden_at: new Date().toISOString(),
+        })
+        .eq('id', reviewId)
+        .neq('status', 'hidden');
+
+      if (error) throw error;
+
+      return {
+        success: true,
+        message: 'Review hidden successfully',
+      };
+    } catch (error) {
+      if (error instanceof BadRequestException) throw error;
+      console.error('Error hiding review:', error);
+      throw new InternalServerErrorException('Failed to hide review');
+    }
+  }
+
+  async unhideReview(
+    reviewId: string,
+  ): Promise<{ success: boolean; message: string }> {
+    if (!reviewId) throw new BadRequestException('Review ID is required');
+
+    try {
+      const { data: review, error: reviewError } = await supabase
+        .schema('review_ai')
+        .from('reviews')
+        .select('id, status')
+        .eq('id', reviewId)
+        .maybeSingle();
+
+      if (reviewError) throw reviewError;
+      if (!review) throw new BadRequestException('Review not found');
+      if ((review as Pick<ReviewRow, 'status'>).status !== 'hidden') {
+        throw new BadRequestException('Only hidden reviews can be made visible');
+      }
+
+      const { error } = await supabase
+        .schema('review_ai')
+        .from('reviews')
+        .update({
+          status: 'approved',
+          hidden_reason: null,
+          hidden_at: null,
+        })
+        .eq('id', reviewId)
+        .eq('status', 'hidden');
+
+      if (error) throw error;
+
+      return {
+        success: true,
+        message: 'Review made visible successfully',
+      };
+    } catch (error) {
+      if (error instanceof BadRequestException) throw error;
+      console.error('Error unhiding review:', error);
+      throw new InternalServerErrorException('Failed to make review visible');
     }
   }
 
@@ -792,6 +907,11 @@ export class AdminReviewsService {
 
       if (reviewError) throw reviewError;
       if (!review) throw new BadRequestException('Review not found');
+      if ((review as ReviewRow).status === 'hidden') {
+        throw new BadRequestException(
+          'Hidden reviews must be made visible before changing time label',
+        );
+      }
       if ((review as ReviewRow).review_type !== 'with_content') {
         throw new BadRequestException(
           'Only reviews with content can be classified',

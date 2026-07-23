@@ -4549,7 +4549,7 @@ def _content_review_ids(client, content_ids: List[str]) -> List[str]:
 
 
 def _expired_short_term_review_ids(client, now_iso: str) -> List[str]:
-    """Load every expired short-term review, including old processed rows."""
+    """Load expired short-term reviews that are still approved."""
     review_ids: List[str] = []
     offset = 0
     while True:
@@ -4557,9 +4557,10 @@ def _expired_short_term_review_ids(client, now_iso: str) -> List[str]:
             client
             .schema("review_ai")
             .from_("review_contents")
-            .select("review_id")
+            .select("review_id,reviews!inner(status)")
             .eq("time_label", "short-term")
             .lte("expiration_date", now_iso)
+            .eq("reviews.status", "approved")
             .range(offset, offset + _DB_BATCH - 1)
             .execute()
         )
@@ -4617,17 +4618,33 @@ def apply_algorithm3_db_updates(
     hidden_long_term_review_ids = _content_review_ids(
         client, hidden_long_term_content_ids
     )
-    hidden_review_ids = list(
-        dict.fromkeys([*expired_review_ids, *hidden_long_term_review_ids])
-    )
-
-    for i in range(0, len(hidden_review_ids), _DB_BATCH):
-        chunk = hidden_review_ids[i : i + _DB_BATCH]
+    for i in range(0, len(expired_review_ids), _DB_BATCH):
+        chunk = expired_review_ids[i : i + _DB_BATCH]
         (
             client
             .schema("review_ai")
             .from_("reviews")
-            .update({"status": "hidden"})
+            .update({
+                "status": "hidden",
+                "hidden_reason": "Đánh giá ngắn hạn đã hết hiệu lực",
+                "hidden_at": now_iso,
+            })
+            .eq("status", "approved")
+            .in_("id", chunk)
+            .execute()
+        )
+
+    for i in range(0, len(hidden_long_term_review_ids), _DB_BATCH):
+        chunk = hidden_long_term_review_ids[i : i + _DB_BATCH]
+        (
+            client
+            .schema("review_ai")
+            .from_("reviews")
+            .update({
+                "status": "hidden",
+                "hidden_reason": "Đánh giá dài hạn này đã được thay thế bởi bản tổng hợp dài hạn mới",
+                "hidden_at": now_iso,
+            })
             .in_("id", chunk)
             .execute()
         )
@@ -4639,7 +4656,11 @@ def apply_algorithm3_db_updates(
             client
             .schema("review_ai")
             .from_("reviews")
-            .update({"status": "approved"})
+            .update({
+                "status": "approved",
+                "hidden_reason": None,
+                "hidden_at": None,
+            })
             .eq("status", "hidden")
             .in_("id", chunk)
             .execute()
