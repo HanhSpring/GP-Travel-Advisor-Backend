@@ -205,6 +205,19 @@ export class CreateItineraryDto {
   @IsBoolean({ message: 'proceedWithOverBudget phải là true/false' })
   proceedWithOverBudget?: boolean;
 
+  // 1b-2. TOKEN XÁC NHẬN NGÂN SÁCH (từ lỗi BUDGET_CONFIRMATION_REQUIRED)
+  // Gửi lại đúng token nhận được ở response 422 trước đó — nếu hợp lệ,
+  // backend dùng thẳng plan đã tính sẵn (cache tạm), bỏ qua chạy lại toàn
+  // bộ thuật toán lập lịch trình.
+  @ApiPropertyOptional({
+    example: 'a1b2c3d4-e5f6-7890-abcd-ef1234567890',
+    description:
+      'Token nhận từ lỗi BUDGET_CONFIRMATION_REQUIRED — nếu gửi kèm, backend dùng thẳng plan đã tính sẵn, bỏ qua chạy lại thuật toán.',
+  })
+  @IsOptional()
+  @IsString()
+  confirmToken?: string;
+
   // 1c. KẾT QUẢ WIZARD PHÂN BỔ VÙNG (REGION_ALLOCATION_REQUIRED)
   // Gửi lại sau khi client đã hiển thị màn hình phân bổ vùng và người dùng
   // đã chốt số ngày cho từng vùng qua stepper. Vùng có days=0 (hoặc không

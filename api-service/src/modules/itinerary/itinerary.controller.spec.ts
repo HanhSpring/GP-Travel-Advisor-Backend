@@ -6,6 +6,7 @@ import { ConfigService } from '@nestjs/config';
 import { ItineraryController } from './itinerary.controller';
 import { RecommendationService } from '../recommendation/recommendation.service';
 import { TwoTowerConfigService } from '../recommendation/two-tower-config.service';
+import { TripCostConfigService } from '../recommendation/trip-cost-config.service';
 import { ItineraryService } from './itinerary.service';
 import { CreateItineraryDto } from './dto/create-itinerary.dto';
 import {
@@ -52,7 +53,13 @@ describe('ItineraryController — nối TwoTowerConfigService vào retrieval th�
     detectRegions: jest.Mock;
   };
   let twoTowerConfig: { getConfig: jest.Mock };
-  let itineraryService: { createGeneratedItinerary: jest.Mock };
+  let tripCostConfig: { getConfig: jest.Mock };
+  let cache: { get: jest.Mock; set: jest.Mock; del: jest.Mock };
+  let itineraryService: {
+    createGeneratedItinerary: jest.Mock;
+    calculatePlanEstimatedCost: jest.Mock;
+    calculateRecommendedBudget: jest.Mock;
+  };
   let configService: { get: jest.Mock };
 
   beforeEach(() => {
@@ -75,12 +82,24 @@ describe('ItineraryController — nối TwoTowerConfigService vào retrieval th�
     twoTowerConfig = {
       getConfig: jest.fn().mockResolvedValue(adminEditedConfig),
     };
+    tripCostConfig = {
+      getConfig: jest.fn().mockResolvedValue({ minDailyBudgetFloor: 300_000 }),
+    };
+    cache = {
+      get: jest.fn().mockResolvedValue(undefined),
+      set: jest.fn().mockResolvedValue(undefined),
+      del: jest.fn().mockResolvedValue(undefined),
+    };
     itineraryService = {
       createGeneratedItinerary: jest.fn().mockResolvedValue({
         id: 'itin-1',
         status: 'pending',
         totalDetails: 6,
       }),
+      // Dưới ngân sách mặc định của `dto` (5_000_000) để các test hiện có
+      // không rơi vào nhánh BUDGET_CONFIRMATION_REQUIRED ngoài ý muốn.
+      calculatePlanEstimatedCost: jest.fn().mockReturnValue(1_000_000),
+      calculateRecommendedBudget: jest.fn().mockReturnValue(2_000_000),
     };
     configService = { get: jest.fn().mockReturnValue(undefined) };
 
@@ -88,6 +107,8 @@ describe('ItineraryController — nối TwoTowerConfigService vào retrieval th�
       itineraryService as unknown as ItineraryService,
       recommendationService as unknown as RecommendationService,
       twoTowerConfig as unknown as TwoTowerConfigService,
+      tripCostConfig as unknown as TripCostConfigService,
+      cache as any,
       configService as unknown as ConfigService,
     );
   });

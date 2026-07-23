@@ -366,7 +366,7 @@ export class IncurredCostsService {
     const { data: detail, error } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('place_id, estimated_cost, visit_date')
+      .select('place_id, estimated_cost, visit_date, detail_type')
       .eq('id', itineraryDetailId)
       .eq('itinerary_id', itineraryId)
       .maybeSingle();
@@ -377,6 +377,15 @@ export class IncurredCostsService {
     }
     const placeId = (detail as any)?.place_id;
     if (!placeId) return; // Không có place_id (vd điểm ảo start point) — bỏ qua.
+    // "Chi phí kế hoạch" là TYPE cố định (ràng buộc CHECK ở DB, dùng để lọc/
+    // phân loại xuyên suốt hệ thống) — không đổi được. Nhưng NOTE (text tự
+    // do) trước đây dùng chung 1 câu mơ hồ cho MỌI loại địa điểm, khiến
+    // khoản chi khách sạn hiện lên y hệt 1 vé tham quan, người dùng không rõ
+    // đang trả tiền cho cái gì. Tách riêng câu cho khách sạn.
+    const isHotel = (detail as any)?.detail_type === 'HOTEL';
+    const baselineNote = isHotel
+      ? 'Chi phí khách sạn (tự động khi check-in)'
+      : 'Chi phí kế hoạch (tự động khi check-in)';
 
     // day_number = ngày thứ N thật sự visited — để computeDayCostBreakdown()
     // lọc thẳng theo cột này thay vì suy ngược qua visit_date mỗi lần đọc.
@@ -429,7 +438,7 @@ export class IncurredCostsService {
         place_id: placeId,
         day_number: dayNumber,
         type: CostType.CHI_PHI_KE_HOACH,
-        note: 'Chi phí kế hoạch (tự động khi check-in)',
+        note: baselineNote,
         amount: Math.round(amount / 1000) * 1000,
         charged_to: [],
         created_by: touristId,
@@ -439,6 +448,170 @@ export class IncurredCostsService {
         `Failed to record baseline expense: ${insertError.message}`,
       );
     }
+  }
+
+  /**
+   * Ghi/GHI ĐÈ dòng "Chi phí kế hoạch" bằng tổng tiền 1 đơn đặt món đã
+   * HOÀN TẤT (order_sys.orders.status = 'completed') — vì đây là giá THẬT
+   * đã trả, chính xác hơn estimated_cost gốc lúc lập kế hoạch. Gọi từ
+   * OrdersCompletionCron ngay sau khi cron chuyển đơn sang completed (không
+   * gọi lúc pending — tránh phải hoàn tác nếu đơn bị huỷ giữa chừng).
+   *
+   * KHÔNG đụng itinerary_details.estimated_cost (cột "kế hoạch", phải đứng
+   * yên) — ghi vào đúng dòng "giá hiệu lực" mà updatePlaceEffectivePrice()
+   * dùng, để không có 2 nguồn khác nhau cho cùng khái niệm "giá hiệu lực".
+   *
+   * Dùng CHUNG khoá dedupe (itinerary_id, place_id) với
+   * recordVisitBaselineExpense() — nên dù đơn đặt món hoàn tất TRƯỚC hay
+   * SAU khi check-in tại quán, đều cùng ghi vào đúng 1 dòng: nếu chưa có
+   * (đặt món trước khi tới quán) thì tạo mới; nếu đã có (check-in trước,
+   * đã tự ghi theo giá kế hoạch) thì GHI ĐÈ bằng giá đơn hàng thật — chỉ
+   * ghi đè khi có đơn thật, không có chiều ngược lại (check-in không bao
+   * giờ ghi đè lên giá đã chốt từ đơn hàng).
+   *
+   * orderTotalAmount là tổng đơn CHO CẢ NHÓM (thường đặt 1 lần cho cả bàn),
+   * trong khi cột "amount" của Chi phí kế hoạch được toàn hệ thống quy ước
+   * là PER-ADULT (giống estimated_cost gốc — xem computeActualSpending()
+   * nhân lại theo adultCount + childPriceRatio×childCount). Nếu ghi thẳng
+   * tổng đơn vào đó, chỗ nhân lại phía dưới sẽ nhân đúp — y hệt bug khách
+   * sạn trước đây. Nên phải chia ngược tổng đơn cho "đầu người quy đổi"
+   * (người lớn tính 1, trẻ em tính childPriceRatio) để ra đúng per-adult
+   * tương đương, thì công thức nhân lại ở downstream mới tái tạo đúng lại
+   * tổng đơn ban đầu, không nhân đúp.
+   */
+  async recordOrderCompletedExpense(
+    itineraryId: string,
+    placeId: string,
+    touristId: string,
+    orderTotalAmount: number,
+    dayNumber: number | null,
+    adultCount: number,
+    childCount: number,
+  ): Promise<void> {
+    const { childPriceRatio } = await this.tripCostConfig.getConfig();
+    const weightedHeadcount = Math.max(
+      1,
+      adultCount + childPriceRatio * childCount,
+    );
+    const perAdultEquivalent = orderTotalAmount / weightedHeadcount;
+    const amount = Math.round(Math.max(0, perAdultEquivalent) / 1000) * 1000;
+    if (amount <= 0) return;
+
+    const { data: existing, error: existingError } = await supabase
+      .schema('travel')
+      .from('incurred_costs')
+      .select('id')
+      .eq('itinerary_id', itineraryId)
+      .eq('place_id', placeId)
+      .eq('type', CostType.CHI_PHI_KE_HOACH)
+      .maybeSingle();
+    if (existingError) {
+      throw new InternalServerErrorException(
+        `Failed to check existing baseline expense: ${existingError.message}`,
+      );
+    }
+
+    if (existing) {
+      const { error: updateError } = await supabase
+        .schema('travel')
+        .from('incurred_costs')
+        .update({
+          amount,
+          note: 'Chi phí kế hoạch (từ đơn đặt món đã hoàn tất)',
+          updated_at: new Date().toISOString(),
+          updated_by: touristId,
+        })
+        .eq('id', (existing as any).id);
+      if (updateError) {
+        throw new InternalServerErrorException(
+          `Failed to update baseline expense from order: ${updateError.message}`,
+        );
+      }
+      return;
+    }
+
+    const { error: insertError } = await supabase
+      .schema('travel')
+      .from('incurred_costs')
+      .insert({
+        itinerary_id: itineraryId,
+        place_id: placeId,
+        day_number: dayNumber,
+        type: CostType.CHI_PHI_KE_HOACH,
+        note: 'Chi phí kế hoạch (từ đơn đặt món đã hoàn tất)',
+        amount,
+        charged_to: [],
+        created_by: touristId,
+      });
+    if (insertError) {
+      throw new InternalServerErrorException(
+        `Failed to record baseline expense from order: ${insertError.message}`,
+      );
+    }
+  }
+
+  /**
+   * Wrapper của recordOrderCompletedExpense() — tự tra itinerary_id/visit_date
+   * (để suy dayNumber) + adult_count/children_count từ order.itinerary_detail_id,
+   * rồi mới gọi hàm ghi chi phí ở trên. TÁCH RA thành hàm dùng chung (thay vì
+   * chỉ nằm trong OrdersCompletionCron) vì đơn có thể chuyển sang "completed"
+   * qua 2 đường: (1) cron tự động sau auto_complete_at, (2) chủ quán bấm
+   * "Hoàn tất" tay qua business.service.ts's updateOrderStatus() — trước đây
+   * chỉ đường (1) gọi hàm ghi chi phí, đường (2) hoàn toàn bỏ qua, khiến đơn
+   * hoàn tất tay không bao giờ lên "Chi phí kế hoạch" của lịch trình.
+   */
+  async recordCompletedOrderExpense(order: {
+    id: string;
+    place_id: string | null;
+    tourist_id: string | null;
+    total_amount: number | null;
+    itinerary_detail_id: string | null;
+  }): Promise<void> {
+    if (!order.itinerary_detail_id || !order.place_id || !order.tourist_id) {
+      return;
+    }
+
+    const { data: detail, error: detailError } = await supabase
+      .schema('travel')
+      .from('itinerary_details')
+      .select('itinerary_id, visit_date')
+      .eq('id', order.itinerary_detail_id)
+      .maybeSingle<{ itinerary_id: string; visit_date: string | null }>();
+    if (detailError || !detail) return;
+
+    const { data: itinerary } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('start_date, adult_count, children_count')
+      .eq('id', detail.itinerary_id)
+      .maybeSingle<{
+        start_date: string | null;
+        adult_count: number | null;
+        children_count: number | null;
+      }>();
+
+    let dayNumber: number | null = null;
+    const startDate = itinerary?.start_date;
+    if (detail.visit_date && startDate) {
+      dayNumber =
+        Math.round(
+          (new Date(detail.visit_date).getTime() -
+            new Date(startDate).getTime()) /
+            86_400_000,
+        ) + 1;
+    }
+    const adultCount = Math.max(0, Number(itinerary?.adult_count ?? 0)) || 1;
+    const childCount = Math.max(0, Number(itinerary?.children_count ?? 0));
+
+    await this.recordOrderCompletedExpense(
+      detail.itinerary_id,
+      order.place_id,
+      order.tourist_id,
+      Number(order.total_amount ?? 0),
+      dayNumber,
+      adultCount,
+      childCount,
+    );
   }
 
   /** Danh sách địa điểm đã "visited" trong lịch trình — dùng cho combobox. */
@@ -946,7 +1119,7 @@ export class IncurredCostsService {
     };
   }
 
-  async computeCostBreakdown(itineraryId: string): Promise<{
+  async computeCostBreakdown(itineraryId: string, userId: string): Promise<{
     memberTotals: Array<{
       userId: string;
       fullName: string;
@@ -982,6 +1155,12 @@ export class IncurredCostsService {
     hotelCostPerAdult: number;
     hotelCostPerChild: number;
     transportPerAdult: number;
+    // Chủ lịch trình ĐÃ ghi ≥1 lần "Điều chỉnh xăng xe" thực tế hay chưa —
+    // false nghĩa là transportPerAdult vẫn chỉ là số ƯỚC TÍNH (chưa ai thật
+    // sự chi tiêu), UI dùng để ẩn/làm rõ con số này cho tới khi lịch trình
+    // hoàn tất, tránh hiển thị 1 số tưởng là "đã tiêu" nhưng thực ra là dự
+    // đoán, khiến người dùng không rõ nó đang tính cho việc gì.
+    transportIsActual: boolean;
     // Minh bạch cho UI: hiển thị rõ "Địa điểm/Lưu trú trẻ em = người lớn ×
     // childPriceRatio" thay vì chỉ hiện số trẻ em không rõ căn cứ.
     childPriceRatio: number;
@@ -992,6 +1171,15 @@ export class IncurredCostsService {
     childCount: number;
   }> {
     const ctx = await this.loadAccessContext(itineraryId);
+    // Chỉ CHI PHÍ PHÁT SINH THỰC TẾ (bảng incurred_costs — ai chi bao nhiêu,
+    // cho việc gì) mới là dữ liệu CÁ NHÂN của nhóm, cần giới hạn chỉ chủ lịch
+    // trình + thành viên được share mới xem được. CHI PHÍ ƯỚC TÍNH (từ
+    // itinerary_cost_estimates — tổng ước tính, mức có thể chi trả) không
+    // phải dữ liệu cá nhân, ai xem được lịch trình (kể cả lịch trình public)
+    // cũng xem được số ước tính này bình thường. Nên KHÔNG throw ở đây —
+    // chỉ xác định isMember để quyết định có tính/trả phần "thực tế" hay
+    // không, phần "ước tính" vẫn tính cho MỌI người gọi.
+    const isMember = ctx.memberIds.includes(userId);
     const profiles = await this.itineraryService.getItineraryMemberProfiles(
       itineraryId,
       ctx.creatorId,
@@ -1022,68 +1210,156 @@ export class IncurredCostsService {
       participantCount,
     );
 
-    const { data: costsData, error } = await supabase
-      .schema('travel')
-      .from('incurred_costs')
-      .select('amount, charged_to, place_id, type')
-      .eq('itinerary_id', itineraryId)
-      .neq('type', CostType.DIEU_CHINH_GIA)
-      // Chi phí kế hoạch đã cộng vào actualBaseCost (computeActualSpending)
-      // — tính lại ở đây sẽ double-count. Điều chỉnh xăng xe KHÔNG còn ảnh
-      // hưởng gì đến chi phí ước tính đóng băng nữa (chỉ tồn tại như 1 dòng
-      // "đã chi" riêng) — vẫn loại khỏi tổng ad-hoc ở đây để không hiện trùng
-      // như 1 khoản cá nhân.
-      .neq('type', CostType.CHI_PHI_KE_HOACH)
-      .neq('type', CostType.DIEU_CHINH_XANG_XE);
-    if (error) {
-      throw new InternalServerErrorException(
-        `Failed to load incurred costs: ${error.message}`,
-      );
-    }
-    // price_adjustment rows are excluded above — those are already folded
-    // into calculatedTripCost (shared base cost), not a personal charge, so
-    // counting them again here would double-charge everyone.
-    const incurredCosts = (costsData ?? []).map((row: any) => ({
-      amount: Number(row.amount ?? 0),
-      chargedTo: Array.isArray(row.charged_to) ? (row.charged_to as string[]) : [],
-      placeId: row.place_id ?? null,
-      type: row.type as CostType,
-    }));
-    const incurredTotal = incurredCosts.reduce((sum, c) => sum + c.amount, 0);
-
     const { childPriceRatio, transportCostPerKm } =
       await this.tripCostConfig.getConfig();
     const memberIds = profileList.map((p) => p.id);
 
-    // Card 3 "mỗi người phải trả" dùng CHI PHÍ THỰC TẾ (chỉ địa điểm đã đi +
-    // chi phí phát sinh gắn với địa điểm đã đi), KHÔNG dùng chi phí kế hoạch
-    // tĩnh nữa — khớp đúng triết lý của Card 2 (spentSoFar) để 2 con số không
-    // lệch nhau về ý nghĩa.
-    const { actualBaseCost, visitedIncurredCosts } =
-      await this.computeActualSpending(itineraryId, incurredCosts);
-    const { totals, categoryTotals, childrenShare, childrenAssignedTo } = distributeCosts(
-      memberIds,
-      ctx.creatorId,
-      ctx.childCount,
-      childPriceRatio,
-      actualBaseCost,
-      visitedIncurredCosts,
-    );
+    // Toàn bộ khối dưới đây đọc travel.incurred_costs — SỔ CHI TIÊU THỰC TẾ
+    // (ai chi bao nhiêu, cho việc gì), là dữ liệu cá nhân của nhóm. Chỉ tính
+    // khi caller là thành viên; không phải thành viên (VD xem lịch trình
+    // public) thì giữ nguyên các giá trị mặc định = 0/rỗng khai báo bên
+    // dưới — KHÔNG throw, vì phần "ước tính" (tính từ dòng này trở xuống,
+    // ngoài khối if) vẫn phải trả về bình thường cho mọi người xem được.
+    let incurredTotal = 0;
+    let transportIsActualFlag = false;
+    let spentSoFar = 0;
+    let childrenShare = 0;
+    // Rỗng hoàn toàn khi không phải thành viên — kể cả tên/ID thành viên
+    // (không chỉ số tiền) cũng là thông tin "ai đi cùng ai" không nên lộ ra
+    // cho người ngoài xem lịch trình public.
+    let memberTotalsResult: Array<{
+      userId: string;
+      fullName: string;
+      isOwner: boolean;
+      total: number;
+      childrenShare: number;
+      categoryBreakdown: Partial<Record<CostType, number>>;
+    }> = [];
 
-    // spentSoFar (Card 2 — tổng CẢ NHÓM đã tiêu) phải nhân theo số người,
-    // giống hệt cách estimatedCostForGroup nhân bên dưới — actualBaseCost là
-    // per-adult (dùng riêng cho distributeCosts() ở trên, KHÔNG được nhân ở
-    // đó vì distributeCosts tự nhân theo từng tài khoản thật + trẻ em).
-    // adhocSpent (tổng các khoản incurredCosts khác) đã là số tuyệt đối thật
-    // sự đã chi, không nhân thêm — giống cách estimatedCostForGroup cũng
-    // không nhân incurredTotal.
-    const adhocSpent = visitedIncurredCosts.reduce(
-      (sum, cost) => sum + cost.amount,
-      0,
-    );
-    const groupActualBaseCost =
-      actualBaseCost * ctx.adultCount + actualBaseCost * childPriceRatio * ctx.childCount;
-    const spentSoFar = Math.round(groupActualBaseCost + adhocSpent);
+    if (isMember) {
+      const { data: costsData, error } = await supabase
+        .schema('travel')
+        .from('incurred_costs')
+        .select('amount, charged_to, place_id, type')
+        .eq('itinerary_id', itineraryId)
+        .neq('type', CostType.DIEU_CHINH_GIA)
+        // Chi phí kế hoạch đã cộng vào actualBaseCost (computeActualSpending)
+        // — tính lại ở đây sẽ double-count. Điều chỉnh xăng xe KHÔNG bị loại
+        // nữa (xem transportActualEntries bên dưới) — cần đọc để biết chủ lịch
+        // trình đã tự ghi xăng xe thực tế hay chưa.
+        .neq('type', CostType.CHI_PHI_KE_HOACH);
+      if (error) {
+        throw new InternalServerErrorException(
+          `Failed to load incurred costs: ${error.message}`,
+        );
+      }
+      // price_adjustment rows are excluded above — those are already folded
+      // into calculatedTripCost (shared base cost), not a personal charge, so
+      // counting them again here would double-charge everyone.
+      const incurredCosts = (costsData ?? []).map((row: any) => ({
+        amount: Number(row.amount ?? 0),
+        chargedTo: Array.isArray(row.charged_to)
+          ? (row.charged_to as string[])
+          : [],
+        placeId: row.place_id ?? null,
+        type: row.type as CostType,
+      }));
+      incurredTotal = incurredCosts.reduce((sum, c) => sum + c.amount, 0);
+
+      // Xăng xe THỰC TẾ:
+      //  - Đã ghi ≥1 lần "Điều chỉnh xăng xe" → dùng ĐÚNG tổng các lần ghi đó
+      //    (không cộng dồn lên trên ước tính) — đúng ý nghĩa "ghi nhận chi phí
+      //    xăng xe thực tế", không phải phụ thu thêm.
+      //  - Chưa ghi lần nào VÀ lịch trình đã "completed" → coi số ƯỚC TÍNH là
+      //    số đã tiêu (không có cách nào tự động đo xăng xe thật, nhưng chuyến
+      //    đã xong nên chắc chắn đã phát sinh khoản này).
+      //  - Chưa ghi lần nào VÀ lịch trình CHƯA hoàn thành → KHÔNG tính vào chi
+      //    phí thực tế (0đ) — trước đây coi ước tính là "đã tiêu" ngay cả khi
+      //    chuyến chưa diễn ra, khiến "đã chi/mỗi người phải trả" hiện số tiền
+      //    xăng xe chưa hề phát sinh, gây hiểu lầm.
+      const transportAdjustmentRows = incurredCosts.filter(
+        (c) => c.type === CostType.DIEU_CHINH_XANG_XE,
+      );
+      const nonTransportIncurredCosts = incurredCosts.filter(
+        (c) => c.type !== CostType.DIEU_CHINH_XANG_XE,
+      );
+      transportIsActualFlag = transportAdjustmentRows.length > 0;
+      const transportActualEntries = transportIsActualFlag
+        ? transportAdjustmentRows
+        : ctx.status === 'completed'
+          ? [
+              {
+                amount: transportCost,
+                chargedTo: [] as string[],
+                placeId: null as string | null,
+                type: CostType.DIEU_CHINH_XANG_XE,
+              },
+            ]
+          : [];
+      // Cả 2 trường hợp đều chargedTo=[] ("cả chuyến") nên distributeCosts()
+      // tự chia đều theo participantSlots (tài khoản thật + trẻ em), KHÔNG
+      // nhân childPriceRatio — đúng quy ước xăng xe dùng chung 1 mức cho mọi
+      // người, và tự động lộ ra categoryBreakdown['Điều chỉnh xăng xe'] riêng
+      // cho từng người luôn, không cần code thêm.
+      const distributionCosts = [
+        ...nonTransportIncurredCosts,
+        ...transportActualEntries,
+      ];
+
+      // Card 3 "mỗi người phải trả" dùng CHI PHÍ THỰC TẾ (chỉ địa điểm đã đi +
+      // chi phí phát sinh gắn với địa điểm đã đi), KHÔNG dùng chi phí kế hoạch
+      // tĩnh nữa — khớp đúng triết lý của Card 2 (spentSoFar) để 2 con số không
+      // lệch nhau về ý nghĩa.
+      const { actualBaseCost, visitedIncurredCosts } =
+        await this.computeActualSpending(itineraryId, distributionCosts);
+      const {
+        totals,
+        categoryTotals,
+        childrenShare: childrenShareResult,
+        childrenAssignedTo,
+      } = distributeCosts(
+        memberIds,
+        ctx.creatorId,
+        ctx.childCount,
+        childPriceRatio,
+        actualBaseCost,
+        visitedIncurredCosts,
+      );
+      childrenShare = childrenShareResult;
+
+      // spentSoFar (Card 2 — tổng CẢ NHÓM đã tiêu) phải nhân theo số người,
+      // giống hệt cách estimatedCostForGroup nhân bên dưới — actualBaseCost là
+      // per-adult (dùng riêng cho distributeCosts() ở trên, KHÔNG được nhân ở
+      // đó vì distributeCosts tự nhân theo từng tài khoản thật + trẻ em).
+      // adhocSpent (tổng các khoản incurredCosts khác) đã là số tuyệt đối thật
+      // sự đã chi, không nhân thêm — giống cách estimatedCostForGroup cũng
+      // không nhân incurredTotal.
+      const adhocSpent = visitedIncurredCosts.reduce(
+        (sum, cost) => sum + cost.amount,
+        0,
+      );
+      const groupActualBaseCost =
+        actualBaseCost * ctx.adultCount +
+        actualBaseCost * childPriceRatio * ctx.childCount;
+      spentSoFar = Math.round(groupActualBaseCost + adhocSpent);
+
+      memberTotalsResult = profileList.map((p) => {
+        const rawCategoryTotals = categoryTotals.get(p.id) ?? {};
+        const roundedCategoryTotals: Partial<Record<CostType, number>> = {};
+        for (const [type, amount] of Object.entries(rawCategoryTotals)) {
+          roundedCategoryTotals[type as CostType] = Math.round(amount ?? 0);
+        }
+        return {
+          userId: p.id,
+          fullName: p.fullName,
+          isOwner: p.isOwner,
+          total: Math.round(totals.get(p.id) ?? 0),
+          childrenShare:
+            p.id === childrenAssignedTo ? Math.round(childrenShare) : 0,
+          categoryBreakdown: roundedCategoryTotals,
+        };
+      });
+    }
 
     // Breakdown cho UI "Quản lý chi phí" xổ ra khi bấm vào dòng người
     // lớn/trẻ em (mục "Địa điểm & ăn uống" / "Lưu trú" / "Xăng xe/tự túc").
@@ -1110,25 +1386,55 @@ export class IncurredCostsService {
     const estimatedCostForGroup = Math.round(
       calculatedTripCost * ctx.adultCount + childBaseCost * ctx.childCount,
     );
-    const payableLimitForGroup = Math.round(
-      ctx.userBudget * ctx.adultCount +
-        ctx.userBudget * childPriceRatio * ctx.childCount,
-    );
     // Dự trù 10% áp dụng cho TỪNG NGƯỜI, làm tròn đến hàng trăm nghìn — quy
     // ước DÙNG CHUNG cho cả người lớn và trẻ em (không phải làm tròn tổng
     // nhóm rồi chia ngược): mỗi người làm tròn xong mới nhân số người để ra
     // roundedGroupTotal, để tổng nhóm luôn khớp bội số 100.000 gọn gàng.
-    const reserveRate = 0.1;
-    const roundedCostPerAdult =
-      Math.round((calculatedTripCost * (1 + reserveRate)) / 100000) * 100000;
+    // Công thức nằm DUY NHẤT ở ItineraryService.roundedPersonCost() — dùng lại
+    // ở đây và ở deriveGroupEstimatedCost() (danh sách lịch trình), tránh mỗi
+    // nơi tự viết lại rồi lệch nhau khi có ai sửa 1 chỗ mà quên chỗ còn lại.
+    const roundedCostPerAdult = this.itineraryService.roundedPersonCost(
+      calculatedTripCost,
+    );
     const roundedCostPerChild =
       ctx.childCount > 0
-        ? Math.round((childBaseCost * (1 + reserveRate)) / 100000) * 100000
+        ? this.itineraryService.roundedPersonCost(childBaseCost)
         : 0;
     const roundedGroupTotal =
       roundedCostPerAdult * ctx.adultCount +
       roundedCostPerChild * ctx.childCount;
     const contingencyCost = roundedGroupTotal - estimatedCostForGroup;
+    // "Có thể chi trả" CHỈ áp công thức dự trù+làm tròn giống "Ước tính" khi
+    // ngân sách gốc THẤP HƠN roundedGroupTotal — tức người dùng đã chấp nhận
+    // dùng mức chi phí gợi ý CAO HƠN ngân sách họ nhập ban đầu
+    // (BUDGET_CONFIRMATION_REQUIRED). Chỉ trong case đó "Có thể chi trả" mới
+    // cần cùng công thức để không hiện THẤP HƠN "Ước tính" (lệch do khác
+    // công thức, không phải do thật sự thiếu tiền). Khi ngân sách gốc đã ĐỦ
+    // (>= roundedGroupTotal), giữ nguyên số RAW người dùng nhập — không cần
+    // "làm đẹp" gì thêm vì đã rõ ràng đủ rồi.
+    // ctx.userBudget (itineraries.estimated_cost) là ngân sách MỖI NGƯỜI LỚN
+    // (đúng như field nhập lúc tạo lịch trình) — tổng nhóm suy ra bằng cách
+    // NHÂN với adultCount/childCount (childCount nhân thêm childPriceRatio),
+    // không chia ngược lại.
+    const rawPayableLimitForGroup = Math.round(
+      ctx.userBudget * ctx.adultCount +
+        ctx.userBudget * childPriceRatio * ctx.childCount,
+    );
+    const needsRoundedPayable = rawPayableLimitForGroup < roundedGroupTotal;
+    const payableLimitPerAdultRounded = needsRoundedPayable
+      ? this.itineraryService.roundedPersonCost(ctx.userBudget)
+      : Math.round(ctx.userBudget);
+    const payableLimitPerChildRounded = needsRoundedPayable
+      ? ctx.childCount > 0
+        ? this.itineraryService.roundedPersonCost(
+            ctx.userBudget * childPriceRatio,
+          )
+        : 0
+      : Math.round(ctx.userBudget * childPriceRatio);
+    const payableLimitForGroup = needsRoundedPayable
+      ? payableLimitPerAdultRounded * ctx.adultCount +
+        payableLimitPerChildRounded * ctx.childCount
+      : rawPayableLimitForGroup;
     // reserveCost dùng LẠI đúng contingencyCost (thay vì tự tính riêng
     // estimatedCostForGroup × 10%) — 2 công thức trước đây ra 2 con số "dự
     // trù" khác nhau ở 2 chỗ hiển thị khác nhau trong app, gây lệch số y hệt
@@ -1136,22 +1442,11 @@ export class IncurredCostsService {
     const reserveCost = contingencyCost;
 
     return {
-      memberTotals: profileList.map((p) => {
-        const rawCategoryTotals = categoryTotals.get(p.id) ?? {};
-        const roundedCategoryTotals: Partial<Record<CostType, number>> = {};
-        for (const [type, amount] of Object.entries(rawCategoryTotals)) {
-          roundedCategoryTotals[type as CostType] = Math.round(amount ?? 0);
-        }
-        return {
-          userId: p.id,
-          fullName: p.fullName,
-          isOwner: p.isOwner,
-          total: Math.round(totals.get(p.id) ?? 0),
-          childrenShare:
-            p.id === childrenAssignedTo ? Math.round(childrenShare) : 0,
-          categoryBreakdown: roundedCategoryTotals,
-        };
-      }),
+      // memberTotals/incurredTotal/childrenShare/spentSoFar giữ nguyên giá
+      // trị mặc định (0/rỗng) khi không phải thành viên — xem khối
+      // `if (isMember)` ở trên. Các field còn lại (ước tính) luôn tính đầy
+      // đủ cho mọi người gọi.
+      memberTotals: memberTotalsResult,
       totalCost: Math.round(calculatedTripCost + incurredTotal),
       basePlanCost: Math.round(calculatedTripCost),
       incurredTotal: Math.round(incurredTotal),
@@ -1161,8 +1456,8 @@ export class IncurredCostsService {
       estimatedCostPerAdult: Math.round(calculatedTripCost),
       estimatedCostPerChild: Math.round(childBaseCost),
       payableLimitForGroup,
-      payableLimitPerAdult: Math.round(ctx.userBudget),
-      payableLimitPerChild: Math.round(ctx.userBudget * childPriceRatio),
+      payableLimitPerAdult: payableLimitPerAdultRounded,
+      payableLimitPerChild: payableLimitPerChildRounded,
       reserveCost,
       roundedGroupTotal,
       contingencyCost,
@@ -1173,6 +1468,7 @@ export class IncurredCostsService {
       hotelCostPerAdult: Math.round(hotelCost),
       hotelCostPerChild: Math.round(hotelCost * childPriceRatio),
       transportPerAdult,
+      transportIsActual: transportIsActualFlag,
       childPriceRatio,
       transportRatePerKm: {
         motorbike: transportCostPerKm.motorbike,
@@ -1194,6 +1490,7 @@ export class IncurredCostsService {
   async computeDayCostBreakdown(
     itineraryId: string,
     dayNumber: number,
+    userId: string,
   ): Promise<{
     memberTotals: Array<{
       userId: string;
@@ -1208,6 +1505,9 @@ export class IncurredCostsService {
     transportPerAdultWholeTrip: number;
   }> {
     const ctx = await this.loadAccessContext(itineraryId);
+    // Cùng lý do bảo mật ở computeCostBreakdown() — chi tiết chi phí theo
+    // ngày cũng là dữ liệu cá nhân của nhóm, chỉ thành viên mới được xem.
+    this.assertCallerIsMember(ctx, userId);
     await this.validateDayNumber(itineraryId, dayNumber);
 
     const { data: itinerary, error: itineraryError } = await supabase

@@ -568,10 +568,21 @@ export class RecommendationService {
         `(retrieval mix: ${this.formatCandidateCounts(retrieval.candidates)})`,
     );
 
+    // dto.budget là ngân sách MỖI NGƯỜI LỚN — và toàn bộ chi phí bên trong
+    // pipeline lập lịch (hotel_total_cost ở selectHotelByEstimatedPrice,
+    // total_activity_cost/poi_cost ở planner.py) đều tính theo MỖI NGƯỜI
+    // LỚN, không nhân theo headcount ở đâu cả (xem comment "hotel cost below
+    // is per-adult, never multiplied by headcount" và "adult_equivalent is
+    // never read by any cost function"). Nên hotelBudgetCap/trip_budget_total
+    // phải dùng THẲNG dto.budget, không được nhân thêm adultCount/childCount
+    // — nhân thêm sẽ làm ngân sách cho thuật toán bị thổi phồng gấp
+    // participantCount lần so với chi phí thật nó đang so sánh.
     const hotelSelection = this.selectHotelByEstimatedPrice(
       details,
       dto.adultCount,
       dto.childCount ?? 0,
+      // Luôn tối thiểu 1 đêm, kể cả chuyến 1 ngày (khớp
+      // planner.py/scheduler_v2.py's _hotel_total_cost).
       Math.max(1, numDays - 1),
       Number(dto.budget ?? 0),
       dto.regionAllocations ?? [],
@@ -1358,6 +1369,7 @@ export class RecommendationService {
     const adults = Number(dto.adultCount ?? 0);
     const children = Number(dto.childCount ?? 0);
     const fullPeople = adults + children;
+    // Luôn tối thiểu 1 đêm, kể cả chuyến 1 ngày.
     const nights = Math.max(1, numDays - 1);
     const scheduleEntries = days.flatMap((day: any) =>
       Array.isArray(day.schedule) ? day.schedule : [],

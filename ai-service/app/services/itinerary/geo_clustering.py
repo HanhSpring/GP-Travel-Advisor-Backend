@@ -14,6 +14,14 @@ from app.services.itinerary.assignment import (
 )
 from app.services.itinerary.clustering_debug_viz import ClusteringDebugRecorder
 from app.services.itinerary import utils
+from app.services.itinerary import planner
+
+# Khung giờ bữa tối — TRÙNG giá trị DINNER_START/DINNER_END trong
+# scheduler_v2.py (không import thẳng từ đó được: scheduler_v2.py đã import
+# GeoClusteringAssignment từ module này, import ngược lại sẽ vòng lặp).
+# Đổi 1 trong 2 chỗ thì phải đổi cả chỗ kia.
+DINNER_START = 18 * 60
+DINNER_END = 19 * 60 + 30
 
 
 class GeoClusteringAssignment:
@@ -760,6 +768,17 @@ class GeoClusteringAssignment:
         spare — exactly the "day has no valid restaurant" failure mode.
         Here, a restaurant is only ever a candidate for the ONE day it's
         genuinely closest to among those that still have room.
+
+        Trước đây việc lấp đầy restaurant_option_limit slot/ngày HOÀN TOÀN
+        theo khoảng cách, không quan tâm giờ mở cửa — khiến 1 ngày có thể vô
+        tình chỉ nhận được các nhà hàng đều đóng cửa trước giờ ăn tối (VD 2
+        nhà hàng gần nhất chỉ mở buổi sáng/trưa). Khi đó CP-SAT solver ở
+        scheduler_v2.py không còn ứng viên nào để gán dinner_flag=true, buộc
+        phải nới lỏng bỏ hẳn ràng buộc ăn tối (xem relaxation_levels) — lịch
+        trình ra thiếu hẳn bữa tối dù "đủ 2 quán ăn". Giờ chia 3 lượt gán:
+        (1) ưu tiên 1 suất/ngày cho nhà hàng khả thi giờ ĂN TỐI gần nhất,
+        (2) tương tự 1 suất cho giờ ĂN TRƯA, (3) mới lấp nốt slot còn lại
+        thuần theo khoảng cách như cũ.
         """
         if not restaurants:
             return
@@ -777,6 +796,39 @@ class GeoClusteringAssignment:
         limit = self.config.restaurant_option_limit
         pool_counts = [0] * len(day_pools)
         assigned_ids: set = set()
+
+        def _assign(pool_idx: int, r: Any) -> None:
+            day_pools[pool_idx]["restaurants"].append(r)
+            assigned_ids.add(str(r.id))
+            pool_counts[pool_idx] += 1
+
+        def _is_dinner_eligible(r: Any) -> bool:
+            return r.open_time <= DINNER_END and r.close_time >= DINNER_START
+
+        def _is_lunch_eligible(r: Any) -> bool:
+            return (
+                r.open_time <= planner.LUNCH_END
+                and r.close_time >= planner.LUNCH_START
+            )
+
+        has_dinner_option = [False] * len(day_pools)
+        for _, pool_idx, r in pairs:
+            if pool_counts[pool_idx] >= limit or has_dinner_option[pool_idx]:
+                continue
+            if str(r.id) in assigned_ids or not _is_dinner_eligible(r):
+                continue
+            _assign(pool_idx, r)
+            has_dinner_option[pool_idx] = True
+
+        has_lunch_option = [False] * len(day_pools)
+        for _, pool_idx, r in pairs:
+            if pool_counts[pool_idx] >= limit or has_lunch_option[pool_idx]:
+                continue
+            if str(r.id) in assigned_ids or not _is_lunch_eligible(r):
+                continue
+            _assign(pool_idx, r)
+            has_lunch_option[pool_idx] = True
+
         for _, pool_idx, r in pairs:
             r_id = str(r.id)
             if r_id in assigned_ids or pool_counts[pool_idx] >= limit:

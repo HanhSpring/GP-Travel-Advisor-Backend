@@ -61,8 +61,12 @@ export class IncurredCostsController {
     summary: 'Tổng hợp "mỗi người phải trả tổng bao nhiêu" (mục 1.7)',
   })
   @ApiParam({ name: 'id', description: 'ID lịch trình' })
-  getBreakdown(@Param('id') itineraryId: string) {
-    return this.service.computeCostBreakdown(itineraryId);
+  @ApiQuery({ name: 'user_id', required: true })
+  getBreakdown(
+    @Param('id') itineraryId: string,
+    @Query('user_id') userId: string,
+  ) {
+    return this.service.computeCostBreakdown(itineraryId, userId);
   }
 
   @Get('day-breakdown')
@@ -71,13 +75,16 @@ export class IncurredCostsController {
   })
   @ApiParam({ name: 'id', description: 'ID lịch trình' })
   @ApiQuery({ name: 'day_number', required: true })
+  @ApiQuery({ name: 'user_id', required: true })
   getDayBreakdown(
     @Param('id') itineraryId: string,
     @Query('day_number') dayNumber: string,
+    @Query('user_id') userId: string,
   ) {
     return this.service.computeDayCostBreakdown(
       itineraryId,
       parseInt(dayNumber, 10),
+      userId,
     );
   }
 

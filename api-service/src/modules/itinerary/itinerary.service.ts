@@ -565,11 +565,21 @@ export class ItineraryService {
       this.getCityNameOrNull(dto.destinationLocationId),
     ]);
 
+    // tripCostConfig/travelMode cần lấy SỚM (trước cả estimatedCostFallback)
+    // vì calculateRecommendedBudget() giờ tính lại transport cost bằng chính
+    // 2 giá trị này (computeSelfDriveTransportCostSync) — khớp đúng công thức
+    // activityRows dùng lúc persist bên dưới, thay vì đọc số ai-service tự
+    // báo (dễ lệch, xem derivePlanCostComponents()).
+    const tripCostConfig = await this.tripCostConfig.getConfig();
+    const travelMode = this.normalizeMatrixTravelMode(dto.transportMode);
+
     // Nếu user không nhập ngân sách, KHÔNG được lưu null — nếu không thì
     // userBudget/payableLimit = 0 và mọi cảnh báo 90/95/100% ở "Quản lý chi
-    // phí" trở nên vô nghĩa (không có gì để so sánh). Fallback = mức ngân
-    // sách đề xuất (calculateRecommendedBudget: chi phí ước tính / 0.9, làm
-    // tròn lên hàng triệu) để luôn có 1 "mức có thể chi trả" hợp lý.
+    // phí" trở nên vô nghĩa (không có gì để so sánh). estimated_cost lưu
+    // NGÂN SÁCH MỖI NGƯỜI LỚN (khớp field nhập lúc tạo lịch trình, xem
+    // IncurredCostsService.computeCostBreakdown dùng ctx.userBudget làm mốc
+    // mỗi người lớn) — calculateRecommendedBudget() giờ cũng trả đúng đơn vị
+    // này (đã dự trù 10%, làm tròn hàng trăm nghìn), không cần tự tính lại.
     const inputBudget = Number(dto.budget ?? 0);
     const estimatedCostFallback =
       inputBudget > 0
@@ -578,6 +588,9 @@ export class ItineraryService {
             plan,
             dto.adultCount,
             dto.childCount ?? 0,
+            tripCostConfig.childPriceRatio,
+            travelMode,
+            tripCostConfig,
           ) || null;
 
     const itineraryInsert: Record<string, any> = {
@@ -603,73 +616,9 @@ export class ItineraryService {
       trip_intent: dto.tripIntent,
       daily_start_time: dto.dailyStartTime ?? '07:00',
       daily_end_time: dto.dailyEndTime ?? '22:00',
-      travel_mode: this.normalizeMatrixTravelMode(dto.transportMode),
+      travel_mode: travelMode,
       proceeded_over_budget: dto.proceedWithOverBudget === true,
     };
-
-    let insertResult = await supabase
-      .schema('travel')
-      .from('itineraries')
-      .insert(itineraryInsert)
-      .select('id')
-      .single();
-
-    let retries = 3;
-    while (
-      insertResult.error &&
-      (insertResult.error.message.includes('Could not find the') ||
-        insertResult.error.message.includes('column')) &&
-      retries > 0
-    ) {
-      const errorMsg = insertResult.error.message;
-      if (errorMsg.includes('daily_start_time'))
-        delete itineraryInsert.daily_start_time;
-      if (errorMsg.includes('daily_end_time'))
-        delete itineraryInsert.daily_end_time;
-      if (errorMsg.includes('trip_intent')) delete itineraryInsert.trip_intent;
-      if (errorMsg.includes('proceeded_over_budget'))
-        delete itineraryInsert.proceeded_over_budget;
-
-      insertResult = await supabase
-        .schema('travel')
-        .from('itineraries')
-        .insert(itineraryInsert)
-        .select('id')
-        .single();
-
-      retries--;
-    }
-
-    const { data: itinerary, error: itineraryError } = insertResult;
-
-    if (itineraryError || !itinerary) {
-      throw new InternalServerErrorException(
-        'Lỗi khi tạo lịch trình: ' + itineraryError?.message,
-      );
-    }
-
-    // Fire-and-forget: this is secondary data for getAddPlaceSuggestions,
-    // must not slow down or fail itinerary creation.
-    const leftoverIds: string[] = (plan as any).leftover_candidate_ids ?? [];
-    if (leftoverIds.length > 0) {
-      supabase
-        .schema('travel')
-        .from('itinerary_candidate_places')
-        .insert(
-          leftoverIds.map((placeId) => ({
-            itinerary_id: (itinerary as any).id,
-            place_id: placeId,
-          })),
-        )
-        .then(({ error }) => {
-          if (error) {
-            console.warn(
-              '[ItineraryService] Không thể lưu candidates thừa:',
-              error.message,
-            );
-          }
-        });
-    }
 
     const placeCostById = await this.getPlaceEstimatedCostMap(plan);
     const hotelTotalCost = Math.max(
@@ -677,7 +626,6 @@ export class ItineraryService {
       Math.round(Number(plan.hotel_selection?.hotel_total_cost ?? 0)),
     );
     const hotelRow = this.buildHotelDetailRow(
-      (itinerary as any).id,
       plan,
       dto.startDate,
       dto.dailyStartTime,
@@ -690,11 +638,9 @@ export class ItineraryService {
     // và gọi lại Goong theo từng chặng một lúc persist (chính là nguồn gây
     // chậm persist đã đo được, ~36s cho 1 lịch trình 8 ngày/51 chặng).
     // transport_cost thì AI không tính (không có trong ScheduleEntryResponse
-    // Python) nên vẫn phải tính ở đây — nhưng chỉ cần await getConfig() một
-    // lần cho toàn bộ chuyến, không phải mỗi chặng một lần.
-    const tripCostConfig = await this.tripCostConfig.getConfig();
+    // Python) nên vẫn phải tính ở đây — tripCostConfig/travelMode đã lấy sẵn
+    // ở trên (dùng lại cho calculateRecommendedBudget()), không cần gọi lại.
     const headcount = Math.max(1, Number(dto.adultCount ?? 0) + Number(dto.childCount ?? 0));
-    const travelMode = this.normalizeMatrixTravelMode(dto.transportMode);
     const activityRows = plan.days.flatMap((day) => {
       const schedule = Array.isArray(day.schedule) ? day.schedule : [];
       const visitDate = this.addDays(dto.startDate, day.day - 1);
@@ -710,7 +656,6 @@ export class ItineraryService {
               ? entry.travel_minutes
               : null;
           return {
-            itinerary_id: (itinerary as any).id,
             place_id: entry.location_id,
             visit_date: visitDate,
             // itinerary_details.arrival_time is the time shown as the activity
@@ -739,42 +684,68 @@ export class ItineraryService {
     const detailRows = [hotelRow, ...activityRows];
 
     if (detailRows.length === 0) {
-      await supabase
-        .schema('travel')
-        .from('itineraries')
-        .delete()
-        .eq('id', (itinerary as any).id);
       throw new BadRequestException(
         'AI planner did not return any valid places to persist',
       );
     }
 
-    if (detailRows.length > 0) {
-      const { error: detailsError } = await supabase
-        .schema('travel')
-        .from('itinerary_details')
-        .insert(detailRows);
+    // Insert itinerary + itinerary_details trong 1 transaction thật ở phía
+    // Postgres (xem travel.create_itinerary_with_details,
+    // api-service/supabase/migrations/20260721_itinerary_atomic_create.sql)
+    // — thay cho 2 insert rời + rollback thủ công trước đây, vốn có thể để
+    // lại itinerary mồ côi (status='pending', 0 details) nếu process
+    // crash/mất mạng đúng lúc giữa 2 bước.
+    const { data: rpcResult, error: rpcError } = await supabase
+      .schema('travel')
+      .rpc('create_itinerary_with_details', {
+        p_itinerary: itineraryInsert,
+        p_details: detailRows,
+      });
 
-      if (detailsError) {
-        // Rollback: xóa itinerary nếu insert detail thất bại
-        await supabase
-          .schema('travel')
-          .from('itineraries')
-          .delete()
-          .eq('id', (itinerary as any).id);
-        throw new InternalServerErrorException(
-          'Lỗi khi lưu chi tiết lịch trình: ' + detailsError.message,
+    if (rpcError) {
+      if (rpcError.message?.includes('no_details_to_persist')) {
+        throw new BadRequestException(
+          'AI planner did not return any valid places to persist',
         );
       }
+      throw new InternalServerErrorException(
+        'Lỗi khi tạo lịch trình: ' + rpcError.message,
+      );
+    }
+
+    const itineraryId = (rpcResult as any).id as string;
+    const totalDetails = (rpcResult as any).total_details as number;
+
+    // Fire-and-forget: this is secondary data for getAddPlaceSuggestions,
+    // must not slow down or fail itinerary creation.
+    const leftoverIds: string[] = (plan as any).leftover_candidate_ids ?? [];
+    if (leftoverIds.length > 0) {
+      supabase
+        .schema('travel')
+        .from('itinerary_candidate_places')
+        .insert(
+          leftoverIds.map((placeId) => ({
+            itinerary_id: itineraryId,
+            place_id: placeId,
+          })),
+        )
+        .then(({ error }) => {
+          if (error) {
+            console.warn(
+              '[ItineraryService] Không thể lưu candidates thừa:',
+              error.message,
+            );
+          }
+        });
     }
 
     // Tính + lưu chi phí ước tính đóng băng lần đầu tiên. Không được phép
     // fail cả request tạo lịch trình nếu bước này lỗi.
     try {
-      await this.recomputeCostEstimate((itinerary as any).id as string);
+      await this.recomputeCostEstimate(itineraryId);
     } catch (err: any) {
       this.logger.warn(
-        `Cannot compute initial itinerary_cost_estimates for ${(itinerary as any).id}: ${err?.message ?? err}`,
+        `Cannot compute initial itinerary_cost_estimates for ${itineraryId}: ${err?.message ?? err}`,
       );
     }
 
@@ -785,30 +756,55 @@ export class ItineraryService {
     // ngày nào 0 nhà hàng thì ghi chú thẳng vào notes của hoạt động đầu
     // ngày đó — không cần đổi schema, không phụ thuộc engine nào tạo ra plan.
     try {
-      await this.annotateDaysMissingRestaurant((itinerary as any).id as string);
+      await this.annotateDaysMissingRestaurant(itineraryId);
     } catch (err: any) {
       this.logger.warn(
-        `Cannot annotate days missing restaurant for ${(itinerary as any).id}: ${err?.message ?? err}`,
+        `Cannot annotate days missing restaurant for ${itineraryId}: ${err?.message ?? err}`,
       );
     }
 
     return {
-      id: (itinerary as any).id as string,
-      totalDetails: detailRows.length,
+      id: itineraryId,
+      totalDetails,
       status: 'pending',
     };
   }
 
+  // Cả 3 note dưới đây CỐ Ý không dùng khung "khu vực này không có/chỉ có
+  // quán ăn..." — đọc như hệ thống thiếu dữ liệu/lỗi. Đổi sang khung "để đảm
+  // bảo trải nghiệm tham quan tốt nhất" — truyền tải đúng bản chất: đây là
+  // lựa chọn tối ưu (ưu tiên thêm giờ tham quan) chứ không phải thiếu sót.
   private static readonly NO_LUNCH_NOTE =
-    'Khu vực này không có quán ăn phù hợp gần lịch trình vì thời gian và ' +
-    'tuyến đường không đủ thuận tiện — bạn có thể ăn nhẹ trên xe.';
+    'Để đảm bảo tối đa trải nghiệm tham quan, ngày này chưa xếp quán ăn cố ' +
+    'định — bạn có thể ăn uống tự túc, ăn nhẹ trên đường.';
+
+  private static readonly FEW_RESTAURANT_NOTE =
+    'Để đảm bảo tối đa trải nghiệm tham quan, ngày này chỉ xếp 1 quán ăn cố ' +
+    'định — bạn có thể ăn uống tự túc, ăn nhẹ trên đường cho bữa còn lại.';
+
+  // Đủ 2 quán ăn NHƯNG cả 2 đều rơi vào sáng/trưa (VD nhà hàng gần nhất đều
+  // đóng cửa trước giờ tối) — khác 2 note trên (thiếu SỐ LƯỢNG), đây là
+  // thiếu ĐÚNG BỮA dù đủ số lượng. Xem geo_clustering.py's _inject_restaurants
+  // (ai-service) — đã sửa để ưu tiên 1 suất/ngày cho nhà hàng khả thi giờ
+  // tối, nhưng khu vực quá thưa nhà hàng buổi tối thì vẫn có thể xảy ra.
+  private static readonly NO_DINNER_NOTE =
+    'Để đảm bảo tối đa trải nghiệm tham quan, buổi tối ngày này chưa xếp ' +
+    'quán ăn cố định — bạn có thể ăn uống tự túc, ăn nhẹ trên đường.';
+
+  // Nhà hàng có giờ bắt đầu từ mốc này trở đi mới tính là "có phương án ăn
+  // tối" — nới hơn khung DINNER_START (18:00) bên ai-service 1 chút vì đây
+  // chỉ là cảnh báo tham khảo cho UI, không phải ràng buộc cứng của solver.
+  private static readonly DINNER_WARNING_HOUR = 17;
 
   /**
    * Đếm số nhà hàng THẬT đã lưu cho từng ngày (không tin dữ liệu ai-service
    * trả về lúc lập kế hoạch — đối chiếu lại đúng những gì vừa persist).
-   * Ngày nào 0 nhà hàng thì gắn NO_LUNCH_NOTE vào cột `notes` sẵn có của
-   * hoạt động đầu tiên trong ngày đó — không đè lên note đã có sẵn (VD user
-   * tự thêm ghi chú riêng cho hoạt động đó).
+   * Ngày nào 0 hoặc chỉ 1 nhà hàng thì gắn cảnh báo tương ứng vào cột
+   * `notes` sẵn có của hoạt động đầu tiên trong ngày đó — không đè lên note
+   * đã có sẵn (VD user tự thêm ghi chú riêng cho hoạt động đó). Từ 2 nhà
+   * hàng trở lên, còn kiểm tra thêm liệu có nhà hàng nào rơi vào buổi tối
+   * hay không — 2 nhà hàng đều sáng/trưa vẫn thiếu bữa tối thật sự, dù đủ
+   * SỐ LƯỢNG theo tiêu chí cũ.
    */
   private async annotateDaysMissingRestaurant(
     itineraryId: string,
@@ -817,7 +813,7 @@ export class ItineraryService {
       .schema('travel')
       .from('itinerary_details')
       .select(
-        'id, visit_date, sequence_order, notes, place_id, places(slot_type, types(name, categories(id,name)))',
+        'id, visit_date, sequence_order, notes, place_id, arrival_time, places(slot_type, types(name, categories(id,name)))',
       )
       .eq('itinerary_id', itineraryId)
       .eq('detail_type', 'ACTIVITY')
@@ -839,7 +835,7 @@ export class ItineraryService {
 
     const updates: Array<{ id: string; notes: string }> = [];
     for (const rows of rowsByDate.values()) {
-      const hasRestaurant = rows.some((row: any) => {
+      const restaurantRows = rows.filter((row: any) => {
         const place = row.places;
         const typeData = Array.isArray(place?.types) ? place.types[0] : place?.types;
         const categoryData = Array.isArray(typeData?.categories)
@@ -858,11 +854,26 @@ export class ItineraryService {
           ) === 'restaurant'
         );
       });
-      if (hasRestaurant) continue;
+      const restaurantCount = restaurantRows.length;
 
       const first = rows[0];
       if (!first || first.notes) continue;
-      updates.push({ id: first.id, notes: ItineraryService.NO_LUNCH_NOTE });
+
+      if (restaurantCount === 0) {
+        updates.push({ id: first.id, notes: ItineraryService.NO_LUNCH_NOTE });
+        continue;
+      }
+      if (restaurantCount === 1) {
+        updates.push({ id: first.id, notes: ItineraryService.FEW_RESTAURANT_NOTE });
+        continue;
+      }
+      const hasEveningRestaurant = restaurantRows.some((row: any) => {
+        const hour = Number(String(row.arrival_time ?? '').split(':')[0]);
+        return Number.isFinite(hour) && hour >= ItineraryService.DINNER_WARNING_HOUR;
+      });
+      if (!hasEveningRestaurant) {
+        updates.push({ id: first.id, notes: ItineraryService.NO_DINNER_NOTE });
+      }
     }
 
     if (updates.length === 0) return;
@@ -3329,24 +3340,53 @@ export class ItineraryService {
       new Set([...expectedDates, ...daysMap.keys()]),
     ).sort();
 
+    // Quy ước hiển thị khách sạn theo ngày (tham khảo cách lịch trình du
+    // lịch thường trình bày: ngày đầu "về khách sạn" cuối ngày sau khi chơi,
+    // các ngày sau "xuất phát từ khách sạn" đầu ngày):
+    //  - Ngày 1: khách sạn ở CUỐI ngày (chưa check-in từ đầu) — giờ nhận
+    //    phòng nối tiếp NGAY SAU hoạt động cuối cùng (không dùng giờ cố định
+    //    như 22:00, để liên tục với lịch trình thật, giống 1 địa điểm bình
+    //    thường nối vào hoạt động trước nó).
+    //  - Ngày 2 trở đi: khách sạn ở ĐẦU ngày (điểm xuất phát buổi sáng), giữ
+    //    nguyên arrival_time gốc (= daily_start_time, đã set lúc tạo lịch
+    //    trình ở buildHotelDetailRow) — đã liên tục sẵn vì hoạt động đầu
+    //    ngày cũng bắt đầu quanh mốc daily_start_time.
+    // Chuyến CHỈ 1 NGÀY DUY NHẤT chỉ có "ngày 1" nên luôn rơi vào case đầu.
+    const fallbackEndOfDayTime =
+      this.trimTime(itinerary.daily_end_time) || '22:00';
     const days = sortedDates.map((dateStr, index) => {
       const dayNumber = index + 1;
       const activitiesRaw = daysMap.get(dateStr) || [];
-      // Day 1 starts directly from the first scheduled activity. From day 2
-      // onward the hotel is shown as the day's departure point, but its cost
-      // remains exclusively in the trip-level accommodation breakdown.
-      const displayRows =
-        hotelDetail && index > 0
-          ? [
-              {
-                ...hotelDetail,
-                visit_date: dateStr,
-                estimated_cost: 0,
-                place: placesById.get(hotelDetail.place_id) ?? null,
-              },
-              ...activitiesRaw,
-            ]
-          : activitiesRaw;
+      const isFirstDay = index === 0;
+      let hotelDisplayRow: any = null;
+      if (hotelDetail && isFirstDay) {
+        const lastActivity = activitiesRaw[activitiesRaw.length - 1];
+        const hotelArrivalTime = lastActivity
+          ? this.addMinutesToTime(
+              lastActivity.arrival_time,
+              Number(lastActivity.duration_minutes ?? 0),
+            ) || fallbackEndOfDayTime
+          : fallbackEndOfDayTime;
+        hotelDisplayRow = {
+          ...hotelDetail,
+          visit_date: dateStr,
+          arrival_time: hotelArrivalTime,
+          estimated_cost: 0,
+          place: placesById.get(hotelDetail.place_id) ?? null,
+        };
+      } else if (hotelDetail && !isFirstDay) {
+        hotelDisplayRow = {
+          ...hotelDetail,
+          visit_date: dateStr,
+          estimated_cost: 0,
+          place: placesById.get(hotelDetail.place_id) ?? null,
+        };
+      }
+      const displayRows = !hotelDisplayRow
+        ? activitiesRaw
+        : isFirstDay
+          ? [...activitiesRaw, hotelDisplayRow]
+          : [hotelDisplayRow, ...activitiesRaw];
 
       const activities = displayRows.map((act, actIndex) => {
         const place = act.place;
@@ -3621,6 +3661,8 @@ export class ItineraryService {
     );
     const rideHailingTransportCost =
       transportCost > 0 ? Math.round(transportCost * 2.5) : 0;
+    // Luôn tối thiểu 1 đêm, kể cả chuyến 1 ngày — mọi lịch trình đều bắt
+    // buộc có 1 khoản khách sạn thật; tránh chia cho 0 ở dòng dưới.
     const hotelNights = Math.max(1, (diffDays || days.length || 1) - 1);
     const hotelCostPerPersonPerNight =
       hotelCost > 0 ? Math.round(hotelCost / hotelNights) : 0;
@@ -4159,7 +4201,6 @@ export class ItineraryService {
   }
 
   private buildHotelDetailRow(
-    itineraryId: string,
     plan: AIPlanResult,
     visitDate: string,
     dailyStartTime: string,
@@ -4167,7 +4208,6 @@ export class ItineraryService {
   ) {
     const startTime = this.trimTime(dailyStartTime) || '08:00';
     return {
-      itinerary_id: itineraryId,
       place_id: plan.hotel_id,
       visit_date: visitDate,
       arrival_time: startTime,
@@ -4335,51 +4375,139 @@ export class ItineraryService {
     return Math.round(placeCost + hotelCost + transportPerAdult);
   }
 
-  calculatePlanEstimatedCost(
+  /** Tỉ lệ dự trù dùng CHUNG cho mọi chỗ tính "tổng đã làm tròn" — đổi ở đây
+   * là đổi cho toàn hệ thống (snapshot cache, Quản lý chi phí, danh sách). */
+  readonly reserveRate = 0.1;
+
+  /** Công thức DUY NHẤT cho "dự trù 10% rồi làm tròn hàng trăm nghìn", áp
+   * dụng cho 1 NGƯỜI (người lớn hoặc trẻ em) — gọi từ:
+   *  - upsertCostEstimate() (snapshot cache, cho người lớn)
+   *  - deriveGroupEstimatedCost() (danh sách lịch trình, cho trẻ em)
+   *  - IncurredCostsService.computeCostBreakdown() (Quản lý chi phí, cả 2)
+   * Trước đây 3 nơi này tự viết lại công thức này riêng — dễ lệch nếu sau
+   * này có ai sửa 1 chỗ mà quên 2 chỗ còn lại.
+   * BẮT BUỘC dùng Math.ceil (làm tròn LÊN), không phải Math.round: nếu làm
+   * tròn thường, giá trị có thể bị làm tròn XUỐNG dưới cả rawPersonCost gốc
+   * (mất luôn phần dự trù 10%, thậm chí thấp hơn cả chi phí gốc), khiến
+   * contingencyCost = roundedGroupTotal - estimatedCostForGroup ra ÂM — tức
+   * "dự trù" hiển thị số âm, vô lý vì dự trù không bao giờ được phép âm. */
+  roundedPersonCost(rawPersonCost: number): number {
+    return Math.ceil((rawPersonCost * (1 + this.reserveRate)) / 100000) * 100000;
+  }
+
+  /** Tách activity/hotel/transport cost thô từ 1 AIPlanResult, quy ra
+   * perAdultCost (giống perAdultTripTotal) + childBaseCost (địa điểm/khách
+   * sạn nhân childPriceRatio, xăng xe dùng chung không nhân ratio) — DÙNG
+   * CHUNG cho cả calculatePlanEstimatedCost() và calculateRecommendedBudget()
+   * để 2 hàm luôn cộng ra đúng TỔNG CẢ NHÓM (không phải chỉ 1 người lớn),
+   * khớp công thức estimatedCostForGroup/roundedGroupTotal ở
+   * deriveGroupEstimatedCost()/IncurredCostsService.computeCostBreakdown().
+   *
+   * transportCost KHÔNG đọc day.total_transport_cost (số ai-service tự tính
+   * bằng self.cost_per_km NỘI BỘ của nó — bảng cost-per-km ai-service chỉ
+   * đồng bộ 1 lần lúc khởi động, có thể lệch NestJS's tripCostConfig đọc mỗi
+   * 60s, xem ghi chú "case 1 chậm" ở itinerary.controller.ts) — mà TÍNH LẠI
+   * bằng computeSelfDriveTransportCostSync() với distance_km thật + config
+   * SỐNG của NestJS, ĐÚNG công thức activityRows dùng lúc persist
+   * (createGeneratedItinerary). Trước đây dùng số ai-service tự báo (thường
+   * là 0 vì field không được ai-service điền số thật), khiến recommendedBudget
+   * thiếu hẳn phần xăng xe, thấp hơn hẳn so với "Ước tính" thật sau khi
+   * persist (VD dialog báo 400k nhưng Sổ chi tiêu ra 500k). */
+  private derivePlanCostComponents(
     plan: AIPlanResult,
     adultCount: number,
     childCount: number,
-  ): number {
+    childPriceRatio: number,
+    transportMode: string,
+    tripCostConfig: TripCostConfig,
+  ): { perAdultCost: number; childBaseCost: number } {
     const hotelCost = Math.max(
       0,
       Number(plan.hotel_selection?.hotel_total_cost ?? 0),
     );
-    const activityCost = (plan.days ?? []).reduce(
-      (total, day) =>
-        total +
-        (day.schedule ?? []).reduce((dayTotal, entry) => {
-          if (entry.is_return_to_hotel) return dayTotal;
-          return dayTotal + Math.max(0, Number(entry.estimated_cost ?? 0));
-        }, 0),
-      0,
-    );
-    const transportCost = (plan.days ?? []).reduce(
-      (total, day: any) =>
-        total + Math.max(0, Number(day.total_transport_cost ?? 0)),
-      0,
-    );
     const participantCount = Math.max(1, adultCount + childCount);
-    return this.perAdultTripTotal(
+    let activityCost = 0;
+    let transportCost = 0;
+    for (const day of plan.days ?? []) {
+      for (const entry of day.schedule ?? []) {
+        if (entry.is_return_to_hotel) continue;
+        activityCost += Math.max(0, Number(entry.estimated_cost ?? 0));
+        const travelDistanceKm =
+          Number.isFinite(entry.distance_km) && entry.distance_km > 0
+            ? entry.distance_km
+            : null;
+        if (travelDistanceKm) {
+          transportCost += this.computeSelfDriveTransportCostSync(
+            travelDistanceKm,
+            transportMode,
+            participantCount,
+            tripCostConfig,
+          );
+        }
+      }
+    }
+    const perAdultCost = this.perAdultTripTotal(
       activityCost,
       hotelCost,
       transportCost,
       participantCount,
     );
+    const transportPerAdult =
+      Math.round(transportCost / participantCount / 1000) * 1000;
+    const childBaseCost =
+      activityCost * childPriceRatio +
+      hotelCost * childPriceRatio +
+      transportPerAdult;
+    return { perAdultCost, childBaseCost };
+  }
+
+  /** Chi phí RAW (chưa dự trù) của MỖI NGƯỜI LỚN — luôn dùng đơn vị mỗi
+   * người lớn xuyên suốt hệ thống (body.budget/requestedBudget nhập từ UI
+   * cũng là mỗi người lớn), tránh quy đổi qua lại giữa 2 đơn vị ở tầng gọi.
+   * childBaseCost bị bỏ qua ở đây vì không có field ngân sách riêng cho trẻ
+   * em để so sánh — trẻ em chỉ tham gia ở bước nhân ra tổng nhóm lúc hiển
+   * thị (xem IncurredCostsService.computeCostBreakdown). */
+  calculatePlanEstimatedCost(
+    plan: AIPlanResult,
+    adultCount: number,
+    childCount: number,
+    childPriceRatio: number,
+    transportMode: string,
+    tripCostConfig: TripCostConfig,
+  ): number {
+    const { perAdultCost } = this.derivePlanCostComponents(
+      plan,
+      adultCount,
+      childCount,
+      childPriceRatio,
+      transportMode,
+      tripCostConfig,
+    );
+    return Math.round(perAdultCost);
   }
 
   calculateRecommendedBudget(
     plan: AIPlanResult,
     adultCount: number,
     childCount: number,
+    childPriceRatio: number,
+    transportMode: string,
+    tripCostConfig: TripCostConfig,
   ): number {
-    const calculatedCost = this.calculatePlanEstimatedCost(
+    const { perAdultCost } = this.derivePlanCostComponents(
       plan,
       adultCount,
       childCount,
+      childPriceRatio,
+      transportMode,
+      tripCostConfig,
     );
-    if (calculatedCost <= 0) return 0;
-    const withReserve = calculatedCost / 0.9;
-    return Math.ceil(withReserve / 1_000_000) * 1_000_000;
+    if (perAdultCost <= 0) return 0;
+    // Dùng ĐÚNG roundedPersonCost() (dự trù 10%, làm tròn hàng trăm nghìn)
+    // — quy ước DUY NHẤT cho "đã làm tròn mỗi người lớn" trong toàn hệ
+    // thống, để con số gợi ý ở đây khớp TUYỆT ĐỐI với roundedCostPerAdult
+    // hiển thị lại ở Sổ chi tiêu sau khi tạo lịch trình.
+    return this.roundedPersonCost(perAdultCost);
   }
 
   /**
@@ -4510,8 +4638,9 @@ export class ItineraryService {
     },
   ): Promise<void> {
     try {
-      const roundedCalculatedTripCost =
-        Math.round((breakdown.calculatedTripCost * 1.1) / 100000) * 100000;
+      const roundedCalculatedTripCost = this.roundedPersonCost(
+        breakdown.calculatedTripCost,
+      );
       const { error } = await supabase
         .schema('travel')
         .from('itinerary_cost_estimates')
@@ -4699,11 +4828,8 @@ export class ItineraryService {
     const childBaseCost =
       placeCost * childPriceRatio + hotelCost * childPriceRatio + transportPerAdult;
 
-    const reserveRate = 0.1;
     const roundedCostPerChild =
-      childCount > 0
-        ? Math.round((childBaseCost * (1 + reserveRate)) / 100000) * 100000
-        : 0;
+      childCount > 0 ? this.roundedPersonCost(childBaseCost) : 0;
 
     return {
       estimatedCostForGroup: Math.round(

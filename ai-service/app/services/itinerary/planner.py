@@ -2459,6 +2459,9 @@ class MultiDayTripPlanner:
             if hotel.estimated_cost > 0
             else FALLBACK_HOTEL_COST_PER_NIGHT / ROOM_CAPACITY
         )
+        # Luôn tính tối thiểu 1 đêm lưu trú, kể cả chuyến 1 ngày — mọi lịch
+        # trình đều bắt buộc có 1 khoản khách sạn thật, khớp mobile:
+        # nightCount = max(1, durationDays - 1).
         nights = max(1, self.num_days - 1)
         return per_person_nightly * nights * self.full_people
 
