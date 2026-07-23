@@ -33,6 +33,7 @@ type AlgorithmRow = {
 type AlgorithmLogRow = {
   id: string;
   algorithm_id: string | null;
+  admin_id: string | null;
   status: string;
   action: string;
   details: string | null;
@@ -71,6 +72,7 @@ export class AdminAlgorithmPipelineService {
 
   async runPipeline(
     dto: PipelineRunRequestDto,
+    adminId: string | null = null,
   ): Promise<PipelineRunResponseDto> {
     this.logger.log('Kich hoat pipeline phan loai review...');
     let requestPayload: Record<string, any> = dto;
@@ -88,11 +90,11 @@ export class AdminAlgorithmPipelineService {
           { timeout: 600_000 },
         ),
       );
-      await this.insertPipelineLog('active', response.data, requestPayload);
+      await this.insertPipelineLog('active', response.data, requestPayload, adminId);
       return response.data;
     } catch (error) {
       this.logger.error(`Pipeline run failed: ${error.message}`);
-      await this.insertPipelineLog('failed', null, requestPayload, error);
+      await this.insertPipelineLog('failed', null, requestPayload, adminId, error);
       if (error.response?.data) {
         throw new InternalServerErrorException(
           error.response.data.detail || 'Pipeline th?t b?i',
@@ -136,7 +138,7 @@ export class AdminAlgorithmPipelineService {
       let request = supabase
         .schema('ai_config')
         .from('algorithm_logs')
-        .select('id,algorithm_id,status,action,details,created_at', {
+        .select('id,algorithm_id,admin_id,status,action,details,created_at', {
           count: 'exact',
         })
         .order('created_at', { ascending: false });
@@ -164,11 +166,14 @@ export class AdminAlgorithmPipelineService {
           .map((row) => row.algorithm_id)
           .filter((id): id is string => Boolean(id)),
       );
+      const adminMap = await this.loadAdminMap(
+        rows.map((row) => row.admin_id).filter((id): id is string => Boolean(id)),
+      );
 
       const total = count ?? rows.length;
 
       return {
-        history: rows.map((row) => this.toHistoryItem(row, algorithmMap)),
+        history: rows.map((row) => this.toHistoryItem(row, algorithmMap, adminMap)),
         total,
         page: safePage,
         pageSize: safePageSize,
@@ -194,6 +199,7 @@ export class AdminAlgorithmPipelineService {
 
   async updateReviewFilterSchedule(
     dto: UpdateReviewFilterScheduleDto,
+    adminId: string | null = null,
   ): Promise<ReviewFilterScheduleDto> {
     const algorithm = await this.ensureReviewFilterAlgorithm();
     const current = await this.ensureScheduleRow(algorithm.id);
@@ -230,7 +236,7 @@ export class AdminAlgorithmPipelineService {
         'Could not update review filter schedule',
       );
       const updated = data as ScheduleRow;
-      await this.insertScheduleLog(algorithm.id, current, updated);
+      await this.insertScheduleLog(algorithm.id, current, updated, adminId);
       return this.buildScheduleResponse(updated);
     }
 
@@ -300,7 +306,7 @@ export class AdminAlgorithmPipelineService {
         requestedAction: 'recommender_retrain_started',
         run_id: row.id,
         trigger_type: triggerType,
-      });
+      }, triggeredBy);
     } catch (startError: any) {
       await supabase
         .schema('ai_config')
@@ -360,6 +366,7 @@ export class AdminAlgorithmPipelineService {
 
   async updateRecommenderRetrainSchedule(
     dto: UpdateReviewFilterScheduleDto,
+    adminId: string | null = null,
   ): Promise<ReviewFilterScheduleDto> {
     const algorithm = await this.ensureRecommenderAlgorithm();
     const current = await this.ensureScheduleRow(algorithm.id);
@@ -379,7 +386,7 @@ export class AdminAlgorithmPipelineService {
       .select('*')
       .single();
     this.throwIfSupabaseError(error, 'Could not update recommender retrain schedule');
-    await this.insertScheduleLog(algorithm.id, current, data as ScheduleRow);
+    await this.insertScheduleLog(algorithm.id, current, data as ScheduleRow, adminId);
     return this.buildScheduleResponse(data as ScheduleRow);
   }
 
@@ -418,12 +425,14 @@ export class AdminAlgorithmPipelineService {
     algorithmId: string,
     status: 'active' | 'failed',
     details: Record<string, any>,
+    adminId: string | null = null,
   ): Promise<void> {
     const { error } = await supabase
       .schema('ai_config')
       .from('algorithm_logs')
       .insert({
         algorithm_id: algorithmId,
+        admin_id: adminId,
         status,
         action: 'updated',
         details: JSON.stringify(details),
@@ -435,6 +444,7 @@ export class AdminAlgorithmPipelineService {
     status: 'active' | 'failed',
     result: PipelineRunResponseDto | null,
     request: Record<string, any>,
+    adminId: string | null,
     error?: any,
   ): Promise<void> {
     try {
@@ -472,6 +482,7 @@ export class AdminAlgorithmPipelineService {
         .from('algorithm_logs')
         .insert({
           algorithm_id: algorithm.id,
+          admin_id: adminId,
           status,
           action: 'updated',
           details: JSON.stringify(details),
@@ -681,6 +692,7 @@ export class AdminAlgorithmPipelineService {
     algorithmId: string,
     before: ScheduleRow,
     after: ScheduleRow,
+    adminId: string | null = null,
   ): Promise<void> {
     const changes: string[] = [];
     const add = (label: string, oldValue: string, newValue: string) => {
@@ -715,6 +727,7 @@ export class AdminAlgorithmPipelineService {
       .from('algorithm_logs')
       .insert({
         algorithm_id: algorithmId,
+        admin_id: adminId,
         status: 'active',
         action: 'parameter_changed',
         details: JSON.stringify({
@@ -763,6 +776,30 @@ export class AdminAlgorithmPipelineService {
       ((data ?? []) as AlgorithmRow[]).map((algorithm) => [
         algorithm.id,
         algorithm,
+      ]),
+    );
+  }
+
+  private async loadAdminMap(adminIds: string[]): Promise<Map<string, string>> {
+    const uniqueIds = Array.from(new Set(adminIds));
+    if (!uniqueIds.length) {
+      return new Map();
+    }
+
+    const { data, error } = await supabase
+      .from('users')
+      .select('id,full_name,email')
+      .in('id', uniqueIds);
+
+    if (error) {
+      this.logger.warn(`Could not load admin names: ${error.message}`);
+      return new Map();
+    }
+
+    return new Map(
+      (data ?? []).map((user: any) => [
+        user.id,
+        user.full_name || user.email || user.id,
       ]),
     );
   }
@@ -820,6 +857,7 @@ export class AdminAlgorithmPipelineService {
   private toHistoryItem(
     row: AlgorithmLogRow,
     algorithmMap: Map<string, AlgorithmRow>,
+    adminMap: Map<string, string>,
   ): PipelineHistoryItemDto {
     const details = this.parseDetails(row.details);
     const success = row.status !== 'failed';
@@ -831,6 +869,8 @@ export class AdminAlgorithmPipelineService {
       algorithm_name:
         (row.algorithm_id && algorithmMap.get(row.algorithm_id)?.name) ||
         'unknown',
+      admin_id: row.admin_id,
+      admin_name: (row.admin_id && adminMap.get(row.admin_id)) || null,
       status: row.status,
       action: row.action,
       details,

@@ -22,8 +22,8 @@ export class AdminAlgorithmPipelineController {
   @ApiOperation({
     summary: 'Kích hoạt pipeline phân loại review (3 thuật toán)',
   })
-  async runPipeline(@Body() dto: PipelineRunRequestDto) {
-    return this.service.runPipeline(dto);
+  async runPipeline(@Body() dto: PipelineRunRequestDto, @Request() req: any) {
+    return this.service.runPipeline(dto, req.user?.userId ?? null);
   }
 
   @Get('history')
@@ -64,8 +64,8 @@ export class AdminAlgorithmPipelineController {
   @ApiOperation({
     summary: 'Cập nhật lịch chạy tự động thuật toán lọc đánh giá',
   })
-  async updateReviewFilterSchedule(@Body() dto: UpdateReviewFilterScheduleDto) {
-    return this.service.updateReviewFilterSchedule(dto);
+  async updateReviewFilterSchedule(@Body() dto: UpdateReviewFilterScheduleDto, @Request() req: any) {
+    return this.service.updateReviewFilterSchedule(dto, req.user?.userId ?? null);
   }
 
   @Post('recommender-retrain/run')
@@ -92,7 +92,7 @@ export class AdminAlgorithmPipelineController {
   }
 
   @Patch('recommender-retrain/schedule')
-  async updateRecommenderRetrainSchedule(@Body() dto: UpdateReviewFilterScheduleDto) {
-    return this.service.updateRecommenderRetrainSchedule(dto);
+  async updateRecommenderRetrainSchedule(@Body() dto: UpdateReviewFilterScheduleDto, @Request() req: any) {
+    return this.service.updateRecommenderRetrainSchedule(dto, req.user?.userId ?? null);
   }
 }

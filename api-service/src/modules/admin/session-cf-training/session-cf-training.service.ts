@@ -53,6 +53,7 @@ export class SessionCfTrainingService {
 
   async runTraining(
     dto: SessionCfTrainingRunRequestDto,
+    adminId: string | null = null,
   ): Promise<SessionCfTrainingRunResponseDto> {
     this.logger.log('Kích hoạt train lại Session-Aware CF Reranker...');
     try {
@@ -63,11 +64,11 @@ export class SessionCfTrainingService {
           { timeout: 600_000 },
         ),
       );
-      await this.insertTrainingLog('active', response.data, dto);
+      await this.insertTrainingLog('active', response.data, dto, adminId);
       return response.data;
     } catch (error) {
       this.logger.error(`Session-CF training failed: ${error.message}`);
-      await this.insertTrainingLog('failed', null, dto, error);
+      await this.insertTrainingLog('failed', null, dto, adminId, error);
       if (error.response?.data) {
         throw new InternalServerErrorException(
           error.response.data.detail || 'Train thất bại',
@@ -87,6 +88,7 @@ export class SessionCfTrainingService {
 
   async updateSchedule(
     dto: UpdateSessionCfTrainingScheduleDto,
+    adminId: string | null = null,
   ): Promise<SessionCfTrainingScheduleDto> {
     const algorithm = await this.ensureAlgorithm();
     const current = await this.ensureScheduleRow(algorithm.id);
@@ -123,7 +125,7 @@ export class SessionCfTrainingService {
         'Could not update session-cf training schedule',
       );
       const updated = data as ScheduleRow;
-      await this.insertScheduleLog(algorithm.id, current, updated);
+      await this.insertScheduleLog(algorithm.id, current, updated, adminId);
       return this.buildScheduleResponse(updated);
     }
 
@@ -159,6 +161,7 @@ export class SessionCfTrainingService {
     status: 'active' | 'failed',
     result: SessionCfTrainingRunResponseDto | null,
     request: Record<string, any>,
+    adminId: string | null,
     error?: any,
   ): Promise<void> {
     try {
@@ -194,6 +197,7 @@ export class SessionCfTrainingService {
         .from('algorithm_logs')
         .insert({
           algorithm_id: algorithm.id,
+          admin_id: adminId,
           status,
           action: 'updated',
           details: JSON.stringify(details),
@@ -373,6 +377,7 @@ export class SessionCfTrainingService {
     algorithmId: string,
     before: ScheduleRow,
     after: ScheduleRow,
+    adminId: string | null = null,
   ): Promise<void> {
     const changes: string[] = [];
     const add = (label: string, oldValue: string, newValue: string) => {
@@ -407,6 +412,7 @@ export class SessionCfTrainingService {
       .from('algorithm_logs')
       .insert({
         algorithm_id: algorithmId,
+        admin_id: adminId,
         status: 'active',
         action: 'parameter_changed',
         details: JSON.stringify({

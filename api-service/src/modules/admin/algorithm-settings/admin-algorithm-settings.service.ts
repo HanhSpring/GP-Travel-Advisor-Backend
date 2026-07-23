@@ -457,6 +457,7 @@ export class AdminAlgorithmSettingsService {
 
   async updateReviewFilterSettings(
     dto: UpdateReviewFilterSettingsDto,
+    adminId: string | null = null,
   ): Promise<ReviewFilterSettingsDto> {
     const algorithm = await this.ensureAlgorithm(
       REVIEW_FILTER_ALGORITHM_NAME,
@@ -501,14 +502,14 @@ export class AdminAlgorithmSettingsService {
         requestedAction: 'review_filter_update',
         message: this.buildChangeLogMessage(logChanges),
         changes: logChanges,
-      });
+      }, adminId);
     }
 
     this.invalidateReviewFilterCache();
     return this.getReviewFilterSettings(false);
   }
 
-  async resetReviewFilterSettings(): Promise<ReviewFilterSettingsDto> {
+  async resetReviewFilterSettings(adminId: string | null = null): Promise<ReviewFilterSettingsDto> {
     const algorithm = await this.ensureAlgorithm(
       REVIEW_FILTER_ALGORITHM_NAME,
       'Review filtering and time-label classification pipeline',
@@ -550,7 +551,7 @@ export class AdminAlgorithmSettingsService {
         oldValue: change.oldValue,
         newValue: change.newValue,
       })),
-    });
+    }, adminId);
 
     this.invalidateReviewFilterCache();
     return this.getReviewFilterSettings(false);
@@ -610,6 +611,7 @@ export class AdminAlgorithmSettingsService {
 
   async updateTwoTowerSettings(
     dto: UpdateTwoTowerSettingsDto,
+    adminId: string | null = null,
   ): Promise<TwoTowerSettingsDto> {
     const algorithm = await this.getAlgorithm();
     const params = await this.getParameterMap(algorithm.id);
@@ -667,13 +669,13 @@ export class AdminAlgorithmSettingsService {
         source: 'admin_ui',
         changedBy: null,
         changes: logChanges,
-      });
+      }, adminId);
     }
 
     return this.getTwoTowerSettings();
   }
 
-  async resetTwoTowerSettings(): Promise<TwoTowerSettingsDto> {
+  async resetTwoTowerSettings(adminId: string | null = null): Promise<TwoTowerSettingsDto> {
     const algorithm = await this.getAlgorithm();
     const params = await this.getParameterMap(algorithm.id);
     const timestamp = new Date().toISOString();
@@ -731,7 +733,7 @@ export class AdminAlgorithmSettingsService {
       source: 'admin_ui',
       changedBy: null,
       changes,
-    });
+    }, adminId);
 
     return this.getTwoTowerSettings();
   }
@@ -1244,6 +1246,7 @@ export class AdminAlgorithmSettingsService {
     status: 'success' | 'failed',
     action: 'updated' | 'reset',
     details: Record<string, unknown>,
+    adminId: string | null = null,
   ): Promise<void> {
     const statusValue = status === 'failed' ? 'failed' : 'active';
     const actionValue = 'parameter_changed';
@@ -1251,7 +1254,8 @@ export class AdminAlgorithmSettingsService {
       .schema('ai_config')
       .from('algorithm_logs')
       .insert({
-        algorithm_id: algorithmId,
+       algorithm_id: algorithmId,
+       admin_id: adminId,
         status: statusValue,
         action: actionValue,
         details: JSON.stringify({

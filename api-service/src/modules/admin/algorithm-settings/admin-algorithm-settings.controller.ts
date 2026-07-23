@@ -6,6 +6,7 @@ import {
   Patch,
   Post,
   Query,
+  Request,
   UseGuards,
 } from '@nestjs/common';
 import {
@@ -54,8 +55,9 @@ export class AdminAlgorithmSettingsController {
   @ApiResponse({ status: 200, type: ReviewFilterSettingsDto })
   updateReviewFilterSettings(
     @Body() dto: UpdateReviewFilterSettingsDto,
+    @Request() req: any,
   ): Promise<ReviewFilterSettingsDto> {
-    return this.service.updateReviewFilterSettings(dto);
+    return this.service.updateReviewFilterSettings(dto, req.user?.userId ?? null);
   }
 
   @Post('review-filter/reset')
@@ -63,8 +65,8 @@ export class AdminAlgorithmSettingsController {
     summary: 'Reset review filtering pipeline settings to defaults',
   })
   @ApiResponse({ status: 200, type: ReviewFilterSettingsDto })
-  resetReviewFilterSettings(): Promise<ReviewFilterSettingsDto> {
-    return this.service.resetReviewFilterSettings();
+  resetReviewFilterSettings(@Request() req: any): Promise<ReviewFilterSettingsDto> {
+    return this.service.resetReviewFilterSettings(req.user?.userId ?? null);
   }
 
   @Get('two-tower')
@@ -79,15 +81,16 @@ export class AdminAlgorithmSettingsController {
   @ApiResponse({ status: 200, type: TwoTowerSettingsDto })
   updateTwoTowerSettings(
     @Body() dto: UpdateTwoTowerSettingsDto,
+    @Request() req: any,
   ): Promise<TwoTowerSettingsDto> {
-    return this.service.updateTwoTowerSettings(dto);
+    return this.service.updateTwoTowerSettings(dto, req.user?.userId ?? null);
   }
 
   @Post('two-tower/reset')
   @ApiOperation({ summary: 'Reset Two Tower retrieval settings to defaults' })
   @ApiResponse({ status: 200, type: TwoTowerSettingsDto })
-  resetTwoTowerSettings(): Promise<TwoTowerSettingsDto> {
-    return this.service.resetTwoTowerSettings();
+  resetTwoTowerSettings(@Request() req: any): Promise<TwoTowerSettingsDto> {
+    return this.service.resetTwoTowerSettings(req.user?.userId ?? null);
   }
 
   @Get('two-tower/logs')
