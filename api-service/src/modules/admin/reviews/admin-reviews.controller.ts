@@ -13,6 +13,7 @@ import { AdminReviewListResponseDto } from './dto/admin-review-list.dto';
 import { AdminReviewDetailDto } from './dto/admin-review-detail.dto';
 import { AdminReviewActionDto } from './dto/admin-review-action.dto';
 import { AdminReviewTimeLabelDto } from './dto/admin-review-time-label.dto';
+import { AdminReviewHideDto } from './dto/admin-review-visibility.dto';
 
 @ApiTags('Admin - Reviews')
 @Controller('admin/reviews')
@@ -141,6 +142,29 @@ export class AdminReviewsController {
       );
     }
     return this.service.updateReviewStatus(id, 'violation', dto.reason);
+  }
+
+  @Put(':id/hide')
+  @ApiOperation({ summary: 'Hide review with an admin-provided reason' })
+  @ApiResponse({
+    status: 200,
+    description: 'Review hidden successfully',
+  })
+  async hideReview(
+    @Param('id') id: string,
+    @Body() dto: AdminReviewHideDto,
+  ) {
+    return this.service.hideReview(id, dto.reason);
+  }
+
+  @Put(':id/unhide')
+  @ApiOperation({ summary: 'Make a hidden review visible again' })
+  @ApiResponse({
+    status: 200,
+    description: 'Review made visible successfully',
+  })
+  async unhideReview(@Param('id') id: string) {
+    return this.service.unhideReview(id);
   }
 
   @Put(':id')

@@ -102,15 +102,44 @@ def test_apply_algorithm3_db_updates_persists_all_three_rules():
     assert (
         "reviews",
         "update",
-        {"status": "hidden"},
-        [("in", "id", ["review-expired", "review-old"])],
+        {
+            "status": "hidden",
+            "hidden_reason": "Đánh giá ngắn hạn đã hết hiệu lực",
+            "hidden_at": "2026-07-16T12:00:00+00:00",
+        },
+        [("eq", "status", "approved"), ("in", "id", ["review-expired"])],
     ) in updates
     assert (
         "reviews",
         "update",
-        {"status": "approved"},
+        {
+            "status": "hidden",
+            "hidden_reason": "Đánh giá dài hạn đã được thay thế bởi thông tin mới hơn",
+            "hidden_at": "2026-07-16T12:00:00+00:00",
+        },
+        [("in", "id", ["review-old"])],
+    ) in updates
+    assert (
+        "reviews",
+        "update",
+        {
+            "status": "approved",
+            "hidden_reason": None,
+            "hidden_at": None,
+        },
         [("eq", "status", "hidden"), ("in", "id", ["review-promoted"])],
     ) in updates
+    assert (
+        "review_contents",
+        "select",
+        "review_id,reviews!inner(status)",
+        [
+            ("eq", "time_label", "short-term"),
+            ("lte", "expiration_date", "2026-07-16T12:00:00+00:00"),
+            ("eq", "reviews.status", "approved"),
+            ("range", 0, 49),
+        ],
+    ) in client.calls
     assert counts == {
         "expired_reviews_hidden": 1,
         "long_term_reviews_hidden": 1,

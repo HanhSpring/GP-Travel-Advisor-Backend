@@ -70,6 +70,12 @@ export class AdminReviewDetailDto {
   @ApiProperty({ nullable: true, type: String })
   violation_reason: string | null;
 
+  @ApiProperty({ nullable: true, type: String })
+  hidden_reason: string | null;
+
+  @ApiProperty({ nullable: true, type: String })
+  hidden_at: string | null;
+
   @ApiProperty()
   created_at: string;
 }
