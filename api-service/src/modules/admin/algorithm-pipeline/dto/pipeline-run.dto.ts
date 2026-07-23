@@ -86,6 +86,8 @@ export interface PipelineHistoryItemDto {
   run_id: string;
   algorithm_id?: string | null;
   algorithm_name?: string;
+  admin_id?: string | null;
+  admin_name?: string | null;
   status?: string;
   action?: string;
   details?: Record<string, any> | null;
