@@ -366,7 +366,16 @@ export class ItineraryController {
         body.transportMode,
         costConfigForCalc,
       );
-      if (calculatedCost > requestedBudget) {
+      // So sánh bằng bản ĐÃ dự trù 10% + làm tròn (roundedPersonCost) —
+      // đúng con số "Chi phí ước tính" thật sự hiển thị cho user sau khi
+      // tạo (Sổ chi tiêu's roundedCostPerAdult dùng chung công thức này).
+      // Trước đây so calculatedCost RAW (chưa dự trù) với requestedBudget —
+      // 1 plan có raw cost thấp hơn budget vẫn lọt qua gate, nhưng sau khi
+      // +10% dự trù + làm tròn lên lại vượt budget, khiến lịch trình được
+      // tạo thẳng không hỏi xác nhận dù số hiển thị cao hơn ngân sách nhập.
+      const roundedCalculatedCost =
+        this.service.roundedPersonCost(calculatedCost);
+      if (roundedCalculatedCost > requestedBudget) {
         const recommendedBudget = this.service.calculateRecommendedBudget(
           plan as any,
           adultCount,
