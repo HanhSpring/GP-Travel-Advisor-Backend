@@ -576,15 +576,20 @@ export class ItineraryService {
     // Nếu user không nhập ngân sách, KHÔNG được lưu null — nếu không thì
     // userBudget/payableLimit = 0 và mọi cảnh báo 90/95/100% ở "Quản lý chi
     // phí" trở nên vô nghĩa (không có gì để so sánh). estimated_cost lưu
-    // NGÂN SÁCH MỖI NGƯỜI LỚN (khớp field nhập lúc tạo lịch trình, xem
-    // IncurredCostsService.computeCostBreakdown dùng ctx.userBudget làm mốc
-    // mỗi người lớn) — calculateRecommendedBudget() giờ cũng trả đúng đơn vị
-    // này (đã dự trù 10%, làm tròn hàng trăm nghìn), không cần tự tính lại.
+    // NGÂN SÁCH MỖI NGƯỜI LỚN Ở DẠNG RAW (chưa dự trù) — khớp đúng bản chất
+    // dto.budget (số user tự gõ vào, chưa cộng gì thêm), vì
+    // IncurredCostsService.computeCostBreakdown TỰ áp roundedPersonCost() lên
+    // ctx.userBudget khi cần hiển thị "Có thể chi trả". Trước đây dùng
+    // calculateRecommendedBudget() (đã dự trù 10% + làm tròn SẴN) làm
+    // fallback — khiến ctx.userBudget mang 1 lớp dự trù, rồi
+    // computeCostBreakdown() áp roundedPersonCost() THÊM 1 LẦN NỮA lên trên,
+    // ra "Có thể chi trả" bị dự trù chồng 2 lần, cao hơn hẳn "Chi phí ước
+    // tính" dù không hề nhập ngân sách để so sánh.
     const inputBudget = Number(dto.budget ?? 0);
     const estimatedCostFallback =
       inputBudget > 0
         ? inputBudget
-        : this.calculateRecommendedBudget(
+        : this.calculatePlanEstimatedCost(
             plan,
             dto.adultCount,
             dto.childCount ?? 0,
