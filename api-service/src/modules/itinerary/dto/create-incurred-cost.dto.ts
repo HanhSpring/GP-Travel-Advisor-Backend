@@ -57,7 +57,7 @@ export class CreateIncurredCostDto {
 
   @ApiPropertyOptional({
     description:
-      'Ngày thứ N (1-indexed) của chuyến, dùng khi khoản chi không gắn địa điểm cụ thể nhưng vẫn biết rơi vào ngày nào. Không dùng cùng lúc với placeId, và không áp dụng cho type "Chi phí kế hoạch"/"Điều chỉnh xăng xe".',
+      'Ngày thứ N (1-indexed) của chuyến, dùng khi khoản chi không gắn địa điểm cụ thể nhưng vẫn biết rơi vào ngày nào. Bị bỏ qua nếu có placeId — ngày sẽ tự động lấy theo ngày viếng thăm thực tế của địa điểm đó. Không áp dụng cho type "Chi phí kế hoạch"/"Điều chỉnh xăng xe".',
     example: 3,
   })
   @IsOptional()

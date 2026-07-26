@@ -6,6 +6,7 @@ import {
   IsOptional,
   IsString,
   IsUUID,
+  MaxLength,
   Max,
   Min,
   ValidateNested,
@@ -37,6 +38,7 @@ export class CreateOrderDto {
   @ApiProperty({ required: false, nullable: true })
   @IsOptional()
   @IsString()
+  @MaxLength(500)
   notes?: string;
 
   @ApiProperty({ type: [CreateOrderItemDto] })

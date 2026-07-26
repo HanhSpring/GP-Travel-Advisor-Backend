@@ -17,6 +17,7 @@ interface ItineraryRow {
   adult_count: number | null;
   children_count: number | null;
   status: string | null;
+  tracking_active?: boolean | null;
   destination: string | null;
   created_at: string;
   is_public: boolean | null;
@@ -792,14 +793,21 @@ export class ExploreService implements OnModuleInit {
   }
 
   async getCurrentItinerary(touristId: string) {
+    const today = new Intl.DateTimeFormat('en-CA', {
+      timeZone: 'Asia/Ho_Chi_Minh',
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date());
     const { data: ongoing, error } = await supabase
       .schema('travel')
       .from('itineraries')
       .select(
-        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, destination, created_at, is_public, itinerary_details(arrival_time, duration_minutes)',
+        'id, creator_id, description, start_date, end_date, adult_count, children_count, status, tracking_active, destination, created_at, is_public, itinerary_details(arrival_time, duration_minutes)',
       )
       .eq('creator_id', touristId)
       .eq('status', 'ongoing')
+      .gte('end_date', today)
       .eq('is_deleted', false)
       .order('created_at', { ascending: false })
       .limit(1)
@@ -821,6 +829,7 @@ export class ExploreService implements OnModuleInit {
       time_range: this.computeTimeRange(ongoing.itinerary_details),
       participant_count: this.toParticipantCount(ongoing),
       status: ongoing.status,
+      tracking_active: ongoing.tracking_active === true,
       can_start: false,
       start_target: null,
     };

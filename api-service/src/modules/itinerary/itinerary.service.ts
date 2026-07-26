@@ -16,7 +16,10 @@ import { ShareItineraryDto } from './dto/share-itinerary.dto';
 import { RespondItineraryShareDto } from './dto/respond-itinerary-share.dto';
 import { CreateItineraryShareLinkDto } from './dto/create-itinerary-share-link.dto';
 import { RespondItineraryShareLinkDto } from './dto/respond-itinerary-share-link.dto';
-import { LUNCH_START_MIN, LUNCH_END_MIN } from '../../common/constants/lunch-window.constant';
+import {
+  LUNCH_START_MIN,
+  LUNCH_END_MIN,
+} from '../../common/constants/lunch-window.constant';
 
 import { CreateItineraryDto, TransportMode } from './dto/create-itinerary.dto';
 import { HotelRoomResponseDto } from './dto/hotel-room-response.dto';
@@ -90,7 +93,10 @@ export class ItineraryService {
   // Goong riêng cho cùng 1 cặp, dội rate limit (429) dù distance_matrix đã có
   // sẵn hàng chục nghìn dòng. Map này đảm bảo chỉ 1 request thật sự đi gọi
   // Goong cho mỗi cặp, các request khác chờ dùng chung kết quả.
-  private readonly pendingGoongLegRequests = new Map<string, Promise<any | null>>();
+  private readonly pendingGoongLegRequests = new Map<
+    string,
+    Promise<any | null>
+  >();
 
   constructor(
     private readonly tripCostConfig: TripCostConfigService,
@@ -104,12 +110,15 @@ export class ItineraryService {
   ): Promise<R[]> {
     const results: R[] = new Array(items.length);
     let cursor = 0;
-    const workers = Array.from({ length: Math.min(limit, items.length) }, async () => {
-      while (cursor < items.length) {
-        const index = cursor++;
-        results[index] = await fn(items[index]);
-      }
-    });
+    const workers = Array.from(
+      { length: Math.min(limit, items.length) },
+      async () => {
+        while (cursor < items.length) {
+          const index = cursor++;
+          results[index] = await fn(items[index]);
+        }
+      },
+    );
     await Promise.all(workers);
     return results;
   }
@@ -189,7 +198,9 @@ export class ItineraryService {
       ],
     });
     const tTracking = Date.now();
-    const result = await this.withEstimatedListCosts(this.withListStats(merged));
+    const result = await this.withEstimatedListCosts(
+      this.withListStats(merged),
+    );
     const tCosts = Date.now();
     const total = tCosts - t0;
     const itineraryCount = Array.isArray((merged as any)?.itineraries)
@@ -494,7 +505,8 @@ export class ItineraryService {
     // trước) + childPriceRatio đọc 1 lần (đã cache in-memory 60s ở
     // TripCostConfigService, nhưng đọc trước cho rõ ràng, không phải đọc lại
     // trong vòng lặp).
-    const costEstimatesById = await this.getCachedCostBreakdownBatch(itineraryIds);
+    const costEstimatesById =
+      await this.getCachedCostBreakdownBatch(itineraryIds);
     const { childPriceRatio } = await this.tripCostConfig.getConfig();
 
     const enriched = itineraries.map((item: any) => {
@@ -651,7 +663,10 @@ export class ItineraryService {
     // transport_cost thì AI không tính (không có trong ScheduleEntryResponse
     // Python) nên vẫn phải tính ở đây — tripCostConfig/travelMode đã lấy sẵn
     // ở trên (dùng lại cho calculateRecommendedBudget()), không cần gọi lại.
-    const headcount = Math.max(1, Number(dto.adultCount ?? 0) + Number(dto.childCount ?? 0));
+    const headcount = Math.max(
+      1,
+      Number(dto.adultCount ?? 0) + Number(dto.childCount ?? 0),
+    );
     const activityRows = plan.days.flatMap((day) => {
       const schedule = Array.isArray(day.schedule) ? day.schedule : [];
       const visitDate = this.addDays(dto.startDate, day.day - 1);
@@ -832,7 +847,9 @@ export class ItineraryService {
       .order('sequence_order', { ascending: true });
 
     if (error) {
-      this.logger.warn(`annotateDaysMissingRestaurant read error: ${error.message}`);
+      this.logger.warn(
+        `annotateDaysMissingRestaurant read error: ${error.message}`,
+      );
       return;
     }
     if (!data || data.length === 0) return;
@@ -848,7 +865,9 @@ export class ItineraryService {
     for (const rows of rowsByDate.values()) {
       const restaurantRows = rows.filter((row: any) => {
         const place = row.places;
-        const typeData = Array.isArray(place?.types) ? place.types[0] : place?.types;
+        const typeData = Array.isArray(place?.types)
+          ? place.types[0]
+          : place?.types;
         const categoryData = Array.isArray(typeData?.categories)
           ? typeData.categories[0]
           : typeData?.categories;
@@ -875,12 +894,17 @@ export class ItineraryService {
         continue;
       }
       if (restaurantCount === 1) {
-        updates.push({ id: first.id, notes: ItineraryService.FEW_RESTAURANT_NOTE });
+        updates.push({
+          id: first.id,
+          notes: ItineraryService.FEW_RESTAURANT_NOTE,
+        });
         continue;
       }
       const hasEveningRestaurant = restaurantRows.some((row: any) => {
         const hour = Number(String(row.arrival_time ?? '').split(':')[0]);
-        return Number.isFinite(hour) && hour >= ItineraryService.DINNER_WARNING_HOUR;
+        return (
+          Number.isFinite(hour) && hour >= ItineraryService.DINNER_WARNING_HOUR
+        );
       });
       if (!hasEveningRestaurant) {
         updates.push({ id: first.id, notes: ItineraryService.NO_DINNER_NOTE });
@@ -1248,6 +1272,9 @@ export class ItineraryService {
 
     if (dto.action === 'accept') {
       const wasMember = await this.isItineraryMember(itineraryId, dto.userId);
+      if (!wasMember) {
+        await this.assertCanJoinActiveItinerary(itineraryId, dto.userId);
+      }
       await this.addItineraryMember(itineraryId, dto.userId);
       // Đồng bộ trạng thái: nếu user cũng nhận lời mời trực tiếp đang chờ
       // cho lịch trình này thì đánh dấu đã chấp nhận để thông báo không
@@ -1432,6 +1459,7 @@ export class ItineraryService {
     }
 
     if (dto.action === 'accept') {
+      await this.assertCanJoinActiveItinerary(itineraryId, dto.userId);
       await this.addItineraryMember(itineraryId, dto.userId);
     }
 
@@ -1549,7 +1577,10 @@ export class ItineraryService {
       .schema('public')
       .from('notifications')
       .select('id', { count: 'exact', head: true })
-      .in('action_type', ['respond_itinerary_share', 'itinerary_share_accepted'])
+      .in('action_type', [
+        'respond_itinerary_share',
+        'itinerary_share_accepted',
+      ])
       .filter('metadata->>itinerary_id', 'eq', itineraryId);
 
     if (error) {
@@ -1659,6 +1690,90 @@ export class ItineraryService {
 
     if (error && error.code !== '23505') {
       throw new InternalServerErrorException(error.message);
+    }
+  }
+
+  /**
+   * Một tài khoản chỉ được tham gia một lịch trình đang chạy tại một thời điểm.
+   * Không tự dừng lịch trình hiện tại vì accept lời mời không nên gây thay đổi
+   * trạng thái ngoài ý muốn; user phải kết thúc/dừng chuyến hiện tại trước.
+   */
+  private async assertCanJoinActiveItinerary(
+    itineraryId: string,
+    userId: string,
+  ) {
+    const { data: target, error: targetError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, status, tracking_active')
+      .eq('id', itineraryId)
+      .maybeSingle();
+    if (targetError) {
+      throw new InternalServerErrorException(targetError.message);
+    }
+    if (!target) {
+      throw new NotFoundException(`Itinerary not found: ${itineraryId}`);
+    }
+
+    const targetIsActive =
+      String((target as any).status ?? '').toLowerCase() === 'ongoing' ||
+      (target as any).tracking_active === true;
+    if (!targetIsActive) return;
+
+    const { data: ownedActive, error: ownedError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, description, destination')
+      .eq('creator_id', userId)
+      .neq('id', itineraryId)
+      .or('status.eq.ongoing,tracking_active.eq.true')
+      .limit(1)
+      .maybeSingle();
+    if (ownedError) {
+      throw new InternalServerErrorException(ownedError.message);
+    }
+
+    let sharedActive: any = null;
+    if (!ownedActive) {
+      const { data: memberships, error: membershipError } = await supabase
+        .schema('travel')
+        .from('itinerary_members')
+        .select('itinerary_id')
+        .eq('tourist_id', userId)
+        .neq('itinerary_id', itineraryId);
+      if (membershipError) {
+        throw new InternalServerErrorException(membershipError.message);
+      }
+
+      const sharedIds = (memberships ?? []).map(
+        (item: any) => item.itinerary_id,
+      );
+      if (sharedIds.length > 0) {
+        const { data, error } = await supabase
+          .schema('travel')
+          .from('itineraries')
+          .select('id, description, destination')
+          .in('id', sharedIds)
+          .or('status.eq.ongoing,tracking_active.eq.true')
+          .limit(1)
+          .maybeSingle();
+        if (error) {
+          throw new InternalServerErrorException(error.message);
+        }
+        sharedActive = data;
+      }
+    }
+
+    const conflict = ownedActive ?? sharedActive;
+    if (conflict) {
+      const activeName =
+        (conflict as any).description ||
+        (conflict as any).destination ||
+        'lịch trình hiện tại';
+      throw new ConflictException(
+        `Bạn đang tham gia lịch trình "${activeName}". ` +
+          'Vui lòng kết thúc hoặc dừng lịch trình đó trước khi chấp nhận lời mời vào một lịch trình đang diễn ra.',
+      );
     }
   }
 
@@ -2249,10 +2364,7 @@ export class ItineraryService {
     `;
     // Fallback query cần inner-join để `.eq('types.category_id', ...)` lọc
     // được ở top-level row (PostgREST bỏ qua filter embed nếu không !inner).
-    const selectQueryInnerType = selectQuery.replace(
-      'types (',
-      'types!inner(',
-    );
+    const selectQueryInnerType = selectQuery.replace('types (', 'types!inner(');
 
     const format = (rows: any[]) =>
       rows.map((p: any) => {
@@ -2297,10 +2409,11 @@ export class ItineraryService {
         };
       });
 
-    const recommended = await this.recommendationsService.getRecommendedPlaceIds(
-      currentPlace.id,
-      { userId },
-    );
+    const recommended =
+      await this.recommendationsService.getRecommendedPlaceIds(
+        currentPlace.id,
+        { userId },
+      );
     const recommendedIds = recommended
       .map((item) => item.id)
       .filter((id) => !excludedPlaceIds.includes(id));
@@ -2975,8 +3088,7 @@ export class ItineraryService {
       ) {
         throw new BadRequestException({
           code: 'LUNCH_CONFLICT',
-          message:
-            'Địa điểm ăn trưa phải nằm trọn trong khung 10:30 - 14:00',
+          message: 'Địa điểm ăn trưa phải nằm trọn trong khung 10:30 - 14:00',
         });
       }
     }
@@ -3018,12 +3130,12 @@ export class ItineraryService {
             : null;
           const overlapAlreadyExisted = Boolean(
             oldLeft &&
-              oldRight &&
-              oldLeft.visitDate === oldRight.visitDate &&
-              oldLeftEnd != null &&
-              oldRightEnd != null &&
-              this.toMinutes(oldLeft.arrivalTime) < oldRightEnd &&
-              this.toMinutes(oldRight.arrivalTime) < oldLeftEnd,
+            oldRight &&
+            oldLeft.visitDate === oldRight.visitDate &&
+            oldLeftEnd != null &&
+            oldRightEnd != null &&
+            this.toMinutes(oldLeft.arrivalTime) < oldRightEnd &&
+            this.toMinutes(oldRight.arrivalTime) < oldLeftEnd,
           );
           if (overlapAlreadyExisted) continue;
 
@@ -3222,7 +3334,8 @@ export class ItineraryService {
       itinerary.travel_mode,
       Math.max(
         1,
-        Number(itinerary.adult_count ?? 0) + Number(itinerary.children_count ?? 0),
+        Number(itinerary.adult_count ?? 0) +
+          Number(itinerary.children_count ?? 0),
       ),
     );
     // Nếu vừa tính + lưu thêm được chặng nào trước đó còn thiếu (thường do
@@ -3530,9 +3643,7 @@ export class ItineraryService {
           // Không tự tạo điểm đánh giá khi nguồn dữ liệu chưa có rating.
           // Client sẽ chỉ hiển thị khi cả rating và số lượt đánh giá là hợp lệ.
           rating:
-            place?.average_rating != null
-              ? Number(place.average_rating)
-              : null,
+            place?.average_rating != null ? Number(place.average_rating) : null,
           reviewCount:
             place?.review_count != null ? Number(place.review_count) : 0,
           // Hệ thống tự ghi (VD annotateDaysMissingRestaurant() cảnh báo
@@ -4005,9 +4116,13 @@ export class ItineraryService {
       result += places.categories.name + ' ';
     }
 
-    const typeData = Array.isArray(places.types) ? places.types[0] : places.types;
+    const typeData = Array.isArray(places.types)
+      ? places.types[0]
+      : places.types;
     if (typeData) {
-      const catData = Array.isArray(typeData.categories) ? typeData.categories[0] : typeData.categories;
+      const catData = Array.isArray(typeData.categories)
+        ? typeData.categories[0]
+        : typeData.categories;
       if (catData?.name) {
         result += catData.name + ' ';
       }
@@ -4015,7 +4130,7 @@ export class ItineraryService {
         result += typeData.name + ' ';
       }
     }
-    
+
     return result.trim() || null;
   }
   async optimizeDayRoute(
@@ -4283,11 +4398,16 @@ export class ItineraryService {
     // been priced the same as CAR here, so it maps onto "car".
     const capacityMode = mode === TransportMode.MOTORBIKE ? 'motorbike' : 'car';
     const costPerKm =
-      config.transportCostPerKm[capacityMode] ?? config.transportCostPerKmDefault;
+      config.transportCostPerKm[capacityMode] ??
+      config.transportCostPerKmDefault;
     // Fuel cost is per vehicle, not per person: the group needs
     // ceil(headcount / seats_per_vehicle) vehicles, each burning fuel over
     // the same distance.
-    const vehicles = this.tripCostConfig.vehiclesNeeded(headcount, capacityMode, config);
+    const vehicles = this.tripCostConfig.vehiclesNeeded(
+      headcount,
+      capacityMode,
+      config,
+    );
     // Rounded to the nearest 1,000đ (not the nearest đ) — gasoline cost is an
     // estimate, showing exact-đồng precision reads as falsely precise.
     return Math.round((km * costPerKm * vehicles) / 1000) * 1000;
@@ -4403,7 +4523,9 @@ export class ItineraryService {
    * contingencyCost = roundedGroupTotal - estimatedCostForGroup ra ÂM — tức
    * "dự trù" hiển thị số âm, vô lý vì dự trù không bao giờ được phép âm. */
   roundedPersonCost(rawPersonCost: number): number {
-    return Math.ceil((rawPersonCost * (1 + this.reserveRate)) / 100000) * 100000;
+    return (
+      Math.ceil((rawPersonCost * (1 + this.reserveRate)) / 100000) * 100000
+    );
   }
 
   /** Tách activity/hotel/transport cost thô từ 1 AIPlanResult, quy ra
@@ -4531,9 +4653,7 @@ export class ItineraryService {
    * KHÔNG cộng "Điều chỉnh xăng xe" (khoản đó cũng chỉ tồn tại trong
    * incurred_costs, không đụng vào số ước tính đóng băng này).
    */
-  async calculateTripCostBreakdown(
-    itineraryId: string,
-  ): Promise<{
+  async calculateTripCostBreakdown(itineraryId: string): Promise<{
     placeCost: number;
     hotelCost: number;
     transportCost: number;
@@ -4550,7 +4670,10 @@ export class ItineraryService {
         `Failed to load itinerary: ${itineraryError.message}`,
       );
     }
-    const adultCount = Math.max(0, Number((itinerary as any)?.adult_count ?? 0));
+    const adultCount = Math.max(
+      0,
+      Number((itinerary as any)?.adult_count ?? 0),
+    );
     const childCount = Math.max(
       0,
       Number((itinerary as any)?.children_count ?? 0),
@@ -4823,8 +4946,12 @@ export class ItineraryService {
     // calculatedTripCost ở đây là bản ĐÃ reserve/round (đọc thẳng từ
     // itinerary_cost_estimates.calculated_trip_cost) — dùng luôn làm
     // roundedCostPerAdult, không tính lại reserve/round cho người lớn nữa.
-    const { calculatedTripCost: roundedCostPerAdult, placeCost, hotelCost, transportCost } =
-      breakdown;
+    const {
+      calculatedTripCost: roundedCostPerAdult,
+      placeCost,
+      hotelCost,
+      transportCost,
+    } = breakdown;
     const participantCount = Math.max(1, adultCount + childCount);
     // Bản RAW (chưa reserve) chỉ dùng cho estimatedCostForGroup/estimatedCostPerAdult
     // (số tham chiếu, không hiển thị chính).
@@ -4837,7 +4964,9 @@ export class ItineraryService {
     const transportPerAdult =
       Math.round(transportCost / participantCount / 1000) * 1000;
     const childBaseCost =
-      placeCost * childPriceRatio + hotelCost * childPriceRatio + transportPerAdult;
+      placeCost * childPriceRatio +
+      hotelCost * childPriceRatio +
+      transportPerAdult;
 
     const roundedCostPerChild =
       childCount > 0 ? this.roundedPersonCost(childBaseCost) : 0;
@@ -4858,9 +4987,7 @@ export class ItineraryService {
    * riêng cho từng lịch trình (N query, dù chạy song song vẫn là N round-trip
    * mạng). Lịch trình nào chưa có dòng cache (hiếm, tạo trước khi có bảng
    * này) mới backfill riêng, không kéo cả danh sách xuống N query như cũ. */
-  private async getCachedCostBreakdownBatch(
-    itineraryIds: string[],
-  ): Promise<
+  private async getCachedCostBreakdownBatch(itineraryIds: string[]): Promise<
     Map<
       string,
       {
@@ -5139,7 +5266,10 @@ export class ItineraryService {
 
     // Dedupe trong phạm vi 1 lệnh gọi — 1 itinerary có thể ghé lại cùng 1 cặp
     // điểm nhiều lần (đi rồi quay lại) nhưng chỉ cần tra/gọi Goong 1 lần.
-    const uniqueLegs = new Map<string, { originId: string; destination: any }>();
+    const uniqueLegs = new Map<
+      string,
+      { originId: string; destination: any }
+    >();
     for (const leg of legs) {
       uniqueLegs.set(`${leg.originId}:${leg.destination.place_id}`, leg);
     }
@@ -5177,8 +5307,10 @@ export class ItineraryService {
         ]),
     );
 
-    const entries = [...uniqueLegs.entries()].filter(([, leg]) =>
-      coordinates.has(leg.originId) && coordinates.has(leg.destination.place_id),
+    const entries = [...uniqueLegs.entries()].filter(
+      ([, leg]) =>
+        coordinates.has(leg.originId) &&
+        coordinates.has(leg.destination.place_id),
     );
 
     // Mỗi cặp (origin, destination, mode) chỉ có TỐI ĐA 1 request Goong đang
@@ -5193,9 +5325,11 @@ export class ItineraryService {
         const pending = this.pendingGoongLegRequests.get(lockKey);
         if (pending) return pending;
 
-        const promise = this.resolveSingleGoongLeg(leg, travelMode, coordinates).finally(
-          () => this.pendingGoongLegRequests.delete(lockKey),
-        );
+        const promise = this.resolveSingleGoongLeg(
+          leg,
+          travelMode,
+          coordinates,
+        ).finally(() => this.pendingGoongLegRequests.delete(lockKey));
         this.pendingGoongLegRequests.set(lockKey, promise);
         return promise;
       },
@@ -5345,13 +5479,10 @@ export class ItineraryService {
     endDate?: string | null,
   ): number {
     const start = new Date(`${startDate}T00:00:00.000Z`).getTime();
-    const end = new Date(
-      `${endDate || startDate}T00:00:00.000Z`,
-    ).getTime();
+    const end = new Date(`${endDate || startDate}T00:00:00.000Z`).getTime();
     if (!Number.isFinite(start) || !Number.isFinite(end) || end < start) {
       return 1;
     }
     return Math.floor((end - start) / 86_400_000) + 1;
   }
-
 }

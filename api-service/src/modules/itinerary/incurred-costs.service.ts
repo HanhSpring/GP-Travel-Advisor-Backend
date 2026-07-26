@@ -51,10 +51,13 @@ export interface CostDistributionResult {
   /** Tổng chi phí trẻ em (childCount * basePlanCost * childPriceRatio), báo
    * riêng để UI hiển thị thành 1 dòng độc lập, không trộn vào total của ai. */
   childrenShare: number;
-  /** Thành viên đang chịu trách nhiệm phần trẻ em ở trên (mặc định = chủ
-   * lịch trình), null nếu không có trẻ em hoặc chủ lịch trình không còn
-   * trong memberIds. */
-  childrenAssignedTo: string | null;
+  /** Phần childrenShare CỦA TỪNG THÀNH VIÊN — chia theo số trẻ họ được gán
+   * phụ trách (xem travel.itinerary_child_assignments/childAssignments
+   * param). Trẻ CHƯA được gán ai mặc định dồn về chủ lịch trình, giữ đúng
+   * hành vi cũ khi không có gán nào cả. Chỉ member có childAssignments >
+   * 0 hoặc là chủ lịch trình (khi có phần chưa gán) mới có giá trị > 0
+   * trong map này. */
+  childrenShareByMember: Map<string, number>;
 }
 
 /**
@@ -66,11 +69,16 @@ export interface CostDistributionResult {
  * recommendation.service.ts/itinerary.service.ts) — share lịch trình không
  * làm thay đổi mức giá này: mỗi tài khoản thật (tối đa = số người lớn) luôn
  * gánh đúng basePlanCost, không chia nhỏ theo số tài khoản đang có. Trẻ em
- * không có tài khoản nên mặc định toàn bộ chi phí trẻ em thuộc về chủ lịch
- * trình — nhưng đây là 1 con số RIÊNG (childrenShare), không được cộng gộp
- * thẳng vào total của chủ lịch trình (dễ gây hiểu lầm "sao chủ trả nhiều hơn
- * người khác mà không rõ vì sao"). Chuyển phần trẻ em cho thành viên khác là
- * một tính năng riêng (UI "điều chỉnh giá"), chưa xây dựng ở đây.
+ * không có tài khoản nên chi phí trẻ em là 1 con số RIÊNG (childrenShare),
+ * không được cộng gộp thẳng vào total của ai (dễ gây hiểu lầm "sao người
+ * này trả nhiều hơn người khác mà không rõ vì sao").
+ *
+ * childAssignments (từ travel.itinerary_child_assignments — memberId → số
+ * trẻ họ phụ trách) quyết định childrenShare chia cho AI: chia đều theo
+ * "giá mỗi trẻ" (childrenShare / childCount) rồi nhân số trẻ mỗi người được
+ * gán. Trẻ CHƯA được gán ai (childCount trừ tổng đã gán) mặc định dồn về
+ * chủ lịch trình — giữ đúng hành vi cũ khi chưa từng gán (childAssignments
+ * rỗng/undefined) hoặc gán chưa đủ.
  */
 export function distributeCosts(
   memberIds: string[],
@@ -79,13 +87,19 @@ export function distributeCosts(
   childPriceRatio: number,
   basePlanCost: number,
   incurredCosts: Array<{ amount: number; chargedTo: string[]; type: CostType }>,
+  childAssignments?: Map<string, number>,
 ): CostDistributionResult {
   const totals = new Map<string, number>(memberIds.map((id) => [id, 0]));
   const categoryTotals = new Map<string, Partial<Record<CostType, number>>>(
     memberIds.map((id) => [id, {}]),
   );
   if (memberIds.length === 0) {
-    return { totals, categoryTotals, childrenShare: 0, childrenAssignedTo: null };
+    return {
+      totals,
+      categoryTotals,
+      childrenShare: 0,
+      childrenShareByMember: new Map(),
+    };
   }
 
   // Sharing không thay đổi giá: mỗi tài khoản thật gánh đúng basePlanCost
@@ -101,8 +115,6 @@ export function distributeCosts(
   // người lớn, không có "giá trẻ em" như vé/khách sạn).
   let childrenShare =
     childCount > 0 ? childCount * basePlanCost * childPriceRatio : 0;
-  const childrenAssignedTo =
-    childCount > 0 && totals.has(ownerId) ? ownerId : null;
 
   const addCategoryShare = (id: string, type: CostType, share: number) => {
     const entry = categoryTotals.get(id);
@@ -137,7 +149,37 @@ export function distributeCosts(
       }
     }
   }
-  return { totals, categoryTotals, childrenShare, childrenAssignedTo };
+
+  // Chia childrenShare theo số trẻ mỗi người được gán — "giá mỗi trẻ" chia
+  // đều trên tổng childCount, phần chưa gán (childCount - tổng đã gán) dồn
+  // về chủ lịch trình. childAssignments rỗng/undefined → toàn bộ là "chưa
+  // gán" → 100% về chủ lịch trình, đúng hành vi cũ.
+  const childrenShareByMember = new Map<string, number>();
+  if (childCount > 0 && childrenShare > 0) {
+    const perChildShare = childrenShare / childCount;
+    let assignedCount = 0;
+    if (childAssignments) {
+      for (const [id, count] of childAssignments.entries()) {
+        if (!totals.has(id) || count <= 0) continue;
+        const clamped = Math.min(count, childCount - assignedCount);
+        if (clamped <= 0) continue;
+        assignedCount += clamped;
+        childrenShareByMember.set(
+          id,
+          (childrenShareByMember.get(id) ?? 0) + perChildShare * clamped,
+        );
+      }
+    }
+    const unassignedCount = Math.max(0, childCount - assignedCount);
+    if (unassignedCount > 0 && totals.has(ownerId)) {
+      childrenShareByMember.set(
+        ownerId,
+        (childrenShareByMember.get(ownerId) ?? 0) + perChildShare * unassignedCount,
+      );
+    }
+  }
+
+  return { totals, categoryTotals, childrenShare, childrenShareByMember };
 }
 
 @Injectable()
@@ -183,6 +225,115 @@ export class IncurredCostsService {
       childCount: Math.max(0, Number((itinerary as any).children_count ?? 0)),
       userBudget: Math.max(0, Number((itinerary as any).estimated_cost ?? 0)),
       memberIds,
+    };
+  }
+
+  /** tourist_id → số trẻ họ phụ trách, dùng cho distributeCosts(). Rỗng nếu
+   * chưa ai gán gì — hàm gọi nó tự fallback 100% childrenShare về chủ lịch
+   * trình như hành vi cũ. */
+  private async loadChildAssignments(
+    itineraryId: string,
+  ): Promise<Map<string, number>> {
+    const { data, error } = await supabase
+      .schema('travel')
+      .from('itinerary_child_assignments')
+      .select('tourist_id, child_count')
+      .eq('itinerary_id', itineraryId);
+    if (error) {
+      throw new InternalServerErrorException(
+        `Failed to load child assignments: ${error.message}`,
+      );
+    }
+    return new Map(
+      (data ?? []).map((row: any) => [
+        row.tourist_id as string,
+        Number(row.child_count ?? 0),
+      ]),
+    );
+  }
+
+  /** Chủ lịch trình gán số trẻ em cho từng thành viên phụ trách — thay thế
+   * TOÀN BỘ bảng gán cũ (không phải patch từng dòng), để UI luôn gửi lên
+   * đúng trạng thái đầy đủ nó đang hiển thị, tránh lệch nếu 2 thiết bị sửa
+   * cùng lúc. Cho phép tổng < childCount (phần còn lại tự dồn về chủ lịch
+   * trình) nhưng KHÔNG cho tổng > childCount (gán vượt số trẻ thật có). */
+  async setChildAssignments(
+    itineraryId: string,
+    callerId: string,
+    assignments: Array<{ touristId: string; childCount: number }>,
+  ): Promise<void> {
+    const ctx = await this.loadAccessContext(itineraryId);
+    this.assertNotLocked(ctx);
+    if (ctx.creatorId !== callerId) {
+      throw new ForbiddenException(
+        'Chỉ chủ lịch trình mới được gán trẻ em cho thành viên',
+      );
+    }
+    const cleaned = assignments
+      .map((a) => ({
+        touristId: a.touristId,
+        childCount: Math.max(0, Math.trunc(a.childCount)),
+      }))
+      .filter((a) => a.childCount > 0);
+    for (const a of cleaned) {
+      if (!ctx.memberIds.includes(a.touristId)) {
+        throw new BadRequestException(
+          'Chỉ được gán cho thành viên thật của lịch trình này',
+        );
+      }
+    }
+    const totalAssigned = cleaned.reduce((sum, a) => sum + a.childCount, 0);
+    if (totalAssigned > ctx.childCount) {
+      throw new BadRequestException(
+        `Tổng số trẻ được gán (${totalAssigned}) vượt quá số trẻ em của lịch trình (${ctx.childCount})`,
+      );
+    }
+
+    const { error: deleteError } = await supabase
+      .schema('travel')
+      .from('itinerary_child_assignments')
+      .delete()
+      .eq('itinerary_id', itineraryId);
+    if (deleteError) {
+      throw new InternalServerErrorException(deleteError.message);
+    }
+    if (cleaned.length === 0) return;
+    const { error: insertError } = await supabase
+      .schema('travel')
+      .from('itinerary_child_assignments')
+      .insert(
+        cleaned.map((a) => ({
+          itinerary_id: itineraryId,
+          tourist_id: a.touristId,
+          child_count: a.childCount,
+        })),
+      );
+    if (insertError) {
+      throw new InternalServerErrorException(insertError.message);
+    }
+  }
+
+  /** Danh sách gán hiện tại + phần CHƯA gán (tự động hiểu là của chủ lịch
+   * trình) — cho UI hiển thị đúng trạng thái để sửa tiếp. */
+  async getChildAssignments(
+    itineraryId: string,
+    callerId: string,
+  ): Promise<{
+    childCount: number;
+    assignments: Array<{ touristId: string; childCount: number }>;
+    unassignedCount: number;
+  }> {
+    const ctx = await this.loadAccessContext(itineraryId);
+    this.assertCallerIsMember(ctx, callerId);
+    const map = await this.loadChildAssignments(itineraryId);
+    const assignments = Array.from(map.entries())
+      .filter(([id]) => ctx.memberIds.includes(id))
+      .map(([touristId, childCount]) => ({ touristId, childCount }));
+    const totalAssigned = assignments.reduce((s, a) => s + a.childCount, 0);
+    return {
+      childCount: ctx.childCount,
+      assignments,
+      unassignedCount: Math.max(0, ctx.childCount - totalAssigned),
     };
   }
 
@@ -270,15 +421,23 @@ export class IncurredCostsService {
     return unique;
   }
 
-  /** Địa điểm phải thuộc lịch trình này VÀ đã ở trạng thái visited. */
-  private async validatePlaceId(
+  /** Địa điểm phải thuộc lịch trình này VÀ đã ở trạng thái visited. Trả về
+   * ngày thứ N (1-indexed) mà địa điểm được visited — dùng để tự động gán
+   * day_number cho khoản chi gắn theo địa điểm (xem createIncurredCost/
+   * updateIncurredCost): người dùng không tự chọn ngày cho khoản chi có
+   * placeId nữa, ngày phải khớp ngày viếng thăm thực tế. Trả null nếu thiếu
+   * visit_date/start_date (dữ liệu cũ) — không throw, vì thiếu dữ liệu ngày
+   * không phải lý do để chặn tạo chi phí. Nếu 1 địa điểm được visited nhiều
+   * ngày (hiếm, vd ghé lại), lấy ngày SỚM NHẤT — nhất quán với
+   * getEligiblePlaces() (dedupe theo place_id, không phân biệt lần viếng). */
+  private async validatePlaceIdAndResolveDay(
     itineraryId: string,
     placeId: string,
-  ): Promise<void> {
+  ): Promise<number | null> {
     const { data: detailRows, error } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('id')
+      .select('id, visit_date')
       .eq('itinerary_id', itineraryId)
       .eq('place_id', placeId);
     if (error) {
@@ -302,16 +461,49 @@ export class IncurredCostsService {
         `Failed to validate visit status: ${visitError.message}`,
       );
     }
-    if (!visits || visits.length === 0) {
+    const visitedDetailIds = new Set(
+      (visits ?? []).map((v: any) => v.itinerary_detail_id),
+    );
+    const visitedDetails = detailRows.filter((d: any) =>
+      visitedDetailIds.has(d.id),
+    );
+    if (visitedDetails.length === 0) {
       throw new BadRequestException(
         'Chỉ có thể gắn chi phí vào địa điểm đã đi (trạng thái đã đi)',
       );
     }
+
+    const visitDates = visitedDetails
+      .map((d: any) => d.visit_date)
+      .filter((v: any): v is string => !!v)
+      .sort();
+    if (visitDates.length === 0) return null;
+
+    const { data: itinerary, error: itinError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('start_date')
+      .eq('id', itineraryId)
+      .maybeSingle();
+    if (itinError) {
+      throw new InternalServerErrorException(
+        `Failed to resolve place day: ${itinError.message}`,
+      );
+    }
+    const startDate = (itinerary as any)?.start_date;
+    if (!startDate) return null;
+    return (
+      Math.round(
+        (new Date(visitDates[0]).getTime() - new Date(startDate).getTime()) /
+          86_400_000,
+      ) + 1
+    );
   }
 
   /** Ngày phải nằm trong khoảng [1, số ngày chuyến] — không gate theo trạng
-   * thái visit/status (khác validatePlaceId): user có thể gắn 1 khoản chi
-   * vào ngày bất kỳ, kể cả ngày chưa tới. */
+   * thái visit/status (khác validatePlaceIdAndResolveDay): user có thể gắn 1
+   * khoản chi vào ngày bất kỳ, kể cả ngày chưa tới. Chỉ áp dụng khi KHÔNG có
+   * placeId — có placeId thì ngày luôn tự suy, không dùng đường này. */
   private async validateDayNumber(
     itineraryId: string,
     dayNumber: number,
@@ -408,21 +600,6 @@ export class IncurredCostsService {
       }
     }
 
-    const { data: existing, error: existingError } = await supabase
-      .schema('travel')
-      .from('incurred_costs')
-      .select('id')
-      .eq('itinerary_id', itineraryId)
-      .eq('place_id', placeId)
-      .eq('type', CostType.CHI_PHI_KE_HOACH)
-      .maybeSingle();
-    if (existingError) {
-      throw new InternalServerErrorException(
-        `Failed to check existing baseline expense: ${existingError.message}`,
-      );
-    }
-    if (existing) return; // Đã ghi rồi — idempotent.
-
     // Lưu ĐÚNG estimated_cost gốc tại thời điểm check-in — đây là giá
     // "hiệu lực" đầu tiên. Muốn sửa giá sau này (owner) thì gọi
     // updatePlaceEffectivePrice() để cập nhật THẲNG lên dòng này (không có
@@ -430,6 +607,12 @@ export class IncurredCostsService {
     const amount = Math.max(0, Number((detail as any).estimated_cost ?? 0));
     if (amount <= 0) return; // Địa điểm miễn phí — không cần ghi dòng 0đ.
 
+    // INSERT thẳng thay vì SELECT-rồi-INSERT: check-rồi-ghi không atomic nên
+    // nhiều người trong đoàn check-in CÙNG 1 địa điểm gần như đồng thời vẫn
+    // có thể race qua được bước check, tạo 2 dòng trùng. Unique index
+    // incurred_costs_baseline_dedupe_idx (itinerary_id, place_id) WHERE
+    // type='Chi phí kế hoạch' chặn việc này ở tầng DB — 23505 nghĩa là dòng
+    // đã được 1 request khác ghi xong trước, coi như thành công (idempotent).
     const { error: insertError } = await supabase
       .schema('travel')
       .from('incurred_costs')
@@ -443,7 +626,7 @@ export class IncurredCostsService {
         charged_to: [],
         created_by: touristId,
       });
-    if (insertError) {
+    if (insertError && insertError.code !== '23505') {
       throw new InternalServerErrorException(
         `Failed to record baseline expense: ${insertError.message}`,
       );
@@ -478,6 +661,13 @@ export class IncurredCostsService {
    * (người lớn tính 1, trẻ em tính childPriceRatio) để ra đúng per-adult
    * tương đương, thì công thức nhân lại ở downstream mới tái tạo đúng lại
    * tổng đơn ban đầu, không nhân đúp.
+   *
+   * CHỈ làm tròn tới ĐỒNG (không làm tròn tới nghìn như các chi phí ước
+   * tính/ad-hoc khác) — đây là TIỀN THẬT đã trả, làm tròn nghìn sẽ khiến
+   * nhân ngược lại ở downstream lệch tới cả nghìn đồng so với đúng
+   * orderTotalAmount (vd 337.000 / 3.4 = 99.117,65 → làm tròn nghìn thành
+   * 99.000 → nhân lại chỉ ra 336.600, lệch 400đ). Làm tròn đồng thì sai số
+   * chỉ còn dưới 1đ, coi như khớp tuyệt đối.
    */
   async recordOrderCompletedExpense(
     itineraryId: string,
@@ -494,42 +684,18 @@ export class IncurredCostsService {
       adultCount + childPriceRatio * childCount,
     );
     const perAdultEquivalent = orderTotalAmount / weightedHeadcount;
-    const amount = Math.round(Math.max(0, perAdultEquivalent) / 1000) * 1000;
+    const amount = Math.round(Math.max(0, perAdultEquivalent));
     if (amount <= 0) return;
 
-    const { data: existing, error: existingError } = await supabase
-      .schema('travel')
-      .from('incurred_costs')
-      .select('id')
-      .eq('itinerary_id', itineraryId)
-      .eq('place_id', placeId)
-      .eq('type', CostType.CHI_PHI_KE_HOACH)
-      .maybeSingle();
-    if (existingError) {
-      throw new InternalServerErrorException(
-        `Failed to check existing baseline expense: ${existingError.message}`,
-      );
-    }
-
-    if (existing) {
-      const { error: updateError } = await supabase
-        .schema('travel')
-        .from('incurred_costs')
-        .update({
-          amount,
-          note: 'Chi phí kế hoạch (từ đơn đặt món đã hoàn tất)',
-          updated_at: new Date().toISOString(),
-          updated_by: touristId,
-        })
-        .eq('id', (existing as any).id);
-      if (updateError) {
-        throw new InternalServerErrorException(
-          `Failed to update baseline expense from order: ${updateError.message}`,
-        );
-      }
-      return;
-    }
-
+    // INSERT trước (thay vì SELECT-rồi-INSERT/UPDATE): cách cũ không atomic
+    // nên đơn hoàn tất TAY (business.service.ts) trùng lúc
+    // OrdersCompletionCron cũng xử lý CÙNG đơn có thể cùng SELECT thấy
+    // "chưa có" rồi cùng INSERT, ra 2 dòng "Chi phí kế hoạch" cho cùng 1 địa
+    // điểm. Unique index incurred_costs_baseline_dedupe_idx (itinerary_id,
+    // place_id) WHERE type='Chi phí kế hoạch' chặn việc này ở tầng DB — gặp
+    // 23505 nghĩa là dòng đã tồn tại (do request khác vừa tạo, hoặc do
+    // recordVisitBaselineExpense ghi trước đó lúc check-in), fallback sang
+    // UPDATE để vẫn ghi đè giá THẬT từ đơn hàng lên dòng đã có.
     const { error: insertError } = await supabase
       .schema('travel')
       .from('incurred_costs')
@@ -543,9 +709,28 @@ export class IncurredCostsService {
         charged_to: [],
         created_by: touristId,
       });
-    if (insertError) {
+    if (!insertError) return;
+    if (insertError.code !== '23505') {
       throw new InternalServerErrorException(
         `Failed to record baseline expense from order: ${insertError.message}`,
+      );
+    }
+
+    const { error: updateError } = await supabase
+      .schema('travel')
+      .from('incurred_costs')
+      .update({
+        amount,
+        note: 'Chi phí kế hoạch (từ đơn đặt món đã hoàn tất)',
+        updated_at: new Date().toISOString(),
+        updated_by: touristId,
+      })
+      .eq('itinerary_id', itineraryId)
+      .eq('place_id', placeId)
+      .eq('type', CostType.CHI_PHI_KE_HOACH);
+    if (updateError) {
+      throw new InternalServerErrorException(
+        `Failed to update baseline expense from order: ${updateError.message}`,
       );
     }
   }
@@ -761,17 +946,18 @@ export class IncurredCostsService {
         'Điều chỉnh xăng xe áp dụng cho cả chuyến, không gắn địa điểm/ngày cụ thể',
       );
     }
-    if (dto.placeId && dto.dayNumber) {
-      throw new BadRequestException(
-        'Chỉ được gắn khoản chi theo địa điểm HOẶC theo ngày, không cả hai',
-      );
-    }
-
+    // Có placeId thì ngày LUÔN lấy theo ngày viếng thăm thực tế của địa
+    // điểm — bỏ qua dto.dayNumber nếu client vẫn gửi kèm (UI đã khoá chọn
+    // ngày khi có địa điểm, đây là chốt chặn phía server).
+    let resolvedDayNumber: number | null = null;
     if (dto.placeId) {
-      await this.validatePlaceId(itineraryId, dto.placeId);
-    }
-    if (dto.dayNumber) {
+      resolvedDayNumber = await this.validatePlaceIdAndResolveDay(
+        itineraryId,
+        dto.placeId,
+      );
+    } else if (dto.dayNumber) {
       await this.validateDayNumber(itineraryId, dto.dayNumber);
+      resolvedDayNumber = dto.dayNumber;
     }
     // transport_adjustment thay đổi chi phí nền dùng chung — không gán riêng
     // cho ai, nên charged_to luôn bị ép rỗng bất kể client gửi gì.
@@ -785,7 +971,7 @@ export class IncurredCostsService {
       .insert({
         itinerary_id: itineraryId,
         place_id: dto.placeId ?? null,
-        day_number: dto.dayNumber ?? null,
+        day_number: resolvedDayNumber,
         type,
         note: dto.note,
         amount,
@@ -911,10 +1097,27 @@ export class IncurredCostsService {
         'Điều chỉnh giá phải gắn với 1 địa điểm cụ thể',
       );
     }
-    if (effectivePlaceId && effectiveDayNumber) {
-      throw new BadRequestException(
-        'Chỉ được gắn khoản chi theo địa điểm HOẶC theo ngày, không cả hai',
-      );
+
+    // Có địa điểm (mới đổi hoặc giữ nguyên từ dòng cũ) thì ngày LUÔN lấy
+    // theo ngày viếng thăm thực tế — bỏ qua dto.dayNumber. `undefined` nghĩa
+    // là "không đổi cột day_number" (địa điểm không đổi trong request này).
+    let resolvedDayNumber: number | null | undefined;
+    if (effectivePlaceId) {
+      if (dto.placeId) {
+        resolvedDayNumber = await this.validatePlaceIdAndResolveDay(
+          itineraryId,
+          dto.placeId,
+        );
+      }
+    } else if (dto.dayNumber !== undefined) {
+      if (dto.dayNumber) {
+        await this.validateDayNumber(itineraryId, dto.dayNumber);
+      }
+      resolvedDayNumber = dto.dayNumber;
+    } else if (dto.placeId !== undefined) {
+      // Vừa bỏ gắn địa điểm, không chọn ngày mới — dọn luôn day_number cũ
+      // (có thể còn sót từ lúc gắn địa điểm) tránh để lại giá trị treo.
+      resolvedDayNumber = null;
     }
 
     const update: Record<string, unknown> = {
@@ -924,18 +1127,8 @@ export class IncurredCostsService {
     if (dto.type !== undefined) update.type = dto.type;
     if (dto.note !== undefined) update.note = dto.note;
     if (normalizedAmount !== undefined) update.amount = normalizedAmount;
-    if (dto.placeId !== undefined) {
-      if (dto.placeId) {
-        await this.validatePlaceId(itineraryId, dto.placeId);
-      }
-      update.place_id = dto.placeId;
-    }
-    if (dto.dayNumber !== undefined) {
-      if (dto.dayNumber) {
-        await this.validateDayNumber(itineraryId, dto.dayNumber);
-      }
-      update.day_number = dto.dayNumber;
-    }
+    if (dto.placeId !== undefined) update.place_id = dto.placeId;
+    if (resolvedDayNumber !== undefined) update.day_number = resolvedDayNumber;
     // transport_adjustment/price_adjustment không bao giờ gán riêng cho ai
     // — bỏ qua chargedTo dù client có gửi.
     if (
@@ -1060,7 +1253,7 @@ export class IncurredCostsService {
    * — không có giá/đêm riêng trong schema nên không thể chia theo số đêm thực
    * tế đã qua), cộng với chi phí phát sinh gắn với 1 địa điểm đã đi (hoặc
    * không gắn địa điểm nào). Chi phí phát sinh gắn với 1 địa điểm CHƯA đi thì
-   * không tính — validatePlaceId() vốn đã chặn việc tạo mới trường hợp này,
+   * không tính — validatePlaceIdAndResolveDay() vốn đã chặn việc tạo mới trường hợp này,
    * tình huống này chỉ có thể xảy ra nếu status visit bị đổi lại sau khi đã
    * tạo cost.
    */
@@ -1169,6 +1362,13 @@ export class IncurredCostsService {
     transportRatePerKm: { motorbike: number; car: number };
     adultCount: number;
     childCount: number;
+    /** Số trẻ mỗi thành viên đang phụ trách (chỉ những người có > 0) — dùng
+     * để hiển thị card trẻ em riêng + điền sẵn khi sửa gán. Rỗng khi chưa
+     * ai gán gì HOẶC khi không phải thành viên. */
+    childAssignments: Array<{ userId: string; childCount: number }>;
+    /** Số trẻ CHƯA gán ai — mặc định thuộc về chủ lịch trình (xem
+     * distributeCosts()). */
+    unassignedChildCount: number;
   }> {
     const ctx = await this.loadAccessContext(itineraryId);
     // Chỉ CHI PHÍ PHÁT SINH THỰC TẾ (bảng incurred_costs — ai chi bao nhiêu,
@@ -1235,6 +1435,12 @@ export class IncurredCostsService {
       childrenShare: number;
       categoryBreakdown: Partial<Record<CostType, number>>;
     }> = [];
+    // Số trẻ mỗi thành viên phụ trách (không phải số tiền) — cho UI hiển thị
+    // + tiền điền sẵn khi mở sheet sửa gán. Rỗng khi không phải thành viên,
+    // giống các field "thực tế" khác.
+    let childAssignmentsResult: Array<{ userId: string; childCount: number }> =
+      [];
+    let unassignedChildCount = ctx.childCount;
 
     if (isMember) {
       const { data: costsData, error } = await supabase
@@ -1312,11 +1518,12 @@ export class IncurredCostsService {
       // lệch nhau về ý nghĩa.
       const { actualBaseCost, visitedIncurredCosts } =
         await this.computeActualSpending(itineraryId, distributionCosts);
+      const childAssignments = await this.loadChildAssignments(itineraryId);
       const {
         totals,
         categoryTotals,
         childrenShare: childrenShareResult,
-        childrenAssignedTo,
+        childrenShareByMember,
       } = distributeCosts(
         memberIds,
         ctx.creatorId,
@@ -1324,8 +1531,17 @@ export class IncurredCostsService {
         childPriceRatio,
         actualBaseCost,
         visitedIncurredCosts,
+        childAssignments,
       );
       childrenShare = childrenShareResult;
+      childAssignmentsResult = Array.from(childAssignments.entries())
+        .filter(([id, count]) => memberIds.includes(id) && count > 0)
+        .map(([userId, childCount]) => ({ userId, childCount }));
+      unassignedChildCount = Math.max(
+        0,
+        ctx.childCount -
+          childAssignmentsResult.reduce((sum, a) => sum + a.childCount, 0),
+      );
 
       // spentSoFar (Card 2 — tổng CẢ NHÓM đã tiêu) phải nhân theo số người,
       // giống hệt cách estimatedCostForGroup nhân bên dưới — actualBaseCost là
@@ -1354,8 +1570,7 @@ export class IncurredCostsService {
           fullName: p.fullName,
           isOwner: p.isOwner,
           total: Math.round(totals.get(p.id) ?? 0),
-          childrenShare:
-            p.id === childrenAssignedTo ? Math.round(childrenShare) : 0,
+          childrenShare: Math.round(childrenShareByMember.get(p.id) ?? 0),
           categoryBreakdown: roundedCategoryTotals,
         };
       });
@@ -1476,6 +1691,8 @@ export class IncurredCostsService {
       },
       adultCount: ctx.adultCount,
       childCount: ctx.childCount,
+      childAssignments: childAssignmentsResult,
+      unassignedChildCount,
     };
   }
 
@@ -1617,7 +1834,8 @@ export class IncurredCostsService {
         type: row.type as CostType,
       }));
 
-    const { totals, categoryTotals, childrenShare, childrenAssignedTo } =
+    const dayChildAssignments = await this.loadChildAssignments(itineraryId);
+    const { totals, categoryTotals, childrenShare, childrenShareByMember } =
       distributeCosts(
         memberIds,
         ctx.creatorId,
@@ -1625,6 +1843,7 @@ export class IncurredCostsService {
         childPriceRatio,
         dayBasePlanCost,
         dayIncurredCosts,
+        dayChildAssignments,
       );
 
     // Đọc từ bảng chi phí ước tính đóng băng — transport_cost giờ là số
@@ -1648,8 +1867,7 @@ export class IncurredCostsService {
           fullName: p.fullName,
           isOwner: p.isOwner,
           total: Math.round(totals.get(p.id) ?? 0),
-          childrenShare:
-            p.id === childrenAssignedTo ? Math.round(childrenShare) : 0,
+          childrenShare: Math.round(childrenShareByMember.get(p.id) ?? 0),
           categoryBreakdown: roundedCategoryTotals,
         };
       }),

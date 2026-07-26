@@ -1325,24 +1325,49 @@ export class BusinessService {
   }
 
   async updateOrderStatus(orderId: string, status: string) {
-    const { data, error } = await supabase
+    // Đơn ĐÃ 'completed' rồi thì không cho chuyển lại lần nữa (chặn double-
+    // tap nút "Hoàn tất", hoặc trùng lúc OrdersCompletionCron cũng vừa xử lý
+    // cùng đơn) — nếu không, mỗi lần gọi lại đều kích hoạt
+    // recordCompletedOrderExpense() lần nữa, cùng lúc với đường cron/2 request
+    // hoàn tất tay chạy song song từng gây ra 2 dòng "Chi phí kế hoạch" trùng
+    // nhau cho cùng 1 địa điểm (xem incurred-costs.service.ts).
+    let query = supabase
       .schema('order_sys')
       .from('orders')
       .update({ status })
-      .eq('id', orderId)
+      .eq('id', orderId);
+    if (status === 'completed') {
+      query = query.neq('status', 'completed');
+    }
+    const { data, error } = await query
       .select('id, status, place_id, tourist_id, total_amount, itinerary_detail_id')
-      .single();
+      .maybeSingle();
 
     if (error) throw new InternalServerErrorException(error.message);
-    if (!data)
-      throw new NotFoundException(`Không tìm thấy đơn hàng: ${orderId}`);
+
+    if (!data) {
+      // update không đổi được dòng nào: hoặc đơn không tồn tại, hoặc (khi
+      // status='completed') đơn đã completed từ trước — coi trường hợp sau
+      // là no-op thành công thay vì báo lỗi, vì trạng thái mong muốn đã đúng.
+      const { data: existing, error: existingError } = await supabase
+        .schema('order_sys')
+        .from('orders')
+        .select('id, status, place_id, tourist_id, total_amount, itinerary_detail_id')
+        .eq('id', orderId)
+        .maybeSingle();
+      if (existingError) throw new InternalServerErrorException(existingError.message);
+      if (!existing)
+        throw new NotFoundException(`Không tìm thấy đơn hàng: ${orderId}`);
+      return { message: 'Cập nhật trạng thái thành công', order: existing };
+    }
 
     // Chủ quán bấm "Hoàn tất" TAY (khác đường tự động của
     // OrdersCompletionCron sau auto_complete_at) — trước đây đường này không
     // hề ghi giá món ăn thật vào "Chi phí kế hoạch" của lịch trình, khiến chi
     // phí đặt món biến mất hoàn toàn nếu chủ quán hoàn tất đơn tay thay vì để
     // hệ thống tự động. Lỗi ở bước ghi chi phí không được làm hỏng việc cập
-    // nhật trạng thái đơn đã thành công ở trên.
+    // nhật trạng thái đơn đã thành công ở trên. Nhờ guard phía trên, đoạn này
+    // chỉ chạy đúng 1 lần cho mỗi lần đơn THỰC SỰ chuyển sang completed.
     if (status === 'completed') {
       try {
         await this.incurredCostsService.recordCompletedOrderExpense(
