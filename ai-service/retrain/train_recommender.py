@@ -41,6 +41,8 @@ EMBED_FIELDS = [
     "type_name", "category_name", "city_name", "description",
 ]
 TOP_K_CB = 50
+CB_EVAL_K = 10
+CB_RELEVANCE_THRESHOLD = 4.0
 DEFAULT_SVD_PARAMS = {"n_factors": 32, "n_epochs": 20, "lr_all": 0.005, "reg_all": 0.1}
 CB_EMB_FILE = "content_embeddings_foody_rich.npy"
 CB_EMB_META_FILE = "content_embedding_meta_foody_rich.csv"
@@ -396,9 +398,112 @@ def train_cf(places: pd.DataFrame, grid_search: bool, prev_params: dict | None) 
         "_algo": algo,
         "_val_raw": val_raw,
         "_test_raw": test_raw,
+        "_train_raw": train_raw,
         "_user_ids": cf_user_ids,
         "_item_ids": cf_item_ids,
     }
+
+
+def evaluate_content_based_f1(
+    cf: dict,
+    k: int = CB_EVAL_K,
+    relevance_threshold: float = CB_RELEVANCE_THRESHOLD,
+) -> dict:
+    """Evaluate item-to-item CB as a Top-K recommender on held-out positives.
+
+    A user's positively-rated training items are used as content seeds. Candidate
+    items receive reciprocal-rank votes from each seed's precomputed CB neighbour
+    list; all training interactions are excluded. Relevance is defined only from
+    held-out explicit ratings, so no test interaction leaks into recommendation.
+
+    The reported F1 is micro-averaged across evaluable users, which weights every
+    recommended/relevant item equally and remains well-defined for sparse users.
+    """
+    with open(OUTPUT_ARTIFACT_DIR / CB_LOOKUP_FILE, "rb") as f:
+        cb_lookup: dict[str, list[str]] = pickle.load(f)
+
+    user_ids, item_ids = cf["_user_ids"], cf["_item_ids"]
+
+    def physical_ids(rows, positive_only: bool = False) -> dict[int, set[str]]:
+        grouped: dict[int, set[str]] = {}
+        for raw_u, raw_i, rating, _timestamp in rows:
+            if positive_only and float(rating) < relevance_threshold:
+                continue
+            uid = int(user_ids[int(raw_u)])
+            pid = str(item_ids[int(raw_i)])
+            grouped.setdefault(uid, set()).add(pid)
+        return grouped
+
+    train_seen = physical_ids(cf["_train_raw"])
+    train_positive = physical_ids(cf["_train_raw"], positive_only=True)
+    test_positive = physical_ids(cf["_test_raw"], positive_only=True)
+
+    true_positive = 0
+    recommended_total = 0
+    relevant_total = 0
+    evaluated_users = 0
+    per_user_f1: list[float] = []
+    for uid, relevant in test_positive.items():
+        seeds = train_positive.get(uid, set())
+        if not seeds:
+            continue
+
+        seen = train_seen.get(uid, set())
+        scores: dict[str, float] = {}
+        for seed in seeds:
+            for rank, candidate in enumerate(cb_lookup.get(seed, []), start=1):
+                candidate = str(candidate)
+                if candidate not in seen:
+                    scores[candidate] = scores.get(candidate, 0.0) + 1.0 / rank
+        if not scores:
+            continue
+
+        recommended = {
+            pid for pid, _score in sorted(
+                scores.items(), key=lambda pair: (-pair[1], pair[0])
+            )[:k]
+        }
+        user_true_positive = len(recommended & relevant)
+        user_precision = user_true_positive / len(recommended)
+        user_recall = user_true_positive / len(relevant)
+        user_f1 = (
+            2.0 * user_precision * user_recall / (user_precision + user_recall)
+            if user_precision + user_recall else 0.0
+        )
+        per_user_f1.append(user_f1)
+        true_positive += user_true_positive
+        recommended_total += len(recommended)
+        relevant_total += len(relevant)
+        evaluated_users += 1
+
+    precision = true_positive / recommended_total if recommended_total else 0.0
+    recall = true_positive / relevant_total if relevant_total else 0.0
+    f1 = 2.0 * precision * recall / (precision + recall) if precision + recall else 0.0
+    macro_f1 = float(np.mean(per_user_f1)) if per_user_f1 else 0.0
+    metrics = {
+        # Keep `f1` for backward compatibility; explicitly name its averaging too.
+        "f1": float(f1),
+        "micro_f1": float(f1),
+        "macro_f1": macro_f1,
+        "precision": float(precision),
+        "recall": float(recall),
+        "k": int(k),
+        "relevance_threshold": float(relevance_threshold),
+        "evaluated_users": int(evaluated_users),
+        "test_positive_users": int(len(test_positive)),
+        "user_coverage": (
+            float(evaluated_users / len(test_positive)) if test_positive else 0.0
+        ),
+        "true_positives": int(true_positive),
+        "recommended_items": int(recommended_total),
+        "relevant_items": int(relevant_total),
+    }
+    print(
+        f"[train] Content-Based F1@{k}: {f1:.6f} "
+        f"(precision={precision:.6f}, recall={recall:.6f}, "
+        f"users={evaluated_users}, relevant>={relevance_threshold:g})"
+    )
+    return metrics
 
 
 def train_activity_cf(places: pd.DataFrame, params: dict) -> dict | None:
@@ -543,7 +648,12 @@ def evaluate_hybrid_rmse(cf: dict, log_cf: dict | None, max_log_weight: float = 
 
 # ────────────────────────── Manifest (giống cell 10) ──────────────────────────
 
-def write_manifest(cf: dict, log_cf: dict | None = None, hybrid_metrics: dict | None = None) -> None:
+def write_manifest(
+    cf: dict,
+    log_cf: dict | None = None,
+    hybrid_metrics: dict | None = None,
+    cb_metrics: dict | None = None,
+) -> None:
     snapshot = {}
     snap_file = OUTPUT_DATA_DIR / "snapshot.json"
     if snap_file.exists():
@@ -592,6 +702,7 @@ def write_manifest(cf: dict, log_cf: dict | None = None, hybrid_metrics: dict | 
             "rating_only_test_rmse": cf["test_rmse"],
             "hybrid_log_coverage_val": (hybrid_metrics or {}).get("val_log_coverage", 0),
             "hybrid_log_coverage_test": (hybrid_metrics or {}).get("test_log_coverage", 0),
+            "content_based": cb_metrics or {},
         },
         "data_snapshot": snapshot,
     }
@@ -637,9 +748,10 @@ def main(grid_search: bool = False, prev_manifest: Path | None = None) -> dict:
     places = load_places()
     train_content_based(places)
     cf = train_cf(places, grid_search=grid_search, prev_params=prev_params)
+    cb_metrics = evaluate_content_based_f1(cf)
     log_cf = train_activity_cf(places, cf["best_svd_params"])
     hybrid_metrics = evaluate_hybrid_rmse(cf, log_cf, max_log_weight=0.35)
-    write_manifest(cf, log_cf, hybrid_metrics)
+    write_manifest(cf, log_cf, hybrid_metrics, cb_metrics)
     cf["log_cf"] = log_cf
     return cf
 

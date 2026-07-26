@@ -56,6 +56,7 @@ interface ItineraryDetailRow {
   place_id: string;
   visit_date: string | null;
   arrival_time: string | null;
+  sequence_order: number | null;
 }
 
 interface TypeCategoryRow {
@@ -88,7 +89,9 @@ import { CommonNotificationsService } from '../../common/notifications/notificat
 
 @Injectable()
 export class OrdersService {
-  constructor(private readonly notificationsService: CommonNotificationsService) {}
+  constructor(
+    private readonly notificationsService: CommonNotificationsService,
+  ) {}
 
   private readonly validOrderStatuses = [
     'pending',
@@ -300,9 +303,7 @@ export class OrdersService {
     return true;
   }
 
-  private getTargetStatus(
-    action: string,
-  ): 'processing' | 'cancelled' {
+  private getTargetStatus(action: string): 'processing' | 'cancelled' {
     if (action === 'confirm') return 'processing';
     if (action === 'cancel') return 'cancelled';
     throw new BadRequestException('Thao tác xử lý đơn không hợp lệ');
@@ -355,7 +356,10 @@ export class OrdersService {
     if (targetStatus === 'processing') {
       const now = new Date();
       updatePayload.confirmed_at = now.toISOString();
-      const prepMinutes = await this.getEstimatedPrepTime(orderId, order.place_id);
+      const prepMinutes = await this.getEstimatedPrepTime(
+        orderId,
+        order.place_id,
+      );
       if (prepMinutes) {
         updatePayload.auto_complete_at = new Date(
           now.getTime() + prepMinutes * 60 * 1000,
@@ -395,7 +399,8 @@ export class OrdersService {
         .select('estimated_preparation_time')
         .eq('id', placeId)
         .maybeSingle<{ estimated_preparation_time: number | null }>();
-      if (data?.estimated_preparation_time) return data.estimated_preparation_time;
+      if (data?.estimated_preparation_time)
+        return data.estimated_preparation_time;
     }
 
     // Fallback: join through order_items → food_items → places
@@ -582,7 +587,6 @@ export class OrdersService {
       .from('itineraries')
       .select('id, creator_id')
       .eq('id', itineraryId)
-      .eq('creator_id', touristId)
       .maybeSingle<ItineraryOwnerRow>();
 
     if (itineraryError) {
@@ -590,16 +594,34 @@ export class OrdersService {
     }
 
     if (!itinerary) {
-      throw new NotFoundException('Itinerary not found for this tourist');
+      throw new NotFoundException('Itinerary not found');
+    }
+
+    // Thành viên được chia sẻ cũng cần danh sách quán ăn để tracking có thể
+    // hiển thị popup/notification trong bán kính cấu hình.
+    if (itinerary.creator_id !== touristId) {
+      const { data: membership, error: membershipError } = await supabase
+        .schema('travel')
+        .from('itinerary_members')
+        .select('itinerary_id')
+        .eq('itinerary_id', itineraryId)
+        .eq('tourist_id', touristId)
+        .maybeSingle();
+      if (membershipError) {
+        throw new InternalServerErrorException(membershipError.message);
+      }
+      if (!membership) {
+        throw new NotFoundException('Itinerary not found for this tourist');
+      }
     }
 
     const { data: details, error: detailsError } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('id, place_id, visit_date, arrival_time')
+      .select('id, place_id, visit_date, arrival_time, sequence_order')
       .eq('itinerary_id', itineraryId)
       .order('visit_date', { ascending: true })
-      .order('arrival_time', { ascending: true })
+      .order('sequence_order', { ascending: true, nullsFirst: false })
       .returns<ItineraryDetailRow[]>();
 
     if (detailsError) {
@@ -611,15 +633,43 @@ export class OrdersService {
       return { itinerary_id: itineraryId, places: [] };
     }
 
-    const orderedUniquePlaceIds: string[] = [];
-    const firstOccurrence = new Map<string, ItineraryDetailRow>();
-    for (const item of orderedDetails) {
-      if (firstOccurrence.has(item.place_id)) {
-        continue;
-      }
-      firstOccurrence.set(item.place_id, item);
-      orderedUniquePlaceIds.push(item.place_id);
-    }
+    // Không gợi ý lại địa điểm đã ghé hoặc đã từng đặt món trong lịch trình.
+    const [
+      { data: visits, error: visitsError },
+      { data: orders, error: ordersError },
+    ] = await Promise.all([
+      supabase
+        .schema('tracking')
+        .from('geofence_visits')
+        .select('itinerary_detail_id')
+        .eq('itinerary_id', itineraryId)
+        .eq('status', 'visited'),
+      supabase
+        .schema('order_sys')
+        .from('orders')
+        .select('itinerary_detail_id')
+        .eq('tourist_id', touristId)
+        .in(
+          'itinerary_detail_id',
+          orderedDetails.map((item) => item.id),
+        ),
+    ]);
+    if (visitsError)
+      throw new InternalServerErrorException(visitsError.message);
+    if (ordersError)
+      throw new InternalServerErrorException(ordersError.message);
+
+    const excludedDetailIds = new Set<string>([
+      ...(visits ?? []).map((item) => String(item.itinerary_detail_id)),
+      ...(orders ?? []).map((item) => String(item.itinerary_detail_id)),
+    ]);
+    const popupEligibleDetails = orderedDetails.filter(
+      (item) => !excludedDetailIds.has(item.id),
+    );
+
+    const orderedUniquePlaceIds = Array.from(
+      new Set(popupEligibleDetails.map((item) => item.place_id)),
+    );
 
     const { data: placeRows, error: placeError } = await supabase
       .schema('travel')
@@ -641,8 +691,9 @@ export class OrdersService {
       (placeRows ?? []).map((item) => [item.id, item]),
     );
 
-    const filtered = orderedUniquePlaceIds
-      .map((placeId) => {
+    const filtered = popupEligibleDetails
+      .map((detail) => {
+        const placeId = detail.place_id;
         const place = placeTypeMap.get(placeId);
         const type = this.extractSingle(place?.types ?? null);
         const category = this.extractSingle(type?.categories ?? null);
@@ -657,13 +708,12 @@ export class OrdersService {
           return null;
         }
 
-        const occurrence = firstOccurrence.get(placeId);
         return {
-          itinerary_detail_id: occurrence?.id ?? '',
+          itinerary_detail_id: detail.id,
           place_id: placeId,
           place_name: placeMap.get(placeId) ?? 'Địa điểm',
-          visit_date: occurrence?.visit_date ?? null,
-          arrival_time: occurrence?.arrival_time ?? null,
+          visit_date: detail.visit_date,
+          arrival_time: detail.arrival_time,
           categories,
         };
       })
@@ -693,7 +743,12 @@ export class OrdersService {
       .from('places')
       .select('id, name, estimated_preparation_time, vendor_id')
       .eq('id', placeId)
-      .maybeSingle<{ id: string; name: string; estimated_preparation_time: number | null; vendor_id: string | null }>();
+      .maybeSingle<{
+        id: string;
+        name: string;
+        estimated_preparation_time: number | null;
+        vendor_id: string | null;
+      }>();
 
     if (placeError) {
       throw new InternalServerErrorException(placeError.message);
@@ -761,13 +816,14 @@ export class OrdersService {
     const orderedAt = toVietnamTimestamp();
 
     const orderId = randomUUID();
+    const normalizedNotes = payload.notes?.trim() || null;
     const orderInsertVariants = [
       {
         id: orderId,
         ordered_at: orderedAt,
         total_amount: totalAmount,
         status: 'pending',
-        notes: payload.notes ?? null,
+        notes: normalizedNotes,
         tourist_id: payload.tourist_id,
         itinerary_detail_id: payload.itinerary_detail_id ?? null,
         place_id: placeId,
@@ -777,6 +833,7 @@ export class OrdersService {
         ordered_at: orderedAt,
         total_amount: totalAmount,
         status: 'pending',
+        notes: normalizedNotes,
         tourist_id: payload.tourist_id,
         place_id: placeId,
       },
@@ -784,6 +841,7 @@ export class OrdersService {
         id: orderId,
         ordered_at: orderedAt,
         status: 'pending',
+        notes: normalizedNotes,
         tourist_id: payload.tourist_id,
       },
     ];
@@ -895,7 +953,7 @@ export class OrdersService {
         `Bạn có một đơn đặt món mới tại "${place.name}" với tổng tiền ${totalAmount.toLocaleString('vi-VN')}đ.`,
         'success',
         'new_order',
-        { order_id: orderId, place_id: placeId }
+        { order_id: orderId, place_id: placeId },
       );
     }
 
