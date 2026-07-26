@@ -620,7 +620,6 @@ export class ItineraryReviewsService {
   private async getPlaceReviewsForItinerary(
     touristId: string,
     itineraryId: string,
-    placeIds: string[] = [],
   ): Promise<
     Map<
       string,
@@ -633,34 +632,20 @@ export class ItineraryReviewsService {
       }
     >
   > {
-    const normalizedPlaceIds = Array.from(
-      new Set(placeIds.map((id) => id.trim()).filter(Boolean)),
-    );
-
-    let query = supabase
+    // Scoped strictly to this itinerary — a review left for the same place
+    // under a different itinerary must not count here.
+    const { data, error } = await supabase
       .schema('review_ai')
       .from('reviews')
       .select('id, itinerary_id, place_id, rating, tags, url_image, created_at')
       .eq('tourist_id', touristId)
-      .order('created_at', { ascending: false });
-
-    if (normalizedPlaceIds.length > 0) {
-      query = query.or(
-        `itinerary_id.eq.${itineraryId},place_id.in.(${normalizedPlaceIds.join(',')})`,
-      );
-    } else {
-      query = query.eq('itinerary_id', itineraryId);
-    }
-
-    const { data, error } = await query.returns<PlaceReviewRow[]>();
+      .eq('itinerary_id', itineraryId)
+      .order('created_at', { ascending: false })
+      .returns<PlaceReviewRow[]>();
 
     if (error) throw new InternalServerErrorException(error.message);
 
-    const placeIdSet = new Set(normalizedPlaceIds);
-    const reviews = (data ?? []).filter(
-      (review) =>
-        review.itinerary_id === itineraryId || placeIdSet.has(review.place_id),
-    );
+    const reviews = data ?? [];
 
     if (reviews.length === 0) {
       return new Map();
@@ -688,14 +673,10 @@ export class ItineraryReviewsService {
         reviewedAt: string | null;
       }
     >();
-    const exactItineraryReviewPlaceIds = new Set<string>();
     for (const r of reviews) {
-      const isExactItineraryReview = r.itinerary_id === itineraryId;
-      if (
-        byPlaceId.has(r.place_id) &&
-        (!isExactItineraryReview ||
-          exactItineraryReviewPlaceIds.has(r.place_id))
-      ) {
+      // Rows are ordered by created_at desc, so the first one seen per
+      // place is already the most recent review for it.
+      if (byPlaceId.has(r.place_id)) {
         continue;
       }
 
@@ -706,10 +687,6 @@ export class ItineraryReviewsService {
         mediaUrls: Array.isArray(r.url_image) ? r.url_image : [],
         reviewedAt: r.created_at ?? null,
       });
-
-      if (isExactItineraryReview) {
-        exactItineraryReviewPlaceIds.add(r.place_id);
-      }
     }
     return byPlaceId;
   }
@@ -717,42 +694,19 @@ export class ItineraryReviewsService {
   private async getReviewedPlaceIdsForItinerary(
     touristId: string,
     itineraryId: string,
-    placeIds: string[] = [],
   ): Promise<Set<string>> {
-    const normalizedPlaceIds = Array.from(
-      new Set(placeIds.map((id) => id.trim()).filter(Boolean)),
-    );
-
-    let query = supabase
+    // Scoped strictly to this itinerary — see getPlaceReviewsForItinerary.
+    const { data, error } = await supabase
       .schema('review_ai')
       .from('reviews')
-      .select('itinerary_id, place_id')
-      .eq('tourist_id', touristId);
-
-    if (normalizedPlaceIds.length > 0) {
-      query = query.or(
-        `itinerary_id.eq.${itineraryId},place_id.in.(${normalizedPlaceIds.join(',')})`,
-      );
-    } else {
-      query = query.eq('itinerary_id', itineraryId);
-    }
-
-    const { data, error } =
-      await query.returns<
-        Array<{ itinerary_id: string | null; place_id: string }>
-      >();
+      .select('place_id')
+      .eq('tourist_id', touristId)
+      .eq('itinerary_id', itineraryId)
+      .returns<Array<{ place_id: string }>>();
 
     if (error) throw new InternalServerErrorException(error.message);
 
-    const placeIdSet = new Set(normalizedPlaceIds);
-    return new Set(
-      (data ?? [])
-        .filter(
-          (item) =>
-            item.itinerary_id === itineraryId || placeIdSet.has(item.place_id),
-        )
-        .map((item) => item.place_id),
-    );
+    return new Set((data ?? []).map((item) => item.place_id));
   }
 
   private async getVisitStatusForItinerary(
@@ -785,7 +739,7 @@ export class ItineraryReviewsService {
     const placeIds = [...new Set(details.map((d) => d.place_id))];
     const [places, placeReviewsMap] = await Promise.all([
       this.getPlaces(placeIds),
-      this.getPlaceReviewsForItinerary(touristId, itineraryId, placeIds),
+      this.getPlaceReviewsForItinerary(touristId, itineraryId),
     ]);
     const placeMap = new Map(places.map((p) => [p.id, p]));
     const { dayByDate } = this.buildDayInfo(details);
@@ -932,7 +886,7 @@ export class ItineraryReviewsService {
     const placeIds = Array.from(new Set(details.map((item) => item.place_id)));
     const [places, placeReviewsMap] = await Promise.all([
       this.getPlaces(placeIds),
-      this.getPlaceReviewsForItinerary(touristId, itineraryId, placeIds),
+      this.getPlaceReviewsForItinerary(touristId, itineraryId),
     ]);
     const placeMap = new Map(places.map((item) => [item.id, item]));
 
@@ -1024,11 +978,9 @@ export class ItineraryReviewsService {
 
     await this.getItineraryOrThrow(touristId, itineraryId);
     const details = await this.getItineraryDetails(itineraryId);
-    const itineraryPlaceIds = details.map((detail) => detail.place_id);
     const existingPlaceIds = await this.getReviewedPlaceIdsForItinerary(
       touristId,
       itineraryId,
-      itineraryPlaceIds,
     );
 
     if (details.length === 0) {

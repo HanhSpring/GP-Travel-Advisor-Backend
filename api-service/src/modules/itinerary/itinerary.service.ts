@@ -382,7 +382,13 @@ export class ItineraryService {
       const place = Array.isArray((row as any).places)
         ? (row as any).places[0]
         : (row as any).places;
-      const imageUrl = place?.image_url;
+      // places.image_url là cột text[] (mảng) — Supabase JS trả về string[],
+      // không phải string, nên phải lấy phần tử đầu tiên (khớp cách RPC SQL
+      // travel.get_my_itineraries dùng p.image_url[1]).
+      const rawImageUrl = place?.image_url;
+      const imageUrl = Array.isArray(rawImageUrl)
+        ? rawImageUrl[0]
+        : rawImageUrl;
       if (
         typeof imageUrl === 'string' &&
         imageUrl.length > 0 &&
