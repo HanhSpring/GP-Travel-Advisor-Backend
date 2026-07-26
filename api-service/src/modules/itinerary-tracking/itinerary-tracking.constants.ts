@@ -11,10 +11,9 @@ export const DEFAULT_GEOFENCE_RADIUS_M = 100;
 export const MIN_GEOFENCE_RADIUS_M = 80;
 export const MAX_GEOFENCE_RADIUS_M = 150;
 
-// Ngưỡng dwell time theo UC: max(2 phút, 30% thời lượng hoạt động dự kiến).
-// 60-phút place → 1080s (18 min); 30-phút → 540s; short → tối thiểu 120s.
-export const MIN_DWELL_SECONDS = 120;
-export const DWELL_FRACTION = 0.3;
+// Config dwell dùng cho demo. Đổi duy nhất giá trị này khi cần tăng/giảm thời
+// gian chờ; cả bản ghi mới lẫn bản ghi của ngày được start lại sẽ nhận giá trị này.
+export const DEFAULT_DWELL_SECONDS = 15;
 export const DEFAULT_EXPECTED_DURATION_MINUTES = 60;
 
 // Lịch tự động cho mobile (AlarmManager).
@@ -53,10 +52,9 @@ export const STATUS_MAP_ICON: Record<VisitStatus, string> = {
 
 /** Tính ngưỡng dwell time (giây) từ thời lượng dự kiến (phút). */
 export function computeDwellThresholdSeconds(
-  expectedDurationMinutes: number | null | undefined,
+  _expectedDurationMinutes: number | null | undefined,
 ): number {
-  const minutes = expectedDurationMinutes ?? DEFAULT_EXPECTED_DURATION_MINUTES;
-  return Math.max(MIN_DWELL_SECONDS, Math.round(minutes * 60 * DWELL_FRACTION));
+  return DEFAULT_DWELL_SECONDS;
 }
 
 /** Giới hạn bán kính geofence trong khoảng cho phép. */

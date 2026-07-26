@@ -1,5 +1,6 @@
 import {
   BadRequestException,
+  ConflictException,
   Injectable,
   InternalServerErrorException,
   NotFoundException,
@@ -369,7 +370,7 @@ export class ItineraryTrackingService {
         .from('notifications')
         .insert({
           id: notificationId,
-          title: 'Check-in lịch trình',
+          title: 'Check-in địa điểm',
           content: message,
           type: 'itinerary', // -> icon "map" ở màn hình thông báo
           is_global: false,
@@ -405,7 +406,7 @@ export class ItineraryTrackingService {
       if (userRow?.fcm_token) {
         void this.pushService.sendPush(
           userRow.fcm_token,
-          'Check-in lịch trình',
+          'Check-in địa điểm',
           message,
           {
             notification_id: notificationId,
@@ -560,18 +561,61 @@ export class ItineraryTrackingService {
     const date = this.resolveDate(dto.date);
     const itinerary = await this.loadItinerary(dto.itineraryId, dto.touristId);
 
+    const { data: otherOwnedActive, error: activeError } = await supabase
+      .schema('travel')
+      .from('itineraries')
+      .select('id, description, destination')
+      .eq('creator_id', dto.touristId)
+      .neq('id', dto.itineraryId)
+      .or('status.eq.ongoing,tracking_active.eq.true')
+      .limit(1)
+      .maybeSingle();
+    if (activeError) this.dbError(activeError, 'start.findOtherActive');
+    let otherSharedActive: {
+      id: string;
+      description: string | null;
+      destination: string | null;
+    } | null = null;
+    if (!otherOwnedActive) {
+      const { data: memberships, error: membershipError } = await supabase
+        .schema('travel')
+        .from('itinerary_members')
+        .select('itinerary_id')
+        .eq('tourist_id', dto.touristId)
+        .neq('itinerary_id', dto.itineraryId);
+      if (membershipError) {
+        this.dbError(membershipError, 'start.findMemberships');
+      }
+      const sharedIds = (memberships ?? []).map(
+        (item) => item.itinerary_id as string,
+      );
+      if (sharedIds.length > 0) {
+        const { data, error } = await supabase
+          .schema('travel')
+          .from('itineraries')
+          .select('id, description, destination')
+          .in('id', sharedIds)
+          .or('status.eq.ongoing,tracking_active.eq.true')
+          .limit(1)
+          .maybeSingle();
+        if (error) this.dbError(error, 'start.findSharedActive');
+        otherSharedActive = data;
+      }
+    }
+
+    const otherActive = otherOwnedActive ?? otherSharedActive;
+    if (otherActive) {
+      const activeName =
+        otherActive.description ||
+        otherActive.destination ||
+        'lịch trình hiện tại';
+      throw new ConflictException(
+        `Bạn đang theo dõi lịch trình "${activeName}". Vui lòng dừng hoặc kết thúc lịch trình đó trước khi bắt đầu lịch trình mới.`,
+      );
+    }
+
     // Đánh dấu lịch trình đang diễn ra + bật cờ tracking_active.
     if ((itinerary.status ?? '').toLowerCase() !== 'completed') {
-      const { error: clearOtherError } = await supabase
-        .schema('travel')
-        .from('itineraries')
-        .update({ status: 'uncompleted', tracking_active: false })
-        .eq('creator_id', itinerary.creator_id)
-        .eq('status', 'ongoing')
-        .neq('id', dto.itineraryId);
-      if (clearOtherError)
-        this.dbError(clearOtherError, 'start.clearOtherOngoing');
-
       const { error } = await supabase
         .schema('travel')
         .from('itineraries')
@@ -644,7 +688,9 @@ export class ItineraryTrackingService {
         detail,
         place,
         geofenceId: geofence.id,
-        threshold: existingRow?.dwell_threshold_seconds ?? threshold,
+        // Luôn áp dụng config hiện tại khi start lại để môi trường demo không
+        // phải update thủ công các geofence_visit đã được tạo trước đó.
+        threshold,
         expected: existingRow?.expected_duration_minutes ?? expected,
         status: existingRow?.status ?? DEFAULT_VISIT_STATUS,
       });
@@ -667,6 +713,20 @@ export class ItineraryTrackingService {
           updated_at: nowIso,
         });
       }
+    }
+
+    const existingDetailIds = built
+      .filter((item) => existingByDetail.has(item.detail.id))
+      .map((item) => item.detail.id);
+    if (existingDetailIds.length > 0) {
+      const { error } = await supabase
+        .schema('tracking')
+        .from('geofence_visits')
+        .update({ dwell_threshold_seconds: computeDwellThresholdSeconds(null) })
+        .eq('itinerary_id', dto.itineraryId)
+        .eq('track_date', date)
+        .in('itinerary_detail_id', existingDetailIds);
+      if (error) this.dbError(error, 'start.updateDwellThreshold');
     }
 
     if (toUpsert.length > 0) {

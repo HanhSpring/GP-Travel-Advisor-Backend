@@ -9,14 +9,21 @@ export class PushNotificationService implements OnModuleInit {
   private initialized = false;
 
   onModuleInit() {
-    const serviceAccountPath = path.resolve(
-      process.cwd(),
-      'firebase-service-account.json',
-    );
+    const candidates = [
+      process.env.FIREBASE_SERVICE_ACCOUNT_PATH,
+      path.resolve(process.cwd(), 'firebase-service-account.json'),
+      path.resolve(
+        process.cwd(),
+        'api-service',
+        'firebase-service-account.json',
+      ),
+      path.resolve(__dirname, '../../../../firebase-service-account.json'),
+    ].filter((value): value is string => !!value);
+    const serviceAccountPath = candidates.find((value) => fs.existsSync(value));
 
-    if (!fs.existsSync(serviceAccountPath)) {
+    if (!serviceAccountPath) {
       this.logger.warn(
-        'firebase-service-account.json not found — FCM push disabled',
+        `firebase-service-account.json not found — FCM push disabled (checked: ${candidates.join(', ')})`,
       );
       return;
     }
@@ -31,7 +38,9 @@ export class PushNotificationService implements OnModuleInit {
         });
       }
       this.initialized = true;
-      this.logger.log('Firebase Admin initialized — FCM push enabled');
+      this.logger.log(
+        `Firebase Admin initialized — FCM push enabled (${serviceAccountPath})`,
+      );
     } catch (err) {
       this.logger.error('Failed to initialize Firebase Admin:', err);
     }
@@ -43,8 +52,14 @@ export class PushNotificationService implements OnModuleInit {
     body: string,
     data?: Record<string, string>,
   ): Promise<void> {
-    if (!this.initialized) return;
-    if (!fcmToken) return;
+    if (!this.initialized) {
+      this.logger.warn('FCM push skipped because Firebase Admin is disabled');
+      return;
+    }
+    if (!fcmToken) {
+      this.logger.warn('FCM push skipped because the user has no FCM token');
+      return;
+    }
 
     try {
       await admin.messaging().send({
