@@ -12,4 +12,7 @@ export class PlaceType {
 
   @ApiProperty({ example: 'Ẩm thực', required: false, nullable: true })
   category_name: string | null;
+
+  @ApiProperty({ enum: ['food', 'accommodation', 'service'] })
+  data_mode: 'food' | 'accommodation' | 'service';
 }

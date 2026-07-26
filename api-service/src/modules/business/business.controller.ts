@@ -57,15 +57,15 @@ export class BusinessController {
   }
 
   @Get('place-detail')
-  getPlaceDetail(@Query() query: PlaceDto) {
-    return this.businessService.getPlaceDetail(query.placeId);
+  getPlaceDetail(@Query() query: PlaceDto, @Req() req: any) {
+    return this.businessService.getPlaceDetail(query.placeId, req.user.userId);
   }
 
   @Put('place-detail')
-  updatePlaceDetail(@Body() body: any) {
+  updatePlaceDetail(@Body() body: any, @Req() req: any) {
     return this.businessService.updatePlaceDetail(
       body.placeId || body.id,
-      body.vendorId || body.vendor_id,
+      req.user.userId,
       body,
     );
   }
@@ -85,8 +85,8 @@ export class BusinessController {
   }
 
   @Get('order-detail')
-  getOrderDetail(@Query() query: OrderDto) {
-    return this.businessService.getOrderDetail(query.orderId);
+  getOrderDetail(@Query() query: OrderDto, @Req() req: any) {
+    return this.businessService.getOrderDetail(query.orderId, req.user.userId);
   }
 
   @Get('place-services')
@@ -98,8 +98,8 @@ export class BusinessController {
   @ApiOperation({
     summary: 'Lấy dịch vụ của địa điểm theo loại (miễn phí/trả phí)',
   })
-  getPlaceServicesByType(@Query() query: PlaceDto) {
-    return this.businessService.getPlaceServicesByType(query.placeId);
+  getPlaceServicesByType(@Query() query: PlaceDto, @Req() req: any) {
+    return this.businessService.getPlaceServicesByType(query.placeId, req.user.userId);
   }
 
   @Get('dashboard')
@@ -139,8 +139,11 @@ export class BusinessController {
       typeName: body.p_type_name || body.typeName || '',
       categories: this.parseFlexible(body.p_categories || body.categories),
       services: this.parseFlexible(body.p_services || body.services),
-      menu: this.parseFlexible(body.p_menu || body.menu),
+      menu: this.parseFlexible(body.p_food_items || body.p_menu || body.menu),
       rooms: this.parseFlexible(body.p_rooms || body.rooms),
+      p_catalog_mode: body.p_catalog_mode || body.catalogMode,
+      p_estimated_preparation_time:
+        body.p_estimated_preparation_time ?? body.estimated_preparation_time,
 
       // 👉 BỔ SUNG CÁC DÒNG DƯỚI ĐÂY ĐỂ TRUYỀN DỮ LIỆU SANG SERVICE
       p_open_time: body.p_open_time || body.openTime,
@@ -220,34 +223,37 @@ export class BusinessController {
 
   @Post('menu-item')
   @ApiOperation({ summary: 'Thêm dịch vụ (menu item) cho địa điểm' })
-  addMenuItem(@Body() body: any) {
+  addMenuItem(@Body() body: any, @Req() req: any) {
     return this.businessService.addSingleMenuItem(
       body.placeId,
       body.name,
       body.description ?? null,
       Number(body.price ?? 0),
+      req.user.userId,
     );
   }
 
   @Put('menu-item')
   @ApiOperation({ summary: 'Cập nhật dịch vụ (menu item)' })
-  updateMenuItem(@Body() body: any) {
+  updateMenuItem(@Body() body: any, @Req() req: any) {
     return this.businessService.updateSingleMenuItem(
       body.itemId ?? body.id,
       body.placeId,
       body.name,
       body.description ?? null,
       Number(body.price ?? 0),
+      req.user.userId,
     );
   }
 
   @Delete('menu-item')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Xóa dịch vụ (menu item)' })
-  deleteMenuItem(@Body() body: any) {
+  deleteMenuItem(@Body() body: any, @Req() req: any) {
     return this.businessService.deleteSingleMenuItem(
       body.itemId ?? body.id,
       body.placeId,
+      req.user.userId,
     );
   }
 
@@ -255,60 +261,65 @@ export class BusinessController {
 
   @Post('hotel-room')
   @ApiOperation({ summary: 'Them phong cho dia diem luu tru' })
-  addHotelRoom(@Body() body: any) {
+  addHotelRoom(@Body() body: any, @Req() req: any) {
     return this.businessService.addSingleHotelRoom(
       body.placeId,
       body.name,
       Number(body.price ?? 0),
       Number(body.quantity ?? body.max_occupancy ?? 0),
+      req.user.userId,
     );
   }
 
   @Put('hotel-room')
   @ApiOperation({ summary: 'Cap nhat phong luu tru' })
-  updateHotelRoom(@Body() body: any) {
+  updateHotelRoom(@Body() body: any, @Req() req: any) {
     return this.businessService.updateSingleHotelRoom(
       body.roomId ?? body.id,
       body.placeId,
       body.name,
       Number(body.price ?? 0),
       Number(body.quantity ?? body.max_occupancy ?? 0),
+      req.user.userId,
     );
   }
 
   @Delete('hotel-room')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Xoa phong luu tru' })
-  deleteHotelRoom(@Body() body: any) {
+  deleteHotelRoom(@Body() body: any, @Req() req: any) {
     return this.businessService.deleteSingleHotelRoom(
       body.roomId ?? body.id,
       body.placeId,
+      req.user.userId,
     );
   }
 
   @Post('free-service')
   @ApiOperation({ summary: 'Thêm tiện ích miễn phí cho địa điểm' })
-  addFreeService(@Body() body: any) {
-    return this.businessService.addSingleFreeService(body.placeId, body.name);
+  addFreeService(@Body() body: any, @Req() req: any) {
+    return this.businessService.addSingleFreeService(body.placeId, body.name, req.user.userId);
   }
 
   @Put('free-service')
   @ApiOperation({ summary: 'Cập nhật tiện ích miễn phí' })
-  updateFreeService(@Body() body: any) {
+  updateFreeService(@Body() body: any, @Req() req: any) {
     return this.businessService.updateSingleFreeService(
       body.placeId,
       body.serviceId ?? body.id,
       body.name,
+      req.user.userId,
     );
   }
 
   @Delete('free-service')
   @HttpCode(HttpStatus.OK)
   @ApiOperation({ summary: 'Xóa tiện ích miễn phí' })
-  deleteFreeService(@Body() body: any) {
+  deleteFreeService(@Body() body: any, @Req() req: any) {
     return this.businessService.deleteSingleFreeService(
       body.placeId,
       body.serviceId ?? body.id,
+      req.user.userId,
     );
   }
 }

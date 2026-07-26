@@ -67,7 +67,10 @@ export class CreateFullPlaceDto {
   p_type_name?: string;
 
   @ApiProperty({ required: false })
-  p_services?: Array<{ name: string; description?: string }>;
+  p_services?: Array<{ service_id?: string; name: string }>;
+
+  @ApiProperty({ enum: ['food', 'accommodation', 'service'], required: false })
+  p_catalog_mode?: 'food' | 'accommodation' | 'service';
   @ApiProperty({ example: '10:00', required: false })
   p_open_time?: string;
 
@@ -85,6 +88,9 @@ export class CreateFullPlaceDto {
 
   @ApiProperty({ required: false })
   p_menu?: Array<{ name: string; description?: string; price: number }>;
+
+  @ApiProperty({ required: false })
+  p_food_items?: Array<{ name: string; description?: string; price: number; image_url?: string }>;
 
   @ApiProperty({ required: false })
   p_rooms?: Array<{ name: string; price: number; quantity: number }>;
