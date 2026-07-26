@@ -15,6 +15,7 @@ import { IncurredCostsService } from './incurred-costs.service';
 import { CreateIncurredCostDto } from './dto/create-incurred-cost.dto';
 import { UpdateIncurredCostDto } from './dto/update-incurred-cost.dto';
 import { UpdatePlacePriceDto } from './dto/update-place-price.dto';
+import { UpdateChildAssignmentsDto } from './dto/update-child-assignments.dto';
 
 @ApiTags('Itinerary — Chi phí phát sinh')
 @Controller('itinerary/:id/incurred-costs')
@@ -97,6 +98,34 @@ export class IncurredCostsController {
     @Body() dto: CreateIncurredCostDto,
   ) {
     return this.service.createIncurredCost(itineraryId, dto);
+  }
+
+  @Get('child-assignments')
+  @ApiOperation({
+    summary: 'Danh sách "ai phụ trách bao nhiêu trẻ em" hiện tại của lịch trình',
+  })
+  @ApiParam({ name: 'id', description: 'ID lịch trình' })
+  @ApiQuery({ name: 'user_id', required: true })
+  getChildAssignments(
+    @Param('id') itineraryId: string,
+    @Query('user_id') userId: string,
+  ) {
+    return this.service.getChildAssignments(itineraryId, userId);
+  }
+
+  @Patch('child-assignments')
+  @ApiOperation({
+    summary:
+      'Gán lại toàn bộ "ai phụ trách bao nhiêu trẻ em" — chỉ chủ lịch trình',
+  })
+  @ApiParam({ name: 'id', description: 'ID lịch trình' })
+  updateChildAssignments(
+    @Param('id') itineraryId: string,
+    @Body() dto: UpdateChildAssignmentsDto,
+  ) {
+    return this.service
+      .setChildAssignments(itineraryId, dto.userId, dto.assignments)
+      .then(() => ({ success: true }));
   }
 
   @Patch('place-price')

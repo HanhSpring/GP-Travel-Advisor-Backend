@@ -62,7 +62,8 @@ export class UpdateIncurredCostDto {
   chargedTo?: string[];
 
   @ApiPropertyOptional({
-    description: 'Ngày thứ N (1-indexed) mới (truyền null để gỡ khỏi ngày hiện tại).',
+    description:
+      'Ngày thứ N (1-indexed) mới (truyền null để gỡ khỏi ngày hiện tại). Bị bỏ qua nếu khoản chi đang/sẽ gắn placeId — ngày sẽ tự động lấy theo ngày viếng thăm thực tế của địa điểm đó.',
     example: 3,
     nullable: true,
   })

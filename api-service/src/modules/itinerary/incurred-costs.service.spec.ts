@@ -42,13 +42,20 @@ function makeBuilder(result: { data: any; error: any }) {
   return builder;
 }
 
-/** Map tên bảng -> kết quả trả về cho MỌI query nhắm vào bảng đó trong 1 test. */
+/** Map tên bảng -> kết quả trả về cho MỌI query nhắm vào bảng đó trong 1 test.
+ * Trả về luôn map builder đã tạo cho từng bảng (builder CUỐI CÙNG nếu 1 bảng
+ * bị query nhiều lần) để test có thể assert insert()/update() được gọi với
+ * đúng payload, ví dụ builders.incurred_costs.insert. */
 function mockTables(tables: Record<string, { data: any; error: any }>) {
+  const builders: Record<string, any> = {};
   schemaMock.mockImplementation(() => ({
-    from: jest.fn((table: string) =>
-      makeBuilder(tables[table] ?? { data: null, error: null }),
-    ),
+    from: jest.fn((table: string) => {
+      const builder = makeBuilder(tables[table] ?? { data: null, error: null });
+      builders[table] = builder;
+      return builder;
+    }),
   }));
+  return builders;
 }
 
 describe('distributeCosts — sharing không được chia nhỏ theo số tài khoản thật', () => {
@@ -74,8 +81,8 @@ describe('distributeCosts — sharing không được chia nhỏ theo số tài 
     expect(totals.get('owner-1')).not.toBe(basePlanCost / 2);
   });
 
-  it('childrenShare báo riêng cho chủ lịch trình, KHÔNG cộng gộp vào total của owner', () => {
-    const { totals, childrenShare, childrenAssignedTo } = distributeCosts(
+  it('childrenShare báo riêng cho chủ lịch trình (chưa gán ai), KHÔNG cộng gộp vào total của owner', () => {
+    const { totals, childrenShare, childrenShareByMember } = distributeCosts(
       memberIds,
       'owner-1',
       1,
@@ -83,14 +90,15 @@ describe('distributeCosts — sharing không được chia nhỏ theo số tài 
       basePlanCost,
       [],
     );
-    expect(childrenAssignedTo).toBe('owner-1');
+    expect(childrenShareByMember.get('owner-1')).toBe(childrenShare);
+    expect(childrenShareByMember.has('member-2')).toBe(false);
     expect(childrenShare).toBe(1 * basePlanCost * childPriceRatio);
     // total của owner vẫn chỉ là basePlanCost, không phải basePlanCost + childrenShare.
     expect(totals.get('owner-1')).toBe(basePlanCost);
   });
 
-  it('không có trẻ em thì childrenShare = 0 và childrenAssignedTo = null', () => {
-    const { childrenShare, childrenAssignedTo } = distributeCosts(
+  it('không có trẻ em thì childrenShare = 0 và childrenShareByMember rỗng', () => {
+    const { childrenShare, childrenShareByMember } = distributeCosts(
       memberIds,
       'owner-1',
       0,
@@ -99,7 +107,37 @@ describe('distributeCosts — sharing không được chia nhỏ theo số tài 
       [],
     );
     expect(childrenShare).toBe(0);
-    expect(childrenAssignedTo).toBeNull();
+    expect(childrenShareByMember.size).toBe(0);
+  });
+
+  it('gán 1 trẻ cho member-2 (còn 1 trẻ chưa gán) chia đúng theo tỉ lệ, phần dư dồn về owner', () => {
+    // 2 trẻ em, childrenShare = 2 * basePlanCost * ratio -> mỗi trẻ = 1 suất.
+    const { childrenShare, childrenShareByMember } = distributeCosts(
+      memberIds,
+      'owner-1',
+      2,
+      childPriceRatio,
+      basePlanCost,
+      [],
+      new Map([['member-2', 1]]),
+    );
+    const perChild = childrenShare / 2;
+    expect(childrenShareByMember.get('member-2')).toBeCloseTo(perChild);
+    expect(childrenShareByMember.get('owner-1')).toBeCloseTo(perChild);
+  });
+
+  it('gán vượt quá childCount bị CLAMP lại, không cho childrenShareByMember vượt tổng childrenShare', () => {
+    const { childrenShare, childrenShareByMember } = distributeCosts(
+      memberIds,
+      'owner-1',
+      1,
+      childPriceRatio,
+      basePlanCost,
+      [],
+      new Map([['member-2', 5]]),
+    );
+    expect(childrenShareByMember.get('member-2')).toBeCloseTo(childrenShare);
+    expect(childrenShareByMember.has('owner-1')).toBe(false);
   });
 
   it('chi phí phát sinh chargedTo=[1 người] chỉ cộng cho đúng người đó', () => {
@@ -165,7 +203,7 @@ describe('distributeCosts — sharing không được chia nhỏ theo số tài 
     const result = distributeCosts([], 'owner-1', 1, childPriceRatio, basePlanCost, []);
     expect(result.totals.size).toBe(0);
     expect(result.childrenShare).toBe(0);
-    expect(result.childrenAssignedTo).toBeNull();
+    expect(result.childrenShareByMember.size).toBe(0);
   });
 
   it('categoryTotals chia theo đúng CostType cho từng người, không gồm basePlanCost', () => {
@@ -210,6 +248,7 @@ describe('IncurredCostsService — phân quyền, khoá sau khi hoàn thành, va
     adult_count: 3,
     children_count: 1,
     estimated_cost: 1_000_000,
+    start_date: '2026-02-01',
   };
 
   const memberProfiles = [
@@ -356,18 +395,48 @@ describe('IncurredCostsService — phân quyền, khoá sau khi hoàn thành, va
     ).resolves.toBeDefined();
   });
 
-  it('không được gắn khoản chi CẢ placeId LẪN dayNumber cùng lúc', async () => {
-    mockTables({ itineraries: { data: baseItinerary, error: null } });
-    await expect(
-      service.createIncurredCost('itin-1', {
-        userId: 'owner-1',
-        type: CostType.KHAC,
-        note: 'Ăn vặt',
-        amount: 20_000,
-        placeId: 'place-1',
-        dayNumber: 2,
-      } as any),
-    ).rejects.toThrow(BadRequestException);
+  it('có placeId thì day_number tự lấy theo ngày viếng thăm thực tế, bỏ qua dayNumber client gửi', async () => {
+    const builders = mockTables({
+      itineraries: { data: baseItinerary, error: null },
+      itinerary_details: {
+        data: [{ id: 'detail-1', visit_date: '2026-02-03' }],
+        error: null,
+      },
+      geofence_visits: {
+        data: [{ itinerary_detail_id: 'detail-1' }],
+        error: null,
+      },
+      incurred_costs: {
+        data: {
+          id: 'cost-adhoc',
+          itinerary_id: 'itin-1',
+          place_id: 'place-1',
+          day_number: 3,
+          type: CostType.KHAC,
+          note: 'Ăn vặt',
+          amount: 20_000,
+          charged_to: [],
+          created_by: 'owner-1',
+          created_at: '2026-02-03',
+          updated_at: '2026-02-03',
+          updated_by: null,
+        },
+        error: null,
+      },
+    });
+    // baseItinerary.start_date = 2026-02-01, visit_date = 2026-02-03 -> ngày
+    // thứ 3. dayNumber: 2 client gửi kèm phải bị BỎ QUA hoàn toàn.
+    await service.createIncurredCost('itin-1', {
+      userId: 'owner-1',
+      type: CostType.KHAC,
+      note: 'Ăn vặt',
+      amount: 20_000,
+      placeId: 'place-1',
+      dayNumber: 2,
+    } as any);
+    expect(builders.incurred_costs.insert).toHaveBeenCalledWith(
+      expect.objectContaining({ place_id: 'place-1', day_number: 3 }),
+    );
   });
 
   it('số tiền làm tròn xuống dưới 1.000đ bị từ chối', async () => {
@@ -557,6 +626,47 @@ describe('IncurredCostsService — phân quyền, khoá sau khi hoàn thành, va
         type: CostType.DIEU_CHINH_GIA,
       } as any),
     ).rejects.toThrow(BadRequestException);
+  });
+
+  it('update: gắn placeId mới thì day_number tự cập nhật theo ngày viếng thăm, bỏ qua dayNumber client gửi', async () => {
+    const builders = mockTables({
+      itineraries: { data: baseItinerary, error: null },
+      itinerary_details: {
+        data: [{ id: 'detail-2', visit_date: '2026-02-04' }],
+        error: null,
+      },
+      geofence_visits: {
+        data: [{ itinerary_detail_id: 'detail-2' }],
+        error: null,
+      },
+      incurred_costs: {
+        data: {
+          id: 'cost-4',
+          itinerary_id: 'itin-1',
+          place_id: null,
+          day_number: 1,
+          type: CostType.KHAC,
+          note: 'Ăn vặt',
+          amount: 20_000,
+          charged_to: [],
+          created_by: 'owner-1',
+          created_at: '2026-01-01',
+          updated_at: '2026-01-01',
+          updated_by: null,
+        },
+        error: null,
+      },
+    });
+    // baseItinerary.start_date = 2026-02-01, visit_date của place-2 =
+    // 2026-02-04 -> ngày thứ 4. dayNumber: 1 client gửi kèm phải bị BỎ QUA.
+    await service.updateIncurredCost('itin-1', 'cost-4', {
+      userId: 'owner-1',
+      placeId: 'place-2',
+      dayNumber: 1,
+    } as any);
+    expect(builders.incurred_costs.update).toHaveBeenCalledWith(
+      expect.objectContaining({ place_id: 'place-2', day_number: 4 }),
+    );
   });
 
   it('lịch trình đã completed thì không cho sửa/xoá chi phí nữa', async () => {
