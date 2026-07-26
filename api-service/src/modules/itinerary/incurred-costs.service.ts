@@ -600,21 +600,6 @@ export class IncurredCostsService {
       }
     }
 
-    const { data: existing, error: existingError } = await supabase
-      .schema('travel')
-      .from('incurred_costs')
-      .select('id')
-      .eq('itinerary_id', itineraryId)
-      .eq('place_id', placeId)
-      .eq('type', CostType.CHI_PHI_KE_HOACH)
-      .maybeSingle();
-    if (existingError) {
-      throw new InternalServerErrorException(
-        `Failed to check existing baseline expense: ${existingError.message}`,
-      );
-    }
-    if (existing) return; // Đã ghi rồi — idempotent.
-
     // Lưu ĐÚNG estimated_cost gốc tại thời điểm check-in — đây là giá
     // "hiệu lực" đầu tiên. Muốn sửa giá sau này (owner) thì gọi
     // updatePlaceEffectivePrice() để cập nhật THẲNG lên dòng này (không có
@@ -622,6 +607,12 @@ export class IncurredCostsService {
     const amount = Math.max(0, Number((detail as any).estimated_cost ?? 0));
     if (amount <= 0) return; // Địa điểm miễn phí — không cần ghi dòng 0đ.
 
+    // INSERT thẳng thay vì SELECT-rồi-INSERT: check-rồi-ghi không atomic nên
+    // nhiều người trong đoàn check-in CÙNG 1 địa điểm gần như đồng thời vẫn
+    // có thể race qua được bước check, tạo 2 dòng trùng. Unique index
+    // incurred_costs_baseline_dedupe_idx (itinerary_id, place_id) WHERE
+    // type='Chi phí kế hoạch' chặn việc này ở tầng DB — 23505 nghĩa là dòng
+    // đã được 1 request khác ghi xong trước, coi như thành công (idempotent).
     const { error: insertError } = await supabase
       .schema('travel')
       .from('incurred_costs')
@@ -635,7 +626,7 @@ export class IncurredCostsService {
         charged_to: [],
         created_by: touristId,
       });
-    if (insertError) {
+    if (insertError && insertError.code !== '23505') {
       throw new InternalServerErrorException(
         `Failed to record baseline expense: ${insertError.message}`,
       );
@@ -670,6 +661,13 @@ export class IncurredCostsService {
    * (người lớn tính 1, trẻ em tính childPriceRatio) để ra đúng per-adult
    * tương đương, thì công thức nhân lại ở downstream mới tái tạo đúng lại
    * tổng đơn ban đầu, không nhân đúp.
+   *
+   * CHỈ làm tròn tới ĐỒNG (không làm tròn tới nghìn như các chi phí ước
+   * tính/ad-hoc khác) — đây là TIỀN THẬT đã trả, làm tròn nghìn sẽ khiến
+   * nhân ngược lại ở downstream lệch tới cả nghìn đồng so với đúng
+   * orderTotalAmount (vd 337.000 / 3.4 = 99.117,65 → làm tròn nghìn thành
+   * 99.000 → nhân lại chỉ ra 336.600, lệch 400đ). Làm tròn đồng thì sai số
+   * chỉ còn dưới 1đ, coi như khớp tuyệt đối.
    */
   async recordOrderCompletedExpense(
     itineraryId: string,
@@ -686,42 +684,18 @@ export class IncurredCostsService {
       adultCount + childPriceRatio * childCount,
     );
     const perAdultEquivalent = orderTotalAmount / weightedHeadcount;
-    const amount = Math.round(Math.max(0, perAdultEquivalent) / 1000) * 1000;
+    const amount = Math.round(Math.max(0, perAdultEquivalent));
     if (amount <= 0) return;
 
-    const { data: existing, error: existingError } = await supabase
-      .schema('travel')
-      .from('incurred_costs')
-      .select('id')
-      .eq('itinerary_id', itineraryId)
-      .eq('place_id', placeId)
-      .eq('type', CostType.CHI_PHI_KE_HOACH)
-      .maybeSingle();
-    if (existingError) {
-      throw new InternalServerErrorException(
-        `Failed to check existing baseline expense: ${existingError.message}`,
-      );
-    }
-
-    if (existing) {
-      const { error: updateError } = await supabase
-        .schema('travel')
-        .from('incurred_costs')
-        .update({
-          amount,
-          note: 'Chi phí kế hoạch (từ đơn đặt món đã hoàn tất)',
-          updated_at: new Date().toISOString(),
-          updated_by: touristId,
-        })
-        .eq('id', (existing as any).id);
-      if (updateError) {
-        throw new InternalServerErrorException(
-          `Failed to update baseline expense from order: ${updateError.message}`,
-        );
-      }
-      return;
-    }
-
+    // INSERT trước (thay vì SELECT-rồi-INSERT/UPDATE): cách cũ không atomic
+    // nên đơn hoàn tất TAY (business.service.ts) trùng lúc
+    // OrdersCompletionCron cũng xử lý CÙNG đơn có thể cùng SELECT thấy
+    // "chưa có" rồi cùng INSERT, ra 2 dòng "Chi phí kế hoạch" cho cùng 1 địa
+    // điểm. Unique index incurred_costs_baseline_dedupe_idx (itinerary_id,
+    // place_id) WHERE type='Chi phí kế hoạch' chặn việc này ở tầng DB — gặp
+    // 23505 nghĩa là dòng đã tồn tại (do request khác vừa tạo, hoặc do
+    // recordVisitBaselineExpense ghi trước đó lúc check-in), fallback sang
+    // UPDATE để vẫn ghi đè giá THẬT từ đơn hàng lên dòng đã có.
     const { error: insertError } = await supabase
       .schema('travel')
       .from('incurred_costs')
@@ -735,9 +709,28 @@ export class IncurredCostsService {
         charged_to: [],
         created_by: touristId,
       });
-    if (insertError) {
+    if (!insertError) return;
+    if (insertError.code !== '23505') {
       throw new InternalServerErrorException(
         `Failed to record baseline expense from order: ${insertError.message}`,
+      );
+    }
+
+    const { error: updateError } = await supabase
+      .schema('travel')
+      .from('incurred_costs')
+      .update({
+        amount,
+        note: 'Chi phí kế hoạch (từ đơn đặt món đã hoàn tất)',
+        updated_at: new Date().toISOString(),
+        updated_by: touristId,
+      })
+      .eq('itinerary_id', itineraryId)
+      .eq('place_id', placeId)
+      .eq('type', CostType.CHI_PHI_KE_HOACH);
+    if (updateError) {
+      throw new InternalServerErrorException(
+        `Failed to update baseline expense from order: ${updateError.message}`,
       );
     }
   }
