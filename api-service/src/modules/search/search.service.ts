@@ -925,8 +925,10 @@ export class SearchService {
     preferCategory: string = '',
     radius: number = 10,
     q?: string,
+    city?: string,
   ): Promise<any[]> {
     const normalizedQuery = q?.trim() ?? '';
+    const normalizedCity = city?.trim() ?? '';
     let indexedCandidateIds: string[] | null = null;
 
     // Search requests use a DB-side RPC so the existing trigram index handles
@@ -947,6 +949,7 @@ export class SearchService {
           p_prefer_category: preferCategory || '__all__',
           p_radius_km: radius,
           p_query: normalizedQuery,
+          p_city: normalizedCity,
         });
 
       if (!rpcError && Array.isArray(rpcData) && rpcData.length > 0) {
@@ -1006,6 +1009,22 @@ export class SearchService {
 
     if (excludeIds.length > 0) {
       query = query.not('id', 'in', `(${excludeIds.join(',')})`);
+    }
+
+    if (normalizedCity) {
+      // The `cities` table is tiny (one row per city/province), so this
+      // lookup is negligible next to the places bounding-box scan above.
+      const { data: cityRows } = await supabase
+        .schema('travel')
+        .from('cities')
+        .select('id')
+        .ilike('name', `%${normalizedCity}%`);
+      const cityIds = (cityRows ?? []).map((c: any) => c.id);
+      // Fail open on no match — an unresolved city name shouldn't zero out
+      // an otherwise valid nearby search.
+      if (cityIds.length > 0) {
+        query = query.in('city_id', cityIds);
+      }
     }
 
     if (indexedCandidateIds !== null) {

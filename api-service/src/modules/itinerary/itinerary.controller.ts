@@ -820,12 +820,18 @@ export class ItineraryController {
     name: 'activityId',
     description: 'ID hoạt động cần tìm gợi ý thay thế',
   })
+  @ApiQuery({ name: 'limit', required: false, type: Number, example: 20 })
   @ApiResponse({ status: 200, type: SuggestionsResponseDto })
   async getSuggestions(
     @Param('itineraryId') itineraryId: string,
     @Param('activityId') activityId: string,
+    @Query('limit') limit?: string,
   ) {
-    return this.service.getSuggestions(itineraryId, activityId);
+    return this.service.getSuggestions(
+      itineraryId,
+      activityId,
+      limit ? Number(limit) : undefined,
+    );
   }
 
   /** See ItineraryService.getAddPlaceSuggestions for the ranking/fallback logic. */
