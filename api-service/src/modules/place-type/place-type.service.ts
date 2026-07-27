@@ -4,6 +4,23 @@ import { PlaceType } from './entity/place-type.entity';
 
 @Injectable()
 export class PlaceTypesService {
+  private resolveDataMode(...values: Array<string | null | undefined>) {
+    const value = values
+      .filter(Boolean)
+      .join(' ')
+      .normalize('NFD')
+      .replace(/[\u0300-\u036f]/g, '')
+      .toLowerCase();
+
+    if (/(luu tru|khach san|nha nghi|hotel|motel|hostel|homestay|resort|villa|can ho|accommodation)/.test(value)) {
+      return 'accommodation' as const;
+    }
+    if (/(am thuc|nha hang|quan an|an uong|food|restaurant|cafe|coffee)/.test(value)) {
+      return 'food' as const;
+    }
+    return 'service' as const;
+  }
+
   async findAll(searchKeyword?: string): Promise<PlaceType[]> {
     let query = supabase
       .schema('travel')
@@ -30,6 +47,7 @@ export class PlaceTypesService {
         name: row.name,
         category_id: cat?.id ?? null,
         category_name: cat?.name ?? null,
+        data_mode: this.resolveDataMode(cat?.name, row.name),
       } as PlaceType;
     });
   }

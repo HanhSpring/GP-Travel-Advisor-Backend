@@ -43,11 +43,33 @@ export class BusinessService {
         (value) =>
           value.includes('luu tru') ||
           value.includes('khach san') ||
+          value.includes('nha nghi') ||
           value.includes('hotel') ||
+          value.includes('motel') ||
+          value.includes('hostel') ||
           value.includes('accommodation') ||
           value.includes('homestay') ||
-          value.includes('resort'),
+          value.includes('resort') ||
+          value.includes('villa') ||
+          value.includes('can ho'),
       );
+  }
+
+  private resolveCatalogMode(
+    values: Array<string | null | undefined>,
+  ): 'food' | 'accommodation' | 'service' {
+    if (this.isAccommodationType(values)) return 'accommodation';
+
+    const isFood = values
+      .filter((value): value is string => typeof value === 'string')
+      .map((value) => this.normalizeText(value))
+      .some((value) =>
+        /(am thuc|nha hang|quan an|an uong|food|restaurant|cafe|coffee)/.test(
+          value,
+        ),
+      );
+
+    return isFood ? 'food' : 'service';
   }
 
   private async resolvePlaceType(input: {
@@ -124,9 +146,18 @@ export class BusinessService {
     return data.id;
   }
 
+  private async assertPlaceOwnership(placeId: string, vendorId: string) {
+    const { data, error } = await supabase.schema('travel').from('places').select('id').eq('id', placeId).eq('vendor_id', vendorId).maybeSingle();
+    if (error) throw new InternalServerErrorException(error.message);
+    if (!data) throw new NotFoundException('Không tìm thấy địa điểm thuộc đối tác này');
+  }
+
   private async addPlaceServices(
     placeId: string,
-    services: Array<{ name: string; description?: string }>,
+    services: Array<{
+      service_id?: string;
+      name: string;
+    }>,
   ) {
     for (const service of services) {
       const serviceName = service.name?.trim();
@@ -134,12 +165,14 @@ export class BusinessService {
 
       let serviceId: string | null = null;
 
-      const { data: existingService, error: findError } = await supabase
+      const requestedServiceId = service.service_id?.trim();
+      const findQuery = supabase
         .schema('travel')
         .from('services')
-        .select('id')
-        .ilike('name', serviceName)
-        .maybeSingle();
+        .select('id');
+      const { data: existingService, error: findError } = requestedServiceId
+        ? await findQuery.eq('id', requestedServiceId).maybeSingle()
+        : await findQuery.ilike('name', serviceName).maybeSingle();
 
       if (findError) {
         throw new InternalServerErrorException(findError.message);
@@ -275,7 +308,7 @@ export class BusinessService {
     return data;
   }
 
-  async getPlaceDetail(placeId: string) {
+  async getPlaceDetail(placeId: string, vendorId: string) {
     const { data: place, error } = await supabase
       .schema('travel')
       .from('places')
@@ -283,6 +316,7 @@ export class BusinessService {
         'id, name, description, address, email, phone, city_id, cities(name), latitude, longitude, open_time, close_time, image_url, is_approved, rejection_reason, is_active, average_rating, review_count, type_id, estimated_preparation_time, types(id, name, categories(id, name))',
       )
       .eq('id', placeId)
+      .eq('vendor_id', vendorId)
       .maybeSingle();
 
     if (error) throw new InternalServerErrorException(error.message);
@@ -377,6 +411,13 @@ export class BusinessService {
     if (cityName) {
       updatePayload.city_id = await this.resolveCityId(cityName);
     }
+    const typeId = String(dto.p_type_id ?? dto.typeId ?? '').trim();
+    if (typeId) {
+      const resolvedType = await this.resolvePlaceType({ typeId });
+      if (!resolvedType.typeId) throw new BadRequestException('Loại hình kinh doanh không hợp lệ');
+      updatePayload.type_id = resolvedType.typeId;
+    }
+    updatePayload.is_approved = null;
 
     const { data, error } = await supabase
       .schema('travel')
@@ -459,10 +500,27 @@ export class BusinessService {
     return data;
   }
 
-  async getOrderDetail(orderId: string) {
+  async getOrderDetail(orderId: string, vendorId?: string) {
+    let resolvedOrderId = orderId;
+    if (/^TRV[0-9a-f]{6}$/i.test(orderId) && vendorId) {
+      const prefix = orderId.slice(3).toLowerCase();
+      const matches: string[] = [];
+      let page = 1;
+      let total = 0;
+      do {
+        const result = await this.getFilteredOrdersForVendor({ page, limit: 100 } as GetOrdersDto, vendorId);
+        total = result.total;
+        for (const order of result.data) {
+          if (String(order.order_id).toLowerCase().startsWith(prefix)) matches.push(String(order.order_id));
+        }
+        page += 1;
+      } while ((page - 1) * 100 < total && matches.length < 2);
+      if (matches.length !== 1) throw new NotFoundException('Mã đơn hàng không hợp lệ hoặc không duy nhất');
+      resolvedOrderId = matches[0];
+    }
     const { data, error } = await supabase
       .schema('order_sys')
-      .rpc('get_order_detail', { p_order_id: orderId });
+      .rpc('get_order_detail', { p_order_id: resolvedOrderId });
 
     if (error) throw new InternalServerErrorException(error.message);
     return data;
@@ -477,8 +535,9 @@ export class BusinessService {
     return data;
   }
 
-  async getPlaceServicesByType(placeId: string) {
+  async getPlaceServicesByType(placeId: string, vendorId?: string) {
     try {
+      if (vendorId) await this.assertPlaceOwnership(placeId, vendorId);
       const { data: placeServices, error: psError } = await supabase
         .schema('travel')
         .from('place_services')
@@ -535,7 +594,6 @@ export class BusinessService {
             const serviceData = {
               id: service.id,
               name: service.name,
-              description: service.description,
               price: service.price,
             };
 
@@ -718,6 +776,29 @@ export class BusinessService {
     }
   }
 
+  private validateRooms(rooms: any[]) {
+    for (const room of rooms) {
+      const name = String(room?.name || room?.room_name || '').trim();
+      const price = Number(room?.price);
+      const quantity = Number(room?.quantity);
+      if (!name) throw new BadRequestException('Thieu ten loai phong');
+      if (!Number.isFinite(price) || price <= 0)
+        throw new BadRequestException(`Gia phong khong hop le: ${name}`);
+      if (!Number.isInteger(quantity) || quantity <= 0)
+        throw new BadRequestException(`Suc chua phong khong hop le: ${name}`);
+    }
+  }
+
+  private validateServices(services: any[]) {
+    for (const service of services) {
+      const name = String(service?.name || '').trim();
+      const price = Number(service?.price ?? 0);
+      if (!name) throw new BadRequestException('Thieu ten dich vu');
+      if (!Number.isFinite(price) || price < 0)
+        throw new BadRequestException(`Gia dich vu khong hop le: ${name}`);
+    }
+  }
+
   async createFullPlace(dto: any, file?: any) {
     // 1. Kiểm tra dữ liệu đầu vào (Sửa lại cách truy cập biến theo payload bạn đã gửi)
     // Lưu ý: Vì payload bạn gửi có tiền tố p_, nên ta phải đọc đúng key đó
@@ -734,7 +815,7 @@ export class BusinessService {
       categories: Array.isArray(categories) ? categories : [],
     });
     const categoryNames = resolvedType.categoryNames;
-    const isAccommodation = this.isAccommodationType([
+    const catalogMode = this.resolveCatalogMode([
       dto.p_type_name || dto.typeName,
       ...(Array.isArray(categories) ? categories : []),
       ...categoryNames,
@@ -779,8 +860,19 @@ export class BusinessService {
       }
     }
 
-    if (!isAccommodation && menu.length > 0) {
+    if (catalogMode === 'food' && menu.length > 0) {
       this.validateMenu(menu);
+    }
+
+    if (catalogMode !== 'food' && menu.length > 0) {
+      throw new BadRequestException(
+        'Loai dia diem nay khong ho tro danh sach mon an',
+      );
+    }
+    if (catalogMode !== 'accommodation' && rooms.length > 0) {
+      throw new BadRequestException(
+        'Loai dia diem nay khong ho tro danh sach phong',
+      );
     }
 
     // 2. GỌI RPC VỚI ĐẦY ĐỦ 13 THAM SỐ
@@ -795,6 +887,8 @@ export class BusinessService {
     const services = Array.isArray(dto.p_services || dto.services)
       ? dto.p_services || dto.services
       : [];
+    this.validateServices(services);
+    if (catalogMode === 'accommodation') this.validateRooms(rooms);
 
     const { data: createdPlace, error: createPlaceError } = await supabase
       .schema('travel')
@@ -845,11 +939,25 @@ export class BusinessService {
       throw new BadRequestException('Khong lay duoc ID dia diem sau khi tao');
     }
 
-    await this.addPlaceServices(createdPlaceId, services);
-    if (isAccommodation) {
-      await this.addHotelRooms(createdPlaceId, rooms.length > 0 ? rooms : menu);
-    } else {
-      await this.addMenuItems(createdPlaceId, menu);
+    try {
+      await this.addPlaceServices(createdPlaceId, services);
+      if (catalogMode === 'accommodation') {
+        await this.addHotelRooms(createdPlaceId, rooms);
+      } else if (catalogMode === 'food') {
+        await this.addMenuItems(createdPlaceId, menu);
+      }
+    } catch (error) {
+      // Compensating cleanup prevents a half-created place when a catalogue
+      // insert fails. Related records are removed through ON DELETE CASCADE.
+      const { error: cleanupError } = await supabase
+        .schema('travel')
+        .from('places')
+        .delete()
+        .eq('id', createdPlaceId);
+      if (cleanupError) {
+        console.error('Create place cleanup error:', cleanupError);
+      }
+      throw error;
     }
 
     const { data: vendorData } = await supabase
@@ -932,7 +1040,10 @@ export class BusinessService {
     name: string,
     description: string | null,
     price: number,
+    vendorId: string,
   ) {
+    await this.assertPlaceOwnership(placeId, vendorId);
+    if (!name?.trim() || price <= 0) throw new BadRequestException('Tên món và giá phải hợp lệ');
     const { data, error } = await supabase
       .schema('order_sys')
       .from('food_items')
@@ -957,7 +1068,10 @@ export class BusinessService {
     name: string,
     description: string | null,
     price: number,
+    vendorId: string,
   ) {
+    await this.assertPlaceOwnership(placeId, vendorId);
+    if (!name?.trim() || price <= 0) throw new BadRequestException('Tên món và giá phải hợp lệ');
     const { data, error } = await supabase
       .schema('order_sys')
       .from('food_items')
@@ -976,7 +1090,8 @@ export class BusinessService {
     return { message: 'Cập nhật dịch vụ thành công' };
   }
 
-  async deleteSingleMenuItem(itemId: string, placeId: string) {
+  async deleteSingleMenuItem(itemId: string, placeId: string, vendorId: string) {
+    await this.assertPlaceOwnership(placeId, vendorId);
     const { error } = await supabase
       .schema('order_sys')
       .from('food_items')
@@ -993,7 +1108,10 @@ export class BusinessService {
     name: string,
     price: number,
     quantity: number,
+    vendorId: string,
   ) {
+    await this.assertPlaceOwnership(placeId, vendorId);
+    if (!name?.trim() || price <= 0 || !Number.isInteger(quantity) || quantity <= 0) throw new BadRequestException('Thông tin phòng không hợp lệ');
     const { data, error } = await supabase
       .schema('order_sys')
       .from('hotel_rooms')
@@ -1017,7 +1135,10 @@ export class BusinessService {
     name: string,
     price: number,
     quantity: number,
+    vendorId: string,
   ) {
+    await this.assertPlaceOwnership(placeId, vendorId);
+    if (!name?.trim() || price <= 0 || !Number.isInteger(quantity) || quantity <= 0) throw new BadRequestException('Thông tin phòng không hợp lệ');
     const { data, error } = await supabase
       .schema('order_sys')
       .from('hotel_rooms')
@@ -1036,7 +1157,8 @@ export class BusinessService {
     return { message: 'Cap nhat phong thanh cong' };
   }
 
-  async deleteSingleHotelRoom(roomId: string, placeId: string) {
+  async deleteSingleHotelRoom(roomId: string, placeId: string, vendorId: string) {
+    await this.assertPlaceOwnership(placeId, vendorId);
     const { error } = await supabase
       .schema('order_sys')
       .from('hotel_rooms')
@@ -1048,7 +1170,8 @@ export class BusinessService {
     return { message: 'Xoa phong thanh cong' };
   }
 
-  async addSingleFreeService(placeId: string, name: string) {
+  async addSingleFreeService(placeId: string, name: string, vendorId: string) {
+    await this.assertPlaceOwnership(placeId, vendorId);
     const serviceName = name.trim();
 
     const { data: existing, error: findError } = await supabase
@@ -1093,7 +1216,9 @@ export class BusinessService {
     placeId: string,
     oldServiceId: string,
     newName: string,
+    vendorId: string,
   ) {
+    await this.assertPlaceOwnership(placeId, vendorId);
     const { error: deleteError } = await supabase
       .schema('travel')
       .from('place_services')
@@ -1102,10 +1227,11 @@ export class BusinessService {
       .eq('service_id', oldServiceId);
 
     if (deleteError) throw new BadRequestException(deleteError.message);
-    return this.addSingleFreeService(placeId, newName);
+    return this.addSingleFreeService(placeId, newName, vendorId);
   }
 
-  async deleteSingleFreeService(placeId: string, serviceId: string) {
+  async deleteSingleFreeService(placeId: string, serviceId: string, vendorId: string) {
+    await this.assertPlaceOwnership(placeId, vendorId);
     const { error } = await supabase
       .schema('travel')
       .from('place_services')
