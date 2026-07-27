@@ -69,6 +69,8 @@ async def optimize_itinerary(request: OptimizeRequest) -> OptimizeResponse:
             allow_reduce_time=request.allow_reduce_time,
             use_goong=request.use_goong,
             travel_vehicle=request.travel_vehicle,
+            preserve_order=request.preserve_order,
+            start_location=request.start_location,
         )
 
         # Tính tổng chi phí trong ngày

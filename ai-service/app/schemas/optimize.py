@@ -72,6 +72,14 @@ class ActivityInput(BaseModel):
         return v
 
 
+class RouteAnchor(BaseModel):
+    """Điểm xuất phát chỉ dùng để tính chặng đầu, không phải một hoạt động."""
+    id: str = Field(..., description="ID của điểm xuất phát")
+    place_id: str = Field(..., description="ID địa điểm trong travel.places")
+    lat: Optional[float] = Field(default=None, description="Vĩ độ")
+    lng: Optional[float] = Field(default=None, description="Kinh độ")
+
+
 class OptimizeRequest(BaseModel):
     """
     Request body gửi từ NestJS sang FastAPI để tối ưu một ngày trong lịch trình.
@@ -88,6 +96,10 @@ class OptimizeRequest(BaseModel):
         ...,
         min_length=1,
         description="Danh sách hoạt động cần sắp xếp (ít nhất 1)"
+    )
+    start_location: Optional[RouteAnchor] = Field(
+        default=None,
+        description="Điểm xuất phát (ví dụ khách sạn) để cộng thời gian di chuyển tới hoạt động đầu tiên"
     )
 
     # Khung giờ hoạt động trong ngày
@@ -115,6 +127,10 @@ class OptimizeRequest(BaseModel):
     travel_vehicle: str = Field(
         default="bike",
         description="Phương tiện di chuyển: 'bike' (xe máy) hoặc 'car' (ô tô) — quyết định travel_mode khi gọi Goong"
+    )
+    preserve_order: bool = Field(
+        default=False,
+        description="Giữ nguyên thứ tự đầu vào và chỉ dồn lại thời gian sớm nhất có thể"
     )
 
     @field_validator("day_start_time", "day_end_time", mode="before")
@@ -147,6 +163,14 @@ class OptimizedActivity(BaseModel):
     transport_to_next: Optional[str] = Field(
         default=None,
         description="Ước tính thời gian di chuyển đến điểm tiếp theo. VD: '15 phút đi xe máy'"
+    )
+    transport_duration_minutes: Optional[int] = Field(
+        default=None,
+        description="Travel time to the next place, rounded like itinerary creation"
+    )
+    transport_distance_km: Optional[float] = Field(
+        default=None,
+        description="Distance to the next place in kilometres"
     )
 
 

@@ -24,6 +24,7 @@ export class SearchService {
   private readonly defaultPlaceImageUrl =
     process.env.DEFAULT_PLACE_IMAGE_URL ||
     'https://placehold.co/1080x720?text=No+Image';
+  private nearbySearchRpcUnavailableLogged = false;
 
   // ── Ranking (rating + số lượt đánh giá) ────────────────────────────────────
   // Bayesian weighted rating (kiểu IMDb): điểm kéo về mức trung bình PRIOR khi
@@ -925,6 +926,67 @@ export class SearchService {
     radius: number = 10,
     q?: string,
   ): Promise<any[]> {
+    const normalizedQuery = q?.trim() ?? '';
+    let indexedCandidateIds: string[] | null = null;
+
+    // Search requests use a DB-side RPC so the existing trigram index handles
+    // the name lookup and PostgreSQL performs radius filtering, sorting and
+    // limiting before returning rows. Keep the legacy query as a deployment
+    // fallback until the accompanying migration has been applied everywhere.
+    if (normalizedQuery) {
+      const { data: rpcData, error: rpcError } = await supabase
+        .schema('travel')
+        .rpc('search_nearby_places', {
+          p_lat: lat,
+          p_lng: lng,
+          p_limit: limit,
+          p_exclude_ids: excludeIds,
+          // Older DB versions treated an empty preferred category as the
+          // attraction feed and filtered restaurants. Use an explicit
+          // all-category sentinel for keyword search.
+          p_prefer_category: preferCategory || '__all__',
+          p_radius_km: radius,
+          p_query: normalizedQuery,
+        });
+
+      if (!rpcError && Array.isArray(rpcData) && rpcData.length > 0) {
+        return rpcData.map((row: any) => row?.result ?? row);
+      }
+
+      if (rpcError && !this.nearbySearchRpcUnavailableLogged) {
+        this.nearbySearchRpcUnavailableLogged = true;
+        console.warn(
+          'search_nearby_places RPC unavailable; using indexed candidate fallback:',
+          rpcError?.message ?? rpcError,
+        );
+      }
+
+      // The autocomplete RPC and its trigram index already exist in older
+      // deployments. Use it to narrow the detail query to a small ID set while
+      // waiting for search_nearby_places to be migrated.
+      const { data: candidateData, error: candidateError } = await supabase
+        .schema('travel')
+        .rpc('search_autocomplete', {
+          p_query: normalizedQuery,
+        });
+
+      if (!candidateError && Array.isArray(candidateData)) {
+        indexedCandidateIds = candidateData
+          .filter(
+            (row: any) =>
+              String(row?.type ?? '').toLowerCase() === 'place' && row?.id,
+          )
+          .map((row: any) => String(row.id));
+
+        // An empty autocomplete result must not terminate explicit search:
+        // the nearby RPC may not have been migrated yet, and older versions
+        // of autocomplete can miss infix/accent variants that ILIKE finds.
+        if (indexedCandidateIds.length === 0) {
+          indexedCandidateIds = null;
+        }
+      }
+    }
+
     // Pre-filter with bounding box to avoid fetching the entire table.
     const latDelta = radius / 111.32;
     const lngDelta = radius / (111.32 * Math.cos((lat * Math.PI) / 180));
@@ -946,8 +1008,10 @@ export class SearchService {
       query = query.not('id', 'in', `(${excludeIds.join(',')})`);
     }
 
-    if (q && q.trim().length > 0) {
-      query = query.ilike('name', `%${q.trim()}%`);
+    if (indexedCandidateIds !== null) {
+      query = query.in('id', indexedCandidateIds);
+    } else if (normalizedQuery) {
+      query = query.ilike('name', `%${normalizedQuery}%`);
     }
 
     const { data, error } = await query;
@@ -1018,7 +1082,10 @@ export class SearchService {
     const inRadius = placesWithDistance
       .filter((p) => p.distanceKm !== null && p.distanceKm <= radius)
       .filter((p) => {
-        if (normalizedPrefer === 'tham quan' || normalizedPrefer === '') {
+        // Only the default "Tham quan" suggestion feed excludes food and
+        // accommodation. An explicit keyword search sends no preferred
+        // category and must be allowed to return restaurants/cafes as well.
+        if (normalizedPrefer === 'tham quan') {
           const cat = p.category.toLowerCase();
           if (
             cat.includes('nhà hàng') ||
