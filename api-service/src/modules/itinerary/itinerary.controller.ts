@@ -345,11 +345,7 @@ export class ItineraryController {
     // điểm dùng được" mà lờ đi các vi phạm khác không liên quan tới tiền.
     const hasUsablePlan = Number((plan as any)?.total_visited ?? 0) > 0;
 
-    if (
-      requestedBudget > 0 &&
-      hasUsablePlan &&
-      !body.proceedWithOverBudget
-    ) {
+    if (requestedBudget > 0 && hasUsablePlan && !body.proceedWithOverBudget) {
       // childPriceRatio/transportMode/tripCostConfig bắt buộc truyền vào —
       // thiếu childPriceRatio thì bỏ qua tỉ lệ giá trẻ em; thiếu 2 cái sau
       // thì calculatePlanEstimatedCost không tính lại được transport cost
@@ -396,7 +392,8 @@ export class ItineraryController {
           // Câu ngắn, không nhắc lại "mức chi phí khác bên dưới" mơ hồ — số
           // cụ thể (recommendedBudget) do CLIENT tự chèn vào câu (xem
           // _showBudgetConfirmationDialog), tránh lặp ý khi ghép 2 câu lại.
-          message: 'Không tìm thấy lịch trình phù hợp với ngân sách bạn đã nhập.',
+          message:
+            'Không tìm thấy lịch trình phù hợp với ngân sách bạn đã nhập.',
           userBudget: requestedBudget,
           calculatedCost,
           reserveRate: 0.1,
@@ -879,6 +876,8 @@ export class ItineraryController {
       dailyEndTime?: string;
       allowReduceTime?: boolean;
       visitDate?: string;
+      travelMode?: string;
+      preserveOrder?: boolean;
     },
   ) {
     if (!body.activities || body.activities.length === 0) {
@@ -890,6 +889,8 @@ export class ItineraryController {
       body.dailyEndTime,
       body.allowReduceTime || false,
       body.visitDate,
+      body.travelMode,
+      body.preserveOrder ?? false,
     );
     return {
       optimized: result.optimized,

@@ -35,6 +35,14 @@ import { resolvePlannerPlaceType } from '../recommendation/utils/place-type.util
 
 // ─── Địa chỉ FastAPI optimizer (đọc từ env hoặc dùng mặc định) ───
 const AI_SERVICE_URL = process.env.AI_SERVICE_URL ?? 'http://localhost:8000';
+const configuredAiOptimizerTimeoutMs = Number(
+  process.env.AI_OPTIMIZER_TIMEOUT_MS ?? 45_000,
+);
+const AI_OPTIMIZER_TIMEOUT_MS =
+  Number.isFinite(configuredAiOptimizerTimeoutMs) &&
+  configuredAiOptimizerTimeoutMs > 0
+    ? configuredAiOptimizerTimeoutMs
+    : 45_000;
 const APP_DEEP_LINK_SCHEME =
   process.env.APP_DEEP_LINK_SCHEME ?? 'gptraveladvisor';
 const APP_PLAY_STORE_URL = process.env.APP_PLAY_STORE_URL ?? null;
@@ -1943,7 +1951,9 @@ export class ItineraryService {
     const { data: existing, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
-      .select('id, visit_date')
+      .select(
+        'id, visit_date, detail_type, duration_minutes, sequence_order, notes',
+      )
       .eq('id', activityId)
       .eq('itinerary_id', itineraryId)
       .single();
@@ -1951,6 +1961,12 @@ export class ItineraryService {
     if (fetchErr || !existing) {
       throw new NotFoundException(
         `Không tìm thấy hoạt động với id: ${activityId}`,
+      );
+    }
+
+    if (this.isStartPointDetail(existing)) {
+      throw new BadRequestException(
+        'Không thể xóa khách sạn khỏi lịch trình bằng thao tác xóa địa điểm',
       );
     }
 
@@ -2677,10 +2693,6 @@ export class ItineraryService {
             is_restaurant: this.isRestaurant(
               a.places?.slot_type,
               a.locked_arrive_time || a.arrival_time,
-              this.addMinutesToTime(
-                a.locked_arrive_time || a.arrival_time,
-                Number(a.duration_minutes ?? 60),
-              ),
             ),
             original_arrival_time: a.arrival_time,
             is_new: newActivityId ? a.id === newActivityId : false,
@@ -2693,7 +2705,9 @@ export class ItineraryService {
       const response = await axios.post(
         `${AI_SERVICE_URL}/api/v1/itinerary/optimize`,
         optimizePayload,
-        { timeout: 10000 }, // 10 giây timeout
+        // Cold start/reload của AI service phải nạp model và đồng bộ config,
+        // thường lâu hơn 10 giây dù optimizer sau đó vẫn chỉ solve tối đa 5 giây.
+        { timeout: AI_OPTIMIZER_TIMEOUT_MS },
       );
       optimizedSchedule = response.data.optimized_activities;
     } catch (aiErr: any) {
@@ -3062,7 +3076,8 @@ export class ItineraryService {
     }
 
     // Chặn toàn bộ payload trước khi ghi để không tạo lịch trình dở dang:
-    // địa điểm đang đóng vai trò ăn trưa phải luôn nằm trọn trong 10:30-14:00.
+    // địa điểm đang đóng vai trò ăn trưa chỉ cần có giờ đến trong 10:30-14:00;
+    // giờ rời không tham gia điều kiện nhận diện hoặc kích hoạt tối ưu.
     for (const act of editableActivities) {
       const oldState = currentActMap.get(act.id);
       if (!oldState) continue;
@@ -3073,22 +3088,12 @@ export class ItineraryService {
       const currentPlaceType = act.placeId
         ? placeTypeMap.get(act.placeId)
         : oldPlaceType;
-      const oldDepartureTime = this.addMinutesToTime(
-        oldState.arrivalTime,
-        oldState.durationMinutes,
-      );
-      const wasLunch = this.isRestaurant(
-        oldPlaceType,
-        oldState.arrivalTime,
-        oldDepartureTime,
-      );
-      if (
-        wasLunch &&
-        !this.isRestaurant(currentPlaceType, act.startTime, act.endTime)
-      ) {
+      const wasLunch = this.isRestaurant(oldPlaceType, oldState.arrivalTime);
+      if (wasLunch && !this.isRestaurant(currentPlaceType, act.startTime)) {
         throw new BadRequestException({
           code: 'LUNCH_CONFLICT',
-          message: 'Địa điểm ăn trưa phải nằm trọn trong khung 10:30 - 14:00',
+          message:
+            'Giờ đến địa điểm ăn trưa phải nằm trong khung 10:30 - 14:00',
         });
       }
     }
@@ -4081,25 +4086,21 @@ export class ItineraryService {
   /**
    * Một activity chỉ được coi là "địa điểm ăn trưa" khi thỏa cả 2 điều kiện (AND):
    * 1. place_type (travel.places.slot_type — cùng nguồn với lúc tạo lịch trình) = 'restaurant'.
-   * 2. CẢ giờ đến VÀ giờ rời đều nằm trong khung giờ ăn trưa (LUNCH_START_MIN..LUNCH_END_MIN)
-   *    — khớp đúng ràng buộc cứng solver dùng khi tối ưu lại (itinerary_optimizer.py:
-   *    `arrival >= LUNCH_START AND departure <= LUNCH_END`), không chỉ riêng giờ đến.
+   * 2. Giờ đến nằm trong khung giờ ăn trưa (LUNCH_START_MIN..LUNCH_END_MIN).
+   * Giờ rời không ảnh hưởng đến việc nhận diện.
    */
   private isRestaurant(
     placeType: string | null | undefined,
     arrivalTimeStr?: string | null,
-    departureTimeStr?: string | null,
   ): boolean {
     const isFoodPlace = (placeType ?? '').trim().toLowerCase() === 'restaurant';
     if (!isFoodPlace) return false;
 
-    if (arrivalTimeStr && departureTimeStr) {
+    if (arrivalTimeStr) {
       try {
         const [ah, am] = arrivalTimeStr.split(':').map(Number);
-        const [dh, dm] = departureTimeStr.split(':').map(Number);
         const arrivalMin = ah * 60 + (am || 0);
-        const departureMin = dh * 60 + (dm || 0);
-        return arrivalMin >= LUNCH_START_MIN && departureMin <= LUNCH_END_MIN;
+        return arrivalMin >= LUNCH_START_MIN && arrivalMin <= LUNCH_END_MIN;
       } catch (e) {
         // Ignore parse errors, fall back to place_type only
       }
@@ -4139,6 +4140,8 @@ export class ItineraryService {
     dailyEndTime?: string,
     allowReduceTime: boolean = false,
     visitDate?: string,
+    travelMode?: string,
+    preserveOrder: boolean = false,
   ): Promise<{ optimized: any[]; reorderNotes: string[] }> {
     if (activities.length === 0) return { optimized: [], reorderNotes: [] };
 
@@ -4151,16 +4154,81 @@ export class ItineraryService {
     const incomingPlaceIds = activities
       .map((a: any) => a.placeId)
       .filter(Boolean);
+    const incomingActivityIds = activities
+      .map((a: any) => a.id)
+      .filter(Boolean);
+    const { data: persistedActivities } =
+      incomingActivityIds.length > 0
+        ? await supabase
+            .schema('travel')
+            .from('itinerary_details')
+            .select('id, place_id, arrival_time')
+            .in('id', incomingActivityIds)
+        : { data: [] as any[] };
+    const persistedPlaceIds = (persistedActivities || [])
+      .map((activity: any) => activity.place_id)
+      .filter(Boolean);
+    const allRelevantPlaceIds = [
+      ...new Set([...incomingPlaceIds, ...persistedPlaceIds]),
+    ];
     const placeTypeMap = new Map<string, string | null>();
-    if (incomingPlaceIds.length > 0) {
+    if (allRelevantPlaceIds.length > 0) {
       const { data: placesData } = await supabase
         .schema('travel')
         .from('places')
         .select('id, slot_type')
-        .in('id', incomingPlaceIds);
+        .in('id', allRelevantPlaceIds);
       (placesData || []).forEach((p: any) =>
         placeTypeMap.set(p.id, p.slot_type ?? null),
       );
+    }
+    const persistedLunchActivityIds = new Set(
+      (persistedActivities || [])
+        .filter((activity: any) =>
+          this.isRestaurant(
+            placeTypeMap.get(activity.place_id),
+            activity.arrival_time,
+          ),
+        )
+        .map((activity: any) => activity.id),
+    );
+
+    const isAccommodationActivity = (activity: any): boolean => {
+      const slotType = String(
+        (activity.placeId ? placeTypeMap.get(activity.placeId) : null) ??
+          activity.placeType ??
+          '',
+      )
+        .trim()
+        .toLowerCase();
+      return (
+        slotType === 'accommodation' ||
+        slotType === 'hotel' ||
+        this.isAccommodationCategory(activity.category) ||
+        this.isAccommodationCategory(activity.title)
+      );
+    };
+    const schedulableActivities = activities.filter(
+      (activity: any) => !isAccommodationActivity(activity),
+    );
+    const firstSchedulableIndex = activities.findIndex(
+      (activity: any) => !isAccommodationActivity(activity),
+    );
+    const startAccommodationIndex = activities.findIndex((activity: any) =>
+      isAccommodationActivity(activity),
+    );
+    const startAccommodation =
+      startAccommodationIndex >= 0 &&
+      startAccommodationIndex < firstSchedulableIndex
+        ? activities[startAccommodationIndex]
+        : null;
+    const matrixTravelMode = this.normalizeMatrixTravelMode(travelMode);
+
+    // Hotel rows are display-only start/return anchors. Never send them to
+    // the route optimizer, where startTime == endTime would otherwise become
+    // a 60-minute activity and get moved when a place is added.
+    if (schedulableActivities.length === 0) {
+      return { optimized: activities, reorderNotes: [] };
     }
 
     try {
@@ -4170,7 +4238,7 @@ export class ItineraryService {
         visit_date: resolvedVisitDate,
         day_start_time: this.trimTime(dailyStartTime) || '07:00',
         day_end_time: this.trimTime(dailyEndTime) || '22:00',
-        activities: activities.map((a: any) => {
+        activities: schedulableActivities.map((a: any) => {
           // Tính duration từ startTime/endTime nếu không có sẵn
           const startMin = this.toMinutes(a.startTime || '07:00');
           const endMin = this.toMinutes(a.endTime || '08:00');
@@ -4189,6 +4257,28 @@ export class ItineraryService {
             close_time = dayEndStr;
           }
 
+          const lockedArrivalTime = a.lockedArriveTime || a.startTime;
+          const isLunchActivity =
+            persistedLunchActivityIds.has(a.id) ||
+            this.isRestaurant(
+              a.placeId ? placeTypeMap.get(a.placeId) : null,
+              lockedArrivalTime,
+            );
+          if (
+            isLunchActivity &&
+            (a.isLocked ?? false) &&
+            !this.isRestaurant(
+              a.placeId ? placeTypeMap.get(a.placeId) : null,
+              lockedArrivalTime,
+            )
+          ) {
+            throw new BadRequestException({
+              code: 'LUNCH_CONFLICT',
+              message:
+                'Giờ đến địa điểm ăn trưa phải nằm trong khung 10:30 - 14:00',
+            });
+          }
+
           return {
             id: a.id,
             // `id` dùng để map kết quả về đúng itinerary_details; `place_id`
@@ -4203,26 +4293,34 @@ export class ItineraryService {
             close_time,
             estimated_cost: a.price ?? 0,
             category: a.category ?? null,
-            is_restaurant: this.isRestaurant(
-              a.placeId ? placeTypeMap.get(a.placeId) : null,
-              a.lockedArriveTime || a.startTime,
-              this.addMinutesToTime(
-                a.lockedArriveTime || a.startTime,
-                a.durationMinutes ?? duration,
-              ),
-            ),
+            is_restaurant: isLunchActivity,
             original_arrival_time: a.startTime ?? null,
             // Flutter đánh dấu activity mới bằng isNew: true → optimizer chèn vào vị trí tối ưu
             is_new: a.isNew ?? false,
           };
         }),
+        start_location: startAccommodation
+          ? {
+              id: startAccommodation.id,
+              place_id:
+                startAccommodation.placeId ?? startAccommodation.id,
+              lat: startAccommodation.latitude ?? null,
+              lng: startAccommodation.longitude ?? null,
+            }
+          : null,
         allow_reduce_time: allowReduceTime,
+        // Interactive edits must return promptly. Reuse the shared Supabase
+        // distance_matrix cache and let the AI service fall back to Haversine
+        // for a missing pair instead of waiting on live Goong batch retries.
+        use_goong: false,
+        travel_vehicle: matrixTravelMode === 'MOTORBIKE' ? 'bike' : 'car',
+        preserve_order: preserveOrder,
       };
 
       const response = await axios.post(
         `${AI_SERVICE_URL}/api/v1/itinerary/optimize`,
         payload,
-        { timeout: 10000 },
+        { timeout: AI_OPTIMIZER_TIMEOUT_MS },
       );
 
       const optimized: any[] = response.data?.optimized_activities ?? [];
@@ -4247,29 +4345,119 @@ export class ItineraryService {
 
       // Map kết quả TSPTW về format Flutter mong đợi
       const mappedOptimized = optimized.map((opt: any) => {
-        const original = activities.find((a: any) => a.id === opt.id) ?? {};
+        const original =
+          schedulableActivities.find((a: any) => a.id === opt.id) ?? {};
         return {
           ...original,
           startTime: opt.arrival_time,
           endTime: opt.departure_time,
           transportInfo: opt.transport_to_next ?? original.transportInfo,
+          transitDurationMinutes:
+            opt.transport_duration_minutes ??
+            original.transitDurationMinutes ??
+            null,
+          transitDistanceKm:
+            opt.transport_distance_km ?? original.transitDistanceKm ?? null,
           durationMinutes: opt.duration_minutes ?? original.durationMinutes,
         };
       });
 
-      return { optimized: mappedOptimized, reorderNotes };
+      // Preserve every hotel anchor exactly as received and at the same list
+      // position, while filling the remaining slots with optimized activities.
+      let optimizedIndex = 0;
+      const optimizedWithAccommodation = activities.map((activity: any) => {
+        if (isAccommodationActivity(activity)) return activity;
+        return mappedOptimized[optimizedIndex++] ?? activity;
+      });
+
+      // Hotels are fixed display anchors, not schedulable visits. Resolve every
+      // adjacent leg touching a hotel (start hotel -> first place and last place
+      // -> return hotel) with the same pipeline used during itinerary creation.
+      for (
+        let index = 0;
+        index < optimizedWithAccommodation.length - 1;
+        index++
+      ) {
+        const current = optimizedWithAccommodation[index];
+        const next = optimizedWithAccommodation[index + 1];
+        if (
+          !isAccommodationActivity(current) &&
+          !isAccommodationActivity(next)
+        ) {
+          continue;
+        }
+
+        const originPlaceId = current.placeId ?? current.id;
+        const destinationPlaceId = next.placeId ?? next.id;
+        const leg = await this.resolveTravelLegForDisplay(
+          originPlaceId,
+          destinationPlaceId,
+          matrixTravelMode,
+        );
+        optimizedWithAccommodation[index] = {
+          ...current,
+          transportInfo: leg?.label ?? null,
+          transitDurationMinutes: leg?.minutes ?? null,
+          transitDistanceKm: leg?.distanceKm ?? null,
+        };
+      }
+
+      return { optimized: optimizedWithAccommodation, reorderNotes };
     } catch (e: any) {
-      // Python AI service trả về 422 khi lịch kín — phải check 422, không phải 400
+      if (e instanceof BadRequestException) {
+        throw e;
+      }
+      // Python AI service trả về 422 khi lịch kín — phải check 422, không phải 400.
+      // detail có thể là chuỗi "SCHEDULE_FULL" (ValueError của optimizer) hoặc chứa
+      // chuỗi đó lồng trong message dài hơn — không dùng so sánh === tuyệt đối.
+      const detail = e.response?.data?.detail;
       if (
         e.response?.status === 422 &&
-        e.response?.data?.detail === 'SCHEDULE_FULL'
+        typeof detail === 'string' &&
+        detail.includes('SCHEDULE_FULL')
       ) {
         throw new BadRequestException('SCHEDULE_FULL');
       }
-      console.error('optimizeDayRoute failed:', e);
+      if (
+        e.response?.status === 422 &&
+        typeof detail === 'string' &&
+        detail.includes('LUNCH_CONFLICT')
+      ) {
+        throw new BadRequestException({
+          code: 'LUNCH_CONFLICT',
+          message:
+            'Giờ đến địa điểm ăn trưa phải nằm trong khung 10:30 - 14:00',
+        });
+      }
+      // Log đầy đủ response của AI service (không chỉ message axios) để debug được
+      // nguyên nhân thật thay vì chỉ thấy "timeout" chung chung.
+      console.error(
+        'optimizeDayRoute failed:',
+        e.response
+          ? { status: e.response.status, data: e.response.data }
+          : (e.message ?? e),
+      );
       if (allowReduceTime) {
-        // Ném lỗi 500 nếu AI server timeout, để khách hàng biết là do server chứ không phải do lịch kín
-        throw new Error('AI Server is unresponsive or timed out.');
+        // Chỉ báo "AI server timeout" khi ĐÚNG là timeout/network thật (không có response
+        // trả về). Nếu AI service đã trả lời (kể cả lỗi 4xx/5xx), phải trả nguyên nhân
+        // thật cho client — trước đây mọi lỗi đều bị gộp thành "unresponsive or timed out",
+        // che mất lỗi thật (VD: lỗi khi user sửa giờ khiến khung ràng buộc ăn trưa xung đột)
+        // và khiến không thể debug hay hiển thị thông báo đúng cho người dùng.
+        const isRealTimeoutOrNetworkError =
+          !e.response &&
+          ['ECONNABORTED', 'ETIMEDOUT', 'ECONNREFUSED', 'ENOTFOUND'].includes(
+            e.code,
+          );
+        if (isRealTimeoutOrNetworkError) {
+          throw new Error('AI Server is unresponsive or timed out.');
+        }
+        const detailMessage =
+          typeof detail === 'string'
+            ? detail
+            : (detail ? JSON.stringify(detail) : (e.message ?? 'Unknown error'));
+        throw new BadRequestException(
+          `Không thể tối ưu lịch trình: ${detailMessage}`,
+        );
       }
       return { optimized: activities, reorderNotes: [] }; // Fallback: giữ nguyên thứ tự cũ
     }
@@ -5248,9 +5436,72 @@ export class ItineraryService {
   private normalizeMatrixTravelMode(
     mode?: string | null,
   ): 'DRIVING' | 'MOTORBIKE' {
-    return (mode ?? '').toUpperCase() === TransportMode.MOTORBIKE
+    const normalized = (mode ?? '').trim().toUpperCase();
+    return normalized === TransportMode.MOTORBIKE || normalized === 'BIKE'
       ? 'MOTORBIKE'
       : 'DRIVING';
+  }
+
+  private async resolveTravelLegForDisplay(
+    originPlaceId: string,
+    destinationPlaceId: string,
+    travelMode: 'DRIVING' | 'MOTORBIKE',
+  ): Promise<{
+    minutes: number;
+    distanceKm: number;
+    label: string;
+  } | null> {
+    if (
+      !originPlaceId ||
+      !destinationPlaceId ||
+      originPlaceId === destinationPlaceId
+    ) {
+      return null;
+    }
+
+    const { data: cached, error } = await supabase
+      .schema('travel')
+      .from('distance_matrix')
+      .select('distance_meters, duration_seconds')
+      .eq('origin_place_id', originPlaceId)
+      .eq('destination_place_id', destinationPlaceId)
+      .eq('travel_mode', travelMode)
+      .maybeSingle();
+
+    if (error) {
+      this.logger.warn(
+        `Cannot read travel leg ${originPlaceId} -> ${destinationPlaceId}: ${error.message}`,
+      );
+    }
+
+    let row: any = cached;
+    if (!row) {
+      const resolved = await this.fetchAndCacheGoongLegs(
+        [
+          {
+            originId: originPlaceId,
+            destination: { place_id: destinationPlaceId },
+          },
+        ],
+        travelMode,
+      );
+      row = resolved[0] ?? null;
+    }
+    if (!row) return null;
+
+    const distanceKm = Math.max(0, Number(row.distance_meters ?? 0) / 1000);
+    const minutes = this.roundTravelMinutes(
+      Math.ceil(Number(row.duration_seconds ?? 0) / 60),
+    );
+    if (minutes <= 0) return null;
+
+    return {
+      minutes,
+      distanceKm,
+      label: `${this.formatDuration(minutes)} di chuyển • ${Number(
+        distanceKm.toFixed(1),
+      )} km`,
+    };
   }
 
   // Số request Goong chạy song song tối đa cho các cặp THẬT SỰ mới (chưa ai
