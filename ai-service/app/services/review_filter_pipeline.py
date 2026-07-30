@@ -3735,11 +3735,8 @@ class ReviewFilteringPipeline:
             ]
 
             topic = str(content.get("main_topic"))
-            ttl_hours = TTL_HOURS_BY_TOPIC.get(topic, 72)
-            lookback_multiplier = ALGORITHM2_LOOKBACK_MULTIPLIER_BY_TOPIC.get(
-                topic,
-                self.config.old_lookback_multiplier,
-            )
+            ttl_hours = self._ttl_hours_for_topic(topic, 72)
+            lookback_multiplier = self._lookback_multiplier_for_topic(topic)
             lookback_hours = ttl_hours * max(1, lookback_multiplier)
             ref_time = parse_iso(content["created_at"])
             if ref_time is not None:
