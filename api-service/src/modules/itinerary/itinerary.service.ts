@@ -2313,7 +2313,7 @@ export class ItineraryService {
    * preserves the AI model's order), minus hotels and places already in this
    * itinerary. Falls back to same-city places sorted by rating.
    */
-  async getSuggestions(itineraryId: string, activityId: string) {
+  async getSuggestions(itineraryId: string, activityId: string, limit = 20) {
     const { data: current, error: fetchErr } = await supabase
       .schema('travel')
       .from('itinerary_details')
@@ -2445,15 +2445,50 @@ export class ItineraryService {
 
       if (!aiErr && aiPlaces) {
         const byId = new Map(aiPlaces.map((p: any) => [p.id, p]));
-        suggestions = recommendedIds
+        const orderedAiPlaces = recommendedIds
           .map((id) => byId.get(id))
-          .filter(Boolean)
-          .slice(0, 10);
+          .filter(Boolean);
+
+        // The recommendation model isn't category-aware — it's the same
+        // "you might like" signal used on the place detail page. Replacing
+        // a food stop should surface food alternatives first, so re-rank
+        // (not filter) same-category hits ahead of the rest while keeping
+        // the model's relative order within each group.
+        if (currentCategoryId != null) {
+          const sameCategory: any[] = [];
+          const otherCategory: any[] = [];
+          for (const p of orderedAiPlaces) {
+            const typeData = Array.isArray((p as any).types)
+              ? (p as any).types[0]
+              : (p as any).types;
+            if (typeData?.category_id === currentCategoryId) {
+              sameCategory.push(p);
+            } else {
+              otherCategory.push(p);
+            }
+          }
+          suggestions = [...sameCategory, ...otherCategory].slice(0, limit);
+        } else {
+          suggestions = orderedAiPlaces.slice(0, limit);
+        }
       }
     }
 
-    if (suggestions.length === 0) {
-      const buildFallbackQuery = (withCategoryFilter: boolean) => {
+    // The recommendation model rarely returns a full page on its own — top
+    // up with same-city places (same category first, then any category) so
+    // the list stays entirely within this recommendation/fallback pool
+    // instead of the client mixing in an unrelated generic nearby-radius
+    // search to reach `limit`.
+    if (suggestions.length < limit) {
+      const alreadyIncludedIds = new Set<string>([
+        ...excludedPlaceIds,
+        ...suggestions.map((p: any) => p.id),
+      ]);
+
+      const buildFallbackQuery = (
+        withCategoryFilter: boolean,
+        remaining: number,
+      ) => {
         let query = supabase
           .schema('travel')
           .from('places')
@@ -2461,43 +2496,51 @@ export class ItineraryService {
           .eq('city_id', currentPlace.city_id)
           .neq('slot_type', 'accommodation');
 
-        if (excludedPlaceIds.length > 0) {
-          query = query.not('id', 'in', `(${excludedPlaceIds.join(',')})`);
+        if (alreadyIncludedIds.size > 0) {
+          query = query.not(
+            'id',
+            'in',
+            `(${[...alreadyIncludedIds].join(',')})`,
+          );
         }
         if (withCategoryFilter && currentCategoryId) {
           query = query.eq('types.category_id', currentCategoryId);
         }
-        return query.order('average_rating', { ascending: false }).limit(10);
+        return query
+          .order('average_rating', { ascending: false })
+          .limit(remaining);
       };
 
       const { data: sameCategoryData, error: suggestErr } =
-        await buildFallbackQuery(currentCategoryId != null);
+        await buildFallbackQuery(
+          currentCategoryId != null,
+          limit - suggestions.length,
+        );
 
       if (suggestErr) {
         console.error(
           '[ItineraryService] getSuggestions fallback error:',
           suggestErr,
         );
-        return { suggestions: [] };
+      } else if (sameCategoryData && sameCategoryData.length > 0) {
+        suggestions = [...suggestions, ...sameCategoryData];
+        sameCategoryData.forEach((p: any) => alreadyIncludedIds.add(p.id));
       }
 
-      if (sameCategoryData && sameCategoryData.length > 0) {
-        suggestions = sameCategoryData;
-      } else if (currentCategoryId != null) {
-        // Không còn địa điểm nào cùng danh mục trong thành phố — nới lỏng
-        // để vẫn có gợi ý thay vì trả rỗng.
+      const stillRemaining = limit - suggestions.length;
+      if (stillRemaining > 0 && currentCategoryId != null) {
+        // Không còn đủ địa điểm cùng danh mục trong thành phố — nới lỏng để
+        // vẫn lấp đầy danh sách thay vì trả về ít hơn mong muốn.
         const { data: anyCategoryData, error: anyErr } =
-          await buildFallbackQuery(false);
+          await buildFallbackQuery(false, stillRemaining);
         if (anyErr) {
           console.error(
             '[ItineraryService] getSuggestions fallback (any category) error:',
             anyErr,
           );
-          return { suggestions: [] };
+        } else if (anyCategoryData) {
+          suggestions = [...suggestions, ...anyCategoryData];
         }
-        suggestions = anyCategoryData ?? [];
-      } else {
-        suggestions = [];
       }
     }
 

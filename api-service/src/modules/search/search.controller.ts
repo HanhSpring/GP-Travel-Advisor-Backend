@@ -58,6 +58,7 @@ export class SearchController {
     @Query('preferCategory') preferCategory?: string,
     @Query('radius') radius?: number,
     @Query('q') q?: string,
+    @Query('city') city?: string,
   ) {
     const uuidRegex = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
     const ids = excludeIds ? excludeIds.split(',').filter(id => Boolean(id) && uuidRegex.test(id)) : [];
@@ -69,6 +70,7 @@ export class SearchController {
       preferCategory ?? '',
       radius ? Number(radius) : 10,
       q,
+      city,
     );
   }
 }
