@@ -73,6 +73,7 @@ export class AdminAlgorithmPipelineService {
   async runPipeline(
     dto: PipelineRunRequestDto,
     adminId: string | null = null,
+    triggerType: 'manual' | 'scheduled' = 'manual',
   ): Promise<PipelineRunResponseDto> {
     this.logger.log('Kich hoat pipeline phan loai review...');
     let requestPayload: Record<string, any> = dto;
@@ -91,6 +92,12 @@ export class AdminAlgorithmPipelineService {
         ),
       );
       await this.insertPipelineLog('active', response.data, requestPayload, adminId);
+      if (triggerType === 'manual') {
+        const completedAt = new Date(response.data.completed_at).getTime();
+        await this.markScheduleLastRun(
+          Number.isFinite(completedAt) ? completedAt : Date.now(),
+        );
+      }
       return response.data;
     } catch (error) {
       this.logger.error(`Pipeline run failed: ${error.message}`);
@@ -256,10 +263,14 @@ export class AdminAlgorithmPipelineService {
 
     this.logger.log(`Review filter auto schedule due at ${due.toISOString()}`);
     try {
-      await this.runPipeline({
-        dry_run: false,
-        triggered_by: 'schedule',
-      } as PipelineRunRequestDto);
+      await this.runPipeline(
+        {
+          dry_run: false,
+          triggered_by: 'schedule',
+        } as PipelineRunRequestDto,
+        null,
+        'scheduled',
+      );
     } finally {
       await this.markScheduleLastRun(due.getTime());
     }
